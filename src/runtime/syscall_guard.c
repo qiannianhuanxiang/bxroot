@@ -210,6 +210,7 @@ static int should_block(long nr)
 static int path_arg_index(long nr)
 {
     switch (nr) {
+    /* ---- 传统接口（逐条核对过参数位置）---- */
     case 291:  return 1;   /* statx(dfd, path, flags, mask, buf)      */
     case 79:   return 1;   /* newfstatat(dfd, path, buf, flags)       */
     case 78:   return 1;   /* readlinkat(dfd, path, buf, sz)          */
@@ -217,8 +218,42 @@ static int path_arg_index(long nr)
     case 56:   return 1;   /* openat(dfd, path, flags, mode)          */
     case 35:   return 1;   /* unlinkat(dfd, path, flags)              */
     case 34:   return 1;   /* mkdirat(dfd, path, mode)                */
-    case 221:  return 0;   /* execve(path, argv, envp)                */
-    case 1024: return 0;   /* open(path, flags, mode) —— 已废弃仍在用 */
+    case 221:  return 0;   /* execve(path, argv, envp) —— a0 是路径   */
+
+    /*
+     * ---- 现代内核新增的路径型接口 ----
+     *
+     * 审计发现的缺口：这张表最初只列了传统调用，而**走裸 `syscall()`
+     * 的静态链接程序**（本层存在的全部理由）会用新接口。不列进来 =
+     * 那些调用绕过路径翻译，客户看到宿主路径不存在。
+     *
+     * 【编号逐个实测过】本机（Android 6.1 内核 + aarch64）：
+     *     439 faccessat2 → ENOENT（存在）
+     *     281 execveat   → EINVAL（存在）
+     *     276 renameat2  → EINVAL（存在）
+     *     260 linkat     → EPERM （存在）
+     *      38 renameat   → EFAULT（存在）
+     *      36 symlinkat  → EFAULT（存在）
+     *     437 openat2    → **ENOSYS** ← 本内核不支持，故**不列入**
+     *    1024 (旧 open)  → **ENOSYS** ← aarch64 无此编号（那是 i386 的）。
+     *                              原表里的这一项已按实测**删除**。
+     *                              注：它不构成内存缺陷 —— 内核在派发前用
+     *                              `nr > __NR_syscalls` 挡掉，永不进入本函数；
+     *                              但它会让人误以为 open 已被覆盖。
+     *
+     * 【已知不足：双路径参数的调用】
+     * renameat2 / linkat / renameat 各有**两个**路径参数（oldpath + newpath），
+     * 而本函数只能表达"一个位置"，当前只翻 oldpath。这是**已知未覆盖**，
+     * 不是遗漏 —— 覆盖它需要把接口改成返回位掩码。优先保证单路径调用
+     * （statx/openat 等，覆盖绝大多数实际使用）正确。
+     */
+    case 439:  return 1;   /* faccessat2(dfd, path, mode, flags)      */
+    case 281:  return 1;   /* execveat(dfd, path, argv, envp, flags)  */
+    case 276:  return 1;   /* renameat2: 只翻 oldpath                 */
+    case 260:  return 1;   /* linkat:    只翻 oldpath                 */
+    case 38:   return 1;   /* renameat:  只翻 oldpath                 */
+    case 36:   return 1;   /* symlinkat: a1 是 linkpath（a0 是目标）  */
+
     default:   return -1;
     }
 }
@@ -359,17 +394,45 @@ long syscall(long number, ...)
              * exhausted"），用它反而会写坏相邻数据。
              */
             #define SG_POOL_SIZE (64 * 1024)
+            #define SG_SLOT_SIZE 4096
+            #define SG_SLOT_COUNT (SG_POOL_SIZE / SG_SLOT_SIZE)
             static char sg_pool[SG_POOL_SIZE];
-            static unsigned int sg_pool_off;
+            /*
+             * ★ 槽位索引用**原子取号**，不是"读-改-写"。
+             *
+             * 【为什么必须有这一步】
+             * `syscall()` 会被多线程并发调用 —— 而 node/libuv 正是多线程的，
+             * 模块探测时数个线程同时发 statx。先前写成：
+             *
+             *     if (sg_pool_off + need > SG_POOL_SIZE) sg_pool_off = 0;
+             *     tbuf = sg_pool + sg_pool_off;
+             *     sg_pool_off += need;          ← 非原子读-改-写
+             *
+             * 两个线程可能读到同一个 off，拿到**同一个缓冲**：
+             * 一方正在写路径、另一方把它覆盖 —— 内核最终读到一个
+             * 半截或完全错乱的路径。这与本项目先前记录过的
+             * "复用缓冲会崩"是同一类故障（那次是单线程复用，
+             * 这次是并发撞车）。
+             *
+             * 【为什么用原子而不是锁】
+             * 1. 不能加互斥锁：syscall 可能在**信号处理器**上下文被调用
+             *    （我们的 SIGSYS 处理器就会），锁会导致自死锁。
+             * 2. 不能用 _Thread_local：本机加载器 TLS 不完整（其 rodata 里
+             *    有 "tls: runtime static TLS surplus exhausted"），
+             *    实测用它会写坏相邻数据。
+             * 3. `__atomic_fetch_add` 在 aarch64 上编译成 ldxr/stxr 循环，
+             *    无锁、可重入、在信号处理器里安全。
+             *
+             * 【槽位与轮转】
+             * 固定 4 KB 槽位（翻译结果最长 4096，与调用方给的 need 一致）。
+             * 取号对槽位数取模实现轮转 —— 16 个槽位意味着要过 16 次调用
+             * 才回到同一块，而调用方持有路径指针的时间远短于此。
+             */
+            static unsigned int sg_pool_seq;
 
-            char *tbuf;
-            size_t need = 4096;
-
-            /* 池内按 256 字节对齐切块，避免回绕时切碎 */
-            if (sg_pool_off + need > SG_POOL_SIZE)
-                sg_pool_off = 0;
-            tbuf = sg_pool + sg_pool_off;
-            sg_pool_off += need;
+            unsigned int seq = __atomic_fetch_add(&sg_pool_seq, 1, __ATOMIC_RELAXED);
+            char *tbuf = sg_pool + (size_t)(seq % SG_SLOT_COUNT) * SG_SLOT_SIZE;
+            size_t need = SG_SLOT_SIZE;
 
             int tr = bxroot_translate_path(pth, tbuf, need);
 

@@ -2565,7 +2565,7 @@ static int px_do_execve(const char *path, char *const argv[],
 {
     char host[PX_PATH_MAX];
     char guest[PX_PATH_MAX];
-    px_envout env;
+    px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     px_argv_plan plan;
     char *vec[PX_ARGV_MAX + 1];
     size_t need = 0;
@@ -2783,7 +2783,7 @@ int fexecve(int fd, char *const argv[], char *const envp[])
      * 这仍然必要：不重建 envp 的话，fexecve 出来的进程没有任何钩子，
      * 前面对 open 的翻译就白做了。
      */
-    px_envout env;
+    px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     char *const *final_env = envp;
     int rc;
 
@@ -2822,7 +2822,7 @@ int execveat(int dirfd, const char *path, char *const argv[],
      */
     char host[PX_PATH_MAX];
     const char *use = path;
-    px_envout env;
+    px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     char *const *final_env = envp;
     int rc;
 
@@ -2885,7 +2885,7 @@ static int px_do_spawn(pid_t *pid, const char *path,
                        int use_search)
 {
     char host[PX_PATH_MAX];
-    px_envout env;
+    px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     px_argv_plan plan;
     char *vec[PX_ARGV_MAX + 1];
     char *const *final_env = envp;
@@ -3248,7 +3248,7 @@ static int px_system_via_guest(const char *cmd)
 {
     char sh[PX_PATH_MAX];
     char *argv[4];
-    px_envout env;
+    px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     char *const *final_env;
     pid_t pid = 0;
     int rc;

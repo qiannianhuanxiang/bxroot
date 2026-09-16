@@ -202,23 +202,165 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
 /* ------------------------------------------------------------------ */
 
 /*
- * 【重要更正】不拦截 pthread_sigmask / sigprocmask。
+ * 【再次更正·本轮实测】必须拦截 sigprocmask / pthread_sigmask。
  *
- * 早期版本在这里做了"剔除 SIGSYS 屏蔽位"的防护，理由是实测有线程用
- * SIG_SETMASK 屏蔽 SIGSYS。但后续用最小复现程序验证发现：
+ * 上一版这里写着"加载器已经保护 SIGSYS，屏蔽防护多余且有害"。
+ * 本轮用最小复现程序做了 A/B 实测，**该结论被证伪**：
  *
- *     pthread_sigmask(SIG_BLOCK, {SIGSYS}, &old) → 返回 0
- *     回读掩码：SIGSYS **并未被屏蔽**
+ *   探针：sigprocmask(SIG_BLOCK,{SIGSYS}) 之后，直发一个被 seccomp
+ *         TRAP 的内联 svc（nr=99 set_robust_list），看进程是否存活。
  *
- * 也就是说 proroot 的加载器已经在保护 SIGSYS（静默忽略对它的屏蔽），
- * 我们的防护不仅多余，还有害：node 在 PlatformInit 阶段会调用
- * pthread_sigmask 并检查返回码与掩码一致性，我们的实现破坏了它的
- * 预期，导致 `Assertion failed: (err) == (0)` 后 abort（rc=134）。
+ *   官方 proroot：SIGSYS 掩码位**保持为 0**（未被屏蔽）→ 存活 rc=0
+ *   bxroot      ：SIGSYS 掩码位**变成 1**（确实被屏蔽）→ 死 rc=159
  *
- * 结论：这一层只保留 SIGSYS 处理器的安装。屏蔽防护交给加载器。
- * 若将来在没有该保护的环境下运行（例如真机直跑、不经 proroot 加载器），
- * 再按需恢复 —— 但必须有实测证据表明屏蔽确实发生。
+ *   回读证据（sigprocmask(SIG_BLOCK,NULL,&cur) 查询）：
+ *     官方 mode=4: after SIGSYS_blocked=0
+ *     bxroot mode=4: after SIGSYS_blocked=1   ← 差异就在这一位
+ *
+ * 机制：seccomp 以 SECCOMP_RET_TRAP 拦下系统调用时投递 SIGSYS；
+ * **若 SIGSYS 被屏蔽，内核直接杀进程**（man seccomp 明确写入），
+ * 用户态无法捕获 —— 表现为 rc=159。所以屏蔽位必须从源头剔除。
+ *
+ * 上一版为什么误判：当时只回读了掩码，却用了**错误的回读方式**
+ * （裸 rt_sigprocmask 传 sigsetsize=128 的那次调用返回了一个
+ * 像指针的巨大值，掩码内容并未被写入），于是错看成"未被屏蔽"。
+ * 本轮改用 libc 的 sigprocmask(SIG_BLOCK, NULL, &cur) 查询，
+ * 官方与 bxroot 的差异可以稳定复现（各 3 个 mode，见 parity 报告）。
+ *
+ * 与官方实现逐条对齐（官方 helper 在 runtime +0x964c）：
+ *   - 只处理 how == SIG_BLOCK(0) / SIG_SETMASK(2)
+ *     —— 这两种才可能**新增**屏蔽位；
+ *     SIG_UNBLOCK(1) 只会清除屏蔽，原样透传
+ *     （官方判据 `tst w2,#0xfffffffd` 正是"不是 0 也不是 2 就放行"）。
+ *   - 只有集合里**确实含有 SIGSYS** 时才复制并剔除；
+ *     不含则一个字节都不改（避免把 glibc 期望的原集合换掉）。
+ *   - oldset 语义完全交给真实实现，**不自己填** ——
+ *     这就是上一版 rc=134 的根因：node 在 PlatformInit 会校验
+ *     返回码与掩码一致性，自己拼 oldset 会破坏它的预期。
+ *
+ * 注：SIG_UNBLOCK 不剔除是有意的 —— 客户主动解除屏蔽必须被允许，
+ * 否则我们等于替它做了永久屏蔽，与防护目标相反。
  */
+
+/*
+ * 统一入口：glibc 的 __libc_sigaction。
+ *
+ * **不要**用 dlsym(RTLD_NEXT,"sigaction")：实测该环境里 dlsym 拿到的
+ * libc 地址不可靠（外层 proroot 做活体代码补丁，跳进去会 SIGSEGV，
+ * 故障地址呈 0xffffffff…… 符号扩展伪地址形态）。
+ * **也不要**用裸 rt_sigaction：glibc 与内核的 struct sigaction 布局不同
+ * （glibc: handler(0) mask(8) flags(136) restorer(144)，共 152 字节；
+ *  内核: handler(0) flags(8) restorer(16) mask(24)），
+ * 直接传会 EINVAL，处理器静默装不上。
+ * __libc_sigaction 是 GLIBC_PRIVATE 符号，内部做布局转换 —— 这是唯一
+ * 被实测证明可用的路径（安装处与本文件其它地方都依赖它）。
+ */
+static int __libc_sigaction_ref(int sig, const struct sigaction *act,
+                                struct sigaction *old)
+{
+    extern int __libc_sigaction(int, const struct sigaction *,
+                                struct sigaction *);
+    return __libc_sigaction(sig, act, old);
+}
+
+/*
+ * 待提交信号集的 SIGSYS 剔除。
+ *
+ * 返回值：真正应该转发给内核的集合（可能是入参本身，也可能是 tmp）。
+ * 只在需要改写时使用调用方的栈上 tmp —— 不 malloc（可能被信号路径重入）。
+ */
+static const sigset_t *sigsys_strip(int how, const sigset_t *set, sigset_t *tmp)
+{
+    if (set == NULL || !g_installed)
+        return set;
+
+    /* SIG_BLOCK / SIG_SETMASK 之外一律透传（含 SIG_UNBLOCK） */
+    if (how != SIG_BLOCK && how != SIG_SETMASK)
+        return set;
+
+    if (sigismember(set, SIGSYS) != 1)
+        return set;
+
+    *tmp = *set;              /* sigset_t 两侧都是 128 字节位图，直接复制安全 */
+    sigdelset(tmp, SIGSYS);
+    return tmp;
+}
+
+/*
+ * sigprocmask —— 只加"SIGSYS 剔除"这一件事，其余语义原样交给 libc。
+ *
+ * 不用裸 rt_sigprocmask：实测 glibc 与内核在 sigsetsize 上并不一致
+ * （glibc sigset_t 是 128 字节，内核自带的是 8 字节），传错会让掩码
+ * **静默不生效** —— 那正是上一版误判的根源。这里走真实实现。
+ */
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    static int (*real_fn)(int, const sigset_t *, sigset_t *) = NULL;
+    sigset_t tmp;
+
+    if (real_fn == NULL)
+        real_fn = (int (*)(int, const sigset_t *, sigset_t *))
+                  dlsym(RTLD_NEXT, "sigprocmask");
+    if (real_fn == NULL) { errno = ENOSYS; return -1; }
+
+    return real_fn(how, sigsys_strip(how, set, &tmp), oldset);
+}
+
+/*
+ * pthread_sigmask —— 与 sigprocmask 同源（glibc 里两者最终都落到
+ * rt_sigprocmask），同样只剔除 SIGSYS。分开实现而不是互相转发：
+ * 转发会永远只命中本文件的两个包装器中的一个，排查时看不出层次。
+ */
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    static int (*real_fn)(int, const sigset_t *, sigset_t *) = NULL;
+    sigset_t tmp;
+
+    if (real_fn == NULL)
+        real_fn = (int (*)(int, const sigset_t *, sigset_t *))
+                  dlsym(RTLD_NEXT, "pthread_sigmask");
+    if (real_fn == NULL) { errno = ENOSYS; return -1; }
+
+    return real_fn(how, sigsys_strip(how, set, &tmp), oldset);
+}
+
+/*
+ * signal() —— 与 sigaction() 等价的封堵，**不能只防 sigaction**。
+ *
+ * 实测（探针 mode=1/2）：客户调 signal(SIGSYS, SIG_IGN) 或
+ * signal(SIGSYS, SIG_DFL) 之后，任何被 TRAP 的系统调用都会让内核
+ * 直接杀进程（rc=159）—— 因为"忽略 + 被 TRAP"在内核里等价于死亡。
+ *
+ * 而 glibc 的 signal() **不经** sigaction 的 PLT（它是 libc 内部实现），
+ * 所以已有的 sigaction 钩子拦不住它：实测 bxroot 下回读到的处理器
+ * 真的变成了 SIG_IGN。官方导出了 signal() 正是为此。
+ *
+ * 处理方式与 sigaction 钩子保持一致：SIG_IGN / SIG_DFL 静默拒绝，
+ * 保留我们的处理器，并返回"上一个处理器"而不是报错（调用方通常
+ * 不检查返回值，返回 SIG_ERR 反而会让它走进错误分支）。
+ * 真正的自定义处理器照常放行（官方亦然，已实测一致）。
+ */
+sighandler_t signal(int signum, sighandler_t handler)
+{
+    static sighandler_t (*real_fn)(int, sighandler_t) = NULL;
+    struct sigaction cur;
+
+    if (signum == SIGSYS && g_installed &&
+        (handler == SIG_IGN || handler == SIG_DFL)) {
+        /* 回读当前处理器作为返回值；读失败则返回 SIG_ERR 保持诚实 */
+        memset(&cur, 0, sizeof(cur));
+        if (__libc_sigaction_ref(SIGSYS, NULL, &cur) == 0)
+            return cur.sa_handler;
+        return SIG_ERR;
+    }
+
+    if (real_fn == NULL)
+        real_fn = (sighandler_t (*)(int, sighandler_t))
+                  dlsym(RTLD_NEXT, "signal");
+    if (real_fn == NULL) { errno = ENOSYS; return SIG_ERR; }
+
+    return real_fn(signum, handler);
+}
 
 /*
  * 防住 sigaction(SIGSYS, SIG_IGN/SIG_DFL)：忽略 SIGSYS 与屏蔽等价 ——
@@ -233,27 +375,17 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
  */
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old)
 {
-    static int (*real_sigaction_fn)(int, const struct sigaction *,
-                                    struct sigaction *);
-
     if (sig == SIGSYS && act != NULL && g_installed) {
         if (act->sa_handler == SIG_IGN || act->sa_handler == SIG_DFL)
             return 0;   /* 静默拒绝，保持我们的处理器 */
     }
 
     /*
-     * 透传一律走 glibc 的 __libc_sigaction。
-     *
-     * 不用 dlsym(RTLD_NEXT,"sigaction")：实测该环境里 dlsym 拿到的 libc
-     * 地址不可靠（外层做活体代码补丁，跳进去会 SIGSEGV）。
-     * 也不用裸 rt_sigaction：结构体布局不同（见安装处的详细说明）。
+     * 透传一律走 glibc 的 __libc_sigaction（理由见该 helper 的注释）。
+     * 这里**不要**改用 dlsym(RTLD_NEXT,"sigaction")：实测那条路拿到的
+     * 地址会 SIGSEGV。
      */
-    {
-        extern int __libc_sigaction(int, const struct sigaction *,
-                                    struct sigaction *);
-        return __libc_sigaction(sig, act, old);
-    }
-    (void)real_sigaction_fn;
+    return __libc_sigaction_ref(sig, act, old);
 }
 
 /* ------------------------------------------------------------------ */
@@ -305,8 +437,14 @@ int bxroot_sigsys_install(void)
      * 主线程解除 SIGSYS 屏蔽。
      *
      * 用裸 syscall 而非 libc 的 sigprocmask —— 我们自己就 hook 了那个名字，
-     * 在这里调用它会绕回本文件（重入）。而且实测加载器已保护 SIGSYS
-     * （屏蔽请求会被静默忽略），这一步主要是幂等保险。
+     * 在这里调用它会绕回本文件（重入）。
+     *
+     * 【注意】此处的裸 rt_sigprocmask 只做"解除屏蔽"这一个动作，
+     * **不能**用它做任何"读取当前掩码"的判断：实测 glibc 与内核在
+     * sigsetsize 上并不一致，裸调用读回的掩码是垃圾值。
+     * 本项目曾因此误判"加载器已保护 SIGSYS，防护多余"—— 那个结论
+     * 是错的，真正的屏蔽检测必须用 libc 的 sigprocmask(SIG_BLOCK, NULL, &cur)
+     * 查询（见本文件上方的实测记录）。
      */
     sigemptyset(&s);
     sigaddset(&s, SIGSYS);

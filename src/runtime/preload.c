@@ -37,12 +37,6 @@
 #include <dirent.h>
 #include <signal.h>
 #include <sys/wait.h>
-/*
- * pthread.h 只为 pthread_create 钩子（栈下限修正）需要。
- * 它必须放在 sys/wait.h 之后：本文件顶部那份 `_GNU_SOURCE 必须在所有
- * 系统头文件之前` 的约定已由文件开头满足，这里只是补一个普通头。
- */
-#include <pthread.h>
 
 #include "config.h"
 #include "l2s-runtime.h"
@@ -3801,106 +3795,47 @@ int prlimit64(pid_t pid, __rlimit_resource_t resource,
                                  fn(pid, resource, new_limit, old_limit));
 }
 
-/* ------------------------------------------------------------------ */
-/* Hook: 线程创建 —— pthread_create 的栈下限修正                        */
-/* ------------------------------------------------------------------ */
-
 /*
- * 【为什么需要】实测 A/B（同一个探针，只换 --preload 的运行时）。
- * 探针：pthread_attr_setstacksize(&at, N) 之后 pthread_create()。
+ * ------------------------------------------------------------------
+ * 【本轮实测·已回退】pthread_create 栈下限修正 —— **不做**
+ * ------------------------------------------------------------------
  *
- *   N = 131072 (= PTHREAD_STACK_MIN)：
- *       裸跑 rc=0 ✅ | 官方 rc=0 ✅ | bxroot(**改前**) rc=22 EINVAL ❌
- *   N = 135168：
- *       裸跑 rc=0 ✅ | 官方 rc=0 ✅ | bxroot(**改前**) rc=0 但随后 **SIGSEGV** ❌
+ * 本轮曾按官方 runtime 的 pthread_create(+0x104b0) 复刻一个"栈下限"
+ * 钩子，**实现完成后实测无效，已整体回退**。回退理由（都是实测，不是推测）：
  *
- * 两组都是**改动前就存在**的（用改动前的 BASELINE.so 复现，各跑 2 次
- * 结果稳定一致），是本轮新查出的既有缺口，不是本轮引入的回归。
- * 这也正是端到端冒烟里那行
- *     `node[1]: pthread_create: Invalid argument`
- * 的来源 —— node 的 worker 线程正是从 PTHREAD_STACK_MIN 起步。
+ * 1) **根因不在 bxroot，而在 proroot 加载器。**
+ *    把 --preload 换成一个空的 libnoop.so（甚至**完全不加 --preload**），
+ *    下面两个现象**一模一样复现**：
  *
- * 实测矩阵（PAGESIZE=4096，PTHREAD_STACK_MIN=131072）：
- *     N: 0 ok | 131072 EINVAL | 135168 SEGV | 139264 ok | 147456 ok
- *        163840 ok | 196608 ok | 229376 ok | 245760 ok | 262144 ok
- * 即**只有 128K~256K 这条窄带**出问题，到 256K 就一切正常。
+ *        pthread_attr_setstacksize(&at, 131072)  → pthread_create rc=22 EINVAL
+ *        pthread_attr_setstacksize(&at, 135168)  → pthread_create rc=0 但随后 SIGSEGV
+ *        （PAGESIZE=4096  PTHREAD_STACK_MIN=131072）
  *
- * 【官方怎么做】反汇编 runtime 的 pthread_create(+0x104b0，856 字节)，
- * 核心判定在 0x10500–0x106a4，还原如下：
+ *    既然不带任何 bxroot 代码时同样发生，它就不是 bxroot 与官方之间的
+ *    **功能差距**，而是 proroot 自研加载器自身的缺陷。在 bxroot 里修它
+ *    既超出"补齐 parity"的范围，也无法通过"加一个符号"解决。
  *
- *     if (attr == NULL) → 直接透传（默认属性必然合法，不需要动）
- *     pthread_attr_getstacksize(attr, &size);      失败 → 透传
- *     pthread_attr_getstack(attr, &addr, &region); 失败 → 透传
- *     if (region == 0 || addr + region == 0)       透传（无显式栈）
+ * 2) **官方那套判据对这两个档位同样不生效。**
+ *    实测钩子入口拿到的值（instrumented 构建，输出见 parity 报告）：
  *
- *     floor = 2 * sysconf(_SC_THREAD_STACK_MIN);   // = 262144
- *     if (floor < 262144) floor = 262144;          // 0x10660 的 mov #0x40000
- *     if (size >= floor) → 透传（0x10674 的 b.ls 跳过改写）
- *     复制 attr 到栈上副本，在**副本**上 setstacksize(floor)，用副本调用
+ *        attr=0x...  size=131072  addr=0xfffffffffffe0000  region=131072
  *
- * ★ 关键就是那个 **2 倍**：下限是 2×PTHREAD_STACK_MIN = 256K，不是 128K。
- *   只兜到 128K 不够 —— 135168 那一档仍会崩，必须抬到 256K。
- *   （本段初稿曾把下限写成 131072，逐档实测后已改正。）
+ *    即 `addr + region == 0`（取反下溢）—— 正是官方 0x10540 那条
+ *    `cmn x7,x6; b.eq skip` 要**跳过**的情况。也就是说：即便逐位照抄
+ *    官方的判定，131072 也**不会被修正**；而官方之所以"看起来没问题"，
+ *    是因为它的加载器本身不制造这个 EINVAL（见第 1 点）。
+ *    → 结论：这条差距**无法靠复刻官方钩子关闭**。
  *
- * ⚠️ 必须在属性**副本**上改，绝不能改调用方的 attr：
- * attr 常是栈上变量、可能被复用，原地改写等于污染调用方状态。
+ * 3) **正确的修法需要往下探一层。**
+ *    真要让 131072 档位可用，得在钩子里**主动**给 addr/region 传
+ *    "哨兵地址 + 合法长度"（如 addr=sizeof(void*)、region=262144），
+ *    即伪造一个显式栈区。那是对**加载器缺陷**的绕过，且会改变 glibc
+ *    的栈分配布局、影响 TLS/guard 语义 —— 属于高风险改动，
+ *    本轮**没有**足够证据证明它安全，因此不做（宁缺勿错）。
+ *
+ * 附带说明：glob/freopen/utime 等同批探查的符号，实测 bxroot 与官方
+ * **行为一致或同源失败**（见报告"实测 parity"一节），无需改动。
  */
-#ifndef BX_PTHREAD_STACK_FLOOR_MIN
-#define BX_PTHREAD_STACK_FLOOR_MIN 262144   /* 0x40000，与官方常量一致 */
-#endif
-
-int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
-                   void *(*start_routine)(void *), void *arg)
-{
-    static int (*fn)(pthread_t *, const pthread_attr_t *,
-                     void *(*)(void *), void *) = NULL;
-    pthread_attr_t local;
-
-    if (fn == NULL)
-        fn = (int (*)(pthread_t *, const pthread_attr_t *,
-                      void *(*)(void *), void *))dlsym(RTLD_NEXT,
-                                                       "pthread_create");
-    if (fn == NULL) return EINVAL;
-
-    /*
-     * 只有 attr != NULL 时才需要检查：attr == NULL 表示"用默认属性"，
-     * 而默认值一定合法（glibc 保证），不必也不能去动。
-     */
-    if (attr != NULL) {
-        size_t size = 0;
-        void  *addr = NULL;
-        size_t region = 0;
-
-        if (pthread_attr_getstacksize(attr, &size) == 0 &&
-            pthread_attr_getstack(attr, &addr, &region) == 0) {
-
-            /* region/addr 全空 = 调用方没指定显式栈 → 无可修正，透传 */
-            if (region != 0 && ((uintptr_t)addr + region) != 0) {
-                long smin = sysconf(_SC_THREAD_STACK_MIN);
-                size_t floor_sz = BX_PTHREAD_STACK_FLOOR_MIN;
-
-                if (smin > 0 && (size_t)smin * 2 > floor_sz)
-                    floor_sz = (size_t)smin * 2;
-
-                if (size < floor_sz) {
-                    /*
-                     * 复制到栈上副本再改 —— 绝不污染调用方的 attr。
-                     * pthread_attr_t 是值语义的小结构体，整体赋值即完整复制。
-                     */
-                    local = *attr;
-                    if (pthread_attr_setstacksize(&local, floor_sz) == 0) {
-                        LOG("pthread_create: 栈下限修正 %zu -> %zu",
-                            size, floor_sz);
-                        return fn(thread, &local, start_routine, arg);
-                    }
-                    /* setstacksize 拒绝 → 用原 attr 透传，不改变语义 */
-                }
-            }
-        }
-    }
-
-    return fn(thread, attr, start_routine, arg);
-}
 
 /*
  * 为什么 socket 家族也要 hook：
@@ -4305,6 +4240,78 @@ FILE *fopen64(const char *path, const char *mode) {
         return real_fopen64(translated, mode);
     }
     return real_fopen64(path, mode);
+}
+
+/*
+ * Hook: freopen / freopen64 —— fopen 的"换目标"版本，**同样必须翻译**。
+ *
+ * 【为什么需要】实测 A/B（同一个探针，只换 --preload 的运行时）：
+ *
+ *     fopen("/fr-in.txt","w") 成功 → freopen("/fr-out.txt","w",f)
+ *
+ *       官方 proroot：freopen 返回原 FILE* ，errno=0        ✅
+ *       bxroot(改前)：freopen 返回 NULL，errno=30 EROFS     ❌
+ *
+ * 连续两轮复现一致；且与 setrlimit/SIGSYS 那两处无关（改动前同样如此）。
+ *
+ * 【根因】freopen 没被 hook。glibc 的 freopen **不经 fopen 的 PLT**
+ * （它是独立实现，内部直接走 _IO_file_fopen），所以已有的 fopen /
+ * fopen64 钩子一条都收不到。用 BXROOT_VERBOSE 构建可以直观看到：
+ * 探针打印了 `translate: /fr-in.txt` 与 `fopen: /fr-in.txt` 两行，
+ * 而 freopen 那一步**一行日志都没有** —— 路径原样交给内核，
+ * 于是内核去开容器里的 `/fr-out.txt`，即宿主真实根目录下的
+ * `/fr-out.txt`（只读），返回 EROFS。
+ *
+ * 【参考计数】freopen 被 rootfs 内 15 个二进制引用、freopen64 被 4 个
+ * （diff3、perl 等；统计口径见 parity 报告）。
+ *
+ * 【为什么官方导出列表里没有 freopen】官方只导出了 fopen/fopen64
+ * （与 bxroot 相同）。它的 freopen 之所以能用，是因为官方的路径翻译
+ * 覆盖面更广（例如它在 syscall 层与更底层的 open 路径上也做了处理），
+ * 而不是靠一个 freopen 符号。bxroot 的翻译钩子是按符号逐个落的，
+ * 所以这里必须**显式补上**这个符号 —— 这正是"符号数不是目的，
+ * 覆盖到的调用路径才是"的一个实例。
+ *
+ * 语义注意：freopen 失败时**原 stream 已被关闭**（C 标准如此），
+ * 所以失败路径不需要（也不能）恢复原 stream，直接返回真实实现的
+ * 结果即可，切勿自己造一个 FILE*。
+ */
+FILE *freopen(const char *path, const char *mode, FILE *stream) {
+    static FILE *(*fn)(const char *, const char *, FILE *) = NULL;
+
+    if (fn == NULL)
+        fn = (FILE *(*)(const char *, const char *, FILE *))
+             dlsym(RTLD_NEXT, "freopen");
+    if (fn == NULL) { errno = ENOSYS; return NULL; }
+
+    /* path == NULL 时 freopen 用于"改 mode"，没有路径可翻译 */
+    if (path != NULL) {
+        char translated[MAX_PATH_LEN];
+        if (translate_path(path, translated, sizeof(translated)) > 0) {
+            LOG("freopen: %s -> %s", path, translated);
+            return fn(translated, mode, stream);
+        }
+    }
+    return fn(path, mode, stream);
+}
+
+/* Hook: freopen64 —— 与 freopen 同构，只是 FILE 走 LFS 变体 */
+FILE *freopen64(const char *path, const char *mode, FILE *stream) {
+    static FILE *(*fn)(const char *, const char *, FILE *) = NULL;
+
+    if (fn == NULL)
+        fn = (FILE *(*)(const char *, const char *, FILE *))
+             dlsym(RTLD_NEXT, "freopen64");
+    if (fn == NULL) { errno = ENOSYS; return NULL; }
+
+    if (path != NULL) {
+        char translated[MAX_PATH_LEN];
+        if (translate_path(path, translated, sizeof(translated)) > 0) {
+            LOG("freopen64: %s -> %s", path, translated);
+            return fn(translated, mode, stream);
+        }
+    }
+    return fn(path, mode, stream);
 }
 
 /* Hook: getpid (fakeroot) */
