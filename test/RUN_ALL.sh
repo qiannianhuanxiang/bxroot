@@ -95,6 +95,12 @@ WORK_DIR=$(dirname "$RESULT_FILE")
 PASS=0
 FAIL=0
 SKIP=0
+KNOWN=0
+
+# 已知缺陷登记表：这些项当前**预期失败**，失败记为 KNOWN 而不是 FAIL，
+# 免得整轮回归长期红着、把别的新问题掩盖掉。
+# 修复后把对应条目删掉即可（那时它应当 PASS，也就不会再走这条分支）。
+KNOWN_FAIL="l2s 端到端契约"
 
 # 记录一条结果：$1=状态(PASS/FAIL/SKIP) $2=名称 $3=摘要
 note() {
@@ -142,6 +148,19 @@ run_step() {
         PASS=$((PASS + 1))
         printf '✅ rc=0  %s\n' "$summary"
     else
+        # 已知缺陷：记 KNOWN，不计入失败总数（但仍醒目显示）
+        case " $KNOWN_FAIL " in
+            *" $name "*)
+                note KNOWN "$name" "rc=$rc $summary"
+                KNOWN=$((KNOWN + 1))
+                printf '⚠️  rc=%s （已知缺陷）%s\n' "$rc" "$summary"
+                echo "   --- 末尾 5 行 ---"
+                tail -5 "$logf" 2>/dev/null | sed 's/^/   /'
+                echo "   ----------------"
+                rm -f "$logf"
+                return 0
+                ;;
+        esac
         note FAIL "$name" "rc=$rc $summary"
         FAIL=$((FAIL + 1))
         printf '❌ rc=%s  %s\n' "$rc" "$summary"
@@ -317,6 +336,26 @@ else
 fi
 
 # =====================================================================
+# 8c. l2s 端到端契约（依赖真机 rootfs；不在真机上会自行跳过）
+# =====================================================================
+#
+# 为什么这个必须端到端：`test_l2s_rt.c` 是纯逻辑测试（全过），但
+# **库正确 ≠ 接线正确**。实测缺口：bxroot 下 l2s 的"创建"那半正常
+# （目录里有 .l2s.* 中间文件），"伪装"那半没生效 ——
+#   官方: nlink=2 islink=false     bxroot: nlink=1 islink=true
+# 纯逻辑测试注入的是 l2s 自己的 ops 表，走的路径与真实 stat 钩子不同，
+# 所以永远测不出来。
+#
+# ★ 这是一项**已知缺陷**，当前预期就是 FAIL ★
+# 用 BXROOT_KNOWN_FAIL 标记：失败时记为"已知缺陷"而不是"回归失败"，
+# 免得整轮回归长期红着、掩盖别的新问题。修复后把该变量去掉即可。
+if [ -f test/RUN_L2S_E2E.sh ]; then
+    run_step "l2s 端到端契约" sh test/RUN_L2S_E2E.sh
+else
+    run_step "l2s 端到端契约"
+fi
+
+# =====================================================================
 # 9. wait 家族钩子（依赖上一步的构建产物）
 # =====================================================================
 if [ -f test/RUN_WAIT_TESTS.sh ] && [ -f build/libbxroot-runtime.so ]; then
@@ -352,10 +391,11 @@ while IFS='|' read -r st nm sm; do
     PASS) printf '  ✅ %-24s %s\n' "$nm" "$sm" ;;
     FAIL) printf '  ❌ %-24s %s\n' "$nm" "$sm" ;;
     SKIP) printf '  ⏭️  %-24s %s\n' "$nm" "$sm" ;;
+    KNOWN) printf '  ⚠️  %-24s %s\n' "$nm" "$sm" ;;
     esac
 done < "$RESULT_FILE"
 echo "------------------------------------------------------"
-echo "  通过 $PASS / 失败 $FAIL"
+echo "  通过 $PASS / 失败 $FAIL$([ "$KNOWN" -gt 0 ] && echo " / 已知缺陷 $KNOWN")"
 rm -f "$RESULT_FILE"
 
 if [ "$FAIL" -gt 0 ]; then
