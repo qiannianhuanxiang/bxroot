@@ -4483,9 +4483,14 @@ typedef struct {
 } px_kox_ctx;
 
 /*
- * 对单个账本条目的判定。返回 1 表示「已处理」（无论成功或跳过），
- * 返回 0 让遍历继续 —— 本函数**从不**返回 0，保留返回值是为了
- * 让 px_ledger_foreach 的契约有未来扩展余地。
+ * 对单个账本条目的判定。
+ *
+ * ★ 返回值语义：0 = 继续遍历，非 0 = 提前停止 ★
+ * 本函数**永远返回 0** —— 每个条目都要看一遍。这里曾经写成"返回 1 表示
+ * 已处理"，而 px_ledger_foreach 的契约是"非 0 即停止"，于是清理在**第一个
+ * 条目之后就停了**。实测现象：fork 出 2 个子进程，日志打印
+ * "遍历 1 条，结束 1"，只有 1 个子进程被杀。
+ * 教训：遍历回调的返回值极性必须与遍历器逐字对齐，且**必须实测**。
  *
  * ★ 这里是安全约束的唯一执行点 ★
  * 每一层拒绝都对应 docs/杀进程安全规则.md 里的一条，且**拒绝方向
@@ -4498,17 +4503,17 @@ static int px_killonexit_consider(const px_procinfo *info, void *ud)
     int rc;
 
     if (info == NULL || ctx == NULL) {
-        return 1;
+        return 0;
     }
     /* 只处理 pid 维度；pgid 条目（kind == PX_ENTRY_PGID）不能直接当
      * pid 杀 —— 那会变成按组杀，正是规则里禁止的广播形态。 */
     if (info->kind != PX_ENTRY_PID) {
         g_kox_skipped++;
-        return 1;
+        return 0;
     }
     if (info->pid <= 0) {
         g_kox_skipped++;
-        return 1;
+        return 0;
     }
     /*
      * ★ 只杀 PX_LIVE ★
@@ -4517,13 +4522,13 @@ static int px_killonexit_consider(const px_procinfo *info, void *ud)
      */
     if (info->life != PX_LIVE) {
         g_kox_skipped++;
-        return 1;
+        return 0;
     }
     /* 自己：绝不杀。px_killonexit_is_ancestor 的第一条也会拦，
      * 这里显式写一遍是为了让「不能杀自己」在代码里一眼可见。 */
     if (info->pid == ctx->self) {
         g_kox_skipped++;
-        return 1;
+        return 0;
     }
     /* 祖先链：绝不杀（判不出来时 is_ancestor 返回 1 → 跳过） */
     if (px_killonexit_is_ancestor(info->pid, ctx->self)) {
@@ -4532,7 +4537,7 @@ static int px_killonexit_consider(const px_procinfo *info, void *ud)
                    (int)info->pid);
         }
         g_kox_skipped++;
-        return 1;
+        return 0;
     }
 
     /*
@@ -4564,7 +4569,7 @@ static int px_killonexit_consider(const px_procinfo *info, void *ud)
             }
         }
     }
-    return 1;
+    return 0;                   /* 继续遍历下一个条目 */
 }
 
 /*

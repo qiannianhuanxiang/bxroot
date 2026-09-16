@@ -136,6 +136,57 @@ int l2s_rt_init(const l2s_rt_ops *ops, const l2s_config *cfg)
     g_cfg.prefix = g_prefix;
 
     /*
+     * ================================================================
+     * ★ 命名族归一化：本层只写 PROOT 式名字，所以只按 PROOT 式名字读 ★
+     * ================================================================
+     *
+     * 【为什么必须在这里强制，而不是信任 cfg.scheme】
+     *
+     * 本层的**创建**与**识别**曾经走两套不同的判据，于是可以被配置成
+     * 一个必然自坏的状态：
+     *
+     *   创建（l2s_rt_link -> l2s_make_paths_ex）
+     *       只看 cfg.prefix 与 cfg.l2s_dir，**完全不看 scheme**，
+     *       永远产出 PROOT 式的 ".l2s.<name>GGGG[.NNNN]"。
+     *
+     *   识别（probe_fake_link / resolve_final -> l2s_classify）
+     *       看 scheme：PROROOT 时**跳过** parse_l2s_name()，
+     *       只认 16 位 hex 的元数据树键。
+     *
+     * 两者一组合，scheme=PROROOT 就得到一个荒谬的结果：本层写出的
+     * 中间层，本层自己认不出来。症状**不在创建那一半**（建档不经过
+     * 分类器，link() 照样成功、目录里也照样出现 .l2s.* 中间文件），
+     * 而在伪装那一半 —— probe_fake_link() 一律返回 0，于是
+     *     l2s_rt_patch_stat()  直接 return（st_nlink 停在 1、st_mode 仍是 S_IFLNK）
+     *     l2s_rt_rewrite_readlink() 直接 return 0（客户看到中间层名）
+     * 客户于是看到"link() 成功，但 stat 说这不是硬链接"这种自相矛盾的
+     * 元数据 —— pnpm 会据此判定"没链接上"，退化成整份复制。
+     *
+     * 【为什么归一化到 PROOT 是无损的，而不是"猜一个能用的值"】
+     *
+     * l2s_classify() 在 scheme=PROOT 下的分支是：
+     *     parse_l2s_name() 失败 -> 落到 parse_proroot_meta_name()
+     * 即 **PROOT 分支已经包含 PROROOT 的识别能力**，是严格超集：
+     * 元数据树的名字在 PROOT 配置下照样解析得出（见 l2s.c:520-526）。
+     * 反过来则不成立。所以强制 PROOT 不丢任何识别能力，只多认出本层
+     * 自己写的那一族名字。
+     *
+     * 【为什么不是"返回错误让调用方改"】
+     *
+     * 本层根本没有元数据树的**写**能力（全文件不引用 l2s_key16 /
+     * l2s_meta_entry / L2S_PROROOT_META_DIR），所以 PROROOT 对本层
+     * 而言不是一个"尚未实现、将来会实现"的选项，而是一个**永远无法
+     * 自洽**的选项。与其让调用方拿着一个静默失效的配置跑，不如在
+     * 入口处把不变量钉死：**本层写什么名字，就按什么名字读**。
+     *
+     * 【实测证据】同一份代码、同一颗 node、只换这一个字段：
+     *     scheme=PROOT   -> nlink=2  isSymbolicLink=false   ← 与官方一致
+     *     scheme=PROROOT -> nlink=1  isSymbolicLink=true    ← 缺陷复现
+     * 见 docs/l2s-stat伪装修复.md 与 test/test_l2s_scheme_guard.c。
+     */
+    g_cfg.scheme = L2S_SCHEME_PROOT;
+
+    /*
      * 集中目录布局时，l2s_dir 也可能为 NULL（"中间层放在原文件旁边"），
      * 由 l2s 纯逻辑层处理，这里不需要额外动作。
      */
@@ -564,8 +615,10 @@ void l2s_rt_patch_stat(struct stat *st, const char *path)
     }
 }
 
-void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
-                        unsigned int statx_nlink_bit, const char *path)
+/* 公共实现：stx_mode 为 NULL 时只补 nlink（历史行为，向后兼容）。 */
+static void patch_statx_impl(unsigned int *stx_nlink, unsigned int *stx_mask,
+                             unsigned int *stx_mode,
+                             unsigned int statx_nlink_bit, const char *path)
 {
     char mid[L2S_PATH_MAX];
     char final[L2S_PATH_MAX];
@@ -588,5 +641,50 @@ void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
         return;
 
     *stx_nlink = count;
+
+    /*
+     * ★ stx_mode 也要补 —— 只补 nlink 会被 lstatSync 一眼看穿 ★
+     *
+     * statx 的 stx_mode 与 stat 的 st_mode 是同一个东西。磁盘上伪造
+     * 链接是符号链接，客户眼里必须是普通文件。只改 nlink 而留 S_IFLNK，
+     * 客户一句 lstatSync().isSymbolicLink() 就得到 true ——
+     * 而这个 API 正是本模块要骗过的那一个。
+     *
+     * 【实测证据】裸 syscall(291) 探针（node/libuv 走的正是这条路）：
+     *     官方 proroot: mode=0100600 nlink=2 islnk=0
+     *     bxroot      : mode=0120777 nlink=1 islnk=1   ← 修前
+     *                   mode=0100777 nlink=2 islnk=0   ← 修后
+     *
+     * 【与 stat 那条路保持一致】
+     * l2s_rt_patch_stat() 早就在抹 S_IFLNK 了；statx 只是同一个语义
+     * 的现代接口，没有理由区别对待 —— 此前的差异纯属遗漏。
+     */
+    if (stx_mode != NULL && g_hide_symlink)
+        *stx_mode = (*stx_mode & ~(unsigned int)S_IFMT) | (unsigned int)S_IFREG;
+
     g_stats.nlink_patched++;
+}
+
+/*
+ * 4 参数版本：只补 nlink。**签名保持不变**，因为 preload.c 现有的
+ * statx 钩子按这个签名调用，改签名会让别人的编译单元直接编不过。
+ */
+void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
+                        unsigned int statx_nlink_bit, const char *path)
+{
+    patch_statx_impl(stx_nlink, stx_mask, NULL, statx_nlink_bit, path);
+}
+
+/*
+ * 5 参数版本：连 stx_mode 的 S_IFLNK 一起抹掉。
+ *
+ * 给裸 syscall(291) 那条路用（node/libuv 的 uv__fs_statx() 走的就是它，
+ * 完全不经过 libc 的 statx() 包装），也给 preload.c 的 statx 钩子升级用。
+ * 原有的 4 参数版本保留，是为了让调用方可以分步迁移、不必一次改两处。
+ */
+void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
+                             unsigned int *stx_mode,
+                             unsigned int statx_nlink_bit, const char *path)
+{
+    patch_statx_impl(stx_nlink, stx_mask, stx_mode, statx_nlink_bit, path);
 }

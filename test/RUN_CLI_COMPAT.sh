@@ -207,6 +207,61 @@ for opt in -R -S; do
 done
 
 # ---------------------------------------------------------------------
+# G. DSHA 真实命令行（集成验收）
+# ---------------------------------------------------------------------
+#
+# 这一项的价值：前面的 A–F 都是**逐选项**验证，而真实集成是**一整条
+# 命令行**。逐选项都对、拼起来跑不通的情况是存在的（例如 bind 数量
+# 超过上限、选项顺序敏感、某个选项需要前一个先出现）。
+#
+# 参数逐字取自 DSHA 的 `BxrootRuntime.baseArgv()` 与 `BINDS` 清单
+# （`app/src/main/java/com/deepseekharness/app/runtime/BxrootRuntime.java`）。
+# 若那边的清单变了，这里会红 —— 这正是我们想要的提醒。
+echo
+echo "--- G) DSHA 真实命令行（集成验收）---"
+DSHA_ROOTFS="/data/data/com.dsh.client/files/linux/ubuntu"
+if [ -d "$DSHA_ROOTFS" ]; then
+    # 逐字复刻 BxrootRuntime 的 argv 组装顺序
+    set -- -r "$DSHA_ROOTFS" -0 -w /root \
+        -b /dev:/dev \
+        -b /dev/urandom:/dev/random \
+        -b /proc:/proc \
+        -b /sys:/sys \
+        -b /system:/system \
+        -b /apex:/apex \
+        -b /proc/self/fd:/dev/fd \
+        -b /storage/emulated/0:/sdcard \
+        -b /storage/emulated/0:/storage/emulated/0 \
+        --link2symlink \
+        /bin/true
+    # ★ 一定要带一个 guest 命令 ★
+    # 首版没带，于是 rc=1 是"必须指定要执行的命令" —— 判据虽然通过了
+    # （因为它只看"是否被拒"），但 rc 的含义变得模棱两可：看不出
+    # 到底是选项被拒、还是仅仅缺命令。带上命令后 rc 才有确定含义：
+    #   0 = 整条命令行被正确接受并执行
+    timeout 15 "$LAUNCHER" "$@" >"$WORK/o" 2>&1
+    rc=$?
+    first=$(head -1 "$WORK/o")
+    # 判据：**不能**是"未知选项/未实现"，也不能是"最多 N 个 bind"
+    # （后者说明 MAX_BINDS 不够 —— DSHA 用 9 条，留了充足余量但要有断言）
+    case "$first" in
+        *未知选项*|*未实现*)
+            bad "DSHA 命令行" "★ 有选项被拒：$first" ;;
+        *最多*bind*)
+            bad "DSHA 命令行" "★ bind 容量不足：$first" ;;
+        *)
+            if [ "$rc" = "0" ]; then
+                ok "DSHA 命令行" "被接受且执行成功（9 条 bind）"
+            else
+                # 非 0 但不是选项问题 —— 可能是 rootfs 内没有 /bin/true
+                ok "DSHA 命令行" "被接受（rc=$rc，非选项问题）"
+            fi ;;
+    esac
+else
+    echo "  ⏭️  跳过：本环境没有 DSHA rootfs"
+fi
+
+# ---------------------------------------------------------------------
 # 汇总
 # ---------------------------------------------------------------------
 rm -rf "$WORK"
