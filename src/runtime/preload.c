@@ -2785,10 +2785,20 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
          * 优先级高于 stat —— 不补这里，stat 补得再对也会被绕过。
          * 只在 mask 声明了 STATX_NLINK 时才改写（与 statx 语义一致：
          * mask 未声明的字段是未定义的，写进去会让客户读到垃圾）。
+         *
+         * ★ 必须用 _full 版本，把 stx_mode 的 S_IFLNK 一起抹掉 ★
+         *
+         * 只补 stx_nlink 会让客户的 lstatSync().isSymbolicLink() 仍为
+         * true —— 而 statx 的 stx_mode 与 stat 的 st_mode 是同一个语义，
+         * l2s_rt_patch_stat() 早就在抹它了；statx 只是同一个语义的现代
+         * 接口，没有理由区别对待。
+         *
+         * 实测（libc statx 入口）：只补 nlink 时 mode=0120777（带着
+         * S_IFLNK），抹掉后是 0100777 —— 与 stat/lstat 两条路一致。
          */
         if (rc == 0 && buf != NULL)
-            l2s_rt_patch_statx(&buf->stx_nlink, &buf->stx_mask,
-                               STATX_NLINK, p);
+            l2s_rt_patch_statx_full(&buf->stx_nlink, &buf->stx_mask,
+                                    &buf->stx_mode, STATX_NLINK, p);
         return rc;
     }
 }

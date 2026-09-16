@@ -75,7 +75,7 @@
  */
 __attribute__((weak))
 void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
-                             unsigned int *stx_mode,
+                             uint16_t *stx_mode,
                              unsigned int statx_nlink_bit, const char *path);
 
 /*
@@ -829,9 +829,22 @@ long syscall(long number, ...)
              * 加偏移寻址，避免为一个结构体拖进 <linux/stat.h>。 */
             unsigned int *base = (unsigned int *)(uintptr_t)a4;
 
-            l2s_rt_patch_statx_full(&base[4] /* stx_nlink */,
-                                    &base[0] /* stx_mask  */,
-                                    &base[7] /* stx_mode  */,
+            /*
+             * ★ stx_mode 是 __u16，不是 u32 ★
+             *
+             * 它在 struct statx 里 offset 28、宽 2 字节；而 `base[7]` 是
+             * u32 下标 7（= offset 28）的 **4 字节**视图。传 `&base[7]`
+             * 给一个写入方，会让它做 4 字节写，越界覆盖 offset 30-31。
+             *
+             * 所以这里用字节寻址 + 正确的 uint16_t* —— 与结构体定义一致。
+             * （字段偏移经 `offsetof` 实测：stx_mask=0, stx_nlink=16,
+             *   stx_mode=28。）
+             */
+            uint16_t *mode16 = (uint16_t *)(void *)((unsigned char *)(uintptr_t)a4 + 28);
+
+            l2s_rt_patch_statx_full(&base[4] /* stx_nlink, offset 16 */,
+                                    &base[0] /* stx_mask,  offset 0  */,
+                                    mode16   /* stx_mode,  offset 28 */,
                                     SCG_STATX_NLINK,
                                     (const char *)(uintptr_t)a1);
         }

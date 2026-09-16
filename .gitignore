@@ -1,0 +1,75 @@
+# bxroot .gitignore
+#
+# 本项目在开发过程中会**大量产生**测试产物，而它们与源码放在同一目录树里
+# （例如 `src/runtime/t_null`、`src/proc/test_proc`）。没有这份清单时，
+# `git add -A` 很容易把它们一起提交进去 —— 那会让仓库里出现几十个几 MB 的
+# 二进制文件，且没人会去看 diff。
+#
+# 实测教训：一次 `git add -A` 之前，工作副本里同时存在
+#     src/runtime/t_null  src/runtime/t_write  src/runtime/t_stack
+#     src/proc/test_proc  src/proc/test_proc.ub
+# 五个 ELF 可执行文件。当时是手工核对的 —— 这份文件把"手工核对"变成默认安全。
+
+# === 构建产物 ===
+build/
+*.o
+*.so
+*.so.*
+*.a
+*.tmp
+*.tmp.*
+
+# === 测试可执行文件 ===
+#
+# 测试运行器把编译产物写在源码目录旁边（跟 `test/` 与 `src/*/` 同级），
+# 名字规律是"测试源文件名去掉 .c"。逐个列出比用通配符更安全 ——
+# 通配符（如 `test_*`）会误伤 `test_*.c` 源文件。
+test/test_fakeroot
+test/test_fakeroot.ub
+test/test_integration
+test/test_integration.ub
+test/test_l2s_rt
+test/test_l2s_rt.ub
+test/test_wait_hooks
+test/test_wait_hooks.ub
+test/test_syscall_argpos
+test/test_syscall_argpos.ub
+test/test_rename_link_argpos
+test/test_rename_link_argpos.ub
+test/test_syscall_table_audit
+test/test_syscall_table_audit.ub
+test/test_l2s_entrypoints
+test/test_l2s_entrypoints.ub
+src/proc/test_proc
+src/proc/test_proc.ub
+src/runtime/test_crash
+src/runtime/test_crash.ub
+
+# 探针/临时可执行（`t_*` 是子代理常用的命名）
+src/runtime/t_*
+src/proc/t_*
+test/t_*
+t_*
+
+# === 编辑器与工具 ===
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+compile_commands.json
+
+# === 运行期产物 ===
+*.log
+*.pid
+core
+core.*
+vgcore.*
+
+# === 临时/工作目录 ===
+#
+# 这些是开发期的一次性目录（存探针、快照、隔离实验），不该进仓库。
+# 注意：仓库内的 `.tmp-*` 是测试脚本的回退工作目录（见 test/RUN_ALL.sh），
+# 它必须被忽略，否则每跑一次回归就会多出一堆未跟踪文件。
+.tmp-*
+work/

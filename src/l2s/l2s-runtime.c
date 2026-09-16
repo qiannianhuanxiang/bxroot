@@ -617,7 +617,7 @@ void l2s_rt_patch_stat(struct stat *st, const char *path)
 
 /* 公共实现：stx_mode 为 NULL 时只补 nlink（历史行为，向后兼容）。 */
 static void patch_statx_impl(unsigned int *stx_nlink, unsigned int *stx_mask,
-                             unsigned int *stx_mode,
+                             uint16_t *stx_mode,
                              unsigned int statx_nlink_bit, const char *path)
 {
     char mid[L2S_PATH_MAX];
@@ -659,8 +659,12 @@ static void patch_statx_impl(unsigned int *stx_nlink, unsigned int *stx_mask,
      * l2s_rt_patch_stat() 早就在抹 S_IFLNK 了；statx 只是同一个语义
      * 的现代接口，没有理由区别对待 —— 此前的差异纯属遗漏。
      */
+    /*
+     * 精确的 2 字节写（stx_mode 是 __u16）。见 l2s-runtime.h 的类型说明 ——
+     * 早前按 4 字节写会越界覆盖 __spare0，属未定义行为。
+     */
     if (stx_mode != NULL && g_hide_symlink)
-        *stx_mode = (*stx_mode & ~(unsigned int)S_IFMT) | (unsigned int)S_IFREG;
+        *stx_mode = (uint16_t)((*stx_mode & ~(uint16_t)S_IFMT) | (uint16_t)S_IFREG);
 
     g_stats.nlink_patched++;
 }
@@ -683,7 +687,7 @@ void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
  * 原有的 4 参数版本保留，是为了让调用方可以分步迁移、不必一次改两处。
  */
 void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
-                             unsigned int *stx_mode,
+                             uint16_t *stx_mode,
                              unsigned int statx_nlink_bit, const char *path)
 {
     patch_statx_impl(stx_nlink, stx_mask, stx_mode, statx_nlink_bit, path);

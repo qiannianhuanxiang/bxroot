@@ -15,6 +15,7 @@
 #define L2S_RUNTIME_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -161,8 +162,28 @@ void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
  * stx_mode 传 NULL 时退化成与 l2s_rt_patch_statx 完全相同的行为。
  * 是否抹掉 S_IFLNK 由 l2s_rt_set_hide_symlink() 控制（默认抹）。
  */
+/*
+ * ★ stx_mode 是 uint16_t，不是 unsigned int ★
+ *
+ * `struct statx` 的字段宽度**不一样**：
+ *     stx_mask   __u32
+ *     stx_nlink  __u32
+ *     stx_mode   __u16   ← 只有 2 字节（offset 28，其后 offset 30 是
+ *                          __u16 __spare0[1]）
+ *
+ * 早前这里把 stx_mode 声明成 `unsigned int *`，于是
+ *     *stx_mode = (*stx_mode & ~S_IFMT) | S_IFREG;
+ * 是一次 **4 字节写**，会一并覆盖 stx_mode(28-29) + __spare0(30-31)。
+ *
+ * 当前不致命（覆盖的恰好是 spare 字段），但这是**未定义行为**：
+ * 它依赖"后面正好是 spare"这个巧合，而不是 ABI 契约 —— 一旦将来
+ * 内核在 30-31 放了别的东西，就会静默写坏客户的结构体。
+ * 编译器也为此报了 -Wincompatible-pointer-types（那正是告警门禁抓到的）。
+ *
+ * 用 uint16_t 后是精确的 2 字节写，与 ABI 一致。
+ */
 void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
-                             unsigned int *stx_mode,
+                             uint16_t *stx_mode,
                              unsigned int statx_nlink_bit, const char *path);
 
 /* 默认 1（客户不该看出这是符号链接）。置 0 便于诊断。 */
