@@ -97,6 +97,66 @@
 - 是**用真实工具链（`tar`/`cp -a`）探针**才暴露的 —— 又一次印证：
   **单一入口、单一指标的覆盖不全**（与 `fstatat` 漏接那次同一类问题）
 
+## PRoot 的权威做法（逐行对照）
+
+根因确认后，我把 PRoot 的 `link2symlink` 实现挖了出来
+（`src/extension/link2symlink/link2symlink.c:860-890`）：
+
+```c
+intermediate_proc: size = my_readlink(intermediate, final);   // ① 解析到最终数据文件
+final_proc:        status = lstat(final, &finalStat);          // ② stat 那个数据文件
+                   finalStat.st_nlink = atoi(final + strlen(final) - 4);  // ③ 链长
+
+                   if (sysnum == PR_fstatat64 || sysnum == PR_newfstatat)
+                       sysarg_stat = SYSARG_3;
+                   else
+                       sysarg_stat = SYSARG_2;
+
+                   read_data(tracee, &statl, ...);              // ④ 读客户原本的
+                   finalStat.st_mode = statl.st_mode;           //    保留 mode
+                   finalStat.st_uid  = statl.st_uid;            //    保留 uid
+                   finalStat.st_gid  = statl.st_gid;            //    保留 gid
+
+                   write_data(tracee, ..., &finalStat, sizeof(finalStat));  // ⑤ ★整体替换★
+```
+
+**关键：PRoot 是「整体替换」`struct stat`** ——
+把客户的整个结构体换成**数据文件的**，然后只保留 `mode` / `uid` / `gid` 三项。
+
+也就是说 `st_size` / `st_ino` / `st_blocks` / 时间戳**全部来自数据文件**。
+
+### bxroot 为什么错
+
+`src/l2s/l2s-runtime.c` 第 587-590 行的注释写着：
+
+> 注意 st_size/st_ino 的取舍：PRoot 只改 nlink，并把 stat 的其余部分换成数据文件的
+> （见 handle_sysexit_end 的 finalStat）。本层采取同样的**最小改动**，只动 nlink
+> 与 mode 的 S_IFLNK 位，其余字段保持内核给的值 —— 因为本层**拿不到 data 文件的 stat**
+> （那需要一次额外的 lstat，在 **stat 热路径上代价太高**）。
+
+**这段注释里有两处错误**：
+
+1. **事实错误**：「PRoot 只改 nlink」—— 错。PRoot 是**整体替换**，
+   注释的后半句「并把 stat 的其余部分换成数据文件的」才是对的。**两句自相矛盾**，
+   而实现选择了错的那半句。
+2. **取舍判断错误**：说「拿不到 data 文件的 stat」—— **其实拿得到**。
+   `resolve_final()` 就在同一个文件里（第 266 行），且 `l2s_rt_patch_stat`
+   **已经在调用它**。只差一次 `g_ops->lstat(final, &st)`，而 `g_ops` 里本就有 `lstat`。
+
+至于「热路径代价太高」：那次 lstat 是**必要的** —— 否则客户拿到错误的 size，
+后果是 `tar` 写坏归档。而且 **PRoot 自己就付了这个代价**。
+
+### 一个容易踩的坑
+
+`preload.c` 里的调用顺序是：
+```c
+fakeroot_patch_stat(buf, ...);   /* 先 fakeroot */
+l2s_rt_patch_stat(buf, p);       /* 后 l2s */
+```
+
+所以 l2s 回填时**不能用 `final_st` 的 uid/gid 覆盖** —— 那会把 fakeroot 的伪装抹掉。
+`uid`/`gid` 必须保留**当前 buf 里的值**。
+
 ## 复现
 
 ```sh
