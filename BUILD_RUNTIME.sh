@@ -26,6 +26,11 @@ set -u
 ROOT=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT" || exit 1
 
+# 产物目录：全新克隆时不存在，必须自建 —— 否则链接阶段报
+# "cannot open output file .../build/....tmp: No such file or directory"，
+# 而且这个错误**不是 ICE**，会直接判定为"真错误"退出，不会重试。
+mkdir -p "$ROOT/build" || { echo "❌ 无法创建 build 目录"; exit 1; }
+
 OUT="$ROOT/build/libbxroot-runtime.so"
 TMP="$OUT.tmp"
 LOG=/tmp/bxroot-runtime-cc.err
