@@ -104,7 +104,7 @@ int bridge_open(const char *path, int flags, mode_t mode) {
     }
 
     /* 读取响应 */
-    int result_fd;
+    int result_fd = -1;      /* ★ 必须初始化：见下方 read 返回值的处理 */
     if (read(fd, &result_fd, sizeof(result_fd)) < 0) {
         LOG("read failed: %s", strerror(errno));
         return -1;
@@ -136,13 +136,26 @@ ssize_t bridge_read(int fd, void *buf, size_t count) {
         return -1;
     }
 
-    ssize_t nread;
-    if (read(bridge_fd, &nread, sizeof(nread)) < 0) {
+    /*
+     * ★ 必须初始化，且必须检查"读满"而非"没出错"。
+     *
+     * `read()` 有三种结果：>0（读到的字节数）、0（EOF）、-1（错误）。
+     * 只判 `< 0` 时，**EOF 会漏过去** —— 此时 nread 仍是栈上的垃圾值，
+     * 而它紧接着被当作"对端声明的长度"用于：
+     *     read(bridge_fd, buf, nread)
+     * 即：用一个任意大的数去读 socket。轻则读到不该读的数据，
+     * 重则整进程崩溃（buf 只有 count 字节，而 nread 可能远大于它）。
+     *
+     * 修法：显式检查 read 的返回值是否为 sizeof(nread)，不是就当作故障。
+     */
+    ssize_t nread = 0;
+    if (read(bridge_fd, &nread, sizeof(nread)) != (ssize_t)sizeof(nread)) {
         return -1;
     }
 
     if (nread > 0 && nread <= (ssize_t)count) {
-        if (read(bridge_fd, buf, nread) < 0) {
+        /* 同样要检查读满：短读意味着协议不同步，不能当作正常返回 */
+        if (read(bridge_fd, buf, (size_t)nread) != nread) {
             return -1;
         }
     }

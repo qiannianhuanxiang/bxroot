@@ -2911,9 +2911,43 @@ int __open64_nocancel(const char *path, int flags, mode_t mode) {
     return fn(p, flags, mode);
 }
 
+/*
+ * __getcwd_chk —— FORTIFY 版的 getcwd。
+ *
+ * glibc 的契约（与其它 __*_chk 一致）：
+ *     if (size > buflen) __chk_fail();     // 缓冲溢出，直接 abort
+ *     return getcwd(buf, size);
+ *
+ * 曾经写成 `(void)buflen; return getcwd(buf, size);` —— 那样**把
+ * FORTIFY 保护整个关掉了**：调用方本意是"我声明这个缓冲区只有
+ * buflen 字节"，而我们无视这个声明照写。若客户真传了
+ * `size > buflen`，它本应立即 abort 暴露自己的 bug，结果变成
+ * 静默的栈/堆越界写 —— 比崩溃危险得多。
+ *
+ * 这条与本文件里 __readlink_chk 的注释自定的规则**直接矛盾**：
+ * 那里写着"薄转发，翻译逻辑与主 hook 一致"，而这里却连契约都丢了。
+ * 现在按契约补齐校验。
+ *
+ * 注意：`__chk_fail` 是 glibc 的私有符号（GLIBC_PRIVATE），
+ * 用 dlsym 解析；解析不到时退化为 __builtin_trap()（同样能暴露问题，
+ * 且不依赖任何符号）。
+ */
 char *__getcwd_chk(char *buf, size_t size, size_t buflen) {
-    /* 边界检查版 getcwd；转发后复用 getcwd 的反向翻译逻辑 */
-    (void)buflen;
+    static void (*chk_fail)(void) = NULL;
+    static int tried = 0;
+
+    if (!tried) {
+        tried = 1;
+        chk_fail = (void (*)(void))dlsym(RTLD_NEXT, "__chk_fail");
+    }
+
+    if (buflen != (size_t)-1 && size > buflen) {
+        if (chk_fail != NULL)
+            chk_fail();
+        __builtin_trap();       /* 兜底：绝不静默越界写 */
+    }
+
+    /* 校验通过后转发，复用 getcwd 的反向翻译逻辑 */
     return getcwd(buf, size);
 }
 
@@ -3866,10 +3900,29 @@ static int is_unix_path_sockaddr(const struct sockaddr *addr, socklen_t len,
 {
     const struct sockaddr_un *un;
 
-    if (addr == NULL || addr->sa_family != AF_UNIX)
+    /*
+     * ★ 顺序很重要：**先校验长度，再读 sa_family**。
+     *
+     * 内核的 `move_addr_to_kernel()` 就是这个顺序 —— 它先确认
+     * `addrlen` 落在 [sizeof(sa_family_t), sizeof(struct sockaddr_storage)]
+     * 区间内，才去 copy_from_user。
+     *
+     * 曾经把 `addr->sa_family != AF_UNIX` 写在长度检查**之前**：
+     * 客户传 `addrlen = 0`（或极小值）时，我们已经在读 addr 的第一个
+     * 字节了。若那个地址恰好落在映射边界上（客户从一个页末尾传指针、
+     * 或干脆是野指针），这一读就是 SIGSEGV —— 而内核本来只会
+     * 优雅地返回 EINVAL。
+     *
+     * 即：**我们比内核更严格地解引用客户指针**，这是不该有的行为。
+     */
+    if (addr == NULL)
         return 0;
-    /* 至少要能装下 sun_family + 1 字节路径 */
+
+    /* 至少要能装下 sun_family + 1 字节路径。这一步必须在读 sa_family 之前。 */
     if (len <= (socklen_t)offsetof(struct sockaddr_un, sun_path) + 1)
+        return 0;
+
+    if (addr->sa_family != AF_UNIX)
         return 0;
 
     un = (const struct sockaddr_un *)addr;
