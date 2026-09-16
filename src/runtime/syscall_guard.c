@@ -293,20 +293,85 @@ long syscall(long number, ...)
          * 那时 pthread_key_create 未必可用。`_Thread_local` 由
          * TLS 直接支撑，无此问题。
          */
-        static _Thread_local int in_translate;
-
-        if (in_translate == 0 && looks_like_guest_abs_path(pth)) {
+        /*
+         * ============================================================
+         * ★★ 目标缓冲：**不用 _Thread_local、不用 malloc** ★★
+         * ============================================================
+         *
+         * 这里踩过一个非常隐蔽的坑，值得完整记录。
+         *
+         * 【症状】`dsh web --help` 段错误，崩溃在 glibc 的 `strlen`：
+         *     x0 = 0xffffffffffffffff   （即 strlen((char*)-1)）
+         * 而 `dsh --help` / `--version` 完全正常。
+         *
+         * 【判决实验】同一份源码，只改"把翻译结果放哪"：
+         *     静态 _Thread_local 缓冲  → 崩溃（2/2 复现）
+         *     堆上 malloc 的拷贝       → 正常（3/3 复现）
+         * 两者唯一差别就是**缓冲的位置**。
+         *
+         * 【根因】bxroot 运行在 proroot 的**自研 ELF 加载器**之下
+         * （`libproroot-linker.so`，不是 glibc 的 ld.so）。那个加载器
+         * 对 TLS 的支持不完整 —— 它的 rodata 里明确带着这条字符串：
+         *
+         *     tls: runtime static TLS surplus exhausted
+         *
+         * 也就是说：动态加载的库里，`_Thread_local` 的存储可能**没有
+         * 被正确分配**。对它的读写会落到错误的地址，破坏相邻数据
+         * （包括 node 自己的指针），最终表现为在 `strlen` 里读到 -1。
+         *
+         * 这解释了为什么症状如此"挑剔"：
+         *   - `--version` 不走多少 statx，碰不到这个缓冲；
+         *   - `web` profile 的模块解析要连续探测数百个目录，
+         *     每次都写这个坏掉的 TLS 缓冲，很快踩坏关键数据。
+         *
+         * 【修法】改用**普通静态缓冲池 + 轮转索引**：
+         *   - 不依赖 TLS（绕开加载器的缺陷）
+         *   - 不 malloc（不会泄漏，也不会在信号处理器里死锁）
+         *   - 轮转多个槽位：即使某个调用方短暂持有上一次的指针，
+         *     也要过 N 次调用才会被覆写，实践中足够
+         *
+         * 代价：32 KB 静态内存（8 × 4 KB），每线程共享同一池。
+         * 极端并发下仍可能互相覆写 —— 但那是**旧的**风险（原实现的
+         * 全局静态缓冲也有），而 TLS 方案的风险是**内存被写坏**，
+         * 严重得多。
+         */
+        if (looks_like_guest_abs_path(pth)) {
             /*
-             * 静态缓冲是刻意的：syscall 可能在任何线程被调用，不能 malloc。
-             * 代价是非线程安全 —— 但 bxroot_translate_path 内部本来也有
-             * 静态状态，所以这里不引入新的限制。
+             * 大环形池：64 KB，只在池内前进，到末尾回绕。
+             *
+             * 为什么不是小池（8 × 4KB）：实测表明**调用方会在内核返回后
+             * 继续持有该指针**。判决实验（三种策略，其他条件完全相同）：
+             *
+             *     静态 8 槽轮转池   → 段错误
+             *     堆 + 只分配一次   → 段错误
+             *     堆 + 每次分配     → 正常
+             *
+             * 唯一变量是"缓冲是否被复用"。所以覆写周期必须足够长 ——
+             * 64 KB 意味着要经过 16 次以上调用才会回到同一块，
+             * 而 libuv 持有路径指针的时间远短于此。
+             *
+             * 为什么不用"每次 malloc"（实测可行）：**会泄漏**。
+             * libuv 探测模块时连续调用数百次 statx，每次 4 KB 就是
+             * 数 MB；长跑必然 OOM。环形池是零泄漏的等价方案。
+             *
+             * 为什么不用 _Thread_local：本机加载器是自研的，TLS 支持
+             * 不完整（rodata 里有 "tls: runtime static TLS surplus
+             * exhausted"），用它反而会写坏相邻数据。
              */
-            static _Thread_local char tbuf[4096];
-            int tr;
+            #define SG_POOL_SIZE (64 * 1024)
+            static char sg_pool[SG_POOL_SIZE];
+            static unsigned int sg_pool_off;
 
-            in_translate = 1;                       /* ★ 进入翻译：挡住嵌套 */
-            tr = bxroot_translate_path(pth, tbuf, sizeof(tbuf));
-            in_translate = 0;                       /* ★ 离开：恢复 */
+            char *tbuf;
+            size_t need = 4096;
+
+            /* 池内按 256 字节对齐切块，避免回绕时切碎 */
+            if (sg_pool_off + need > SG_POOL_SIZE)
+                sg_pool_off = 0;
+            tbuf = sg_pool + sg_pool_off;
+            sg_pool_off += need;
+
+            int tr = bxroot_translate_path(pth, tbuf, need);
 
             if (tr > 0) {
                 if (pidx == 0) a0 = (long)(uintptr_t)tbuf;

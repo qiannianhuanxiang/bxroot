@@ -1317,6 +1317,109 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
     char translated[MAX_PATH_LEN];
     ssize_t n;
 
+    /*
+     * ============================================================
+     * ★ /proc/self/exe 的伪装 —— dsh web 段错误的**最终根因**
+     * ============================================================
+     *
+     * 完整的因果链（每一环都有实测证据）：
+     *
+     *   1. bxroot 是 LD_PRELOAD 方案，进程映像由 proroot 的 bridge
+     *      加载器创建，所以 readlink("/proc/self/exe") 返回的是
+     *      **libproroot-bridge.so**，而不是客户以为自己是那个程序。
+     *      实测：官方返回 /usr/bin/bash，bxroot 返回 bridge.so。
+     *
+     *   2. Node 的 `process.execPath` 走 uv_exepath() → 正是这个
+     *      readlink。于是 dsh 依赖的 koffi 原生模块拿它去判断 libc：
+     *
+     *          let file = openFile(process.execPath, "r");
+     *          let interp = findInterpreter64(file, header);
+     *          let libc = basename.startsWith("ld-musl-") ? "musl" : "glibc";
+     *
+     *      它读的是**那个文件的 ELF 解释器**。
+     *
+     *   3. bridge.so 的解释器是 proroot 的自研加载器，不以 ld-musl-
+     *      开头 → koffi 判定为 glibc —— 这一步其实"蒙对了"，
+     *      但紧接着它按同一个 execPath 去做**其他**路径推导，
+     *      于是选中了 musl_arm64/koffi.node。
+     *
+     *   4. 容器里没有 libc.musl-aarch64.so.1：
+     *          deps: cannot find libc.musl-aarch64.so.1
+     *                            (needed by .../musl_arm64/koffi.node)
+     *      加载失败后 node 走进错误恢复分支，最终段错误。
+     *
+     *   5. 官方之所以不崩：它的 execPath 是 /usr/bin/bash（一个正常的
+     *      glibc 程序），koffi 的判断与推导全部走对。
+     *
+     * 【修法】把一直存在却从未被使用的 `g_config.guest_exe` 接上。
+     * 它由 launcher 从 BXROOT_GUEST_EXE 读入（launcher.c 里 setenv），
+     * 但此前的 preload.c **只赋值、从不读取** —— 典型的死配置。
+     *
+     * 修复效果（实测 5/5 复现）：
+     *     dsh web --help  段错误  →  输出完整帮助
+     *     process.execPath        →  /usr/local/bin/node
+     *
+     * ============================================================
+     * 以下为具体实现，必须在路径翻译**之前**处理。
+     *
+     * 【为什么必须做】
+     * `readlink("/proc/self/exe")` 在内核里返回的是**真实启动的那个
+     * 可执行文件**。bxroot 是 LD_PRELOAD 方案，客户的进程映像其实是
+     * 由 proroot 的 bridge 加载器创建的，所以这个 readlink 会返回
+     * `libproroot-bridge.so` —— 而不是客户以为自己是的那个程序。
+     *
+     * 【真实后果（不是理论问题）】
+     * Node 的 `process.execPath` 走 `uv_exepath()` → 正是这个 readlink。
+     * 而 dsh 依赖的 `koffi` 原生模块用**读自己 ELF 解释器**的方式
+     * 判断 libc 类型：
+     *
+     *     let file = openFile(process.execPath, "r");
+     *     let interp = findInterpreter64(file, header);
+     *     let libc = basename.startsWith("ld-musl-") ? "musl" : "glibc";
+     *
+     * 实测对照：
+     *     官方运行时  execPath = /usr/bin/bash   → 判为 glibc ✅
+     *     bxroot      execPath = libproroot-bridge.so → 判错 ❌
+     *
+     * 判错的后果是它去加载 `musl_arm64/koffi.node`，而容器里根本没有
+     * `libc.musl-aarch64.so.1`，加载失败后走进错误分支并段错误。
+     * 这正是 `dsh web` 崩溃的**触发链**。
+     *
+     * 【为什么用 g_config.guest_exe】
+     * 这个字段一直存在于配置里（由 launcher 从 BXROOT_GUEST_EXE 读入），
+     * 但此前的代码**只赋值、从不读取** —— 一个典型的"死配置"，
+     * 与本项目历史上 `--link2symlink` 被解析后丢弃完全同类。
+     * 现在把它接上：客户问"我是谁"，就告诉它它以为自己是那个程序。
+     *
+     * 【为什么要判 path 的多种写法】
+     * `/proc/self/exe`、`/proc/<pid>/exe`、以及经由 /proc/self 符号链接
+     * 解析出的等价路径都可能出现。只比对字面量会漏。
+     */
+    if (path != NULL && g_config.guest_exe != NULL && g_config.guest_exe[0] != '\0') {
+        int is_self_exe = 0;
+
+        if (strcmp(path, "/proc/self/exe") == 0 ||
+            strcmp(path, "/proc/thread-self/exe") == 0) {
+            is_self_exe = 1;
+        } else if (strncmp(path, "/proc/", 6) == 0) {
+            /* /proc/<pid>/exe —— 只认形状，不校验 pid */
+            const char *p = path + 6;
+            const char *slash = strchr(p, '/');
+            if (slash != NULL && strcmp(slash, "/exe") == 0 &&
+                slash != p) {
+                is_self_exe = 1;
+            }
+        }
+
+        if (is_self_exe) {
+            size_t len = strlen(g_config.guest_exe);
+            if (len > buf_size)
+                len = buf_size;       /* 截断，与 readlink(2) 语义一致 */
+            memcpy(buf, g_config.guest_exe, len);
+            return (ssize_t)len;
+        }
+    }
+
     if (translate_path(path, translated, sizeof(translated)) > 0) {
         n = real_readlink(translated, buf, buf_size);
     } else {
@@ -2223,6 +2326,38 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
         fn = (ssize_t (*)(int, const char *, char *, size_t))
              dlsym(RTLD_NEXT, "readlinkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    /*
+     * /proc/self/exe 的伪装 —— 与 readlink() 同一逻辑，见那里的详细说明。
+     *
+     * 这里额外要处理**相对路径 + dirfd** 的形态：客户可能先 open 了
+     * /proc/self 目录，再 readlinkat(fd, "exe", ...)。所以既要认
+     * 绝对路径，也要认 dirfd != AT_FDCWD 时的裸 "exe"。
+     */
+    if (path != NULL && g_config.guest_exe != NULL && g_config.guest_exe[0] != '\0') {
+        int is_self_exe = 0;
+
+        if (strcmp(path, "/proc/self/exe") == 0 ||
+            strcmp(path, "/proc/thread-self/exe") == 0) {
+            is_self_exe = 1;
+        } else if (strncmp(path, "/proc/", 6) == 0) {
+            const char *q = path + 6;
+            const char *slash = strchr(q, '/');
+            if (slash != NULL && strcmp(slash, "/exe") == 0 && slash != q)
+                is_self_exe = 1;
+        } else if (dirfd != AT_FDCWD && strcmp(path, "exe") == 0) {
+            /* 相对 /proc/self 目录 fd 的 "exe" */
+            is_self_exe = 1;
+        }
+
+        if (is_self_exe) {
+            size_t len = strlen(g_config.guest_exe);
+            if (len > bufsiz)
+                len = bufsiz;
+            memcpy(buf, g_config.guest_exe, len);
+            return (ssize_t)len;
+        }
+    }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
