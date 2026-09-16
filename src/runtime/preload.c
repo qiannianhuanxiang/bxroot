@@ -2533,50 +2533,56 @@ void *dlopen(const char *filename, int flags) {
 }
 
 /*
- * dlsym / dlerror —— 纯转发，**不做任何符号解析**。
+ * dl* 家族：**刻意不再导出**（曾经的实现是错的，见下）。
  *
- * 导出它们的原因不是路径翻译（它们没有路径参数），而是：
- *   1. 官方导出了，为对齐符号表；
- *   2. 某些程序会 dlsym(RTLD_DEFAULT, "dlsym") 探测 —— 缺失会走进意外分支。
- * 实现上就是转发，一行逻辑都不加。
+ * ====================================================================
+ * 这里曾经有一组 dlsym/dlerror/dladdr/dl_iterate_phdr 的转发包装器，
+ * 写法是：
+ *
+ *     void *dlsym(void *handle, const char *symbol) {
+ *         static void *(*fn)(void *, const char *) = NULL;
+ *         if (fn == NULL)
+ *             fn = (void *(*)(void *, const char *))dlsym(RTLD_NEXT, "dlsym");
+ *         ...
+ *     }
+ *
+ * **这是一个必然无限递归的结构**：
+ *
+ *   - `dlsym(RTLD_NEXT, "dlsym")` 的语义是"从本库**之后**的搜索顺序里
+ *     找 dlsym"。但解析 `RTLD_NEXT` 这件事本身就要调用 `dlsym` ——
+ *     而符号解析先命中**我们自己**（本 .so 在搜索顺序最前面）。
+ *   - 于是进入本函数 → fn 仍为 NULL → 再次调用 `dlsym(RTLD_NEXT,...)`
+ *     → 又进本函数 …… 每层吃一个栈帧，直到栈耗尽。
+ *
+ * 实测证据（core dump，非推测）：
+ *
+ *   崩溃 PC = 本 .so + 0x6c44，正是 `dlsym` 的入口。
+ *   主线程寄存器 `sp == x29`（栈指针已追平帧指针 = 栈耗尽）。
+ *   崩溃前的调用链上是 `Dl_info` / `dlopen` 相关操作 ——
+ *   即 dsh 加载原生扩展（.node）时触发了 dlsym。
+ *
+ * 这也解释了症状为何是"`dsh --help` 正常、`dsh web --help` 段错误"：
+ * 只有 web profile 会加载原生 N-API 模块，而那条路径要调 dlsym。
+ *
+ * ====================================================================
+ * 修法：不导出它们，让 libc/ld-linux 的原生实现接管。
+ *
+ * 依据：
+ *   1. 这四个函数**没有任何路径语义** —— 没有需要翻译的参数，
+ *      也就没有必须由我们接管的理由。当初导出它们的理由写的是
+ *      "对齐官方符号表"与"某些程序会 dlsym 探测"，但：
+ *        - 官方符号表里有它们，是因为官方有 `ldso_service_*`
+ *          基础设施（它自研加载器），与我们的架构不同；
+ *        - "程序会探测 dlsym" 这个需求，**libc 原生实现本来就满足**。
+ *   2. 更关键：本文件内部有 **144 处 `dlsym(RTLD_NEXT, ...)`**
+ *      用于解析真实函数。这些调用**全部依赖 libc 的原生 `dlsym`**。
+ *      我们导出一个包装器，恰恰把这条主路径也污染了 —— 不只是
+ *      递归自伤，还会让所有钩子的真实函数解析变脆。
+ *
+ * 换言之：**不导出比导出更正确**。少这 4 个符号不影响任何真实功能
+ * （客户 `dlsym(RTLD_DEFAULT, "dlsym")` 依然由 libc 满足），
+ * 而导出它会让整个运行时在遇到 dlopen 时崩掉。
  */
-void *dlsym(void *handle, const char *symbol) {
-    static void *(*fn)(void *, const char *) = NULL;
-
-    if (fn == NULL)
-        fn = (void *(*)(void *, const char *))dlsym(RTLD_NEXT, "dlsym");
-    if (fn == NULL) { errno = ENOSYS; return NULL; }
-    return fn(handle, symbol);
-}
-
-char *dlerror(void) {
-    static char *(*fn)(void) = NULL;
-
-    if (fn == NULL)
-        fn = (char *(*)(void))dlsym(RTLD_NEXT, "dlerror");
-    if (fn == NULL) return NULL;
-    return fn();
-}
-
-int dladdr(const void *addr, Dl_info *info) {
-    static int (*fn)(const void *, Dl_info *) = NULL;
-
-    if (fn == NULL)
-        fn = (int (*)(const void *, Dl_info *))dlsym(RTLD_NEXT, "dladdr");
-    if (fn == NULL) return 0;
-    return fn(addr, info);
-}
-
-int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
-                    void *data) {
-    static int (*fn)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = NULL;
-
-    if (fn == NULL)
-        fn = (int (*)(int (*)(struct dl_phdr_info *, size_t, void *), void *))
-             dlsym(RTLD_NEXT, "dl_iterate_phdr");
-    if (fn == NULL) return 0;
-    return fn(callback, data);
-}
 
 /* ------------------------------------------------------------------ */
 /* Hook: nocancel 变体 —— 高频（不可取消的内部路径）                    */

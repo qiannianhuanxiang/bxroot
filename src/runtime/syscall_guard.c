@@ -257,14 +257,57 @@ long syscall(long number, ...)
         const char *pth = (pidx == 0) ? (const char *)(uintptr_t)a0
                                       : (const char *)(uintptr_t)a1;
 
-        if (looks_like_guest_abs_path(pth)) {
+        /*
+         * ============================================================
+         * 重入守卫（防御性）
+         * ============================================================
+         *
+         * `translate_path` 内部用 `snprintf` 拼路径。虽然实测 glibc 的
+         * 格式化不会回头调 stat 系系统调用，但这条链**理论上**可以
+         * 闭合：任何一次内部 stat 都会重新进入本函数。
+         *
+         * 加这道守卫的成本是一个 thread_local 读写，收益是把
+         * "无限递归到栈溢出"这个**不可调试**的故障模式彻底排除。
+         *
+         * 【一个必须记录的方法论教训】
+         * 我最初的诊断代码是这样写的：
+         *
+         *     static _Thread_local int d291;
+         *     if (number == 291) { d291++; printf("depth=%d", d291); }
+         *
+         * 它输出了 depth=1,2,3,...,400 —— 我据此判定"无限递归"。
+         * **但那个结论是错的**：`d291` 只增不减，所以顺序调用也会
+         * 让它单调递增。真正区分"嵌套"与"顺序"要在**函数返回前递减**。
+         *
+         * 实测（libuv 连续探测数百个 node_modules 子目录）是**顺序**调用，
+         * 不是嵌套。这道守卫因此**没有**解决当初的段错误 —— 保留它
+         * 是因为它防的是另一件事（理论上的递归），而且成本可忽略。
+         *
+         * 【为什么必须是 thread_local】
+         * `syscall` 会被多线程并发调用。用**全局**标志的话：
+         * A 线程正在翻译时，B 线程的翻译会被误判为重入而跳过 ——
+         * 表现为"随机某些路径不翻译"，比崩溃更难排查。
+         *
+         * 【为什么不用 pthread_key】
+         * 这是 LD_PRELOAD 层，构造函数极早期就可能被调用，
+         * 那时 pthread_key_create 未必可用。`_Thread_local` 由
+         * TLS 直接支撑，无此问题。
+         */
+        static _Thread_local int in_translate;
+
+        if (in_translate == 0 && looks_like_guest_abs_path(pth)) {
             /*
              * 静态缓冲是刻意的：syscall 可能在任何线程被调用，不能 malloc。
              * 代价是非线程安全 —— 但 bxroot_translate_path 内部本来也有
              * 静态状态，所以这里不引入新的限制。
              */
             static _Thread_local char tbuf[4096];
-            int tr = bxroot_translate_path(pth, tbuf, sizeof(tbuf));
+            int tr;
+
+            in_translate = 1;                       /* ★ 进入翻译：挡住嵌套 */
+            tr = bxroot_translate_path(pth, tbuf, sizeof(tbuf));
+            in_translate = 0;                       /* ★ 离开：恢复 */
+
             if (tr > 0) {
                 if (pidx == 0) a0 = (long)(uintptr_t)tbuf;
                 else           a1 = (long)(uintptr_t)tbuf;
