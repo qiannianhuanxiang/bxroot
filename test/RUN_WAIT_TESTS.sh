@@ -14,7 +14,26 @@ cd "$(dirname "$0")" || exit 1
 
 ROOT=$(cd .. && pwd)
 LIB="${BXROOT_SO:-$ROOT/build/libbxroot-runtime.so}"
-PROC_DIR="${BXROOT_PROC_DIR:-$(cd "$ROOT/../proc" 2>/dev/null && pwd)}"
+# proc.c 的编译单元位置。
+#
+# ★ 必须**优先查仓库内** `src/proc` ★
+#
+# 原实现只找 `$ROOT/../proc` —— 那是 D4 还是独立子项目时的开发期布局。
+# 源码迁进仓库（`src/proc/`）之后，本脚本在**干净克隆里就找不到 proc.h**，
+# 而开发机上因为 `../proc` 恰好存在而侥幸能跑。
+#
+# 这个缺陷是**干净克隆验证**抓到的：
+#     干净克隆 → ❌ 找不到 proc.h
+#     开发机   → ✅（因为 ../proc 存在）
+# 与 BUILD_RUNTIME.sh、RUN_WARN_GATE.sh 的做法保持一致（它们都已优先查
+# 仓库内），否则三个脚本对同一件事的判断会不一致。
+if [ -n "${BXROOT_PROC_DIR:-}" ] && [ -f "$BXROOT_PROC_DIR/proc.h" ]; then
+    PROC_DIR="$BXROOT_PROC_DIR"
+elif [ -f "$ROOT/src/proc/proc.h" ]; then
+    PROC_DIR="$ROOT/src/proc"
+else
+    PROC_DIR="$(cd "$ROOT/../proc" 2>/dev/null && pwd)"
+fi
 OUT=/tmp/test_wait_hooks
 STUB=/tmp/libwaitstub.so
 LOG=/tmp/wait-hooks-cc.err
