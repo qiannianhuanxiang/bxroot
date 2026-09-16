@@ -246,20 +246,63 @@ int main(int argc, char **argv) {
     if (cfg.stub_loader)
         setenv("BXROOT_STUB_LOADER", cfg.stub_loader, 1);
 
-    /* 设置 bind mount 环境变量 */
+    /*
+     * 设置 bind mount 环境变量。
+     *
+     * 【为什么不用固定 64 KiB + strcat】
+     * 曾经写成 `malloc(65536)` 然后无界 strcat —— 而 `-b` 只校验了
+     * **条数**（最多 16），不校验**每条的路径长度**。16 条各 3 KB 的
+     * 路径就是 96 KB，直接堆溢出：
+     *     带 _FORTIFY_SOURCE 的构建 → "buffer overflow detected" + abort
+     *     不带 FORTIFY 的构建     → 静默越界写（更危险）
+     * 触发条件只是"bind 数量合法、路径较长"，不需要恶意构造。
+     *
+     * 【修法】先精确算出所需长度再分配。
+     * 同时把 max_binds 的上限也用上，避免长度计算本身溢出。
+     */
     if (cfg.bind_count > 0) {
-        char *bind_env = malloc(65536);
-        if (bind_env) {
-            bind_env[0] = '\0';
-            for (int i = 0; i < cfg.bind_count; i++) {
-                if (i > 0) strcat(bind_env, ";");
-                strcat(bind_env, cfg.binds[i * 2]);
-                strcat(bind_env, ":");
-                strcat(bind_env, cfg.binds[i * 2 + 1]);
+        size_t need = 1;                    /* 结尾 NUL */
+
+        for (int i = 0; i < cfg.bind_count; i++) {
+            const char *a = cfg.binds[i * 2];
+            const char *b = cfg.binds[i * 2 + 1];
+            if (a == NULL || b == NULL)
+                continue;
+            need += strlen(a) + 1 + strlen(b);   /* +1 是中间的 ':' */
+            if (i > 0)
+                need += 1;                        /* 分隔符 ';' */
+            if (need > (size_t)1 << 20) {         /* 1 MiB 上限，防御性 */
+                fprintf(stderr, "错误: bind 列表过长（%zu 字节）\n", need);
+                free_config(&cfg);
+                return 1;
             }
-            setenv("BXROOT_BINDS", bind_env, 1);
-            free(bind_env);
         }
+
+        char *bind_env = malloc(need);
+        if (bind_env == NULL) {
+            fprintf(stderr, "错误: 内存不足（bind 列表需要 %zu 字节）\n", need);
+            free_config(&cfg);
+            return 1;
+        }
+
+        {
+            char *w = bind_env;
+            for (int i = 0; i < cfg.bind_count; i++) {
+                const char *a = cfg.binds[i * 2];
+                const char *b = cfg.binds[i * 2 + 1];
+                if (a == NULL || b == NULL)
+                    continue;
+                if (i > 0)
+                    *w++ = ';';
+                w = stpcpy(w, a);
+                *w++ = ':';
+                w = stpcpy(w, b);
+            }
+            *w = '\0';
+        }
+
+        setenv("BXROOT_BINDS", bind_env, 1);
+        free(bind_env);
     }
 
     /*
@@ -323,7 +366,15 @@ int main(int argc, char **argv) {
         /* 绝对路径：加上 rootfs 前缀 */
         snprintf(resolved_path, sizeof(resolved_path), "%s%s", cfg.rootfs, cmd);
         if (access(resolved_path, F_OK) != 0) {
-            fprintf(stderr, "错误: rootfs 内找不到命令 %s (实际路径: %s) errno=%d %s\n", cmd, resolved_path);
+            /*
+             * 注意：这里必须给足 4 个实参。
+             * 曾经只传了 2 个（格式串里却要 4 个），于是 va_arg 从栈上
+             * 读垃圾当 %d/%s —— 用户敲错一条命令行就 SIGSEGV，
+             * 而且**连这条错误消息本身都打不出来**（崩溃在打印过程中），
+             * 现象是"什么都没输出就退出 139"，极难排查。
+             */
+            fprintf(stderr, "错误: rootfs 内找不到命令 %s (实际路径: %s) errno=%d %s\n",
+                    cmd, resolved_path, errno, strerror(errno));
             free_config(&cfg);
             return 1;
         }

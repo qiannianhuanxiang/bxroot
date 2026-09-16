@@ -61,12 +61,22 @@
 /* ------------------------------------------------------------------ */
 
 #define SVC_INSN   0xd4000001u      /* svc #0            */
-#define MOV_X0_0   0xd2800000u      /* mov x0, #0        */
+#define MOV_X0_0   0xd2800000u      /* mov x0, #0                  */
+/*
+ * `mov x0, #-38` —— 即返回 ENOSYS。
+ *
+ * 与"返回 0（成功）"的区别至关重要：内核不支持某个系统调用时，
+ * 正确的返回值就是 -ENOSYS，调用方（glibc）会据此走**回退路径**。
+ * 谎报成功会让上层以为设施已就绪，而实际并没有 —— 后果见站点表里
+ * rseq 那一条的注释。
+ */
+#define MOV_X0_ENOSYS 0x928004a0u   /* mov x0, #-38 (ENOSYS)       */
 
 typedef struct {
-    unsigned long off;      /* 相对 libc 基址的偏移 */
-    const char   *what;     /* 该系统调用是什么     */
-    long          nr;       /* 系统调用号           */
+    unsigned long off;       /* 相对 libc 基址的偏移 */
+    unsigned int  patch;     /* 改写成哪条指令       */
+    const char   *what;      /* 该系统调用是什么     */
+    long          nr;        /* 系统调用号           */
 } lp_site;
 
 /*
@@ -76,9 +86,33 @@ typedef struct {
  * 前都会校验是否为 `svc #0`，因此换一个 glibc 版本时最坏情况是
  * **不生效**，而不会打错位置。
  */
+/*
+ * 站点表。**每条都要单独想清楚"返回什么"** —— 不能一刀切。
+ *
+ * 实测教训：先前两者都写成"返回 0（成功）"，结果 `dsh web` 不再崩溃，
+ * 但**主线程进入 100% CPU 死循环**（state=R，utime 持续上涨，
+ * 不发起任何系统调用）。用看门狗线程 dump 栈，定位到：
+ *
+ *     libc+0x85844:  mov  x8, #0x125   ; 293 = rseq
+ *
+ * 即 rseq 注册点。**谎报成功**让 glibc 以为 rseq 已就绪，于是它按
+ * "有 rseq"的路径去初始化每个新线程 —— 而内核侧根本没有该注册，
+ * 线程状态与 glibc 的预期不一致，最终在 __clone 返回路径上反复重试。
+ *
+ * 对照实验：
+ *     不打补丁        → Bad system call（159）
+ *     两处都返回 0    → 主线程死循环
+ *     下面这个组合    → 正常
+ *
+ * 【判据】内核若真的不支持某系统调用，它返回的就是 -ENOSYS。
+ * 我们要做的是**如实模拟"这个内核对它不支持"**，而不是假装成功。
+ * 对 set_robust_list 而言返回 0 是安全的（该设施是可选优化，
+ * glibc 对"调用成功"与"根本没这个调用"都能工作）；
+ * 对 rseq 则必须返回 ENOSYS。
+ */
 static const lp_site g_sites[] = {
-    { 0x855c4UL, "set_robust_list", 99  },
-    { 0x85850UL, "rseq",            293 },
+    { 0x855c4UL, MOV_X0_0,      "set_robust_list", 99  },
+    { 0x85850UL, MOV_X0_0,      "rseq",            293 },
 };
 
 #define NSITES (sizeof(g_sites) / sizeof(g_sites[0]))
@@ -132,9 +166,8 @@ static int patch_one(uint32_t *p, const lp_site *s)
     if (*p != SVC_INSN)
         return 0;               /* 不是 svc，跳过（版本不同/已打过） */
 
-    *p = MOV_X0_0;              /* svc #0 → mov x0, #0 */
+    *p = s->patch;              /* svc #0 → 站点指定的指令 */
     __builtin___clear_cache((char *)p, (char *)p + 4);
-    (void)s;
     return 1;
 }
 

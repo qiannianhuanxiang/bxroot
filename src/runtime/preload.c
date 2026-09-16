@@ -37,6 +37,12 @@
 #include <dirent.h>
 #include <signal.h>
 #include <sys/wait.h>
+/*
+ * pthread.h 只为 pthread_create 钩子（栈下限修正）需要。
+ * 它必须放在 sys/wait.h 之后：本文件顶部那份 `_GNU_SOURCE 必须在所有
+ * 系统头文件之前` 的约定已由文件开头满足，这里只是补一个普通头。
+ */
+#include <pthread.h>
 
 #include "config.h"
 #include "l2s-runtime.h"
@@ -412,6 +418,101 @@ static int translate_path(const char *path, char *out, size_t out_size) {
     }
 
     LOG("translate: %s -> %s", path, out);
+    return 1;
+}
+
+/*
+ * 反向 bind 映射：宿主路径 → 客户路径。
+ *
+ * ====================================================================
+ * 为什么需要它（一个真实的故障）
+ * ====================================================================
+ *
+ * DSHA 传给 bxroot 的 bind 里有这样两条：
+ *
+ *     -b /storage/emulated/0:/sdcard
+ *     -b /storage/emulated/0:/storage/emulated/0
+ *
+ * 正向翻译（客户 → 宿主）工作正常：`/sdcard/x` 会变成
+ * `/storage/emulated/0/x`。
+ *
+ * 但**反向**没人做：`getcwd()` 从内核拿到的是**宿主路径**
+ * `/storage/emulated/0/Download/...`，我们的 getcwd 钩子只剥了
+ * rootfs 前缀（这里没命中，因为该路径在 rootfs 之外），于是原样返回。
+ *
+ * 实测后果（`dsh web --help`）：
+ *
+ *     官方  : cwd = /sdcard/Download/DSHA/工作区
+ *             → 尝试读 /sdcard/.../.env → ENOENT（被静默忽略）✅
+ *     bxroot: cwd = /storage/emulated/0/Download/DSHA/工作区
+ *             → 尝试读该路径 → **EACCES**（/storage 是 FUSE，权限受限）
+ *             → dsh 的 .env 加载抛错，后续插件初始化被带偏 ❌
+ *
+ * 也就是说：**客户看到一个它从没见过的路径，然后在那条路径上失败。**
+ *
+ * ====================================================================
+ * 实现要点
+ * ====================================================================
+ *
+ * - 取**最长（最具体）**的匹配 source，与正向翻译的策略一致。
+ *   `/storage/emulated/0` 同时匹配两条 bind，但它们 target 不同
+ *   （`/sdcard` 与 `/storage/emulated/0`），必须有一致的选取规则。
+ *   这里偏好**与 source 不同**的 target（即真正的重映射），
+ *   自映射（source == target）只作为兜底。
+ *
+ * - 同样只认**组件边界**（前缀后必须是 '\0' 或 '/'），
+ *   否则 `/storage/emulated/0X` 会被误判。
+ *
+ * - 返回 1 表示已重写，0 表示无匹配。
+ */
+static int detranslate_binds(const char *path, char *out, size_t out_size)
+{
+    int best = -1;
+    size_t best_len = 0;
+
+    if (path == NULL || out == NULL || out_size == 0)
+        return 0;
+    if (path[0] != '/')
+        return 0;
+
+    for (int i = 0; i < g_config.bind_count; i++) {
+        const char *src = g_config.bind_sources ? g_config.bind_sources[i] : NULL;
+        const char *tgt = g_config.bind_targets ? g_config.bind_targets[i] : NULL;
+        size_t sl;
+
+        if (src == NULL || src[0] == '\0' || tgt == NULL)
+            continue;
+
+        sl = strlen(src);
+        if (strncmp(path, src, sl) != 0)
+            continue;
+        if (path[sl] != '\0' && path[sl] != '/')
+            continue;
+
+        /*
+         * 自映射（source == target）在反向时是恒等变换，没有价值。
+         * 只有当**没有**更具体的非自映射匹配时才用它兜底。
+         */
+        if (strcmp(src, tgt) == 0 && best >= 0)
+            continue;
+
+        if (sl > best_len) {
+            best = i;
+            best_len = sl;
+        }
+    }
+
+    if (best < 0)
+        return 0;
+
+    {
+        const char *tgt = g_config.bind_targets[best];
+        const char *rest = path + best_len;
+        int n = snprintf(out, out_size, "%s%s", tgt, rest);
+
+        if (n < 0 || (size_t)n >= out_size)
+            return 0;
+    }
     return 1;
 }
 
@@ -1412,9 +1513,20 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
         }
 
         if (is_self_exe) {
+            /*
+             * readlink(2) 的语义：**不补 NUL**，只写至多 buf_size 字节，
+             * 返回实际写入的字节数。这里必须严格照做。
+             *
+             * 曾经写成"截断后 memcpy 并返回 len"，看起来对，但若
+             * strlen(guest_exe) >= buf_size，客户拿到的是一个**没有终止符**
+             * 的缓冲 —— 客户随后 strlen(buf) 就越界读。
+             *
+             * （官方同样不补 NUL。契约如此，我们不能"好心"多写一个字节：
+             *   buf_size 恰为 len 时多写就是缓冲溢出。）
+             */
             size_t len = strlen(g_config.guest_exe);
             if (len > buf_size)
-                len = buf_size;       /* 截断，与 readlink(2) 语义一致 */
+                len = buf_size;
             memcpy(buf, g_config.guest_exe, len);
             return (ssize_t)len;
         }
@@ -1946,6 +2058,34 @@ char *getcwd(char *buf, size_t size) {
         memmove(buf, rest, restlen + 1);
         (void)tmp;
     }
+
+    /*
+     * 反向 bind 映射。
+     *
+     * 剥完 rootfs 前缀之后，路径可能仍落在某个 bind 的 **source**
+     * （宿主路径）之下 —— 客户不该看到那个名字。典型场景就是
+     * `-b /storage/emulated/0:/sdcard`：内核给的 cwd 是
+     * `/storage/emulated/0/Download/...`，而客户以为自己在
+     * `/sdcard/Download/...`。
+     *
+     * 不做这一步的实测后果：dsh 会拿宿主路径去读 `.env`，撞上
+     * FUSE 的 EACCES（而正确路径下那是 ENOENT，被静默忽略），
+     * 进而打断启动流程。
+     *
+     * 放在 rootfs 剥离**之后**：两者是串联的（先脱 rootfs，再脱 bind），
+     * 且 rootfs 之外的 bind 只有这一步能处理。
+     */
+    {
+        char reb[MAX_PATH_LEN];
+        if (detranslate_binds(buf, reb, sizeof(reb)) == 1) {
+            size_t need = strlen(reb) + 1;
+            if (need > size) {
+                errno = ERANGE;
+                return NULL;
+            }
+            memcpy(buf, reb, need);
+        }
+    }
     return r;
 }
 
@@ -2275,6 +2415,16 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
         fn = (int (*)(int, const char *, mode_t, int))dlsym(RTLD_NEXT, "fchmodat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    /*
+     * path 可能为 NULL —— 内核把它当合法入参（返回 EFAULT），
+     * 而 translate_path() 第一件事就是读 path[0]，不判就会整进程段错误。
+     * 同文件的 statx/utimensat/fchownat/dlopen 都判了 NULL，这里曾是漏判。
+     */
+    if (path == NULL) {
+        rc = fn(dirfd, NULL, mode, flags);
+        return rc;
+    }
+
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
 
@@ -2293,6 +2443,16 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
     if (fn == NULL)
         fn = (int (*)(int, const char *, int, int))dlsym(RTLD_NEXT, "faccessat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    /*
+     * path 可能为 NULL —— 内核把它当合法入参（返回 EFAULT），
+     * 而 translate_path() 第一件事就是读 path[0]，不判就会整进程段错误。
+     * 同文件的 statx/utimensat/fchownat/dlopen 都判了 NULL，这里曾是漏判。
+     */
+    if (path == NULL) {
+        rc = fn(dirfd, NULL, mode, flags);
+        return rc;
+    }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
@@ -2351,6 +2511,7 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
         }
 
         if (is_self_exe) {
+            /* 与 readlink() 同一语义：不补 NUL，见那里的详细说明。 */
             size_t len = strlen(g_config.guest_exe);
             if (len > bufsiz)
                 len = bufsiz;
@@ -3530,6 +3691,49 @@ int getrlimit(__rlimit_resource_t resource, struct rlimit *rlim) {
     return fn(resource, rlim);
 }
 
+/*
+ * RLIMIT_NOFILE 的 EPERM 吞掉（与官方逐条对齐）。
+ *
+ * 【为什么需要】实测 A/B（同一个探针程序，只换 --preload 的运行时）：
+ *
+ *     官方 proroot：setrlimit(RLIMIT_NOFILE, {1M,1M}) → rc=0, errno=0
+ *     bxroot      ：setrlimit(RLIMIT_NOFILE, {1M,1M}) → rc=-1, errno=EPERM
+ *
+ * Android 对每个进程的 fd 上限卡得很死，而 guest 里的
+ * node / pnpm / apt 启动时都会**主动抬高 RLIMIT_NOFILE**并检查返回值。
+ * 拿到 EPERM 后它们的处理策略各不相同：轻则打印告警，重则直接
+ * 降级或退出 —— 这正是"闭源能跑、开源跑不动"这类差距的典型来源。
+ *
+ * 【官方怎么做】反汇编 runtime 的 setrlimit(+0xa228) / setrlimit64(+0xa4a8)
+ * 与 prlimit(+0xa324) / prlimit64(+0xa38c)，四个入口共用同一段判定：
+ *
+ *     rc = syscall(261 /*prlimit64* /, 0, res, new, 0, 0);
+ *     if (rc == 0)                     return 0;
+ *     if (res != RLIMIT_NOFILE)        { errno 原样; return -1; }
+ *     if (errno != EPERM)              { errno 原样; return -1; }
+ *     errno = 0;                       return 0;      // ★ 假装成功
+ *
+ * 即：**只吞 RLIMIT_NOFILE + 只吞 EPERM**，其余资源、其余错误一律如实上报。
+ * 不做任何数值调整（内核没答应就不假装内核答应了），
+ * 只是不让调用方因为一个它无力改变的宿主限制而走进错误分支。
+ *
+ * 【为什么不是真去改内核值】那需要 CAP_SYS_RESOURCE，Android 应用进程
+ * 没有；能做的只有"如实转发 + 对这一种可预期的失败做兼容"。
+ */
+static int rl_nofile_eperm_to_ok(__rlimit_resource_t resource, int rc)
+{
+    if (rc == 0)
+        return 0;
+    if (resource != RLIMIT_NOFILE)
+        return rc;
+    if (errno != EPERM)
+        return rc;
+
+    errno = 0;      /* 与官方一致：对 NOFILE 的 EPERM 报告为成功 */
+    LOG("setrlimit(RLIMIT_NOFILE) EPERM -> 报告成功（与官方一致）");
+    return 0;
+}
+
 int setrlimit(__rlimit_resource_t resource, const struct rlimit *rlim) {
     static int (*fn)(__rlimit_resource_t, const struct rlimit *) = NULL;
     if (fn == NULL)
@@ -3537,13 +3741,7 @@ int setrlimit(__rlimit_resource_t resource, const struct rlimit *rlim) {
              dlsym(RTLD_NEXT, "setrlimit");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    /*
-     * 纯转发。官方在这里会打日志并可能**调整值** ——
-     * 它的动机是 guest 想要的 fd 上限可能超过宿主允许的
-     * （Android 对每个进程的 fd 数量有限制，而 node/pnpm 会要很高）。
-     * bxroot 目前如实转发；若真机上遇到 EPERM，这里是介入点。
-     */
-    return fn(resource, rlim);
+    return rl_nofile_eperm_to_ok(resource, fn(resource, rlim));
 }
 
 int getrlimit64(__rlimit_resource_t resource, struct rlimit64 *rlim) {
@@ -3561,12 +3759,148 @@ int setrlimit64(__rlimit_resource_t resource, const struct rlimit64 *rlim) {
         fn = (int (*)(__rlimit_resource_t, const struct rlimit64 *))
              dlsym(RTLD_NEXT, "setrlimit64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
-    return fn(resource, rlim);
+
+    return rl_nofile_eperm_to_ok(resource, fn(resource, rlim));
+}
+
+/*
+ * prlimit / prlimit64 —— 资源限制的"带 pid"版本，同样只吞 NOFILE+EPERM。
+ *
+ * glibc 的 **setrlimit/setrlimit64 在内部就是走 prlimit64 的**
+ * （官方 setrlimit64 是 `b prlimit64@plt`，即直接跳到自己的 prlimit64），
+ * 所以这两组符号必须共享同一个判定，否则"谁被调用"会决定行为，
+ * 而调用方无从知道 —— 那是最难排查的一类不一致。
+ *
+ * 官方导出的是 prlimit(104B) / prlimit64(284B)，两者共用同一段判定逻辑，
+ * 这里保持同构。注意 prlimit 用 struct rlimit、prlimit64 用 struct rlimit64
+ * 两个**不同**的结构体（与 glibc 头文件一致），不能合并成一个函数。
+ */
+int prlimit(pid_t pid, __rlimit_resource_t resource,
+            const struct rlimit *new_limit, struct rlimit *old_limit) {
+    static int (*fn)(pid_t, __rlimit_resource_t, const struct rlimit *,
+                     struct rlimit *) = NULL;
+    if (fn == NULL)
+        fn = (int (*)(pid_t, __rlimit_resource_t, const struct rlimit *,
+                      struct rlimit *))dlsym(RTLD_NEXT, "prlimit");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    return rl_nofile_eperm_to_ok(resource,
+                                 fn(pid, resource, new_limit, old_limit));
+}
+
+int prlimit64(pid_t pid, __rlimit_resource_t resource,
+              const struct rlimit64 *new_limit, struct rlimit64 *old_limit) {
+    static int (*fn)(pid_t, __rlimit_resource_t, const struct rlimit64 *,
+                     struct rlimit64 *) = NULL;
+    if (fn == NULL)
+        fn = (int (*)(pid_t, __rlimit_resource_t, const struct rlimit64 *,
+                      struct rlimit64 *))dlsym(RTLD_NEXT, "prlimit64");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    return rl_nofile_eperm_to_ok(resource,
+                                 fn(pid, resource, new_limit, old_limit));
 }
 
 /* ------------------------------------------------------------------ */
-/* Hook: 网络 IPC —— AF_UNIX 路径必须翻译                              */
+/* Hook: 线程创建 —— pthread_create 的栈下限修正                        */
 /* ------------------------------------------------------------------ */
+
+/*
+ * 【为什么需要】实测 A/B（同一个探针，只换 --preload 的运行时）。
+ * 探针：pthread_attr_setstacksize(&at, N) 之后 pthread_create()。
+ *
+ *   N = 131072 (= PTHREAD_STACK_MIN)：
+ *       裸跑 rc=0 ✅ | 官方 rc=0 ✅ | bxroot(**改前**) rc=22 EINVAL ❌
+ *   N = 135168：
+ *       裸跑 rc=0 ✅ | 官方 rc=0 ✅ | bxroot(**改前**) rc=0 但随后 **SIGSEGV** ❌
+ *
+ * 两组都是**改动前就存在**的（用改动前的 BASELINE.so 复现，各跑 2 次
+ * 结果稳定一致），是本轮新查出的既有缺口，不是本轮引入的回归。
+ * 这也正是端到端冒烟里那行
+ *     `node[1]: pthread_create: Invalid argument`
+ * 的来源 —— node 的 worker 线程正是从 PTHREAD_STACK_MIN 起步。
+ *
+ * 实测矩阵（PAGESIZE=4096，PTHREAD_STACK_MIN=131072）：
+ *     N: 0 ok | 131072 EINVAL | 135168 SEGV | 139264 ok | 147456 ok
+ *        163840 ok | 196608 ok | 229376 ok | 245760 ok | 262144 ok
+ * 即**只有 128K~256K 这条窄带**出问题，到 256K 就一切正常。
+ *
+ * 【官方怎么做】反汇编 runtime 的 pthread_create(+0x104b0，856 字节)，
+ * 核心判定在 0x10500–0x106a4，还原如下：
+ *
+ *     if (attr == NULL) → 直接透传（默认属性必然合法，不需要动）
+ *     pthread_attr_getstacksize(attr, &size);      失败 → 透传
+ *     pthread_attr_getstack(attr, &addr, &region); 失败 → 透传
+ *     if (region == 0 || addr + region == 0)       透传（无显式栈）
+ *
+ *     floor = 2 * sysconf(_SC_THREAD_STACK_MIN);   // = 262144
+ *     if (floor < 262144) floor = 262144;          // 0x10660 的 mov #0x40000
+ *     if (size >= floor) → 透传（0x10674 的 b.ls 跳过改写）
+ *     复制 attr 到栈上副本，在**副本**上 setstacksize(floor)，用副本调用
+ *
+ * ★ 关键就是那个 **2 倍**：下限是 2×PTHREAD_STACK_MIN = 256K，不是 128K。
+ *   只兜到 128K 不够 —— 135168 那一档仍会崩，必须抬到 256K。
+ *   （本段初稿曾把下限写成 131072，逐档实测后已改正。）
+ *
+ * ⚠️ 必须在属性**副本**上改，绝不能改调用方的 attr：
+ * attr 常是栈上变量、可能被复用，原地改写等于污染调用方状态。
+ */
+#ifndef BX_PTHREAD_STACK_FLOOR_MIN
+#define BX_PTHREAD_STACK_FLOOR_MIN 262144   /* 0x40000，与官方常量一致 */
+#endif
+
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                   void *(*start_routine)(void *), void *arg)
+{
+    static int (*fn)(pthread_t *, const pthread_attr_t *,
+                     void *(*)(void *), void *) = NULL;
+    pthread_attr_t local;
+
+    if (fn == NULL)
+        fn = (int (*)(pthread_t *, const pthread_attr_t *,
+                      void *(*)(void *), void *))dlsym(RTLD_NEXT,
+                                                       "pthread_create");
+    if (fn == NULL) return EINVAL;
+
+    /*
+     * 只有 attr != NULL 时才需要检查：attr == NULL 表示"用默认属性"，
+     * 而默认值一定合法（glibc 保证），不必也不能去动。
+     */
+    if (attr != NULL) {
+        size_t size = 0;
+        void  *addr = NULL;
+        size_t region = 0;
+
+        if (pthread_attr_getstacksize(attr, &size) == 0 &&
+            pthread_attr_getstack(attr, &addr, &region) == 0) {
+
+            /* region/addr 全空 = 调用方没指定显式栈 → 无可修正，透传 */
+            if (region != 0 && ((uintptr_t)addr + region) != 0) {
+                long smin = sysconf(_SC_THREAD_STACK_MIN);
+                size_t floor_sz = BX_PTHREAD_STACK_FLOOR_MIN;
+
+                if (smin > 0 && (size_t)smin * 2 > floor_sz)
+                    floor_sz = (size_t)smin * 2;
+
+                if (size < floor_sz) {
+                    /*
+                     * 复制到栈上副本再改 —— 绝不污染调用方的 attr。
+                     * pthread_attr_t 是值语义的小结构体，整体赋值即完整复制。
+                     */
+                    local = *attr;
+                    if (pthread_attr_setstacksize(&local, floor_sz) == 0) {
+                        LOG("pthread_create: 栈下限修正 %zu -> %zu",
+                            size, floor_sz);
+                        return fn(thread, &local, start_routine, arg);
+                    }
+                    /* setstacksize 拒绝 → 用原 attr 透传，不改变语义 */
+                }
+            }
+        }
+    }
+
+    return fn(thread, attr, start_routine, arg);
+}
 
 /*
  * 为什么 socket 家族也要 hook：
