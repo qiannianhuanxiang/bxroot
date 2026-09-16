@@ -2224,6 +2224,40 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
 
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat(buf, &g_fakeroot_state);
+
+    /*
+     * ★ l2s —— 这一行曾经**漏掉**，而它是危害最大的一个入口 ★
+     *
+     * 实测（纯 C 探针逐个入口读 st_nlink，BXROOT_LINK2SYMLINK=1）：
+     *
+     *     stat(a)               nlink=2  islnk=0    ✅
+     *     lstat(a)              nlink=2  islnk=0    ✅
+     *     fstatat(AT_FDCWD,a)   nlink=1  islnk=0    ❌ ← 本函数
+     *     fstatat(dirfd,"a")    nlink=1  islnk=0    ❌ ← 本函数
+     *
+     * 也就是说 stat/lstat 都对，只有 fstatat 不对。而在产物的调用点统计里，
+     * `stat`/`lstat`/`stat64`/`lstat64` 都有 l2s 调用，**fstatat 是唯一
+     * 一个 0 调用的**。
+     *
+     * 【为什么这一个漏掉就足以让整个功能失效】
+     * `fstatat` 是 **glibc 现代程序的主路径** —— 新程序（含 node）的
+     * `fs.statSync` / `fs.lstatSync` 走的就是它，`stat`/`lstat` 那些老
+     * 入口基本不会被调到。所以：
+     *   - 用老工具（ls / grep）测，看到的是正确的 nlink=2
+     *   - 用 node 测，全错
+     * 这种"按调用者不同而表现不同"的缺陷最难查 —— 探针选错就永远看不见。
+     *
+     * 【为什么 l2s 必须在这里生效】
+     * node/PNPM 靠 st_nlink 判断"store 里的文件是否已被链接"，看到 1 就
+     * 认为没链接，退化成完整复制 —— 这正是 DSHA 被迫使用
+     * package-import-method=copy 的根因。
+     *
+     * 路径参数用**翻译后的宿主路径 p**，不是原始 path：l2s 的中间层与
+     * 数据文件都在宿主侧，用 guest 路径永远 probe 不到（与 stat 处同理）。
+     */
+    if (rc == 0)
+        l2s_rt_patch_stat(buf, p);
+
     return rc;
 }
 

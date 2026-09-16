@@ -83,9 +83,33 @@ case "$APP_LIB" in
 esac
 # 不做 [ -f ] / [ -d ]：见上，那些判据在本环境下恒为假
 
+# ---------------------------------------------------------------------
+# ★ 产物新鲜度检查 ★
+#
+# 踩过的坑：改了 `src/l2s/*.c` 后忘了重新构建，或者**构建了但产物比源码旧**
+# （并行开发时很常见 —— 另一个 agent 刚改完源码，你的 `build/` 还是旧的），
+# 于是本脚本 cp 的是旧产物，你看到"改了没效果"，白排查一轮。
+#
+# 这里显式比对 mtime：产物比任一源文件旧就**警告**（不直接失败 ——
+# 有时确实想测旧产物做对照）。警告足以让人意识到该重建。
+RUNTIME_SO="build/libbxroot-runtime.so"
+if [ ! -f "$RUNTIME_SO" ]; then
+    echo "⏭️  跳过：没有 $RUNTIME_SO（先跑 BUILD_RUNTIME.sh）"
+    exit 2
+fi
+NEWER=$(find src -name '*.c' -o -name '*.h' 2>/dev/null | while read -r f; do
+    [ "$f" -nt "$RUNTIME_SO" ] && echo "$f"
+done | head -3)
+if [ -n "$NEWER" ]; then
+    echo "⚠️  产物比源码旧 —— 下面测的是**旧产物**："
+    echo "$NEWER" | sed 's/^/      /'
+    echo "   先跑 sh BUILD_RUNTIME.sh 再测（除非你就是要对照旧产物）"
+    echo
+fi
+
 rm -rf "$STAGE_MKDIR" 2>/dev/null
 mkdir -p "$STAGE_MKDIR" || { echo "❌ 无法创建落地目录"; exit 2; }
-cp -f build/libbxroot-runtime.so "$STAGE_MKDIR/libbxroot-runtime.so" || exit 2
+cp -f "$RUNTIME_SO" "$STAGE_MKDIR/libbxroot-runtime.so" || exit 2
 
 # ---------------------------------------------------------------------
 # 探针：测 link() 之后的 st_nlink 与"是否被看成符号链接"

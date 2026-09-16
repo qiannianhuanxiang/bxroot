@@ -100,7 +100,19 @@ KNOWN=0
 # 已知缺陷登记表：这些项当前**预期失败**，失败记为 KNOWN 而不是 FAIL，
 # 免得整轮回归长期红着、把别的新问题掩盖掉。
 # 修复后把对应条目删掉即可（那时它应当 PASS，也就不会再走这条分支）。
-KNOWN_FAIL="l2s 端到端契约"
+#
+# ★ 2026-09-16：`l2s 端到端契约` 已修复并移除 ★
+#
+# 它曾在这里登记过一段时间（三个独立缺陷叠加：scheme 自相矛盾 /
+# fstatat 漏接 l2s / node 走裸 syscall(291) 而补丁接在 statx() 符号上）。
+# 修复后实测与官方逐项一致：
+#     bxroot: nlink=2 islink=false content="hello"
+#     官方  : nlink=2 islink=false content="hello"
+# 完整分析见 docs/l2s-stat伪装三缺陷分析.md。
+#
+# 保留这行注释而不是直接删干净，是为了让后来者知道：这张表**是可以清空的** ——
+# 登记不是"把测试关掉"，而是"承认缺陷存在、让它可见但不污染回归信号"。
+KNOWN_FAIL=""
 
 # 记录一条结果：$1=状态(PASS/FAIL/SKIP) $2=名称 $3=摘要
 note() {

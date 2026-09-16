@@ -140,9 +140,30 @@ int l2s_rt_rewrite_readlink(const char *path, const char *raw_target,
  */
 void l2s_rt_patch_stat(struct stat *st, const char *path);
 
-/* statx 版本。statx_nlink_bit 传 STATX_NLINK，避免本头文件依赖 <linux/stat.h>。 */
+/*
+ * statx 版本。statx_nlink_bit 传 STATX_NLINK，避免本头文件依赖 <linux/stat.h>。
+ *
+ * ⚠️ 本函数**只**改写 stx_nlink，不改 stx_mode —— 保留 4 参数签名是为了
+ * 不破坏既有调用方。需要连 S_IFLNK 一起抹掉（node/libuv 的 lstatSync()
+ * 走裸 syscall(291)，读的正是 stx_mode）请用下面的 _full 版本。
+ */
 void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
                         unsigned int statx_nlink_bit, const char *path);
+
+/*
+ * statx 的完整补丁：同时改写 stx_nlink 与 stx_mode 的 S_IFMT 位。
+ *
+ * 存在的理由是一处**实测缺陷**：官方 proroot 在裸 statx 路径上把伪造
+ * 链接的 stx_mode 报成 S_IFREG（实测 mode=0100600 islnk=0），而只补
+ * nlink 的版本会让 lstatSync().isSymbolicLink() 仍为 true —— 客户照样
+ * 看穿模拟。
+ *
+ * stx_mode 传 NULL 时退化成与 l2s_rt_patch_statx 完全相同的行为。
+ * 是否抹掉 S_IFLNK 由 l2s_rt_set_hide_symlink() 控制（默认抹）。
+ */
+void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
+                             unsigned int *stx_mode,
+                             unsigned int statx_nlink_bit, const char *path);
 
 /* 默认 1（客户不该看出这是符号链接）。置 0 便于诊断。 */
 void l2s_rt_set_hide_symlink(int on);

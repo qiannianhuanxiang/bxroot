@@ -49,6 +49,54 @@
 #include "syscall_guard.h"
 
 /*
+ * l2s 层的 statx 结果补丁。前向声明而不是 #include "l2s-runtime.h"：
+ * 本文件是**独立编译单元**，只要一个函数原型，不该为此把整个 l2s 头
+ * （进而 <sys/stat.h>、l2s.h）拖进来 —— 编译单元之间保持最小耦合。
+ *
+ * ★ 必须声明为 weak ★
+ *
+ * 本文件有两种编译方式：
+ *   ① 与 src/l2s/l2s-runtime.c 一起链进 libbxroot-runtime.so —— 正常路径；
+ *   ② **单独**与 test/test_syscall_argpos.c / test_rename_link_argpos.c
+ *      一起编译（这两个测试自带翻译桩，专门测"参数位置表"这一件事，
+ *      不链接 l2s）。
+ *
+ * 方式 ② 下若用普通声明，链接器会报
+ *     undefined reference to `l2s_rt_patch_statx_full'
+ * 直接把两个既有测试打红。weak 声明让它在"没有 l2s 参与链接"时
+ * 解析为 NULL，调用点判空跳过即可 —— 那两个测试本来也不测 l2s 伪装。
+ *
+ * 【为什么不用"复制一份实现"绕过】
+ * 判据（是不是伪造链接、链长多少、要不要抹 S_IFLNK）只有 l2s 层有。
+ * 在这里复制一份等于把同一套规则写两处，两边迟早漂移 —— 那正是本项目
+ * 反复踩过的坑（"测试台的配置与真实部署不同"）。
+ *
+ * 实现体在 src/l2s/l2s-runtime.c。
+ */
+__attribute__((weak))
+void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
+                             unsigned int *stx_mode,
+                             unsigned int statx_nlink_bit, const char *path);
+
+/*
+ * STATX_NLINK：避免为一个常量引入 <linux/stat.h>（见上面的耦合说明）。
+ *
+ * ★ 值必须是 0x4，不要写成 0x200 ★
+ * 实测核对（gcc 打印 <linux/stat.h> 的常量）：
+ *     STATX_TYPE  0x1    STATX_MODE  0x2    STATX_NLINK 0x4
+ *     STATX_UID   0x8    STATX_GID   0x10   ...
+ *     STATX_SIZE  0x200  STATX_BLOCKS 0x400
+ * 写成 0x200 会拿 STATX_SIZE 当门控位。而在本环境里内核返回的
+ * stx_mask 是 0x17ff —— 同时包含 0x4 与 0x200，于是判定照样通过，
+ * 缺陷被**静默掩盖**，只在别的内核/掩码组合下才暴露。这类"碰巧能过"
+ * 的常量错误必须靠核对常量本身排除，不能靠"跑起来是对的"下结论。
+ */
+#define SCG_STATX_NLINK 0x00000004u
+
+/* __NR_statx（asm-generic / aarch64 均为 291，已按本机实测核对）。 */
+#define SCG_NR_statx 291
+
+/*
  * preload.c 提供的路径翻译桥（返回值约定与 translate_path 一致：
  * >0 已翻译 / ==0 无需翻译 / <0 失败）。与 preload.c 编进同一个 .so，
  * 直接调用即可，不需要 dlsym。
@@ -715,7 +763,81 @@ long syscall(long number, ...)
         }   /* for (i = 0; i < 6; i++) */
     }       /* if (pmask != 0) */
 
-    return raw_syscall6(number, a0, a1, a2, a3, a4, a5);
+    {
+        long ret = raw_syscall6(number, a0, a1, a2, a3, a4, a5);
+
+        /*
+         * ============================================================
+         * statx 的**结果补丁** —— 裸 syscall 路径上缺失的那一半
+         * ============================================================
+         *
+         * 【问题】libuv（node 的 FS 层）**故意绕开 libc**：
+         *
+         *     static int uv__fs_statx(int fd, const char* path, ...) {
+         *         struct statx statxbuf;
+         *         int ret = syscall(SYS_statx, fd, path, flags, mask, &statxbuf);
+         *         ...
+         *     }
+         *
+         * 实测证据：node 每次 statSync/lstatSync 都是本函数的
+         * `number=291`，而 preload.c 里那个 statx() **符号钩子一次都
+         * 没被调用**。node 二进制里 24 条 svc、0 处引用 newfstatat/statx
+         * 符号 —— 它只走这条路。
+         *
+         * 后果：路径翻译那一半（本函数上面的 pmask 分支）**是生效的**，
+         * 而结果伪装那一半从未发生。于是 l2s 的硬链接模拟在 node 眼里
+         * 等于不存在：st_nlink 停在 1、stx_mode 带 S_IFLNK。
+         * pnpm 正是靠 st_nlink 判断 store 里的文件是否已链接，看到 1
+         * 就认为没链接，退化成完整复制 —— 这正是 DSHA 被迫使用
+         * package-import-method=copy 的根因。
+         *
+         * 本文件头【问题二】早就记下了"libuv 用 syscall(291) 直接发起"
+         * 这件事，但当时只做了翻译、没做伪装。这里补上缺的那一半。
+         *
+         * 【为什么放在 raw_syscall6 之后】
+         * 补丁必须作用于**内核已经写好**的结构体。放在调用前，
+         * 内核随后会把真实值覆盖回去，等于白写。
+         *
+         * 【为什么必须在这里做，而不是"让 libuv 改走 libc"】
+         * 客户代码不可改。LD_PRELOAD 层的职责就是在客户选择的路径上
+         * 补齐语义，而不是要求客户换路径。
+         *
+         * 【与 l2s_rt_patch_statx_full 的分工】
+         * 本函数只负责"在哪补"（结果缓冲的确切地址 = a4，这是 statx
+         * ABI 里 struct statx * 的位置）。"补成什么"全部交给 l2s 层 ——
+         * 判据（是不是伪造链接、链长多少、要不要抹 S_IFLNK）只有它有，
+         * 这里不复制任何判据。
+         *
+         * 【门控条件，一条都不能少】
+         *   ret == 0   失败时内核没写 buf，改它就是碰运气
+         *   number==291 只碰 statx，绝不影响其他系统调用
+         *   a4 != 0    客户可能传空指针（statx 会回 EFAULT），
+         *              解引用它就是 SIGSEGV
+         *   a1 != 0    路径为空指针时 l2s 层无从 probe，直接跳过
+         *
+         * ★ 官方 proroot 在同一位置做同一件事 ★
+         * 实测（同一个裸 statx 探针，同一颗 node 环境）：
+         *     官方: mode=0100600 nlink=2 islnk=0   ← 已伪装
+         *     bxroot(修前): mode=0120777 nlink=1 islnk=1
+         */
+        if (ret == 0 && number == SCG_NR_statx && a4 != 0 && a1 != 0 &&
+            l2s_rt_patch_statx_full != NULL) {
+            /* struct statx 的字段布局（u32 起始部分）：
+             *   stx_mask(0) stx_blksize(4) stx_attributes(8)
+             *   stx_nlink(16) stx_uid(20) stx_gid(24) stx_mode(28)
+             * 前三个字段之后正好是 nlink/uid/gid/mode —— 用 u32 指针
+             * 加偏移寻址，避免为一个结构体拖进 <linux/stat.h>。 */
+            unsigned int *base = (unsigned int *)(uintptr_t)a4;
+
+            l2s_rt_patch_statx_full(&base[4] /* stx_nlink */,
+                                    &base[0] /* stx_mask  */,
+                                    &base[7] /* stx_mode  */,
+                                    SCG_STATX_NLINK,
+                                    (const char *)(uintptr_t)a1);
+        }
+
+        return ret;
+    }
 }
 unsigned long bxroot_syscall_guard_blocked(void)
 {
