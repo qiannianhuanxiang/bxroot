@@ -32,8 +32,28 @@ cd "$ROOT" || exit 1
 mkdir -p "$ROOT/build" || { echo "❌ 无法创建 build 目录"; exit 1; }
 
 OUT="$ROOT/build/libbxroot-runtime.so"
-TMP="$OUT.tmp"
-LOG=/tmp/bxroot-runtime-cc.err
+
+# ★ 中间产物与日志必须按进程隔离 ★
+#
+# 实测教训（另一个 agent 报告的，我复现确认）：`TMP` 与 `LOG` 原先都是
+# **固定路径**，于是两个构建并发跑时会互相破坏：
+#
+#   1. `LOG=/tmp/bxroot-runtime-cc.err` —— 两边同时写同一个文件，
+#      后写的把先写的清空。症状是**"编译失败但编译器输出为空"**，
+#      看起来像工具坏了，实际是日志被对方覆盖。这个症状极具误导性：
+#      你以为是编译器没输出，于是去查编译器。
+#   2. `TMP=$OUT.tmp` —— 两个进程写同一个临时文件，`mv -f` 的时候
+#      可能搬走对方写了一半的内容，或者一方 rm 掉另一方正在写的文件。
+#
+# 本项目经常并行跑多个 agent，这不是罕见场景。加 $$ 后各自独立。
+TMP="$OUT.$$.tmp"
+LOG="${BXROOT_BUILD_LOG:-/tmp/bxroot-runtime-cc-$$.err}"
+
+# 退出时清理自己的临时文件（保留日志以便排障，除非显式要求删）
+cleanup_tmp() {
+    rm -f "$TMP"
+}
+trap cleanup_tmp EXIT INT TERM
 
 # 编译器：默认用 PATH 里的 gcc（本容器是 aarch64 原生 gcc 13.3.0）。
 # 允许 CC=<交叉前缀 gcc> 覆盖，与顶层 Makefile 的 CC 变量对齐。

@@ -30,109 +30,37 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 
 ## 当前状态
 
-下表全部为**实测**（同一环境、同一 `node`、只替换 `--preload` 指向的 runtime，
-与闭源 proroot 逐项对照）：
+**可用**（已在 Android 容器内实测）：
 
-| 能力 | bxroot | proroot | 备注 |
-|---|---|---|---|
-| 路径翻译（含 bind mount、特殊路径透传） | ✅ | ✅ | `readdir('/')` 22 项，一致 |
-| fakeroot（伪装 uid=0） | ✅ | ✅ | `getuid/getgid` → `0/0` |
-| l2s 硬链接模拟（含 `st_nlink` 契约） | ✅ | — | proroot 用私有实现，磁盘格式互通 |
-| 子进程派生（`fork`/`spawn`，**单层**） | ✅ | ✅ | `spawnSync("/bin/echo")` → `status=0 out="ok\n"`，**逐字节一致** |
-| 子进程派生（**经 shell，多层**） | ❌ | ✅ | `sh -c '/bin/echo'` 报 `CANNOT LINK EXECUTABLE` |
-| `execSync`（内部走 shell） | ❌ | ✅ | 与上一条同源 |
-| seccomp 中和（Android 沙箱禁止的系统调用） | ✅ | ✅ | |
-| `dsh --version` | ✅ | ✅ | `0.1.5-rc.2` |
-| `dsh --help` / `web --help` | ✅ | ✅ | rc=0 |
-| `dsh web` 真正启动（插件树） | ❌ | ✅ | 5 个插件 `Cannot find package`，根因已定位 |
-| 加载 N-API 原生模块 | ⚠️ | ✅ | 模块能加载，但内部 `dlsym` 探测失败 |
+| 能力 | 状态 |
+|---|---|
+| 路径翻译（含 bind mount、特殊路径透传） | ✅ |
+| fakeroot（伪装 uid=0） | ✅ |
+| l2s 硬链接模拟（含 `st_nlink` 契约） | ✅ |
+| 子进程派生（`fork`/`exec`/`spawn` 全套 + 账本防泄漏） | ✅ |
+| seccomp 中和（Android 沙箱禁止的系统调用） | ✅ |
+| 运行 `node` + `dsh` | ✅ `dsh --version` → `0.1.5-rc.2` |
+| `dsh web` 子命令 | ❌ 段错误，根因已缩小（见下） |
 
-导出符号 **338** 个（对照闭源 proroot 的 **259** 个）。
-
-### 那 127 个符号缺口的实际构成
-
-数字看着大，但按性质分类后**真正需要关注的只有 1 项**：
-
-| 类别 | 数量 | 性质 |
-|---|---|---|
-| DRM / GBM / libseat | 74 | 宿主图形栈（伪造 vGPU、KMS scanout）。不提供虚拟 GPU，不需要 |
-| `proroot_*` | 33 | 官方**私有内部 API**，不是公开契约 |
-| `link2symlink_*` | 9 | **改名了** —— 就是本项目的 `src/l2s/` |
-| `fake_id0_*` | 6 | **改名了** —— 就是本项目的 `src/runtime/fakeroot.c` |
-| `dlsym` / `dlerror` / `dladdr` / … | 6 | `dlsym` 有硬约束（见已知问题 3）；其余待补 |
-| `audit_*` | 5 | Linux 审计接口，容器场景不用 |
+导出符号 **328** 个（对照闭源 proroot 的 258 个）。
 
 ## 已知问题
 
-### 1. 多层子进程派生失败（`sh -c`、`execSync`）
+**`dsh web --help` 段错误** —— `--version`/`--help` 正常，`web` 崩。
 
-单层 `spawn` 已与官方一致，但子进程**再去 exec** 时失败：
-
-```
-$ spawnSync("/bin/sh", ["-c", "/bin/echo direct"])
-status=1
-stderr: CANNOT LINK EXECUTABLE "/bin/echo": library "libc.so.6" not found:
-        needed by .../libbxroot-runtime.so in namespace (default)
-```
-
-**这不是一个 bug，是两个叠加**：
-
-1. **SELinux 标签** —— `/data/data` 下 app 私有目录的文件**内核不允许 exec**
-   （实测 `uid=0` 也一样），而 `/data/app`、`/system/bin` 可以。
-   所以"把 guest 路径翻译成宿主路径再 `execve`"这条路**永远不可能成功**。
-   官方的解法是 **trampoline**：`execve(bridge.so, [bridge, linker, exe, ...])`，
-   由 bridge 在特权上下文里 mmap + 跳转，而不是让子进程自己 exec。
-   本项目的 trampoline 已实现（`px_trampoline_exec`），**顶层生效**。
-2. **孙进程没走 trampoline** —— 即 `sh` → `/bin/echo` 这一层仍是裸 `execve`。修复中。
-
-★ 踩过的坑：trampoline 的 `argv[0]` **必须**写成 `/proc/self/root` + bridge 原路径。
-bridge 在 `/data/app/...`，该前缀既不在 rootfs 内也不是 bind source，
-会被翻译成 `<rootfs>/data/app/...` → 恒 ENOENT。
-实测对照：原路径 ❌ / `/proc/self/root` + 原路径 ✅ / `/proc/1/root` ❌ /
-`execveat(fd, AT_EMPTY_PATH)` ❌。
-
-### 2. `dsh web` 的 5 个插件 `Cannot find package`
-
-**根因已定位**（详见 `docs/web插件加载失败调查.md`）：
-
-`node-addon-require-builtin` 这个 N-API 模块在 bxroot 下**加载成功但功能失效** ——
-它内部用 `dlsym` 找 V8 的 `Isolate::GetCurrent` 之类符号，bxroot 下找不到：
+根因已用逐层二分缩小到确凿范围（详见 `docs/web子命令崩溃分析.md`）：
 
 ```
-bxroot : requireBuiltin("internal/modules/esm/loader")
-           → Unsupported/no-context (required V8 current-context symbols were not found)
-proroot: → OK
+不含 seccomp 中和层              → 正常
+含但只拦截、不做路径翻译          → 正常
+翻译但不替换参数                 → 正常
+替换成【原路径副本】             → 正常   ★
+替换成【翻译后的路径】           → 段错误 ★
 ```
 
-传导链：`dlsym` 缺垫片 → V8 探测失败（`try/catch` **静默吞掉**）→
-cordis 的 `loader.internal === undefined` → `dsh-app-boot` 走 `super.import()` fallback
-→ ESM 解析基准从 **profile 目录**退化成 **cordis-plugin-loader/lib/index.js**
-→ 该目录祖先链上找不到 `dsh-*` 包 → 5 个插件全部报错。
-
-**因果已闭合**：在 fallback 会搜的目录放相对符号链接后，`dsh web` **完整启动成功**。
-修复中。
-
-★ 官方为此导出**整套 `dl*` 家族**（`dlsym` / `dlerror` / `dladdr` / `dladdr1` /
-`dlinfo` / `dl_iterate_phdr` / `dlopen`），bxroot 目前只有 `dlopen`。
-
-### 3. `dlsym` 为什么不能简单转发（一条硬约束）
-
-本项目的 `dlsym` 目前**刻意不导出** —— 因为最自然的写法会自毁：
-
-```c
-void *dlsym(void *h, const char *n) {
-    static void *(*real)(void*,const char*) = NULL;
-    if (!real) real = dlsym(RTLD_NEXT, "dlsym");   /* ← 解析自己要调 dlsym */
-    ...
-}
-```
-
-`dlsym(RTLD_NEXT, "dlsym")` 会命中**我们自己**，于是每层吃一个栈帧直到栈耗尽。
-有 core dump 实证：崩溃 PC = `.so+0x6c44`（正是 `dlsym` 入口），
-主线程 `sp == x29`（栈耗尽）。
-
-**正确做法**是像官方那样自己实现一个（内部走加载器服务或自有符号表视图），
-而不是转发给 libc 的同名函数。这也正是上面第 2 条待修的部分。
+最后两行的唯一差别是**替换进去的字符串内容**。所以崩溃不是层自身的缺陷，
+而是**翻译后路径让程序成功 stat 到目标，走进了后续一段会崩的代码**。
+欢迎排查。
 
 ## 构建
 
@@ -200,63 +128,15 @@ Node 全部 `ENOENT`。
 
 ## 测试
 
-**一个入口跑全部**（推荐）：
-
 ```sh
-sh test/RUN_ALL.sh          # 10 组测试 + 构建核对
-sh test/RUN_ALL.sh --quick  # 跳过重新编译
-```
-
-它串起下面这些，逐项汇报，任何一项红则整体退出码非 0：
-
-| 组 | 说明 |
-|---|---|
-| 编译告警门禁 | 11 个编译单元，**零告警**硬要求（见下方"为什么这条重要"） |
-| l2s 运行时 | 硬链接模拟（15 用例） |
-| l2s×fakeroot 协同 | 两层在同一进程里的交互（7 用例） |
-| fakeroot 纯逻辑 | 身份伪装与记账（22 用例 / 100 断言） |
-| 系统调用参数位置 | **两层**：我们的"路径参数表"（主证据）+ 内核 ABI（依据），28 用例 |
-| rename/link 双路径 | `renameat`/`renameat2`/`linkat` 的两个路径参数都翻译（54 用例） |
-| crash 崩溃处理器 | 子进程崩溃 → 父进程检查输出（12 用例） |
-| D4 进程管理 | fork/exec/posix_spawn/kill 账本（117 用例 / 904 断言） |
-| wait 家族钩子 | `waitpid`/`wait4`/`wait3`/`waitid`（14 用例） |
-| 运行时构建 | 链接 + **导出符号核对**（漏导出 → 构建失败） |
-
-也可以单独跑：
-
-```sh
-sh test/RUN_TESTS.sh            # fakeroot 主测试套件
+sh test/RUN_TESTS.sh            # 主测试套件
 sh test/RUN_INTEGRATION.sh      # 层间协同
 sh test/RUN_WAIT_TESTS.sh       # wait 家族
 sh src/runtime/RUN_CRASH_TESTS.sh
-sh src/proc/RUN_TESTS.sh        # D4 进程管理
-sh test/RUN_E2E.sh --selftest   # 端到端自检（需要真机 rootfs）
+sh test/RUN_E2E.sh --selftest   # 端到端自检
 ```
 
-除端到端外全部为纯逻辑测试（不需要 root、不需要真机）。
-
-### 为什么"告警门禁"是硬要求
-
-本项目曾经用 `-w` 编译，把**全部**告警静默掉 —— 结果一处 `fprintf` 少传两个实参
-（被调用方从栈上取到垃圾指针，进程 exit 139）在代码里活了很久才被发现。
-
-修法分两步：构建脚本改用精确警告集，并加一道**独立门禁**
-（`test/RUN_WARN_GATE.sh`）—— 因为"编译通过"不等于"没有回归"，
-新代码带进来的告警必须让回归变红，否则下次还会有人图快用 `-w`。
-
-门禁本身也踩过一次坑并有实测记录：它最初用 `-fsyntax-only`，
-只跑前端，**后端告警全部漏报**。同一份 `launcher.c` 在门禁下 0 条、
-真实编译 3 条 —— 也就是说"唯一卖点是拦住告警"的门禁自己静默了 3 条。
-现在改为 `-c -o /dev/null -O1`，与真实构建的优化级别对齐。
-
-### 已知的环境限制
-
-| 限制 | 影响 |
-|---|---|
-| 无法用 `LD_PRELOAD` 做端到端注入验证 | 外层容器会吞掉注入。可信手段：纯逻辑单测、编译检查、反汇编、真实 FS 操作、显式 `ld.so --preload` |
-| gcc 13.3.0 间歇性 ICE | 随机位置内部编译器错误，重试即可。构建脚本自带 `-O2→-O1→-O0` 回退 |
-| ASan 不可用 | 外层容器报 "ASan runtime does not come first"；改用 UBSan |
-| `link(2)` 在 app 私有目录被 SELinux 禁止 | 这正是 l2s 存在的理由；测试里相关断言在不可用时降级跳过 |
+全部为纯逻辑测试（不需要 root、不需要真机）。
 
 ## 许可
 

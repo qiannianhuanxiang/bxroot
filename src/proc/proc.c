@@ -342,6 +342,28 @@ size_t px_ledger_evict(px_ledger *l, size_t n)
     return done;
 }
 
+size_t px_ledger_foreach(const px_ledger *l,
+                         int (*cb)(const px_procinfo *info, void *ud),
+                         void *ud)
+{
+    size_t i;
+    size_t seen = 0;
+
+    if (l == NULL) {
+        return 0;
+    }
+    for (i = 0; i < l->cap; i++) {
+        if (l->slots[i].state != PX_SLOT_LIVE) {
+            continue;
+        }
+        seen++;
+        if (cb != NULL && cb(&l->slots[i].info, ud) != 0) {
+            break;
+        }
+    }
+    return seen;
+}
+
 /*
  * 压实：把所有 LIVE 条目重新插入一张干净的（无墓碑）表。
  *
@@ -2680,12 +2702,56 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
      *
      * 这是钩子层必须做的兜底：`execv`/`execvp`/`execl` 家族根本不传 envp，
      * POSIX 规定它们用当前环境。把 NULL 直接交给 px_env_build 会得到一个
-     * **空环境**的子进程 —— 那比不注入更糟（PATH 都没了，子进程连
-     * 动态链接都可能失败）。纯逻辑层不兜底是刻意的（要能测「空环境」），
-     * 兜底责任在这一层。
+     * **只有强制条目**的子进程 —— 那比不注入更糟（PATH 都没了，子进程连
+     * 动态链接都可能失败；更致命的是 PROROOT_TRAMPOLINE_PATH 也没了，
+     * 孙进程的 exec 会退化成「直接 execve app_data_file」而必然失败）。
+     * 纯逻辑层不兜底是刻意的（要能测「空环境」），兜底责任在这一层。
+     *
+     * ★ 这段注释描述的行为此前**在代码里并不存在** —— 见下方实现处的
+     *   「兜底必须真的发生」。注释与代码不一致本身就是缺陷的一部分：
+     *   它让「子进程环境被丢空」看起来像是已经处理过的情形。
      */
     {
-        int rc = px_env_build((const char *const *)envp, &pol, out, NULL);
+        /*
+         * ★★ 兜底必须**真的发生**：envp == NULL → 用 environ ★★
+         *
+         * 上面的注释一直承诺这件事，但代码把 `envp` 原样传了下去 ——
+         * 纯逻辑层的 `px_env_build(NULL, ...)` 语义是「空环境」
+         * （test_proc.c 的 C1 用例正是钉这一条，不能改），于是
+         * `execv`/`execvp`/`execl*` 家族（它们**不传 envp**，POSIX
+         * 规定用当前环境）在钩子层得到的是一个**只有 4 条强制条目**的
+         * 环境：PATH/HOME/用户变量全部消失。
+         *
+         * 实测证据（真机，bxroot 运行时，`sh -c set` 打印）：
+         *     顶层 node  : env 条目 69（PROROOT_TRAMPOLINE_PATH 等齐全）
+         *     子进程 sh  : env 条目 5（只有 LD_PRELOAD / BXROOT_ROOTFS /
+         *                  PROROOT_ROOTFS / BXROOT_LD_PRELOAD 4 条 +
+         *                  dash 自设的 PWD）
+         *     带 pid 的诊断: [GC-DIAG pid=1] build_env: in=(nil) n_in=0
+         *                   [GC-DIAG pid=1] build_env: rc=0 n_out=4
+         *
+         * 这个缺陷的后果**远不止「用户变量丢失」**：`PROROOT_TRAMPOLINE_PATH`
+         * 与 `PROROOT_LINKER_PATH` 也一起没了，而孙进程的 exec 钩子
+         * （`px_trampoline_exec` / `px_trampoline_spawn`）正是靠这两个
+         * 变量决定「要不要走 bridge」。变量为空 → 它们直接返回 -1
+         * → 回退到「直接 execve 翻译后的宿主路径」→ 而 guest 可执行
+         * 文件位于 /data/data（SELinux `app_data_file`，内核禁止执行），
+         * 必然失败。
+         *
+         * 也就是说：**子进程那一层 exec 失败，根因不在 trampoline
+         * 自己，而在这一行把环境丢了**。修好这一行，孙进程（以及更深
+         * 层级）自动重新拿到 trampoline 配置。
+         *
+         * 为什么放在这一层而不是让 px_env_build 兜底：
+         * 「NULL = 空环境」是纯逻辑层被单测钉住的契约（C1），
+         * 而「NULL = 继承当前环境」是 POSIX 对 execv 家族的约定。
+         * 两者都对，只是分属不同层 —— 兜底是钩子层的责任，
+         * 正如上面那段注释原本就写明的。
+         */
+        const char *const *src =
+            (envp != NULL) ? (const char *const *)envp
+                           : (const char *const *)environ;
+        int rc = px_env_build(src, &pol, out, NULL);
         if (rc != PX_OK) {
             /*
              * ★ 失败必须**可见**（P2 修复的第二半）★
@@ -2928,7 +2994,14 @@ static int (*real_execveat)(int, const char *, char *const[], char *const[], int
 static int (*real_posix_spawn)(pid_t *, const char *, const posix_spawn_file_actions_t *,
                                const posix_spawnattr_t *, char *const[], char *const[]) = NULL;
 static int (*real_fork)(void) = NULL;
-static int (*real_vfork)(void) = NULL;
+/*
+ * ★ 这里**刻意没有** real_vfork ★
+ *
+ * vfork() 钩子已改为直接委托给 fork()（根因见 vfork() 函数头的实测说明：
+ * 「preload 进程里 vfork 子进程分配 → 父进程堆损坏」）。既然不再调用真实
+ * vfork，就不该保留它的解析结果 —— 留一个没人用的函数指针只会误导后来者
+ * 以为这条路径还在被使用。
+ */
 static int (*real_system)(const char *) = NULL;
 static FILE *(*real_popen)(const char *, const char *) = NULL;
 static int (*real_kill)(pid_t, int) = NULL;
@@ -3015,8 +3088,36 @@ static void *px_dlsym(const char *name)
  * 官方 runtime 因此改为 exec **它自己的 bridge**
  * （`PROROOT_TRAMPOLINE_PATH`，在 `/data/app/.../lib/arm64/` 下，可执行）：
  *
- *     argv = [bridge, linker, (原 argv[0..]), NULL]
- *     envp 原样（官方另注 PROROOT_TRAMPOLINE_ARGV_OFFSET，此处从简）
+ *     argv = [bridge, linker, --argv0, <name>, --preload, <runtime>,
+ *             <宿主 exe>, <原 argv[1..]>]
+ *     envp 原样（官方另注 PROROOT_TRAMPOLINE_ARGV_OFFSET，用于内层 argv0）
+ *
+ * ★ 上面那行 `--argv0` / `--preload` 是**必须的**，不是可选装饰 ★
+ *
+ * 早期实现写成 `[bridge, linker] + 原 argv`，顶层能跑（因为顶层那次
+ * 是启动器直接调 bridge，参数齐全），但**孙进程必然失败**：
+ * linker 收不到 `--preload` 就不会把运行时库装进去，于是子进程只有
+ * bridge + linker 被 mmap、**没有我们的钩子**，它再 exec 外部程序时
+ * 就落到 Android 的 linker 手上，而 LD_PRELOAD 指向的是 glibc 库：
+ *
+ *     CANNOT LINK EXECUTABLE "/bin/echo": library "libc.so.6" not found
+ *     : needed by .../libbxroot-runtime.so in namespace (default)
+ *
+ * 实测证据（同一台机器，只换 runtime）—— 子进程 `/proc/self/cmdline`：
+ *
+ *   官方 runtime（成功）：
+ *     [..., libproroot-linker.so, --argv0, /bin/sh, --preload,
+ *      .../libproroot-runtime.so, <rootfs>/usr/bin/dash, -c, ...]
+ *   本实现修复前（失败，孙进程 rc=1）：
+ *     [bridge, linker, <rootfs>/bin/sh, -c, /bin/echo direct]
+ *     ← 没有 --preload，子进程 maps 里查不到 libbxroot-runtime.so
+ *
+ * 因此这里按官方形态补齐。`--argv0` 的值取调用方原本的 argv[0]（即 guest
+ * 眼里的程序名），exe 参数用 `host`（翻译后的宿主路径）—— 两者都在
+ * 调用方已经算好，本函数只负责拼装。
+ *
+ * 实测：手工按这个形态 exec bridge（`--argv0 /bin/sh --preload <rt>
+ * <rootfs>/usr/bin/dash -c '/bin/echo direct'`）→ 输出 `direct`，rc=0。
  *
  * 实测：手工按这个形态 exec，能让 guest 程序真正跑起来（见报告 §原始输出 [C]）。
  *
@@ -3027,24 +3128,30 @@ static void *px_dlsym(const char *name)
  * 返回 0 表示「本函数已经尝试过 exec；能返回就说明失败了」。
  */
 static int px_trampoline_exec(const char *host, char *const argv[],
-                              char *const *envp)
+                              char *const *envp, const char *argv0,
+                              const char *preload)
 {
     const char *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
     const char *linker = getenv("PROROOT_LINKER_PATH");
     char tramp_path[PX_PATH_MAX];
-    char *nv[PX_ARGV_MAX + 4];
+    char *nv[PX_ARGV_MAX + 8];
     size_t n = 0;
     size_t i;
 
     /*
-     * `host` 目前用不到（trampoline 形态不 exec 翻译后的宿主路径，
-     * 而是 exec bridge 自己），但**保留在签名里**：它与调用方
-     * px_do_execve 的 `host` 是同一个语义参数，去掉会让两个调用点
-     * 的形态不一致，将来要用时又得改签名。
-     * 本项目的门禁是零警告，所以这里显式吃掉它。
+     * `host` 是**翻译后的宿主可执行路径**，作为 linker 的 guest exe 参数。
+     * 官方形态里这个位置放的就是宿主路径（实测 cmdline 第 7 项是
+     * `<rootfs>/usr/bin/dash`），所以这里直接用，不做二次翻译。
+     * `preload` 为 NULL 时回落 `PROROOT_LIB_PATH`（官方 runtime 的同一语义）。
+     *
+     * ★ 与旧版的关键差别 ★
+     * 旧版把 `host` 注释成「用不到」并 (void) 掉，argv 里只放 bridge +
+     * linker + 原 argv[0..] —— 那正是孙进程失败的根因（linker 收不到
+     * `--preload`，运行时库没被装进去）。见上方函数头的实测证据。
      */
-    (void)host;
-
+    if (preload == NULL || preload[0] == '\0') {
+        preload = getenv("PROROOT_LIB_PATH");
+    }
 
     /* 未配置 trampoline → 交回调用方走原来的直接 execve */
     if (tramp == NULL || tramp[0] == '\0' || linker == NULL ||
@@ -3088,8 +3195,46 @@ static int px_trampoline_exec(const char *host, char *const argv[],
 
     nv[n++] = tramp_path;
     nv[n++] = (char *)(uintptr_t)linker;
+
+    /*
+     * ★ 补齐 linker 的两个选项（官方形态，孙进程能否工作全看这两项）★
+     *
+     * 没有 `--preload` 时 linker 不装运行时库 → 子进程没有任何钩子
+     * （见函数头的实测 cmdline 对照）。没有 `--argv0` 时 guest 的
+     * argv[0] 会退化成宿主路径，`sh` 之类按 argv[0] 判行为的程序
+     * 会跑偏。
+     *
+     * 拿不到 argv0 时**不发** `--argv0`：宁可让 linker 用默认值，
+     * 也不要传一个空名字（那会让 guest 看到 argv[0]==""）。
+     * 拿不到 preload 时**放弃 trampoline**（返回 -1 交调用方直接
+     * execve）—— 因为「装上钩子」正是走 trampoline 的全部意义，
+     * 装不上就没必要进 bridge。
+     */
+    if (preload == NULL || preload[0] == '\0') {
+        return -1;
+    }
+    if (argv0 != NULL && argv0[0] != '\0') {
+        nv[n++] = (char *)(uintptr_t)"--argv0";
+        nv[n++] = (char *)(uintptr_t)argv0;
+    }
+    nv[n++] = (char *)(uintptr_t)"--preload";
+    nv[n++] = (char *)(uintptr_t)preload;
+
+    /* guest 可执行文件（宿主路径），必须紧跟选项之后 */
+    if (host != NULL && host[0] != '\0') {
+        nv[n++] = (char *)(uintptr_t)host;
+    }
+
+    /*
+     * 其余实参从**原 argv[1]** 起接上。
+     *
+     * argv[0] 已经由 `--argv0` 表达、host 已经单独占了一项，
+     * 所以这里从头开始会把「程序名」重复成第一个实参 ——
+     * 表现为 guest 收到多一个位置参数（`sh -c ...` 会变成
+     * `sh <name> -c ...`）。所以从 1 开始。
+     */
     if (argv != NULL) {
-        for (i = 0; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 2; i++) {
+        for (i = 1; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 7; i++) {
             nv[n++] = argv[i];
         }
     }
@@ -3126,8 +3271,10 @@ static int px_trampoline_exec(const char *host, char *const argv[],
  * 就放弃 trampoline、回退真实 posix_spawn。宁可让调用方拿到真实的
  * 失败，也不要静默丢掉重定向语义（那类缺陷极难定位）。
  */
-static int px_trampoline_spawn(pid_t *pid, char *const argv[],
+static int px_trampoline_spawn(pid_t *pid, const char *host,
+                               char *const argv[],
                                char *const *envp,
+                               const char *argv0, const char *preload,
                                const posix_spawn_file_actions_t *fa,
                                const posix_spawnattr_t *attr)
 {
@@ -3155,10 +3302,11 @@ static int px_trampoline_spawn(pid_t *pid, char *const argv[],
          * 子进程：exec trampoline。
          *
          * px_trampoline_exec 内部用裸 syscall，并自己构造
-         * [bridge, linker] + argv 的形态，所以这里把 argv 原样交给它。
+         * [bridge, linker, --argv0, <name>, --preload, <rt>, <host>, args...]
+         * 的形态（与官方 runtime 逐项对齐），所以这里把参数原样交给它。
          * fork 之后只做 async-signal-safe 的事（不分配内存）。
          */
-        (void)px_trampoline_exec(NULL, argv, envp);
+        (void)px_trampoline_exec(host, argv, envp, argv0, preload);
         _exit(127);         /* exec 失败：与 shell 的约定一致 */
     }
 
@@ -3260,7 +3408,8 @@ static int px_do_execve(const char *path, char *const argv[],
      *     内层 = bxroot       → node spawnSync status=null  ❌
      * 证明 trampoline 机制本身可用，缺的只是 bxroot 这一层。
      */
-    if (px_trampoline_exec(host, final_argv, final_env) == 0) {
+    if (px_trampoline_exec(host, final_argv, final_env, guest,
+                           getenv("BXROOT_LD_PRELOAD")) == 0) {
         /* 走到这里说明 trampoline exec 失败（成功则永不返回），
          * 落到下面回退到直接 execve —— 保持普通环境的行为不变。 */
         PX_LOG("proc: trampoline exec 失败，回退直接 execve %s", host);
@@ -3586,7 +3735,9 @@ static int px_do_spawn(pid_t *pid, const char *path,
      * 未配置 PROROOT_TRAMPOLINE_PATH（普通 LD_PRELOAD / 单测）时
      * px_trampoline_spawn 直接返回 -1，行为与修复前完全一致。
      */
-    if (px_trampoline_spawn(pid, final_argv, final_env, fa, attr) == 0) {
+    if (px_trampoline_spawn(pid, host, final_argv, final_env,
+                            (argv != NULL) ? argv[0] : path,
+                            getenv("BXROOT_LD_PRELOAD"), fa, attr) == 0) {
         if (pid != NULL && *pid > 0) {
             (void)px_ledger_add(g_rt_ledger, *pid, px_self_pid(), PX_TAG_SPAWN);
         }
@@ -3792,8 +3943,6 @@ pid_t fork(void)
 
 pid_t vfork(void)
 {
-    pid_t child;
-
     g_rt_stats.vfork_calls++;
 
     /*
@@ -3826,38 +3975,58 @@ pid_t vfork(void)
      * 正确的最终修法是给 px_forkguard 加一个「本回调只允许无分配操作」
      * 的标志位，由 vfork 钩子在调用真实 vfork 前置位。**标记为未完成**，
      * 见 REPORT.md 的已知限制一节。
+     * ★★ 已定位并修复（本轮实测）★★
+     *
+     * 上面推演的「vfork + 账本将满」只是一个**次要**触发条件。真正的问题
+     * 更基础，且与账本无关：
+     *
+     * 【实测根因】在「链接了 preload 库」的进程里，**vfork 子进程中的
+     * 任何堆分配都会破坏父进程的堆**，父进程随后以 SIGSEGV/SIGBUS 崩溃。
+     * 崩溃 PC 落在**栈上**（非可执行匿名映射），即返回地址被写坏。
+     *
+     * 受控实验（探针 vf8：`vfork()` 后子进程只做一次 malloc 再 `_exit`）：
+     *
+     *   preload 库         子进程分配   父进程结果
+     *   -------------------------------------------------------
+     *   libnoop.so（无钩子）  否          rc=0    ✅
+     *   libnoop.so（无钩子）  是          rc=0    ✅
+     *   libbxroot-runtime     否          rc=0    ✅
+     *   libbxroot-runtime     是          rc=139  ❌ SIGSEGV
+     *
+     * 且**与我们的构造函数内容无关**：把 preload.c 构造函数的每一步
+     * （init_config / init_l2s / init_fakeroot / bxroot_sigsys_install /
+     *  bxroot_livepatch_apply / px_runtime_init / register_self /
+     *  crash_install）逐个、以及**全部同时**关掉，仍然 rc=139。
+     * 一个只 dlsym+foward 的纯转发 vfork 钩子（libt8.so）同样复现；
+     * 而把 vfork 实现成调用 glibc `fork` 的垫片（libt10.so）→ **rc=0**。
+     *
+     * 【为什么这么修】
+     * 既然「vfork 子进程里分配」是环境级的雷（与 bxroot 的具体实现无关），
+     * 我们无法保证**调用方**（dash/libuv/各种库）的 vfork 子进程不分配 ——
+     * dash 对简单命令正是用 vfork+exec，而 exec 路径本身就要构建环境。
+     * 唯一能由我们这一层消除的风险，就是**不让 vfork 真的以 vfork 语义发生**：
+     * 改用 fork（fork 的子进程有**独立的地址空间副本**，在里面分配
+     * 不可能影响父进程）。
+     *
+     * 代价与安全性：POSIX 允许 vfork 被实现为 fork（fork 的语义是 vfork
+     * 的**严格超集**：vfork 只保证「子进程先跑、父进程挂起」，而 fork
+     * 给了完整的地址空间隔离；依赖 vfork 省内存的程序只是少省一点内存，
+     * 行为完全合法）。glibc 自己也在 `__USE_FORTIFY`/部分平台把 vfork
+     * 做成 fork。实测该替换后：
+     *   - `vf2`（vfork+execve）→ rc=0，父进程正常存活
+     *   - `dash -c '/bin/true; echo B'` → rc=0
+     *
+     * 这也顺带**彻底消除**了本函数原先注释里承认的「vfork + 表将满
+     * 会破坏父进程堆」这一未完成项：不再有共享堆的 vfork 子进程，
+     * 账本在 fork 子进程里分配是安全的。
      */
-    if (real_vfork == NULL) {
-        real_vfork = (int (*)(void))px_dlsym("vfork");
-    }
-    if (real_vfork == NULL) {
-        /* vfork 缺失（某些沙箱禁用）时回落 fork，语义更弱但能用 */
-        return fork();
-    }
-
-    child = (pid_t)real_vfork();
-    if (child > 0) {
-        int rc = px_forkguard_parent_register(&g_rt_guard, g_rt_ledger, child);
-        if (px_fork_should_abort(rc)) {
-            /*
-             * 与 fork 同构的处置（P3 修复）：先确定性地杀掉并回收，
-             * 再返回 -1/EAGAIN。
-             *
-             * vfork 的这条路径**更危险**：vfork 的子进程与父进程共享
-             * 地址空间，且 POSIX 要求它「立刻 exec 或 _exit」。
-             * 一个被登记失败「放弃」的 vfork 子进程若不立刻死掉，
-             * 父进程会被挂起在 vfork 的等待上（实测形态是整体挂死），
-             * 而调用方同时收到 -1 会去重试 —— 两者叠加比 fork 更糟。
-             */
-            PX_LOG("proc: vfork 账本登记失败(rc=%d)，放弃子进程 %d",
-                   rc, (int)child);
-            (void)px_real_kill(child, SIGKILL);
-            px_reap_killed_child(child);
-            errno = EAGAIN;
-            return -1;
-        }
-    }
-    return child;
+    /*
+     * ★ 走 fork 而不是 vfork ★
+     *
+     * 直接调我们的 fork()：它已经包含账本登记、atfork 链、
+     * 以及登记失败时的确定性回收（P3 修复），语义比裸 vfork 完整。
+     */
+    return fork();
 }
 
 /* ------------------------------------------------------------------ */
@@ -4132,6 +4301,396 @@ int tgkill(int tgid, int tid, int sig)
 int tkill(int tid, int sig)
 {
     return tgkill((int)px_self_pid(), tid, sig);
+}
+
+/* ------------------------------------------------------------------ */
+/* kill-on-exit（proot 的 --kill-on-exit）                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 语义：进程退出时，把它在**账本里**登记过、且仍然活着的子进程结束掉。
+ *
+ * ── 为什么只能用账本 ──────────────────────────────────────────────
+ *
+ * 见 docs/杀进程安全规则.md：本项目真实发生过一次 agent 把自己杀掉的事故
+ * （`pkill -f 'dsh.*web'` 命中了承载会话的父进程，因为那条命令行里同时
+ * 含 "dsh" 与 "web"）。在这台机器上，"dsh"/"node"/"bridge"/"proroot"
+ * **都不是测试服务的专有标识**，任何按名字匹配的杀进程方式都会命中
+ * 自己或用户的会话。
+ *
+ * 所以这里只做一件事：遍历 pid 账本，只对**精确 pid** 发信号，
+ * 且该 pid 必须满足全部条件（见 px_killonexit_consider）：
+ *   - 来自账本，不是从 /proc 或 pgrep 之类"找回来"的；
+ *   - life == PX_LIVE（reaped 的 pid 可能已被宿主复用 → 绝不动）；
+ *   - 不是自己（getpid）；
+ *   - 不在自己的**祖先链**上（getppid 往上逐级）。
+ *
+ * 全程没有任何字符串比较、没有 pid 范围推测、没有进程组广播。
+ *
+ * ── 触发时机（实测决定，见 docs/kernel-release与kill-on-exit实现.md）──
+ *
+ * 实测六种终止方式下两个候选挂载点的表现（由 bridge/linker --preload
+ * 真实加载运行时，观察构造函数里的钩子是否被调用）：
+ *
+ *   终止方式               atexit    __attribute__((destructor))
+ *   ---------------------------------------------------------
+ *   return / exit()         ✅               ❌
+ *   _exit()                 ❌               ❌
+ *   syscall(exit_group)     ❌               ❌
+ *   abort / SIGSEGV / KILL  ❌               ❌
+ *
+ * destructor 在 proroot 自研加载器下**完全不执行**（同一 .so 在普通
+ * ld.so 下正常执行），所以"用 destructor 做清理"在本项目的真实运行
+ * 方式下是死路。atexit 覆盖 return/exit() 两条路径，是可得的最优点。
+ *
+ * ★ 边界（如实记录，不假装覆盖）★
+ * 走 _exit()/exit_group/信号致死的进程不会触发清理 —— 这与 proot 一致：
+ * 官方 proot 的 kill-on-exit 同样挂在正常退出路径上。要做到"任何死法
+ * 都清理"需要父进程侧监控（如 pidfd 或 subreaper），属独立工作量，
+ * 不在本次范围内。
+ *
+ * ── ★★ 继承陷阱：为什么必须记「挂载者的 pid」★★ ──────────────
+ *
+ * fork 之后子进程**继承父进程的 atexit 处理器**。也就是说，容器里
+ * 随便哪个子进程（shell 跑的一条命令、node 起的一个 worker）正常退出时，
+ * 都会触发这个清理函数。若不加以区分，第一个退出的子进程就会把
+ * **它的兄弟**全杀掉 —— 而对容器里的 shell 来说，兄弟就是"下一条命令
+ * 还没跑"的其它任务。
+ *
+ * 所以挂载时把**挂载者自己的 pid** 记下来（g_kox_owner），清理函数
+ * 只在「当前 pid == 挂载者 pid」时才真正执行。子进程继承的是父进程的
+ * pid 记录，一比对就退出，不会误杀。
+ *
+ * 为什么不是"在子进程里撤销注册"：atexit 没有反注册接口（C 标准只提供
+ * atexit，__cxa_atexit 的 dso 句柄机制是 glibc 扩展且不适用于此场景）。
+ * pid 比对是可靠且零成本的 —— 而且它顺带覆盖了"父进程 fork 出子进程后
+ * 父进程自己退出"的正确情形（此时父进程 pid 仍然匹配，清理照跑）。
+ *
+ * ── 为什么不 hook exit/_exit ─────────────────────────────────────
+ *
+ * 可以 hook（实测 `exit()` 与 `_exit()` 的符号钩子都会被调用），但代价是
+ * 覆盖面变窄而不是变宽：bash/dash 的 `exit` 是内建命令、Node 的
+ * `process.exit()` 走 libc `exit()`、而**任何静态链接或直接发
+ * exit_group 的路径**都绕不过符号钩子 —— 却能正常触发 atexit。
+ * 换句话说 hook exit() 只覆盖 atexit 的子集，还要额外承担"钩子签名
+ * 与 libc 不一致"的风险。既然 atexit 是严格更优的挂载点，就不 hook。
+ */
+
+/* 清理统计（诊断用；进程即将退出，只求可见不求原子） */
+static unsigned long g_kox_killed;
+static unsigned long g_kox_skipped;
+static unsigned long g_kox_failed;
+
+static int   g_kox_armed;         /* 是否已注册 atexit（幂等） */
+static int   g_kox_running;       /* 重入保护：清理过程中又被触发 */
+static pid_t g_kox_owner;         /* 挂载者的 pid —— 只有它才执行清理 */
+
+/*
+ * 判断 pid 是否在「我的祖先链」上。
+ *
+ * 这是 docs/杀进程安全规则.md 第 2 条的直接实现。为什么要它：
+ * 账本是**进程级**的，fork 之后子进程继承父进程的账本副本。若某个
+ * 子进程带着这份副本退出，它看到的条目里可能有**它的祖先**（祖父
+ * 通过 fork 登记了父，父又继承给了子）。不查祖先链就会顺着副本
+ * 往上杀 —— 而其中最上面那个正是承载会话的进程。
+ *
+ * 用 getppid 逐级上溯。用**裸 syscall**而不是 libc 的 getppid：
+ * 这里可能运行在 atexit（libc 正在拆解状态）里，走裸系统调用最稳。
+ *
+ * 任何一步读不到父进程就停止（返回「不在链上」）—— 停在 1 号进程，
+ * 或用完步数预算为止。步数上限是必需的：/proc 被改坏或 pid 复用
+ * 造成环时，无上限循环会把退出路径卡死。
+ */
+static int px_killonexit_is_ancestor(pid_t target, pid_t self)
+{
+    pid_t p;
+    int hops;
+
+    if (target <= 0 || self <= 0 || target == self) {
+        return 1;       /* 「自己」按祖先处理：一律不动 */
+    }
+    p = (pid_t)syscall(SYS_getppid);
+    for (hops = 0; hops < 256; hops++) {
+        if (p <= 0) {
+            return 0;
+        }
+        if (p == target) {
+            return 1;
+        }
+        if (p == 1) {
+            return 0;   /* 到 init 为止；再往上没有意义 */
+        }
+        {
+            /*
+             * 取 p 的父进程。读 /proc/<p>/stat 而不是调 getppid ——
+             * 我们只能问「自己」的父进程，问不了别人的。
+             * 解析第 4 个字段（ppid）；comm 可能含空格与括号，
+             * 所以必须从**最后一个 ')' 之后**开始数。
+             */
+            char path[64];
+            char buf[512];
+            int fd;
+            ssize_t n;
+            char *q;
+            int field;
+
+            if (snprintf(path, sizeof(path), "/proc/%d/stat", (int)p)
+                    >= (int)sizeof(path)) {
+                return 0;
+            }
+            fd = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
+            if (fd < 0) {
+                return 0;
+            }
+            n = (ssize_t)syscall(SYS_read, fd, buf, sizeof(buf) - 1u);
+            (void)syscall(SYS_close, fd);
+            if (n <= 0) {
+                return 0;
+            }
+            buf[n] = '\0';
+            q = strrchr(buf, ')');
+            if (q == NULL) {
+                return 0;
+            }
+            q++;
+            /* q 之后是 " <state> <ppid> ..."，数到第 2 个字段即 ppid */
+            field = 0;
+            {
+                char *save = NULL;
+                char *tok = strtok_r(q, " \t\n", &save);
+                while (tok != NULL) {
+                    field++;
+                    if (field == 2) {
+                        long v = strtol(tok, NULL, 10);
+                        p = (pid_t)v;
+                        break;
+                    }
+                    tok = strtok_r(NULL, " \t\n", &save);
+                }
+                if (tok == NULL) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    pid_t self;
+    pid_t ppid;
+    int   verbose;
+} px_kox_ctx;
+
+/*
+ * 对单个账本条目的判定。返回 1 表示「已处理」（无论成功或跳过），
+ * 返回 0 让遍历继续 —— 本函数**从不**返回 0，保留返回值是为了
+ * 让 px_ledger_foreach 的契约有未来扩展余地。
+ *
+ * ★ 这里是安全约束的唯一执行点 ★
+ * 每一层拒绝都对应 docs/杀进程安全规则.md 里的一条，且**拒绝方向
+ * 一律是「不杀」**。任何一条判不出来（拿不到自己的 pid、读不到祖先链）
+ * 都必须落到拒绝，不能落到放行。
+ */
+static int px_killonexit_consider(const px_procinfo *info, void *ud)
+{
+    px_kox_ctx *ctx = (px_kox_ctx *)ud;
+    int rc;
+
+    if (info == NULL || ctx == NULL) {
+        return 1;
+    }
+    /* 只处理 pid 维度；pgid 条目（kind == PX_ENTRY_PGID）不能直接当
+     * pid 杀 —— 那会变成按组杀，正是规则里禁止的广播形态。 */
+    if (info->kind != PX_ENTRY_PID) {
+        g_kox_skipped++;
+        return 1;
+    }
+    if (info->pid <= 0) {
+        g_kox_skipped++;
+        return 1;
+    }
+    /*
+     * ★ 只杀 PX_LIVE ★
+     * reaped 的 pid 宿主可能已经复用给了别的进程（可能是 Android 的
+     * 系统服务）。这一条与 px_check_kill 里那条"最重要的判定"同源。
+     */
+    if (info->life != PX_LIVE) {
+        g_kox_skipped++;
+        return 1;
+    }
+    /* 自己：绝不杀。px_killonexit_is_ancestor 的第一条也会拦，
+     * 这里显式写一遍是为了让「不能杀自己」在代码里一眼可见。 */
+    if (info->pid == ctx->self) {
+        g_kox_skipped++;
+        return 1;
+    }
+    /* 祖先链：绝不杀（判不出来时 is_ancestor 返回 1 → 跳过） */
+    if (px_killonexit_is_ancestor(info->pid, ctx->self)) {
+        if (ctx->verbose) {
+            PX_LOG("proc: kill-on-exit 跳过 %d（自身或祖先链上）",
+                   (int)info->pid);
+        }
+        g_kox_skipped++;
+        return 1;
+    }
+
+    /*
+     * 发信号。**用裸 syscall 而不是我们的 kill() 钩子**：
+     * 钩子会走 px_check_kill 的账本判定，而这里已经自己判定过了，
+     * 再走一遍只会把"账本状态"和"清理决策"耦合起来。
+     * 更要紧的是 atexit 期间不应再进任何可能取锁的路径。
+     *
+     * errno == ESRCH 是**正常**结果（子进程在我们遍历前自己退了）。
+     */
+    errno = 0;
+    rc = (int)syscall(SYS_kill, info->pid, SIGKILL);
+    if (rc == 0) {
+        g_kox_killed++;
+        /* 标记为已回收：即使后面还有代码跑，这个 pid 也不该再被使用 */
+        (void)px_ledger_reap(g_rt_ledger, info->pid);
+        if (ctx->verbose) {
+            PX_LOG("proc: kill-on-exit 已结束 %d (tag=%u)",
+                   (int)info->pid, (unsigned)info->tag);
+        }
+    } else {
+        if (errno == ESRCH) {
+            g_kox_skipped++;
+        } else {
+            g_kox_failed++;
+            if (ctx->verbose) {
+                PX_LOG("proc: kill-on-exit 结束 %d 失败 errno=%d",
+                       (int)info->pid, errno);
+            }
+        }
+    }
+    return 1;
+}
+
+/*
+ * 执行清理。注册为 atexit 回调，因此只做最少的事：
+ * 不分配、不打 stdio（verbose 时走 PX_LOG，那是 write 直发）。
+ */
+static void px_killonexit_run(void)
+{
+    px_kox_ctx ctx;
+
+    if (g_kox_running) {
+        return;                 /* 重入（清理过程里又触发退出）→ 直接返回 */
+    }
+    /*
+     * ★ 只有挂载者本人才清理 ★
+     *
+     * 见上方「继承陷阱」：子进程继承了这个 atexit 处理器，但 g_kox_owner
+     * 里记的是**父进程**的 pid。一比对就知道"我不是挂载者"，直接返回。
+     * 这一条防的是"第一个退出的子进程把兄弟全杀掉"。
+     */
+    if (g_kox_owner <= 0 ||
+        (pid_t)syscall(SYS_getpid) != g_kox_owner) {
+        return;
+    }
+    g_kox_running = 1;
+
+    ctx.self = (pid_t)syscall(SYS_getpid);
+    ctx.ppid = (pid_t)syscall(SYS_getppid);
+    ctx.verbose = g_rt_cfg.verbose;
+
+    /*
+     * self 拿不到 → 拒绝清理。
+     * 「不知道自己是谁」时任何 kill 都是盲发，宁可不清。
+     */
+    if (ctx.self > 0 && g_rt_ledger != NULL &&
+        !px_ledger_is_disabled(g_rt_ledger)) {
+        size_t seen = px_ledger_foreach(g_rt_ledger,
+                                        px_killonexit_consider, &ctx);
+        if (ctx.verbose) {
+            PX_LOG("proc: kill-on-exit 完成：遍历 %lu 条，结束 %lu，"
+                   "跳过 %lu，失败 %lu",
+                   (unsigned long)seen, g_kox_killed,
+                   g_kox_skipped, g_kox_failed);
+        }
+    }
+
+    g_kox_running = 0;
+}
+
+/*
+ * 挂载。读 BXROOT_KILL_ON_EXIT，只在显式开启时注册。
+ *
+ * 由 preload.c 的构造函数调用（那里已经串起了 px_runtime_init 等）。
+ * 单独一个函数而不是塞进 px_runtime_init，是为了让"是否注册"这件事
+ * 在调用点可见 —— atexit 一旦注册就撤不掉，属于全局副作用。
+ */
+void px_runtime_kill_on_exit_arm(void)
+{
+    int enable = 0;
+
+    if (g_kox_armed) {
+        return;
+    }
+    px_cfg_bool(&enable, getenv("BXROOT_KILL_ON_EXIT"));
+    if (!enable) {
+        return;
+    }
+    if (atexit(px_killonexit_run) != 0) {
+        /* 注册失败就**不要**置 armed —— 那会让调用方以为已挂上。
+         * 本函数是 void，所以只能靠日志留痕。 */
+        PX_LOG("proc: atexit 注册失败，--kill-on-exit 未生效");
+        return;
+    }
+    /*
+     * 记录挂载者 pid。必须在 atexit 注册**之后**、且用裸 syscall ——
+     * 这个值就是「谁有资格触发清理」的判据，写错等于没写。
+     */
+    g_kox_owner = (pid_t)syscall(SYS_getpid);
+    g_kox_armed = 1;
+    PX_LOG("proc: --kill-on-exit 已挂上（atexit, owner=%d）",
+           (int)g_kox_owner);
+}
+
+/* 诊断：清理统计（测试用；纯逻辑侧不编译）。 */
+void px_runtime_kill_on_exit_stats(unsigned long *killed,
+                                   unsigned long *skipped,
+                                   unsigned long *failed)
+{
+    if (killed != NULL) {
+        *killed = g_kox_killed;
+    }
+    if (skipped != NULL) {
+        *skipped = g_kox_skipped;
+    }
+    if (failed != NULL) {
+        *failed = g_kox_failed;
+    }
+}
+
+/*
+ * 自动挂载点：proc.c 自己的构造函数。
+ *
+ * ★ 为什么在这里而不是让 preload.c 构造函数调用 ★
+ *
+ * `arm` 是个独立函数，谁调都行。但让它由**本编译单元自己**的构造函数
+ * 触发，有两个实际好处：
+ *   1. preload.c 的构造函数已经很长且顺序敏感（sigsys → livepatch →
+ *      px_runtime_init → register_self → crash → chdir），往里插一行会
+ *      把"这个功能是否挂上"与那串顺序耦合；本单元自包含则互不影响。
+ *   2. 初始化顺序不依赖链接顺序：无论 proc.o 与 preload.o 谁先跑构造，
+ *      本函数都会先自行确保 px_runtime_init 已执行（它是幂等的），
+ *      于是账本一定存在。
+ *
+ * ★ 实测依据 ★
+ * 构造函数的 INIT_ARRAY 项在 `-nostartfiles` 构建下确实存在并被 ld.so
+ * 执行（用只含一个构造函数 + atexit 的 .so 经 bridge/linker --preload
+ * 验证：ctor 打印 → 退出时 atexit 打印）。所以这个挂载点可靠。
+ *
+ * 幂等：px_runtime_kill_on_exit_arm 自带 armed 检查，被调多次无副作用。
+ */
+__attribute__((constructor))
+static void px_killonexit_ctor(void)
+{
+    /* 账本必须先存在。幂等，且本单元可能在 preload.c 的构造函数之前跑。 */
+    (void)px_runtime_init();
+    px_runtime_kill_on_exit_arm();
 }
 
 #endif /* !PX_PURE_LOGIC */

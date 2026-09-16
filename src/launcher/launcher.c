@@ -177,8 +177,8 @@ static void usage(const char *prog) {
         "  -R <path>             -r <path> + 一组推荐 bind\n"
         "  -S <path>             -0 -r <path> + 精简推荐 bind\n"
         "  -i, --change-id 0:0   等价于 -0（其它取值未实现）\n"
-        "  -k, --kernel-release <r>  记录内核版本（暂未生效）\n"
-        "      --kill-on-exit    退出时结束容器内进程\n"
+        "  -k, --kernel-release <r>  伪造内核版本（uname 的 release 字段）\n"
+        "      --kill-on-exit    退出时结束容器内进程（清理 pid 账本）\n"
         "      --about / --usage 打印信息\n\n"
         "明确未实现（传入会报错，不会静默忽略）:\n"
         "  -H -L -p -q/--qemu --sysvipc --ashmem-memfd\n\n"
@@ -403,13 +403,11 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
              * pid 账本），launcher 只负责组装参数并 execve ——
              * 它自己没有能力枚举/终止 guest 进程树。
              *
-             * 所以这里如实告知"已接受但尚未接通"，而不是装作设置成功。
-             * 接通它需要 runtime 侧在退出路径上遍历账本，属独立工作量。
+             * 所以 launcher 这一侧的动作是**把开关交给 runtime**
+             * （下面 setenv BXROOT_KILL_ON_EXIT=1），实际清理由 runtime
+             * 在退出路径上遍历账本完成。launcher 不再打印"未接通"。
              */
             cfg->kill_on_exit = 1;
-            fprintf(stderr,
-                    "[bxroot] 注意: --kill-on-exit 已接受，但**当前版本未接通**\n"
-                    "          （需要在 runtime 的进程账本上实现退出清理，尚未实现）。\n");
         } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--change-id") == 0) {
             /*
              * `-i <id>:<id>` —— proot 改 guest 内看到的 uid/gid。
@@ -437,19 +435,19 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
             }
         } else if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--kernel-release") == 0) {
             /*
-             * ★ 这是"接受但不生效"的一类，必须**明确告知** ★
+             * `-k/--kernel-release <release>`：伪造 `uname` 的 release 字段。
              *
-             * proot 的 `-k` 会伪造 `uname` 的 release 字段。本实现没有
-             * uname 钩子，所以这个选项**不会**改变容器里看到的内核版本。
+             * 分两半，各归各的层：
+             *   launcher（本处）：解析并记进 cfg，稍后 setenv 交给运行时；
+             *   runtime（src/runtime/preload.c 的 uname 钩子）：读
+             *   BXROOT_KERNEL_RELEASE 并改写 buf->release。
              *
-             * 为什么不干脆像 -H/-L 那样拒绝？因为它的**失败模式很温和**：
-             * 依赖 uname 版本做判断的程序（如某些安装脚本的版本检查）
-             * 最多是走错分支，不会静默产生错误数据。而拒绝它会让
-             * "从 proot 迁移过来"的命令行直接不可用 —— 代价更大。
+             * ★ 为什么这里不再无条件打"不生效" ★
              *
-             * 但"接受"必须伴随**可见的告知**，否则就成了我最反对的
-             * 静默降级：用户以为内核版本被改了，实际没有，
-             * 然后在别处看到真实版本时一头雾水。
+             * 那句话是**未实现时期**的诚实标注，如今已成事实错误 ——
+             * 留着它会让用户以为设置被忽略，从而去别处找原因。但它也
+             * 不能直接消失：排障时"到底传进去没有"是个真问题，
+             * 所以改成**只在 -v 时**回显实际交给运行时的值。
              */
             if (i + 1 >= argc) {
                 fprintf(stderr, "错误: -k/--kernel-release 需要 <release> 参数\n");
@@ -457,10 +455,6 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
             }
             free(cfg->kernel_release);
             cfg->kernel_release = strdup(argv[++i]);
-            fprintf(stderr,
-                    "[bxroot] 注意: -k/--kernel-release 已接受，但**当前版本不生效**\n"
-                    "          （需要 uname 钩子伪造 release 字段，尚未实现）。\n"
-                    "          容器内 uname 仍返回宿主真实版本。\n");
         } else if (strcmp(argv[i], "-H") == 0) {
             fprintf(stderr,
                     "错误: -H 未实现。\n"
@@ -775,6 +769,103 @@ int main(int argc, char **argv) {
     setenv("BXROOT_GUEST_EXE", cfg.guest_exe, 1);
     setenv("BXROOT_WORKDIR", cfg.workdir, 1);
 
+    /*
+     * ===============================================================
+     * proot 环境变量兼容层
+     * ===============================================================
+     *
+     * 与 CLI 兼容层同样的问题：**用户从 proot 迁移过来时，环境变量也带着**。
+     * 我们不认 `PROOT_*` 的名字，它们就静默失效 —— 用户设了
+     * `PROOT_VERBOSE=1` 却看不到日志、设了 `PROOT_TMP_DIR` 却发现临时文件
+     * 仍在别处，而没有任何报错。
+     *
+     * 语义逐条对照 proot 源码，不靠猜：
+     *
+     *   PROOT_TMP_DIR                     → src/path/temp.c:25
+     *   PROOT_VERBOSE                     → src/cli/cli.c:472
+     *   PROOT_IGNORE_MISSING_BINDINGS     → src/path/binding.c:335
+     *   PROOT_NO_SECCOMP                  → src/cli/cli.c:140（仅影响提示文案）
+     *
+     * ★ 迁移方向：PROOT_* → BXROOT_* ★
+     * **只在新名字未设时**才从旧名字取值。这样显式设了 BXROOT_* 的用户
+     * （我们自己的文档推荐的写法）不会被环境里的旧 PROOT_* 覆盖。
+     */
+    {
+        /*
+         * PROOT_TMP_DIR —— 临时目录。
+         *
+         * ★ 必须保留原值不做规范化 ★
+         * proot 会 realpath() 一次，失败时**退回原字符串**并打 warning。
+         * 我们不做 realpath：launcher 眼里的路径是**容器视角**，而运行
+         * 时用的是内核视角 —— 在这里 realpath 会得到错误的基准（本项目
+         * 反复踩的双视角坑）。原样透传，由运行时按自己的视角解释。
+         */
+        const char *ptmp = getenv("PROOT_TMP_DIR");
+        if (ptmp != NULL && ptmp[0] != '\0' && getenv("BXROOT_TMP_DIR") == NULL) {
+            setenv("BXROOT_TMP_DIR", ptmp, 1);
+        }
+
+        /*
+         * PROOT_VERBOSE —— 详细程度。
+         *
+         * ★ 它是**数字**不是布尔 ★
+         * proot 用 `strtol(verbose_env, NULL, 10)`（cli.c:472），
+         * 所以 `PROOT_VERBOSE=0` 与 `PROOT_VERBOSE=2` 不同：
+         * 前者关日志，后者是更高级别。
+         * 本实现的 BXROOT_VERBOSE 用 atoi 判定（非零即开），能容纳这个语义；
+         * 但**不能**把 `PROOT_VERBOSE=0` 当成"设过了"而跳过 —— 那样
+         * 用户显式关日志的意图会丢失。
+         */
+        const char *pverb = getenv("PROOT_VERBOSE");
+        if (pverb != NULL && pverb[0] != '\0' && getenv("BXROOT_VERBOSE") == NULL) {
+            setenv("BXROOT_VERBOSE", pverb, 1);
+        }
+
+        /*
+         * PROOT_IGNORE_MISSING_BINDINGS —— bind 路径缺失时不警告。
+         *
+         * proot 的语义（binding.c:335）：**仅在 verbose>0 时**才有区别 ——
+         * 它控制的是「重复 bind 覆盖时是否打 warning」。本实现默认就不打
+         * 这类 warning，所以此变量**在当前实现下无行为差异**。
+         *
+         * 记录它（透传下去）而不是假装支持：将来若加了 bind 冲突警告，
+         * 运行时可以直接读这个变量，不必再改 launcher。
+         */
+        const char *pign = getenv("PROOT_IGNORE_MISSING_BINDINGS");
+        if (pign != NULL && pign[0] != '\0' &&
+            getenv("BXROOT_IGNORE_MISSING_BINDINGS") == NULL) {
+            setenv("BXROOT_IGNORE_MISSING_BINDINGS", pign, 1);
+        }
+    }
+
+    /*
+     * 内核版本伪造（-k/--kernel-release）。
+     *
+     * launcher 侧能做的只有「把用户给的值交给运行时」—— uname 钩子在
+     * src/runtime/preload.c 里，改 release 字段由它完成。
+     *
+     * ★ 必须成对 unsetenv ★
+     *
+     * 与 BXROOT_FAKEROOT 同一条约定：这些值一律**由 launcher 从 argv 派生**
+     * （见 docs/DSHA-适配说明.md 的对外契约）。若 DSHA 环境里恰好残留了
+     * 一个 BXROOT_KERNEL_RELEASE，而用户这次没传 -k，只在「传了才 setenv」
+     * 会让那个残留值生效 —— 于是「以 argv 为准」失效，容器里出现一个
+     * 用户从未要求过的内核版本。所以没传时必须显式 unset。
+     */
+    if (cfg.kernel_release)
+        setenv("BXROOT_KERNEL_RELEASE", cfg.kernel_release, 1);
+    else
+        unsetenv("BXROOT_KERNEL_RELEASE");
+
+    /*
+     * --kill-on-exit：交给 runtime 的进程账本执行（launcher 无法枚举
+     * guest 进程树）。同样成对 unset，理由同上。
+     */
+    if (cfg.kill_on_exit)
+        setenv("BXROOT_KILL_ON_EXIT", "1", 1);
+    else
+        unsetenv("BXROOT_KILL_ON_EXIT");
+
     if (cfg.fakeroot)
         setenv("BXROOT_FAKEROOT", "1", 1);
     else
@@ -895,6 +986,11 @@ int main(int argc, char **argv) {
         if (cfg.link2symlink)
             fprintf(stderr, "[bxroot-launcher] link2symlink=1 l2s_dir=%s\n",
                     getenv("BXROOT_L2S_DIR") ? getenv("BXROOT_L2S_DIR") : "(none)");
+        if (cfg.kernel_release)
+            fprintf(stderr, "[bxroot-launcher] kernel_release=%s\n",
+                    cfg.kernel_release);
+        if (cfg.kill_on_exit)
+            fprintf(stderr, "[bxroot-launcher] kill_on_exit=1\n");
     }
 
     /* 注意: 不在 launcher 中 chdir

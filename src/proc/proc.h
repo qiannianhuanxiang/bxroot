@@ -332,6 +332,27 @@ int  px_ledger_eviction_enabled(const px_ledger *l);
 /* 显式淘汰 n 个最久未用的 **reaped** 条目，返回实际淘汰数。 */
 size_t px_ledger_evict(px_ledger *l, size_t n);
 
+/*
+ * 把账本里每个条目交给 cb 看一遍（含 reaped 条目）。
+ *
+ * 为什么需要它：账本按设计是**不透明**的（开放寻址 + 墓碑 + 内部时钟），
+ * 调用方不该知道它的布局。而「退出时把还活着的子进程清掉」这件事必须
+ * 遍历全表 —— 若在外面自己写 for 循环读 l->slots，就等于把布局变成
+ * 公共契约，以后任何一次表结构调整都会静默漏掉一批条目。
+ *
+ * 遍历顺序与槽位顺序一致（不保证按 pid 排序）。cb 返回非 0 时提前停止，
+ * 本函数返回已遍历的条目数；cb 为 NULL 时只计数不回调。
+ *
+ * ★ 不在回调期间持锁 ★
+ * 本函数**不**取账本锁：它是纯逻辑层的只读遍历，调用方（钩子层）自己
+ * 决定是否需要互斥。原因见 §7 的清理流程说明 —— 在持有账本锁的情况下
+ * 调用 kill() 会把「锁」和「进程终止」两件事纠缠在一起，而后者可能
+ * 触发任意用户代码。
+ */
+size_t px_ledger_foreach(const px_ledger *l,
+                         int (*cb)(const px_procinfo *info, void *ud),
+                         void *ud);
+
 /* ================================================================== */
 /* 2. envp 重建（LD_PRELOAD / BXROOT_* 注入）                          */
 /* ================================================================== */
@@ -1031,6 +1052,31 @@ typedef struct {
 
 const px_rt_stats *px_runtime_stats(void);
 void px_runtime_reset_stats(void);
+
+/* ================================================================== */
+/* 7. kill-on-exit（proot 的 --kill-on-exit）                          */
+/* ================================================================== */
+
+/*
+ * 语义与安全约束见 proc.c 里的实现说明，以及 docs/杀进程安全规则.md。
+ *
+ * 一句话：退出时遍历 pid 账本，只对**账本内、PX_LIVE、非自身、非祖先链**
+ * 的精确 pid 发 SIGKILL。没有任何按名字匹配的路径。
+ */
+
+/*
+ * 挂载清理钩子。读 BXROOT_KILL_ON_EXIT，只在显式开启时注册（幂等）。
+ * 由 preload.c 的构造函数调用一次。
+ *
+ * 挂载点是 **atexit**，不是 __attribute__((destructor))：实测 destructor
+ * 在 proroot 自研加载器下完全不执行，而 atexit 覆盖 return 与 exit()。
+ */
+void px_runtime_kill_on_exit_arm(void);
+
+/* 清理统计（诊断）。任一参数可为 NULL。 */
+void px_runtime_kill_on_exit_stats(unsigned long *killed,
+                                   unsigned long *skipped,
+                                   unsigned long *failed);
 
 #endif /* !PX_PURE_LOGIC */
 

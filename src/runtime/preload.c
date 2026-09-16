@@ -102,6 +102,14 @@
  */
 static void ensure_real_functions(void);
 
+/*
+ * 符号解析统一入口（实现见文件后段「dl* 家族」处）。
+ * 语义 = `dlsym(RTLD_NEXT, name)`，但**不经过 libc 的 dlsym** ——
+ * 本库导出了自己的 dlsym，libc 的 dlsym 在 proroot 自研 loader 下
+ * 会返回 NULL。声明放这里是因为 l2s / wait 家族等早期代码就要用。
+ */
+static void *bxroot_next_symbol(const char *name);
+
 static int l2s_real_lstat(const char *p, struct stat *st);
 static int l2s_real_symlink(const char *t, const char *l);
 static int l2s_real_rename(const char *o, const char *n);
@@ -679,7 +687,13 @@ static int   (*px_real_waitid)(idtype_t, id_t, siginfo_t *, int) = NULL;
 
 static void *px_wait_dlsym(const char *name)
 {
-    void *p = dlsym(RTLD_NEXT, name);
+    /*
+     * 走 linker 服务版解析（`bxroot_next_symbol`，语义 = dlsym(RTLD_NEXT)）。
+     * 这里**不能**直接写 dlsym(RTLD_NEXT, …)：本库现在导出了自己的
+     * `dlsym`，而 libc 的 dlsym 与 proroot 自研 loader 不自洽
+     * （实测从本库内部调用会返回 NULL）。详见 bxroot_next_symbol 的注释。
+     */
+    void *p = bxroot_next_symbol(name);
 
     /*
      * 失败必须留痕。这里**不能**用 LOG 宏（编译期门控，发布构建里
@@ -906,7 +920,7 @@ static int l2s_real_lstat(const char *p, struct stat *st)
 static int l2s_real_symlink(const char *t, const char *l)
 {
     static int (*fn)(const char *, const char *) = NULL;
-    if (fn == NULL) fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "symlink");
+    if (fn == NULL) fn = (int (*)(const char *, const char *))bxroot_next_symbol("symlink");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(t, l);
 }
@@ -914,7 +928,7 @@ static int l2s_real_symlink(const char *t, const char *l)
 static int l2s_real_rename(const char *o, const char *n)
 {
     static int (*fn)(const char *, const char *) = NULL;
-    if (fn == NULL) fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "rename");
+    if (fn == NULL) fn = (int (*)(const char *, const char *))bxroot_next_symbol("rename");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(o, n);
 }
@@ -922,7 +936,7 @@ static int l2s_real_rename(const char *o, const char *n)
 static int l2s_real_unlink(const char *p)
 {
     static int (*fn)(const char *) = NULL;
-    if (fn == NULL) fn = (int (*)(const char *))dlsym(RTLD_NEXT, "unlink");
+    if (fn == NULL) fn = (int (*)(const char *))bxroot_next_symbol("unlink");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(p);
 }
@@ -930,7 +944,7 @@ static int l2s_real_unlink(const char *p)
 static ssize_t l2s_real_readlink(const char *p, char *b, size_t sz)
 {
     static ssize_t (*fn)(const char *, char *, size_t) = NULL;
-    if (fn == NULL) fn = (ssize_t (*)(const char *, char *, size_t))dlsym(RTLD_NEXT, "readlink");
+    if (fn == NULL) fn = (ssize_t (*)(const char *, char *, size_t))bxroot_next_symbol("readlink");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(p, b, sz);
 }
@@ -985,36 +999,36 @@ static int l2s_real_write_small(const char *p, const char *b, size_t len)
 /* 懒加载真实函数指针 */
 static void ensure_real_functions(void) {
     if (!real_open) {
-        real_open = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open");
-        real_openat = (int (*)(int, const char *, int, ...))dlsym(RTLD_NEXT, "openat");
-        real_stat = (int (*)(const char *, struct stat *))dlsym(RTLD_NEXT, "stat");
-        real_newfstatat = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_NEXT, "newfstatat");
+        real_open = (int (*)(const char *, int, ...))bxroot_next_symbol("open");
+        real_openat = (int (*)(int, const char *, int, ...))bxroot_next_symbol("openat");
+        real_stat = (int (*)(const char *, struct stat *))bxroot_next_symbol("stat");
+        real_newfstatat = (int (*)(int, const char *, struct stat *, int))bxroot_next_symbol("newfstatat");
         /* glibc 2.33+ 不再导出 newfstatat，现代等价入口是 fstatat。
          * 若 newfstatat 解析失败，回退到 fstatat（glibc 中两者同实现）。 */
         if (!real_newfstatat)
-            real_newfstatat = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_NEXT, "fstatat");
-        real_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_NEXT, "lstat");
-        real_access = (int (*)(const char *, int))dlsym(RTLD_NEXT, "access");
-        real_readlink = (ssize_t (*)(const char *, char *, size_t))dlsym(RTLD_NEXT, "readlink");
-        real_realpath = (char * (*)(const char *, char *))dlsym(RTLD_NEXT, "realpath");
-        real_getpid = (pid_t (*)(void))dlsym(RTLD_NEXT, "getpid");
-        real_getuid = (uid_t (*)(void))dlsym(RTLD_NEXT, "getuid");
-        real_getgid = (gid_t (*)(void))dlsym(RTLD_NEXT, "getgid");
-        real_geteuid = (uid_t (*)(void))dlsym(RTLD_NEXT, "geteuid");
-        real_getegid = (gid_t (*)(void))dlsym(RTLD_NEXT, "getegid");
-        real_chdir = (int (*)(const char *))dlsym(RTLD_NEXT, "chdir");
-        real_uname = (int (*)(struct utsname *))dlsym(RTLD_NEXT, "uname");
-        real_chroot = (int (*)(const char *))dlsym(RTLD_NEXT, "chroot");
-        real_open64 = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open64");
-        real_openat64 = (int (*)(int, const char *, int, ...))dlsym(RTLD_NEXT, "openat64");
-        real_stat64 = (int (*)(const char *, struct stat64 *))dlsym(RTLD_NEXT, "stat64");
-        real_newfstatat64 = (int (*)(int, const char *, struct stat64 *, int))dlsym(RTLD_NEXT, "newfstatat64");
+            real_newfstatat = (int (*)(int, const char *, struct stat *, int))bxroot_next_symbol("fstatat");
+        real_lstat = (int (*)(const char *, struct stat *))bxroot_next_symbol("lstat");
+        real_access = (int (*)(const char *, int))bxroot_next_symbol("access");
+        real_readlink = (ssize_t (*)(const char *, char *, size_t))bxroot_next_symbol("readlink");
+        real_realpath = (char * (*)(const char *, char *))bxroot_next_symbol("realpath");
+        real_getpid = (pid_t (*)(void))bxroot_next_symbol("getpid");
+        real_getuid = (uid_t (*)(void))bxroot_next_symbol("getuid");
+        real_getgid = (gid_t (*)(void))bxroot_next_symbol("getgid");
+        real_geteuid = (uid_t (*)(void))bxroot_next_symbol("geteuid");
+        real_getegid = (gid_t (*)(void))bxroot_next_symbol("getegid");
+        real_chdir = (int (*)(const char *))bxroot_next_symbol("chdir");
+        real_uname = (int (*)(struct utsname *))bxroot_next_symbol("uname");
+        real_chroot = (int (*)(const char *))bxroot_next_symbol("chroot");
+        real_open64 = (int (*)(const char *, int, ...))bxroot_next_symbol("open64");
+        real_openat64 = (int (*)(int, const char *, int, ...))bxroot_next_symbol("openat64");
+        real_stat64 = (int (*)(const char *, struct stat64 *))bxroot_next_symbol("stat64");
+        real_newfstatat64 = (int (*)(int, const char *, struct stat64 *, int))bxroot_next_symbol("newfstatat64");
         if (!real_newfstatat64)
-            real_newfstatat64 = (int (*)(int, const char *, struct stat64 *, int))dlsym(RTLD_NEXT, "fstatat64");
-        real_lstat64 = (int (*)(const char *, struct stat64 *))dlsym(RTLD_NEXT, "lstat64");
-        real_opendir = (DIR * (*)(const char *))dlsym(RTLD_NEXT, "opendir");
-        real_fopen = (FILE * (*)(const char *, const char *))dlsym(RTLD_NEXT, "fopen");
-        real_fopen64 = (FILE * (*)(const char *, const char *))dlsym(RTLD_NEXT, "fopen64");
+            real_newfstatat64 = (int (*)(int, const char *, struct stat64 *, int))bxroot_next_symbol("fstatat64");
+        real_lstat64 = (int (*)(const char *, struct stat64 *))bxroot_next_symbol("lstat64");
+        real_opendir = (DIR * (*)(const char *))bxroot_next_symbol("opendir");
+        real_fopen = (FILE * (*)(const char *, const char *))bxroot_next_symbol("fopen");
+        real_fopen64 = (FILE * (*)(const char *, const char *))bxroot_next_symbol("fopen64");
     }
 }
 
@@ -1356,12 +1370,12 @@ static int fr_do_chown(const char *p, uid_t uid, gid_t gid, int which)
 
     if (which == 0) {
         if (fn_chown == NULL)
-            fn_chown = (int (*)(const char *, uid_t, gid_t))dlsym(RTLD_NEXT, "chown");
+            fn_chown = (int (*)(const char *, uid_t, gid_t))bxroot_next_symbol("chown");
         if (fn_chown == NULL) { errno = ENOSYS; return -1; }
         rc = fn_chown(p, uid, gid);
     } else {
         if (fn_lchown == NULL)
-            fn_lchown = (int (*)(const char *, uid_t, gid_t))dlsym(RTLD_NEXT, "lchown");
+            fn_lchown = (int (*)(const char *, uid_t, gid_t))bxroot_next_symbol("lchown");
         if (fn_lchown == NULL) { errno = ENOSYS; return -1; }
         rc = fn_lchown(p, uid, gid);
     }
@@ -1416,7 +1430,7 @@ int fchown(int fd, uid_t uid, gid_t gid) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, uid_t, gid_t))dlsym(RTLD_NEXT, "fchown");
+        fn = (int (*)(int, uid_t, gid_t))bxroot_next_symbol("fchown");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(fd, uid, gid);
@@ -1645,7 +1659,7 @@ int link(const char *oldpath, const char *newpath) {
         }
     }
 
-    if (fn == NULL) fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "link");
+    if (fn == NULL) fn = (int (*)(const char *, const char *))bxroot_next_symbol("link");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(po, pn);
 }
@@ -1670,7 +1684,7 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
         }
     }
 
-    if (fn == NULL) fn = (int (*)(int, const char *, int, const char *, int))dlsym(RTLD_NEXT, "linkat");
+    if (fn == NULL) fn = (int (*)(int, const char *, int, const char *, int))bxroot_next_symbol("linkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(olddirfd, po, newdirfd, pn, flags);
 }
@@ -1694,7 +1708,7 @@ int unlink(const char *path) {
         }
     }
 
-    if (fn == NULL) fn = (int (*)(const char *))dlsym(RTLD_NEXT, "unlink");
+    if (fn == NULL) fn = (int (*)(const char *))bxroot_next_symbol("unlink");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(p);
 }
@@ -1735,7 +1749,7 @@ int __open_2(const char *path, int flags) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, int))dlsym(RTLD_NEXT, "__open_2");
+        fn = (int (*)(const char *, int))bxroot_next_symbol("__open_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1749,7 +1763,7 @@ int __open64_2(const char *path, int flags) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, int))dlsym(RTLD_NEXT, "__open64_2");
+        fn = (int (*)(const char *, int))bxroot_next_symbol("__open64_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1763,7 +1777,7 @@ int __openat_2(int dirfd, const char *path, int flags) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, int))dlsym(RTLD_NEXT, "__openat_2");
+        fn = (int (*)(int, const char *, int))bxroot_next_symbol("__openat_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1777,7 +1791,7 @@ int __openat64_2(int dirfd, const char *path, int flags) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, int))dlsym(RTLD_NEXT, "__openat64_2");
+        fn = (int (*)(int, const char *, int))bxroot_next_symbol("__openat64_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1800,7 +1814,7 @@ ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen) {
 
     if (fn == NULL)
         fn = (ssize_t (*)(const char *, char *, size_t, size_t))
-             dlsym(RTLD_NEXT, "__readlink_chk");
+             bxroot_next_symbol("__readlink_chk");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1839,7 +1853,7 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
 
     if (fn == NULL)
         fn = (ssize_t (*)(int, const char *, char *, size_t, size_t))
-             dlsym(RTLD_NEXT, "__readlinkat_chk");
+             bxroot_next_symbol("__readlinkat_chk");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1883,7 +1897,7 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
 
     if (fn == NULL)
         fn = (char *(*)(const char *, char *, size_t))
-             dlsym(RTLD_NEXT, "__realpath_chk");
+             bxroot_next_symbol("__realpath_chk");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1915,7 +1929,7 @@ int __xstat(int ver, const char *path, struct stat *buf) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, struct stat *))dlsym(RTLD_NEXT, "__xstat");
+        fn = (int (*)(int, const char *, struct stat *))bxroot_next_symbol("__xstat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1937,7 +1951,7 @@ int __lxstat(int ver, const char *path, struct stat *buf) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, struct stat *))dlsym(RTLD_NEXT, "__lxstat");
+        fn = (int (*)(int, const char *, struct stat *))bxroot_next_symbol("__lxstat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1958,7 +1972,7 @@ int __fxstat(int ver, int fd, struct stat *buf) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, int, struct stat *))dlsym(RTLD_NEXT, "__fxstat");
+        fn = (int (*)(int, int, struct stat *))bxroot_next_symbol("__fxstat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(ver, fd, buf);
@@ -1974,7 +1988,7 @@ int __xstat64(int ver, const char *path, struct stat64 *buf) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, struct stat64 *))dlsym(RTLD_NEXT, "__xstat64");
+        fn = (int (*)(int, const char *, struct stat64 *))bxroot_next_symbol("__xstat64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -1996,7 +2010,7 @@ int __lxstat64(int ver, const char *path, struct stat64 *buf) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, struct stat64 *))dlsym(RTLD_NEXT, "__lxstat64");
+        fn = (int (*)(int, const char *, struct stat64 *))bxroot_next_symbol("__lxstat64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2016,7 +2030,7 @@ int __fxstat64(int ver, int fd, struct stat64 *buf) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, int, struct stat64 *))dlsym(RTLD_NEXT, "__fxstat64");
+        fn = (int (*)(int, int, struct stat64 *))bxroot_next_symbol("__fxstat64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(ver, fd, buf);
@@ -2052,7 +2066,7 @@ char *getcwd(char *buf, size_t size) {
     size_t rl;
 
     if (fn == NULL)
-        fn = (char *(*)(char *, size_t))dlsym(RTLD_NEXT, "getcwd");
+        fn = (char *(*)(char *, size_t))bxroot_next_symbol("getcwd");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
     /* 允许 buf == NULL：glibc 会 malloc 一块，我们不能用栈缓冲替代 */
@@ -2134,7 +2148,7 @@ char *canonicalize_file_name(const char *path) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (char *(*)(const char *))dlsym(RTLD_NEXT, "canonicalize_file_name");
+        fn = (char *(*)(const char *))bxroot_next_symbol("canonicalize_file_name");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2154,7 +2168,7 @@ int fstat(int fd, struct stat *buf) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, struct stat *))dlsym(RTLD_NEXT, "fstat");
+        fn = (int (*)(int, struct stat *))bxroot_next_symbol("fstat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(fd, buf);
@@ -2168,7 +2182,7 @@ int fstat64(int fd, struct stat64 *buf) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, struct stat64 *))dlsym(RTLD_NEXT, "fstat64");
+        fn = (int (*)(int, struct stat64 *))bxroot_next_symbol("fstat64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(fd, buf);
@@ -2190,10 +2204,10 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
 
     if (fn == NULL && fn_fx == NULL) {
         fn = (int (*)(int, const char *, struct stat *, int))
-             dlsym(RTLD_NEXT, "fstatat");
+             bxroot_next_symbol("fstatat");
         if (fn == NULL)
             fn_fx = (int (*)(int, int, const char *, struct stat *, int))
-                    dlsym(RTLD_NEXT, "__fxstatat");
+                    bxroot_next_symbol("__fxstatat");
     }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2222,10 +2236,10 @@ int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
 
     if (fn == NULL && fn_fx == NULL) {
         fn = (int (*)(int, const char *, struct stat64 *, int))
-             dlsym(RTLD_NEXT, "fstatat64");
+             bxroot_next_symbol("fstatat64");
         if (fn == NULL)
             fn_fx = (int (*)(int, int, const char *, struct stat64 *, int))
-                    dlsym(RTLD_NEXT, "__fxstatat64");
+                    bxroot_next_symbol("__fxstatat64");
     }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2268,7 +2282,7 @@ int unlinkat(int dirfd, const char *path, int flags) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, int))dlsym(RTLD_NEXT, "unlinkat");
+        fn = (int (*)(int, const char *, int))bxroot_next_symbol("unlinkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2293,7 +2307,7 @@ int mkdir(const char *path, mode_t mode) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, mode_t))dlsym(RTLD_NEXT, "mkdir");
+        fn = (int (*)(const char *, mode_t))bxroot_next_symbol("mkdir");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2307,7 +2321,7 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, mode_t))dlsym(RTLD_NEXT, "mkdirat");
+        fn = (int (*)(int, const char *, mode_t))bxroot_next_symbol("mkdirat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2321,7 +2335,7 @@ int rmdir(const char *path) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *))dlsym(RTLD_NEXT, "rmdir");
+        fn = (int (*)(const char *))bxroot_next_symbol("rmdir");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2335,7 +2349,7 @@ int symlink(const char *target, const char *linkpath) {
     const char *pt = target, *pl = linkpath;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "symlink");
+        fn = (int (*)(const char *, const char *))bxroot_next_symbol("symlink");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     /*
@@ -2356,7 +2370,7 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath) {
     const char *pl = linkpath;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, int, const char *))dlsym(RTLD_NEXT, "symlinkat");
+        fn = (int (*)(const char *, int, const char *))bxroot_next_symbol("symlinkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(linkpath, tl, sizeof(tl)) > 0)
@@ -2370,7 +2384,7 @@ int rename(const char *oldpath, const char *newpath) {
     const char *po = oldpath, *pn = newpath;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "rename");
+        fn = (int (*)(const char *, const char *))bxroot_next_symbol("rename");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(oldpath, to, sizeof(to)) > 0) po = to;
@@ -2393,7 +2407,7 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
 
     if (fn == NULL)
         fn = (int (*)(int, const char *, int, const char *))
-             dlsym(RTLD_NEXT, "renameat");
+             bxroot_next_symbol("renameat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(oldpath, to, sizeof(to)) > 0) po = to;
@@ -2412,7 +2426,7 @@ int chmod(const char *path, mode_t mode) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, mode_t))dlsym(RTLD_NEXT, "chmod");
+        fn = (int (*)(const char *, mode_t))bxroot_next_symbol("chmod");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2429,7 +2443,7 @@ int fchmod(int fd, mode_t mode) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, mode_t))dlsym(RTLD_NEXT, "fchmod");
+        fn = (int (*)(int, mode_t))bxroot_next_symbol("fchmod");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(fd, mode);
@@ -2445,7 +2459,7 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, mode_t, int))dlsym(RTLD_NEXT, "fchmodat");
+        fn = (int (*)(int, const char *, mode_t, int))bxroot_next_symbol("fchmodat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     /*
@@ -2474,7 +2488,7 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, int, int))dlsym(RTLD_NEXT, "faccessat");
+        fn = (int (*)(int, const char *, int, int))bxroot_next_symbol("faccessat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     /*
@@ -2517,7 +2531,7 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
 
     if (fn == NULL)
         fn = (ssize_t (*)(int, const char *, char *, size_t))
-             dlsym(RTLD_NEXT, "readlinkat");
+             bxroot_next_symbol("readlinkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     /*
@@ -2587,7 +2601,7 @@ int ioctl(int fd, unsigned long request, ...) {
     void *arg;
 
     if (fn == NULL)
-        fn = (int (*)(int, unsigned long, ...))dlsym(RTLD_NEXT, "ioctl");
+        fn = (int (*)(int, unsigned long, ...))bxroot_next_symbol("ioctl");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     /*
@@ -2653,7 +2667,7 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
 
     if (fn == NULL)
         fn = (int (*)(int, const char *, const struct timespec[2], int))
-             dlsym(RTLD_NEXT, "utimensat");
+             bxroot_next_symbol("utimensat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     /* path 可以是 NULL（对 dirfd 本身操作），必须判空 */
@@ -2670,7 +2684,7 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
 
     if (fn == NULL)
         fn = (int (*)(int, const char *, uid_t, gid_t, int))
-             dlsym(RTLD_NEXT, "fchownat");
+             bxroot_next_symbol("fchownat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (path != NULL && translate_path(path, translated, sizeof(translated)) > 0)
@@ -2712,7 +2726,7 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
 
     if (fn == NULL)
         fn = (int (*)(int, const char *, int, unsigned int, struct statx *))
-             dlsym(RTLD_NEXT, "statx");
+             bxroot_next_symbol("statx");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (path != NULL && translate_path(path, translated, sizeof(translated)) > 0)
@@ -2751,7 +2765,7 @@ int statfs(const char *path, struct statfs *buf) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, struct statfs *))dlsym(RTLD_NEXT, "statfs");
+        fn = (int (*)(const char *, struct statfs *))bxroot_next_symbol("statfs");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2765,7 +2779,7 @@ int statvfs(const char *path, struct statvfs *buf) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, struct statvfs *))dlsym(RTLD_NEXT, "statvfs");
+        fn = (int (*)(const char *, struct statvfs *))bxroot_next_symbol("statvfs");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2779,7 +2793,7 @@ int truncate(const char *path, off_t length) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, off_t))dlsym(RTLD_NEXT, "truncate");
+        fn = (int (*)(const char *, off_t))bxroot_next_symbol("truncate");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2793,7 +2807,7 @@ int creat(const char *path, mode_t mode) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, mode_t))dlsym(RTLD_NEXT, "creat");
+        fn = (int (*)(const char *, mode_t))bxroot_next_symbol("creat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2816,7 +2830,7 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
 
     if (fn == NULL)
         fn = (int (*)(int, const char *, int, const char *, unsigned int))
-             dlsym(RTLD_NEXT, "renameat2");
+             bxroot_next_symbol("renameat2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(oldpath, to, sizeof(to)) > 0) po = to;
@@ -2846,13 +2860,135 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
  * 一律纯转发。
  */
 
+/*
+ * ====================================================================
+ * 符号解析的统一入口：**linker 服务优先，libc dlsym 兜底**
+ * ====================================================================
+ *
+ * 为什么不能只写 `dlsym(RTLD_NEXT, name)`：见下面「dl* 家族」那段。
+ * 在本容器（官方 proroot linker + 本运行时）实测：
+ *
+ *     bxroot_next_symbol("open")  →  0x...22680  ✅（libc 的 open）
+ *     换成本库导出 dlsym 之后       →  (nil)     ❌
+ *
+ * 也就是说**一旦本库把 `dlsym` 导出到动态符号表，libc 的 dlsym 在本进程里
+ * 就失效了**（探针实证见 docs/dlsym垫片与插件加载修复.md §3）。
+ * 而客户程序（node 与它的 N-API 原生模块）恰恰**必须**能 dlsym 到
+ * V8 的导出符号，否则整条 `requireBuiltin` 链断掉、`dsh web` 的 5 个插件
+ * 全部加载失败。
+ *
+ * 因此本库改为：**符号解析本身走 linker 服务**，不再依赖 libc 的 dlsym。
+ *
+ * 协议（由官方 runtime 反汇编 + 本容器探针双重确认）：
+ *   - `ldso_service_dlsym_next_from(retaddr, name)` 语义 = libc 的
+ *     `dlsym(RTLD_NEXT, name)`，**retaddr 取调用方的返回地址**
+ *     （官方就是 `xpaclri; mov x0, x30; bl ...`）。
+ *   - `ldso_service_dlsym(handle, name)` 语义 = libc 的 `dlsym(handle, name)`；
+ *     `handle == NULL` 时 = `RTLD_DEFAULT`。
+ *   - 两个服务符号由 linker 在装载时填 PLT，本库**不要**定义它们，
+ *     只声明为外部引用。
+ *
+ * ★ 等价性实测（docs 报告 §3.4）★
+ *   在同一个函数里同时取
+ *       a = dlsym(RTLD_NEXT, name)
+ *       b = ldso_service_dlsym_next_from(__builtin_return_address(0), name)
+ *   对本库内部解析的**全部 133 个符号名**逐一比对：
+ *       **相等 133 / 不等 0**（其中同为 NULL 的 2 个是 glibc 已删除的
+ *       newfstatat / newfstatat64，本库本就有 fstatat 回退）。
+ *   所以改用服务版是**行为保持**的，不是"换了一套语义"。
+ *
+ * ★ 为什么不会递归 ★
+ *   本函数**不调用任何 dlsym**（既不调 libc 的，也不调自己的）：
+ *   服务符号是 linker 直接填的 PLT，与符号解析无关。
+ *   实测（probe14）：本库导出自研 dlsym 后，经服务拿到的"真 dlsym"
+ *   三种形态（NULL / RTLD_DEFAULT / RTLD_NEXT）调用**递归进入次数均为 0**。
+ */
+
+/* linker 提供的私有服务。**只声明，不定义** —— 定义会覆盖 linker 的实现。 */
+extern void *ldso_service_dlsym(void *handle, const char *name);
+extern void *ldso_service_dlsym_global(const char *name);
+extern void *ldso_service_dlsym_next_from(void *retaddr, const char *name);
+
+/*
+ * 本库是否运行在**带 ldso 服务的 linker** 下。
+ *
+ * 官方 linker 一定有；纯 glibc / 其它 loader 下这三个符号解析不到，
+ * 此时必须回落到 libc 的 dlsym —— 否则本库在非 proroot 环境（例如
+ * 开发者直接在 Ubuntu 容器里 `LD_PRELOAD` 跑单测）会整片功能失效。
+ *
+ * 探测方式：`ldso_service_dlsym_global` 是 linker 的全局查找入口，
+ * 拿自己的一个自己一定有的符号（`bxroot_translate_path`）即可。
+ * 取不到 → 判定为无服务，走 libc。
+ *
+ * 注意：这个探测**不能**在构造函数里缓存死。本库的构造函数可能早于
+ * linker 填完 PLT（实测：bxroot linker 场景下构造函数压根没跑到就 SIGILL），
+ * 所以每次解析时按需判定一次即可（成本 = 一次查表，热路径上早已判空短路）。
+ */
+static int bxroot_has_ldso_service(void) {
+    static int cached = -1; /* -1 未知 / 0 无 / 1 有 */
+    if (cached < 0) {
+        void *probe = ldso_service_dlsym_global("bxroot_translate_path");
+        cached = (probe != NULL) ? 1 : 0;
+    }
+    return cached;
+}
+
+/*
+ * 解析"本库之后"的真实符号。语义 = `dlsym(RTLD_NEXT, name)`。
+ *
+ * ★ 必须传调用方的返回地址 ★
+ * 服务用 retaddr 定位调用方在 link_map 里的位置，从而决定搜索起点。
+ * 传本函数的地址是**错的**：那样搜索起点会变成"本函数所在的目标文件"，
+ * 从而把本库自己的钩子当成"真实实现"返回（自递归炸栈）。
+ * 所以这里取 `__builtin_return_address(0)`，即**调用 bxroot_next_symbol 的
+ * 那个函数**的返回地址 —— 与官方 runtime 取 x30 的做法一致。
+ */
+__attribute__((noinline))
+static void *bxroot_next_symbol(const char *name) {
+    if (bxroot_has_ldso_service()) {
+        void *p = ldso_service_dlsym_next_from(__builtin_return_address(0), name);
+        if (p != NULL)
+            return p;
+        /*
+         * 服务说没有 —— 这就是权威答案（与 libc 的 RTLD_NEXT 语义一致，
+         * 例如 glibc 2.33+ 的 newfstatat 确实不存在）。
+         * **不**在这里补一次 libc dlsym：那既多余，又会在"本库已导出 dlsym"
+         * 的语境下拿到 NULL，掩盖真实原因。
+         */
+        return NULL;
+    }
+    /* 无服务：退回 libc 原生 dlsym（非 proroot 环境） */
+    return dlsym(RTLD_NEXT, name);
+}
+
 void *dlopen(const char *filename, int flags) {
     static void *(*fn)(const char *, int) = NULL;
     char translated[MAX_PATH_LEN];
     const char *p = filename;
 
+    /*
+     * ★ dlopen 的真身解析**不能**走 bxroot_next_symbol / linker 服务 ★
+     *
+     * 实测诊断（[DLOPEN-RES]，详见 docs 报告 §5）：
+     *   ldso_service_dlsym_next_from(__builtin_return_address(0), "dlopen")
+     *   从本库的 dlopen 内部调用时返回
+     *       q = 0x…99b0 [libbxroot-runtime.so]   dlopen_self = 0x…99b0  ★同一个★
+     *   即**解析回了本库自己的 dlopen** → 调用它无限递归 → 栈耗尽段错误。
+     *
+     * 原因：`next_from(retaddr, …)` 用 retaddr 定位调用方在 link_map 中的位置，
+     * 再从**其后**开始搜索。本库的 dlopen 是导出符号，调用方可能在库外
+     * （libc / ld.so 的初始化与 node 的装载路径），此时"其后"会绕回本库 →
+     * 命中我们自己的 dlopen。
+     * 而 `bxroot_next_symbol` 是 `static` + `noinline`，调用方**必然**在本库内部，
+     * 所以那里没有这个问题（实测 133/133 与 libc 的 RTLD_NEXT 完全等价）。
+     *
+     * 因此 dlopen 保持原有已验证写法：走 libc 的 `dlsym(RTLD_NEXT, …)`。
+     * 这里不会成环：本库虽然导出 dlsym，但 dlsym 的 RTLD_NEXT 分支走 linker
+     * 服务、不回到 libc 的 dlsym，故不存在 dlsym↔dlopen 相互调用。
+     */
     if (fn == NULL)
         fn = (void *(*)(const char *, int))dlsym(RTLD_NEXT, "dlopen");
+
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
     /* filename 可以为 NULL（获取主程序句柄），必须判空 */
@@ -2894,24 +3030,274 @@ void *dlopen(const char *filename, int flags) {
  * 只有 web profile 会加载原生 N-API 模块，而那条路径要调 dlsym。
  *
  * ====================================================================
- * 修法：不导出它们，让 libc/ld-linux 的原生实现接管。
+ * 【结论已修订 —— 见下方 "修订" 段】不导出它们**并不正确**。
  *
- * 依据：
- *   1. 这四个函数**没有任何路径语义** —— 没有需要翻译的参数，
- *      也就没有必须由我们接管的理由。当初导出它们的理由写的是
- *      "对齐官方符号表"与"某些程序会 dlsym 探测"，但：
- *        - 官方符号表里有它们，是因为官方有 `ldso_service_*`
- *          基础设施（它自研加载器），与我们的架构不同；
- *        - "程序会探测 dlsym" 这个需求，**libc 原生实现本来就满足**。
- *   2. 更关键：本文件内部有 **144 处 `bxroot_real_symbol(...)`**
- *      用于解析真实函数。这些调用**全部依赖 libc 的原生 `dlsym`**。
- *      我们导出一个包装器，恰恰把这条主路径也污染了 —— 不只是
- *      递归自伤，还会让所有钩子的真实函数解析变脆。
+ * 修订（本轮实测）
+ * ----------------
+ * 上面那段"不导出比导出更正确"的推理**被实测证伪**：
  *
- * 换言之：**不导出比导出更正确**。少这 4 个符号不影响任何真实功能
- * （客户 `dlsym(RTLD_DEFAULT, "dlsym")` 依然由 libc 满足），
- * 而导出它会让整个运行时在遇到 dlopen 时崩掉。
+ *   实测（probeapi2.node，同一份 .node 分别跑在官方/bxroot 运行时下）：
+ *
+ *     官方 runtime： dlsym(NULL,"malloc")                        = 0x…7490 [libc]
+ *                    dlsym(NULL,"napi_create_function")          = 0x876a34 [node]
+ *                    dlsym(NULL,"_ZN2v87Isolate10GetCurrentEv")  = 0xc03360 [node]
+ *     bxroot runtime：三个**全部 (nil)**
+ *
+ *   即：**bxroot 运行时下，被 `process.dlopen` 装入的 .node 模块调用
+ *   dlsym(RTLD_DEFAULT, …) 拿不到 node 自己导出的任何符号。**
+ *
+ *   这正是 `node-addon-require-builtin` 报
+ *   `Unsupported/no-context (required V8 current-context symbols were not found)`
+ *   的直接原因（它内部就是 `dlsym(0, "_ZN2v87Isolate10GetCurrentEv")`），
+ *   进而让 `dsh web` 的 5 个插件全部 "Cannot find package"。
+ *
+ * 为什么"让 libc 接管"在这条链路上不成立
+ * --------------------------------------
+ * libc 的 dlsym 依赖 `__libc_dlopen`/`_dl_sym` 那套内部符号解析，
+ * 而这条路径**只有 glibc 自己的 ld.so 被用作 loader 时才完整**。
+ * proroot 用的是自研 loader（官方 `libproroot-linker.so`），它把符号解析
+ * 换成了自己的 `ldso_service_*`。于是：
+ *   - 官方 runtime：**自研 loader + 自研 dlsym（走服务）** → 自洽，能用；
+ *   - bxroot 旧实现：**自研 loader + libc 的 dlsym** → 不自洽，返回 NULL。
+ *
+ * ★ 不能写成"转发给 libc 的同名函数" ★
+ * 上面记录的 core dump 是真实的：`dlsym` 里用 `dlsym(RTLD_NEXT,"dlsym")`
+ * 懒加载真身会无限递归（崩溃 PC = 本 .so + 0x6c44 即 dlsym 入口，
+ * 主线程 sp == x29 即栈耗尽）。
+ *
+ * 正确修法（本段实现）
+ * -------------------
+ * 像官方那样**自己实现 dlsym，内部走 linker 服务**，而不是转发：
+ *
+ *   void *dlsym(void *handle, const char *symbol) {
+ *       RTLD_NEXT(-1)          → ldso_service_dlsym_next_from(retaddr, symbol)
+ *       RTLD_DEFAULT(NULL/-2)  → ldso_service_dlsym(NULL, symbol)
+ *       其它 handle            → 服务拿到"真 dlsym"后再转交（服务返回的是
+ *                                linker 自己的 dlsym 实现，不是本库的）
+ *   }
+ *
+ * 三条安全性质，均已实测（probe14，详见 docs 报告 §4）：
+ *   1. **不递归**：服务拿到的"真 dlsym" `0x…ac3590` ≠ 本库 `&dlsym`
+ *      `0x…8074a8`；它对 NULL / RTLD_DEFAULT / RTLD_NEXT 三种调用
+ *      "递归进入本库 dlsym" 的次数均为 **0**。
+ *   2. **内部解析不受影响**：本库自身的
+ *      `dlsym(RTLD_NEXT, …)` 全部改为 `bxroot_next_symbol()`（走服务），
+ *      与 libc 原生结果等价（133/133 名字逐一比对相同，见上文）。
+ *   3. **仍交给 glibc 做真正的解析**：本库只做 **分派**，
+ *      不解析 ELF、不做重定位 —— 红线 CL-13/CL-14 未被违反
+ *      （linker 服务本来就是官方 loader 的公开入口）。
+ *
+ * 对 `dlerror` / `dladdr` / `dl_iterate_phdr` 的处理
+ * -------------------------------------------------
+ * 本轮**只导出 `dlsym`**。理由：
+ *   - 客户程序（node + N-API 模块）的失败点只有 dlsym 一处，实测已闭合；
+ *   - `dlerror` 为 TLS 错误码语义，自己实现要先复刻 `__libc_dlerror_result`
+ *     的布局；**做错比不做更糟**（dsh 会拿到垃圾字符串）；
+ *   - `dladdr`/`dl_iterate_phdr` 需要 `_dl_find_object`，服务接口
+ *     （`ldso_service_find_object_by_addr`）目前只确认存在、**未验证语义**。
+ * 官方导出全套是因为它连 `dlerror` 一起自研了（反汇编可见它直接用
+ * `tpidr_el0` 读写 TLS 里的错误码），那是另一件事，不在本轮范围。
  */
+
+/*
+ * 自研 dlsym —— 只做**分派**，真正的符号解析仍由 linker 服务完成。
+ *
+ * 为什么必须导出：见上。客户程序（node 的 N-API 模块）要靠它
+ * 看到 node 进程的导出符号。
+ *
+ * 防递归：本函数**绝不在自己的求值路径上调用 dlsym**。
+ *   - RTLD_NEXT / RTLD_DEFAULT 直接走 linker 服务（PLT，与符号解析无关）；
+ *   - 其它 handle 需要"真 dlsym"，而"真 dlsym"通过
+ *     `ldso_service_dlsym(NULL, "dlsym")` 获得 —— 该服务返回 linker
+ *     自己的实现（实测 0x…ac3590 ≠ 本库 &dlsym 0x…8074a8），
+ *     不是本库的，所以不会回到这里。
+ *
+ * 若某个环境**没有** ldso 服务（非 proroot loader），本函数退回
+ * `dlvsym`/libc 语义不可用，此时保守地返回 NULL 并置 ENOSYS 风格错误 ——
+ * 这比"猜一个实现"安全：那种情况下本来也没有服务在提供符号视图。
+ */
+void *dlsym(void *handle, const char *symbol) {
+    if (symbol == NULL) {
+        /* glibc 对 symbol==NULL 的行为是未定义；这里明确失败，不猜 */
+        return NULL;
+    }
+
+    if (bxroot_has_ldso_service()) {
+        /* RTLD_NEXT：从**调用方**之后开始找 */
+        if (handle == RTLD_NEXT) {
+            return ldso_service_dlsym_next_from(__builtin_return_address(0), symbol);
+        }
+        /* RTLD_DEFAULT / NULL：全局查找。
+         * 注意服务在 handle==NULL 时的语义就是 RTLD_DEFAULT
+         * （实测 ldso_service_dlsym(NULL,"malloc") == global("malloc")）。 */
+        if (handle == NULL || handle == RTLD_DEFAULT) {
+            return ldso_service_dlsym(NULL, symbol);
+        }
+        /*
+         * ★ 具体句柄：**直接交给 linker 服务**，不要再去找"真 dlsym" ★
+         *
+         * 为什么不能"取真 dlsym 再转交"：
+         *   实测（probe16）：`ldso_service_dlsym(NULL, "dlsym")` 在本库已导出
+         *   dlsym 的前提下**返回本库自己的 dlsym**（linker 服务是"全局查找"，
+         *   自然优先命中搜索链最前面的本库）。那就是自递归；
+         *   加一层"若等于自己就返回 NULL"的防御后，node 的
+         *   `dlsym(handle, "napi_register_module_v1")` 会拿到 NULL，
+         *   于是报 `Module did not self-register` —— 加载体征与实测完全一致。
+         *
+         * 正确做法：linker 服务本身就提供**带句柄**的查找
+         * （`ldso_service_dlsym(handle, name)`），
+         * 实测（probeapi3 stage 11 / 14）它能正确解析：
+         *     dlsym(libc_handle, "malloc")                  → libc 的 malloc
+         *     dlsym(node_addon_handle, "napi_register_module_v1") → 该 .node 的地址
+         * 而那个 handle 正是本库 dlopen（转发给 libc 的 dlopen）返回的句柄，
+         * 类型一致，无需转换。
+         */
+        return ldso_service_dlsym(handle, symbol);
+    }
+
+    /*
+     * 无 ldso 服务：本库在非 proroot 环境（例如 Ubuntu 容器里直接
+     * LD_PRELOAD 跑单测）。此时 libc 的 dlsym 仍然有效，
+     * 但**不能从本函数里调用它** —— 那正是递归。改用 dlvsym 也不行
+     * （它内部同样会走到这里）。所以这里只处理能用服务表达的情形，
+     * 其余返回 NULL，并让上层知道。
+     *
+     * 实测：本容器（官方 linker + 本运行时）**始终**有服务，
+     * 所以这条分支不影响 DSHA 路径；它只是让"非 proroot 环境"
+     * 退化得明确而不是递归崩溃。
+     */
+    return NULL;
+}
+
+
+/*
+ * ====================================================================
+ * 自研 dladdr —— 补上 `dli_fbase`
+ * ====================================================================
+ *
+ * 为什么非做不可（实测）
+ * ---------------------
+ * bxroot 运行时下，客户程序看到的是 **glibc 的 dladdr**，它同样依赖
+ * glibc 自己的 loader 状态 —— 而 proroot 用的是自研 loader，那份状态是空的。
+ * 实测对照（probeapi3 stage 17/18，同一个 .node、同一地址）：
+ *
+ *   官方 runtime:  dladdr(0x9a2930) → 1, fname=…/usr/local/bin/node, fbase=0x400000
+ *   bxroot runtime: dladdr(0x9a2930) → 1, fname=…/usr/local/bin/node, fbase=(nil) ★
+ *
+ * fname 有值只是巧合（glibc 从 maps 里猜的），**fbase 恒为 NULL**。
+ *
+ * 这一个 NULL 就是 `dsh web` 插件链的**第二道**卡点：
+ * `node-addon-require-builtin` 在用 V8 符号读出 realm 指针后，会做一次
+ * “两地址是否属于同一镜像”的一致性校验（反汇编
+ * `ValidatePlatformRuntimeImagePointers` @0x1d4f4 可见它连续调用两次
+ * `dladdr` 再比较 `dli_fbase`），失败即报
+ *     `Unsupported/no-realm (realm vptr image does not match getter image)`
+ * —— 正是加完 dlsym 垫片后观察到的下一个错误。
+ *
+ * 实现方式：**照抄官方的做法**，不自己解析 ELF
+ * ------------------------------------------------
+ * 官方 `dladdr`（@0x23080）自己没有遍历任何链表，而是：
+ *   1. 准备一个 4 字段的 walk 结构 {addr, fbase, fname, ptype}；
+ *   2. 调 `ldso_service_dl_iterate_phdr(内部回调, &walk)`；
+ *   3. 回调里对每个对象的 PT_LOAD 段做 `vaddr <= addr < vaddr+memsz` 判定，
+ *      命中就填 fbase/fname 并返回非 0 停止遍历；
+ *   4. 回来后把 walk 里的 {fname, fbase} 写进 Dl_info，sname/saddr 置 NULL。
+ *
+ * 回调 ABI 由官方那段反汇编**逐条坐实**（`proroot_dladdr_walk_cb` @0x22d40）：
+ *     x0 = struct dl_phdr_info *   （用 [x0+16]=dlpi_phdr、[x0+24]=dlpi_phnum、
+ *                                   [x0+0]=dlpi_addr、[x0+8]=dlpi_name）
+ *     x2 = void *data              （[x2+0]=待查地址；命中后写 [x2+8]=fbase、
+ *                                   [x2+16]=fname、[x2+24]=p_type）
+ * 这正是 `dl_iterate_phdr` 回调的标准签名。
+ *
+ * ★ 仍然没有自研 ELF 解析 ★
+ * 对象枚举、加载基址、段表全部来自 linker 服务；本函数只做区间比较，
+ * 与官方 runtime 的对应函数是同一个形状。红线 CL-13/CL-14 未被触碰。
+ */
+
+/* linker 服务：枚举已装载对象（回调签名同 dl_iterate_phdr） */
+extern int ldso_service_dl_iterate_phdr(
+    int (*callback)(struct dl_phdr_info *, size_t, void *), void *data);
+
+/* 与官方 @0x22d40 的 walk 结构逐字段对齐 */
+struct bxroot_dladdr_walk {
+    const void *addr;    /* [0]  入参：待查地址               */
+    void       *fbase;   /* [8]  出参：所在对象加载基址       */
+    const char *fname;   /* [16] 出参：所在对象路径           */
+    int         ptype;   /* [24] 出参：命中的 p_type（非 0 = 命中） */
+};
+
+static int bxroot_dladdr_walk_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    struct bxroot_dladdr_walk *w = (struct bxroot_dladdr_walk *)data;
+    (void)size;
+
+    /* 与官方一致：没有段表就跳过该对象 */
+    if (info == NULL || info->dlpi_phdr == NULL || info->dlpi_phnum == 0)
+        return 0;
+
+    /* ★ `dli_fbase` 不是 `dlpi_addr`，而是**第一个 PT_LOAD 的起始地址** ★
+     *
+     * 这一点是从官方回调 @0x22d40 逐条读出来的：
+     *     22d8c: add  x3, x3, x9        ; x3 = dlpi_addr + p_vaddr
+     *     22d90: csel x6, x6, x3, ne    ; x6 为 0 时记下 x3（即首个 PT_LOAD 的 vstart）
+     *     22dd4: stp  x6, x1, [x2, #8]  ; w->fbase = x6
+     * 初版我写成 `dlpi_addr`，实测主程序（dlpi_addr == 0）得到 fbase=(nil)，
+     * 而官方同一地址给出 0x400000 —— 正是主程序首个 PT_LOAD 的 p_vaddr。
+     *
+     * 语义上也应该如此：`dli_fbase` 是"该对象映射的基址"，
+     * 对非零 dlpi_addr 的共享库两者相等，对主程序则等于首个 PT_LOAD 的
+     * 虚拟地址（0x400000 之类），这正是 glibc 的行为。
+     */
+    unsigned long first_load = 0;
+    unsigned long a = (unsigned long)w->addr;
+
+    for (unsigned i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        unsigned long vstart, vend;
+
+        if (ph->p_type != PT_LOAD)
+            continue;
+
+        vstart = (unsigned long)info->dlpi_addr + (unsigned long)ph->p_vaddr;
+        vend   = vstart + (unsigned long)ph->p_memsz;
+
+        /* 与官方 `csel x6, x6, x3, ne` 等价：x6 非 0 则保留，否则取当前 vstart */
+        if (first_load == 0)
+            first_load = vstart;
+
+        if (a >= vstart && a < vend) {
+            w->fbase = (void *)first_load;
+            /* 官方对空 dlpi_name 用空串（csel），这里保持一致：
+             * 客户代码常直接 printf("%s", dli_fname)，给 NULL 会崩。 */
+            w->fname = (info->dlpi_name != NULL) ? info->dlpi_name : "";
+            w->ptype = (int)ph->p_type;
+            return (int)ph->p_type;   /* 非 0 = 停止遍历 */
+        }
+    }
+    return 0;
+}
+
+int dladdr(const void *addr, Dl_info *info) {
+    struct bxroot_dladdr_walk w;
+
+    if (addr == NULL || info == NULL)
+        return 0;
+    if (!bxroot_has_ldso_service())
+        return 0;
+
+    memset(&w, 0, sizeof(w));
+    w.addr = addr;
+    ldso_service_dl_iterate_phdr(bxroot_dladdr_walk_cb, &w);
+
+    if (w.ptype == 0)
+        return 0;   /* 未命中任何 PT_LOAD */
+
+    info->dli_fname = w.fname;
+    info->dli_fbase = w.fbase;
+    info->dli_sname = NULL;
+    info->dli_saddr = NULL;
+    return 1;
+}
 
 /* ------------------------------------------------------------------ */
 /* Hook: nocancel 变体 —— 高频（不可取消的内部路径）                    */
@@ -2928,7 +3314,7 @@ int __open_nocancel(const char *path, int flags, mode_t mode) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, int, mode_t))dlsym(RTLD_NEXT, "__open_nocancel");
+        fn = (int (*)(const char *, int, mode_t))bxroot_next_symbol("__open_nocancel");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2942,7 +3328,7 @@ int __open64_nocancel(const char *path, int flags, mode_t mode) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, int, mode_t))dlsym(RTLD_NEXT, "__open64_nocancel");
+        fn = (int (*)(const char *, int, mode_t))bxroot_next_symbol("__open64_nocancel");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -2977,7 +3363,7 @@ char *__getcwd_chk(char *buf, size_t size, size_t buflen) {
 
     if (!tried) {
         tried = 1;
-        chk_fail = (void (*)(void))dlsym(RTLD_NEXT, "__chk_fail");
+        chk_fail = (void (*)(void))bxroot_next_symbol("__chk_fail");
     }
 
     if (buflen != (size_t)-1 && size > buflen) {
@@ -3036,7 +3422,7 @@ int mkstemp(char *template) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(char *))dlsym(RTLD_NEXT, "mkstemp");
+        fn = (int (*)(char *))bxroot_next_symbol("mkstemp");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -3060,7 +3446,7 @@ char *mkdtemp(char *template) {
     char *rc;
 
     if (fn == NULL)
-        fn = (char *(*)(char *))dlsym(RTLD_NEXT, "mkdtemp");
+        fn = (char *(*)(char *))bxroot_next_symbol("mkdtemp");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -3086,7 +3472,7 @@ int mkstemps(char *template, int suffixlen) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(char *, int))dlsym(RTLD_NEXT, "mkstemps");
+        fn = (int (*)(char *, int))bxroot_next_symbol("mkstemps");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -3109,7 +3495,7 @@ int mkostemp(char *template, int flags) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(char *, int))dlsym(RTLD_NEXT, "mkostemp");
+        fn = (int (*)(char *, int))bxroot_next_symbol("mkostemp");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -3134,7 +3520,7 @@ int fchdir(int fd) {
     static int (*fn)(int) = NULL;
 
     if (fn == NULL)
-        fn = (int (*)(int))dlsym(RTLD_NEXT, "fchdir");
+        fn = (int (*)(int))bxroot_next_symbol("fchdir");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     /*
@@ -3173,7 +3559,7 @@ ssize_t getxattr(const char *path, const char *name, void *value, size_t size) {
 
     if (fn == NULL)
         fn = (ssize_t (*)(const char *, const char *, void *, size_t))
-             dlsym(RTLD_NEXT, "getxattr");
+             bxroot_next_symbol("getxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3188,7 +3574,7 @@ ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) 
 
     if (fn == NULL)
         fn = (ssize_t (*)(const char *, const char *, void *, size_t))
-             dlsym(RTLD_NEXT, "lgetxattr");
+             bxroot_next_symbol("lgetxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3204,7 +3590,7 @@ int setxattr(const char *path, const char *name, const void *value,
 
     if (fn == NULL)
         fn = (int (*)(const char *, const char *, const void *, size_t, int))
-             dlsym(RTLD_NEXT, "setxattr");
+             bxroot_next_symbol("setxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3220,7 +3606,7 @@ int lsetxattr(const char *path, const char *name, const void *value,
 
     if (fn == NULL)
         fn = (int (*)(const char *, const char *, const void *, size_t, int))
-             dlsym(RTLD_NEXT, "lsetxattr");
+             bxroot_next_symbol("lsetxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3235,7 +3621,7 @@ ssize_t listxattr(const char *path, char *list, size_t size) {
 
     if (fn == NULL)
         fn = (ssize_t (*)(const char *, char *, size_t))
-             dlsym(RTLD_NEXT, "listxattr");
+             bxroot_next_symbol("listxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3250,7 +3636,7 @@ ssize_t llistxattr(const char *path, char *list, size_t size) {
 
     if (fn == NULL)
         fn = (ssize_t (*)(const char *, char *, size_t))
-             dlsym(RTLD_NEXT, "llistxattr");
+             bxroot_next_symbol("llistxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3264,7 +3650,7 @@ int removexattr(const char *path, const char *name) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "removexattr");
+        fn = (int (*)(const char *, const char *))bxroot_next_symbol("removexattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3278,7 +3664,7 @@ int lremovexattr(const char *path, const char *name) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "lremovexattr");
+        fn = (int (*)(const char *, const char *))bxroot_next_symbol("lremovexattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3293,7 +3679,7 @@ int inotify_add_watch(int fd, const char *path, uint32_t mask) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(int, const char *, uint32_t))dlsym(RTLD_NEXT, "inotify_add_watch");
+        fn = (int (*)(int, const char *, uint32_t))bxroot_next_symbol("inotify_add_watch");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3315,7 +3701,7 @@ int scandir(const char *dirp, struct dirent ***namelist,
         fn = (int (*)(const char *, struct dirent ***,
                       int (*)(const struct dirent *),
                       int (*)(const struct dirent **, const struct dirent **)))
-             dlsym(RTLD_NEXT, "scandir");
+             bxroot_next_symbol("scandir");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(dirp, translated, sizeof(translated)) > 0)
@@ -3333,7 +3719,7 @@ int statfs64(const char *path, struct statfs64 *buf) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, struct statfs64 *))dlsym(RTLD_NEXT, "statfs64");
+        fn = (int (*)(const char *, struct statfs64 *))bxroot_next_symbol("statfs64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3347,7 +3733,7 @@ int statvfs64(const char *path, struct statvfs64 *buf) {
     const char *p = path;
 
     if (fn == NULL)
-        fn = (int (*)(const char *, struct statvfs64 *))dlsym(RTLD_NEXT, "statvfs64");
+        fn = (int (*)(const char *, struct statvfs64 *))bxroot_next_symbol("statvfs64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
@@ -3385,7 +3771,7 @@ struct passwd *getpwuid(uid_t uid) {
     struct passwd *real;
 
     if (fnsym == NULL)
-        fnsym = (struct passwd *(*)(uid_t))dlsym(RTLD_NEXT, "getpwuid");
+        fnsym = (struct passwd *(*)(uid_t))bxroot_next_symbol("getpwuid");
     if (fnsym == NULL) { errno = ENOSYS; return NULL; }
 
     real = fnsym(uid);
@@ -3422,7 +3808,7 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 
     if (fn == NULL)
         fn = (int (*)(uid_t, struct passwd *, char *, size_t, struct passwd **))
-             dlsym(RTLD_NEXT, "getpwuid_r");
+             bxroot_next_symbol("getpwuid_r");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(uid, pwd, buf, buflen, result);
@@ -3476,7 +3862,7 @@ int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
     {
         static int (*fn)(uid_t *, uid_t *, uid_t *) = NULL;
         if (fn == NULL)
-            fn = (int (*)(uid_t *, uid_t *, uid_t *))dlsym(RTLD_NEXT, "getresuid");
+            fn = (int (*)(uid_t *, uid_t *, uid_t *))bxroot_next_symbol("getresuid");
         if (fn == NULL) { errno = ENOSYS; return -1; }
         return fn(ruid, euid, suid);
     }
@@ -3492,7 +3878,7 @@ int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
     {
         static int (*fn)(gid_t *, gid_t *, gid_t *) = NULL;
         if (fn == NULL)
-            fn = (int (*)(gid_t *, gid_t *, gid_t *))dlsym(RTLD_NEXT, "getresgid");
+            fn = (int (*)(gid_t *, gid_t *, gid_t *))bxroot_next_symbol("getresgid");
         if (fn == NULL) { errno = ENOSYS; return -1; }
         return fn(rgid, egid, sgid);
     }
@@ -3512,7 +3898,7 @@ int getgroups(int size, gid_t list[]) {
     {
         static int (*fn)(int, gid_t[]) = NULL;
         if (fn == NULL)
-            fn = (int (*)(int, gid_t[]))dlsym(RTLD_NEXT, "getgroups");
+            fn = (int (*)(int, gid_t[]))bxroot_next_symbol("getgroups");
         if (fn == NULL) { errno = ENOSYS; return -1; }
         return fn(size, list);
     }
@@ -3574,7 +3960,7 @@ static void fr_reinject_env(void)
         return;
     if (real_setenv == NULL)
         real_setenv = (int (*)(const char *, const char *, int))
-                      dlsym(RTLD_NEXT, "setenv");
+                      bxroot_next_symbol("setenv");
     if (real_setenv == NULL)
         return;
 
@@ -3590,7 +3976,7 @@ int setenv(const char *name, const char *value, int overwrite) {
 
     fr_capture_env();
     if (fn == NULL)
-        fn = (int (*)(const char *, const char *, int))dlsym(RTLD_NEXT, "setenv");
+        fn = (int (*)(const char *, const char *, int))bxroot_next_symbol("setenv");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(name, value, overwrite);
@@ -3615,7 +4001,7 @@ int unsetenv(const char *name) {
 
     fr_capture_env();
     if (fn == NULL)
-        fn = (int (*)(const char *))dlsym(RTLD_NEXT, "unsetenv");
+        fn = (int (*)(const char *))bxroot_next_symbol("unsetenv");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(name);
@@ -3637,7 +4023,7 @@ int putenv(char *string) {
 
     fr_capture_env();
     if (fn == NULL)
-        fn = (int (*)(char *))dlsym(RTLD_NEXT, "putenv");
+        fn = (int (*)(char *))bxroot_next_symbol("putenv");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn(string);
@@ -3651,7 +4037,7 @@ int clearenv(void) {
 
     fr_capture_env();
     if (fn == NULL)
-        fn = (int (*)(void))dlsym(RTLD_NEXT, "clearenv");
+        fn = (int (*)(void))bxroot_next_symbol("clearenv");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     rc = fn();
@@ -3685,7 +4071,7 @@ int clearenv(void) {
 int close(int fd) {
     static int (*fn)(int) = NULL;
     if (fn == NULL)
-        fn = (int (*)(int))dlsym(RTLD_NEXT, "close");
+        fn = (int (*)(int))bxroot_next_symbol("close");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(fd);
 }
@@ -3693,7 +4079,7 @@ int close(int fd) {
 int dup(int oldfd) {
     static int (*fn)(int) = NULL;
     if (fn == NULL)
-        fn = (int (*)(int))dlsym(RTLD_NEXT, "dup");
+        fn = (int (*)(int))bxroot_next_symbol("dup");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(oldfd);
 }
@@ -3701,7 +4087,7 @@ int dup(int oldfd) {
 int dup2(int oldfd, int newfd) {
     static int (*fn)(int, int) = NULL;
     if (fn == NULL)
-        fn = (int (*)(int, int))dlsym(RTLD_NEXT, "dup2");
+        fn = (int (*)(int, int))bxroot_next_symbol("dup2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(oldfd, newfd);
 }
@@ -3709,7 +4095,7 @@ int dup2(int oldfd, int newfd) {
 int dup3(int oldfd, int newfd, int flags) {
     static int (*fn)(int, int, int) = NULL;
     if (fn == NULL)
-        fn = (int (*)(int, int, int))dlsym(RTLD_NEXT, "dup3");
+        fn = (int (*)(int, int, int))bxroot_next_symbol("dup3");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(oldfd, newfd, flags);
 }
@@ -3720,7 +4106,7 @@ int fcntl(int fd, int cmd, ...) {
     void *arg;
 
     if (fn == NULL)
-        fn = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "fcntl");
+        fn = (int (*)(int, int, ...))bxroot_next_symbol("fcntl");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     /* 变参原样搬运 —— fcntl 的第三参数类型随 cmd 变化，不能统一处理 */
@@ -3733,7 +4119,7 @@ int fcntl(int fd, int cmd, ...) {
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
     static ssize_t (*fn)(int, const struct iovec *, int) = NULL;
     if (fn == NULL)
-        fn = (ssize_t (*)(int, const struct iovec *, int))dlsym(RTLD_NEXT, "writev");
+        fn = (ssize_t (*)(int, const struct iovec *, int))bxroot_next_symbol("writev");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(fd, iov, iovcnt);
 }
@@ -3753,7 +4139,7 @@ int getrlimit(__rlimit_resource_t resource, struct rlimit *rlim) {
     static int (*fn)(__rlimit_resource_t, struct rlimit *) = NULL;
     if (fn == NULL)
         fn = (int (*)(__rlimit_resource_t, struct rlimit *))
-             dlsym(RTLD_NEXT, "getrlimit");
+             bxroot_next_symbol("getrlimit");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(resource, rlim);
 }
@@ -3805,7 +4191,7 @@ int setrlimit(__rlimit_resource_t resource, const struct rlimit *rlim) {
     static int (*fn)(__rlimit_resource_t, const struct rlimit *) = NULL;
     if (fn == NULL)
         fn = (int (*)(__rlimit_resource_t, const struct rlimit *))
-             dlsym(RTLD_NEXT, "setrlimit");
+             bxroot_next_symbol("setrlimit");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     return rl_nofile_eperm_to_ok(resource, fn(resource, rlim));
@@ -3815,7 +4201,7 @@ int getrlimit64(__rlimit_resource_t resource, struct rlimit64 *rlim) {
     static int (*fn)(__rlimit_resource_t, struct rlimit64 *) = NULL;
     if (fn == NULL)
         fn = (int (*)(__rlimit_resource_t, struct rlimit64 *))
-             dlsym(RTLD_NEXT, "getrlimit64");
+             bxroot_next_symbol("getrlimit64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(resource, rlim);
 }
@@ -3824,7 +4210,7 @@ int setrlimit64(__rlimit_resource_t resource, const struct rlimit64 *rlim) {
     static int (*fn)(__rlimit_resource_t, const struct rlimit64 *) = NULL;
     if (fn == NULL)
         fn = (int (*)(__rlimit_resource_t, const struct rlimit64 *))
-             dlsym(RTLD_NEXT, "setrlimit64");
+             bxroot_next_symbol("setrlimit64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     return rl_nofile_eperm_to_ok(resource, fn(resource, rlim));
@@ -3848,7 +4234,7 @@ int prlimit(pid_t pid, __rlimit_resource_t resource,
                      struct rlimit *) = NULL;
     if (fn == NULL)
         fn = (int (*)(pid_t, __rlimit_resource_t, const struct rlimit *,
-                      struct rlimit *))dlsym(RTLD_NEXT, "prlimit");
+                      struct rlimit *))bxroot_next_symbol("prlimit");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     return rl_nofile_eperm_to_ok(resource,
@@ -3861,7 +4247,7 @@ int prlimit64(pid_t pid, __rlimit_resource_t resource,
                      struct rlimit64 *) = NULL;
     if (fn == NULL)
         fn = (int (*)(pid_t, __rlimit_resource_t, const struct rlimit64 *,
-                      struct rlimit64 *))dlsym(RTLD_NEXT, "prlimit64");
+                      struct rlimit64 *))bxroot_next_symbol("prlimit64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     return rl_nofile_eperm_to_ok(resource,
@@ -3987,7 +4373,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
     if (fn == NULL)
         fn = (int (*)(int, const struct sockaddr *, socklen_t))
-             dlsym(RTLD_NEXT, "bind");
+             bxroot_next_symbol("bind");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (is_unix_path_sockaddr(addr, addrlen, &path, &off)) {
@@ -4028,7 +4414,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
     if (fn == NULL)
         fn = (int (*)(int, const struct sockaddr *, socklen_t))
-             dlsym(RTLD_NEXT, "connect");
+             bxroot_next_symbol("connect");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (is_unix_path_sockaddr(addr, addrlen, &path, &off)) {
@@ -4065,7 +4451,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 int socket(int domain, int type, int protocol) {
     static int (*fn)(int, int, int) = NULL;
     if (fn == NULL)
-        fn = (int (*)(int, int, int))dlsym(RTLD_NEXT, "socket");
+        fn = (int (*)(int, int, int))bxroot_next_symbol("socket");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(domain, type, protocol);
 }
@@ -4074,7 +4460,7 @@ int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     static int (*fn)(int, struct sockaddr *, socklen_t *) = NULL;
     if (fn == NULL)
         fn = (int (*)(int, struct sockaddr *, socklen_t *))
-             dlsym(RTLD_NEXT, "getsockname");
+             bxroot_next_symbol("getsockname");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(sockfd, addr, addrlen);
 }
@@ -4084,7 +4470,7 @@ int getsockopt(int sockfd, int level, int optname, void *optval,
     static int (*fn)(int, int, int, void *, socklen_t *) = NULL;
     if (fn == NULL)
         fn = (int (*)(int, int, int, void *, socklen_t *))
-             dlsym(RTLD_NEXT, "getsockopt");
+             bxroot_next_symbol("getsockopt");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(sockfd, level, optname, optval, optlen);
 }
@@ -4094,7 +4480,7 @@ int setsockopt(int sockfd, int level, int optname, const void *optval,
     static int (*fn)(int, int, int, const void *, socklen_t) = NULL;
     if (fn == NULL)
         fn = (int (*)(int, int, int, const void *, socklen_t))
-             dlsym(RTLD_NEXT, "setsockopt");
+             bxroot_next_symbol("setsockopt");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(sockfd, level, optname, optval, optlen);
 }
@@ -4103,7 +4489,7 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
     static ssize_t (*fn)(int, const struct msghdr *, int) = NULL;
     if (fn == NULL)
         fn = (ssize_t (*)(int, const struct msghdr *, int))
-             dlsym(RTLD_NEXT, "sendmsg");
+             bxroot_next_symbol("sendmsg");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(sockfd, msg, flags);
 }
@@ -4112,7 +4498,7 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
     static ssize_t (*fn)(int, struct msghdr *, int) = NULL;
     if (fn == NULL)
         fn = (ssize_t (*)(int, struct msghdr *, int))
-             dlsym(RTLD_NEXT, "recvmsg");
+             bxroot_next_symbol("recvmsg");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(sockfd, msg, flags);
 }
@@ -4121,7 +4507,7 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
 int getifaddrs(struct ifaddrs **ifap) {
     static int (*fn)(struct ifaddrs **) = NULL;
     if (fn == NULL)
-        fn = (int (*)(struct ifaddrs **))dlsym(RTLD_NEXT, "getifaddrs");
+        fn = (int (*)(struct ifaddrs **))bxroot_next_symbol("getifaddrs");
     if (fn == NULL) { errno = ENOSYS; return -1; }
     return fn(ifap);
 }
@@ -4129,7 +4515,7 @@ int getifaddrs(struct ifaddrs **ifap) {
 void freeifaddrs(struct ifaddrs *ifa) {
     static void (*fn)(struct ifaddrs *) = NULL;
     if (fn == NULL)
-        fn = (void (*)(struct ifaddrs *))dlsym(RTLD_NEXT, "freeifaddrs");
+        fn = (void (*)(struct ifaddrs *))bxroot_next_symbol("freeifaddrs");
     if (fn == NULL) return;
     fn(ifa);
 }
@@ -4144,7 +4530,7 @@ int mkstemp64(char *template) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(char *))dlsym(RTLD_NEXT, "mkstemp64");
+        fn = (int (*)(char *))bxroot_next_symbol("mkstemp64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -4165,7 +4551,7 @@ int mkostemp64(char *template, int flags) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(char *, int))dlsym(RTLD_NEXT, "mkostemp64");
+        fn = (int (*)(char *, int))bxroot_next_symbol("mkostemp64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -4186,7 +4572,7 @@ int mkstemps64(char *template, int suffixlen) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(char *, int))dlsym(RTLD_NEXT, "mkstemps64");
+        fn = (int (*)(char *, int))bxroot_next_symbol("mkstemps64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -4207,7 +4593,7 @@ int mkostemps(char *template, int suffixlen, int flags) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(char *, int, int))dlsym(RTLD_NEXT, "mkostemps");
+        fn = (int (*)(char *, int, int))bxroot_next_symbol("mkostemps");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -4228,7 +4614,7 @@ int mkostemps64(char *template, int suffixlen, int flags) {
     int rc;
 
     if (fn == NULL)
-        fn = (int (*)(char *, int, int))dlsym(RTLD_NEXT, "mkostemps64");
+        fn = (int (*)(char *, int, int))bxroot_next_symbol("mkostemps64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(template, local, sizeof(local)) <= 0)
@@ -4258,7 +4644,7 @@ int scandir64(const char *dirp, struct dirent64 ***namelist,
                       int (*)(const struct dirent64 *),
                       int (*)(const struct dirent64 **,
                               const struct dirent64 **)))
-             dlsym(RTLD_NEXT, "scandir64");
+             bxroot_next_symbol("scandir64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
     if (translate_path(dirp, translated, sizeof(translated)) > 0)
@@ -4373,7 +4759,7 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
 
     if (fn == NULL)
         fn = (FILE *(*)(const char *, const char *, FILE *))
-             dlsym(RTLD_NEXT, "freopen");
+             bxroot_next_symbol("freopen");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
     /* path == NULL 时 freopen 用于"改 mode"，没有路径可翻译 */
@@ -4393,7 +4779,7 @@ FILE *freopen64(const char *path, const char *mode, FILE *stream) {
 
     if (fn == NULL)
         fn = (FILE *(*)(const char *, const char *, FILE *))
-             dlsym(RTLD_NEXT, "freopen64");
+             bxroot_next_symbol("freopen64");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
     if (path != NULL) {
@@ -4465,18 +4851,81 @@ gid_t getegid(void) {
 }
 
 /* Hook: uname (伪装为 Linux) */
+/*
+ * 有界字符串长度（供 uname 的定长字段拷贝使用）。
+ *
+ * ★ 为什么必须 `noinline` ★
+ * `strnlen(literal, 64)` 会被 gcc 13 判 `-Wstringop-overread`：
+ * 它看到源是 6 字节字面量、而界限是 64，就认为可能越界读。
+ * 实际上 strnlen 遇到 NUL 即停，字面量必然有 NUL，**不会越界** ——
+ * 这是该模式下的已知误报。但告警门禁要求零告警，不能靠 `-Wno-` 掩盖。
+ *
+ * 包一层 `noinline` 之后，gcc 在调用点看不到源对象的尺寸，
+ * 无法做这项推断，误报消失；函数本身仍是"遇到 NUL 即停"，
+ * 语义与直接调用 strnlen 完全一致。
+ */
+__attribute__((noinline))
+static size_t bxroot_bounded_strlen(const char *s, size_t cap) {
+    return strnlen(s, cap);
+}
+
 int uname(struct utsname *buf) {
     ensure_real_functions();
 
     int ret = real_uname(buf);
     if (ret == 0) {
+        /*
+         * ★ 定长字段写入必须显式补 NUL ★
+         *
+         * `struct utsname` 的字段是**定长数组**（`_UTSNAME_LENGTH`，本平台 65），
+         * 不是指针。原来的写法 `strncpy(dst, "6.1.0", sizeof(dst))` 对**固定
+         * 字面量**是安全的（源串远短于目标），但一旦源变成**用户输入**就
+         * 会踩 `strncpy` 的经典陷阱：
+         *
+         *   源串长度 >= sizeof(dst) 时，strncpy **不写结尾 NUL**，
+         *   于是字段没有终止符 —— 调用方 `printf("%s", buf->release)`
+         *   会越界读到相邻字段，直到偶然遇到一个 0 字节。
+         *
+         * `-k/--kernel-release` 正是把用户输入接到这里，所以必须改。
+         * 下面的 `copy_field()` 统一处理三类字段，避免三处各写一遍。
+         */
+        #define UNAME_COPY_FIELD(dst, src)                        \
+            do {                                                  \
+                size_t cap_ = sizeof(dst);                        \
+                size_t n_ = bxroot_bounded_strlen((src), cap_ - 1); \
+                memset((dst), 0, cap_);        /* 先清零 → 必定 NUL */ \
+                memcpy((dst), (src), n_);                         \
+            } while (0)
+
         /* 确保显示为 Linux 而不是 Android */
         if (strstr(buf->sysname, "Android") != NULL) {
-            strncpy(buf->sysname, "Linux", sizeof(buf->sysname));
+            UNAME_COPY_FIELD(buf->sysname, "Linux");
         }
-        /* 伪装 kernel release */
-        strncpy(buf->release, "6.1.0", sizeof(buf->release));
-        strncpy(buf->machine, "aarch64", sizeof(buf->machine));
+
+        /*
+         * 伪装 kernel release。
+         *
+         * 取值优先级：`BXROOT_KERNEL_RELEASE`（由 launcher 从
+         * `-k/--kernel-release` 派生）→ 默认 `"6.1.0"`。
+         *
+         * ★ 默认值不能变 ★
+         * 未设该变量时必须仍是 `6.1.0` —— 这是长期以来的既有行为，
+         * 改了会让所有"没传 -k"的场景出现内核版本变化，属无谓回归。
+         *
+         * 每次调用都 getenv 而不是缓存：uname 不是热路径（正常程序启动
+         * 时调几次），而缓存会引入"环境在运行中被改"的一致性问题。
+         */
+        {
+            const char *rel = getenv("BXROOT_KERNEL_RELEASE");
+            if (rel == NULL || rel[0] == '\0') {
+                rel = "6.1.0";
+            }
+            UNAME_COPY_FIELD(buf->release, rel);
+        }
+
+        UNAME_COPY_FIELD(buf->machine, "aarch64");
+
+        #undef UNAME_COPY_FIELD
     }
 
     return ret;
