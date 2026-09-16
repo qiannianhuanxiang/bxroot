@@ -36,7 +36,15 @@ CC="${CC:-gcc}"
 
 # proc.c / proc.h 所在目录（D4 域源）。允许用环境变量覆盖，
 # 但默认按仓库布局推导，避免把绝对路径写死进仓库。
-PROC_DIR="${BXROOT_PROC_DIR:-$(cd "$ROOT/../proc" 2>/dev/null && pwd)}"
+# 优先仓库内的 src/proc（自足），其次仓库外的 ../proc（开发期布局）。
+PROC_DIR="${BXROOT_PROC_DIR:-}"
+if [ -z "$PROC_DIR" ]; then
+    if [ -f "$ROOT/src/proc/proc.c" ]; then
+        PROC_DIR="$ROOT/src/proc"
+    else
+        PROC_DIR="$(cd "$ROOT/../proc" 2>/dev/null && pwd)"
+    fi
+fi
 
 SRC="src/runtime/preload.c \
      src/l2s/l2s.c src/l2s/l2s-runtime.c \

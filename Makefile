@@ -14,9 +14,11 @@ SO_CFLAGS = -shared -fPIC $(COMMON_CFLAGS)
 SO_LDFLAGS = -ldl -nostartfiles
 
 # D4 进程管理层的源目录（proc.c / proc.h）。
-# 默认按仓库布局推导（rename-bxroot 与 proc 是 agents/ 下的兄弟目录），
-# 可用 `make PROC_DIR=/path/to/proc` 覆盖。
-PROC_DIR ?= $(abspath $(CURDIR)/../proc)
+#
+# 优先仓库内的 src/proc —— 克隆下来即可构建，不依赖仓库外的兄弟目录。
+# 回退到 ../proc 是开发期布局（D4 曾是独立子项目）。
+# 可用 `make PROC_DIR=/path/to/proc` 显式覆盖。
+PROC_DIR ?= $(if $(wildcard src/proc/proc.c),src/proc,$(abspath $(CURDIR)/../proc))
 
 # DSHA 原生库目录（通过 /proc 访问）
 DSHA_PID = 862
