@@ -123,20 +123,54 @@ fs.writeFileSync(a, "hello");
 try { fs.unlinkSync(b); } catch (e) {}
 
 let nlink = -1, isLink = null, content = null, err = "";
+let lsize = -1, ssize = -1;
 try {
     fs.linkSync(a, b);
     const st = fs.statSync(a);
     nlink = st.nlink;
     isLink = fs.lstatSync(a).isSymbolicLink();
     content = fs.readFileSync(b, "utf8");
+    /*
+     * ★ size 两个都要测 ★
+     *
+     * 实测教训：本测试此前只测 nlink / islink / content，**漏了 size**，
+     * 于是"lstat 返回符号链接自身长度（64）而非真实文件大小（5）"这个
+     * 缺陷藏了很久 —— 直到用真实工具链（tar / cp -a）探针才暴露，
+     * 而那时 tar 已经把宿主绝对路径写进了归档。
+     *
+     *   stat().size  —— 走 stat 路径
+     *   lstat().size —— 走 lstat 路径（那条会返回链接自身长度）
+     * 两者都必须是真实内容长度，且**彼此相等**。
+     */
+    ssize = st.size;
+    lsize = fs.lstatSync(a).size;
 } catch (e) { err = e.code || e.message; }
+
+/*
+ * ★ 真符号链接的 readlink 必须仍然正常 ★
+ *
+ * 这是修复"伪造链接的 readlink 应返回 EINVAL"时**最容易破坏**的东西：
+ * 一刀切地让 readlink 失败，就会把正常功能一起关掉。
+ * 所以这里显式验证：用户自己建的符号链接，readlink 要返回它的目标。
+ */
+let realLinkOk = null, realLinkErr = "";
+try {
+    const t = d + "/target.txt", l = d + "/real.lnk";
+    fs.writeFileSync(t, "t");
+    try { fs.unlinkSync(l); } catch (e) {}
+    fs.symlinkSync("target.txt", l);          /* 相对目标，便于比对 */
+    realLinkOk = (fs.readlinkSync(l) === "target.txt");
+} catch (e) { realLinkOk = false; realLinkErr = e.code || e.message; }
 
 try { fs.rmSync(d, {recursive: true}); } catch (e) {}
 
 /* 单行、机器可解析的输出 —— 便于本脚本与人工核对 */
 console.log("RESULT nlink=" + nlink + " islink=" + isLink +
+            " size=" + lsize + " stsize=" + ssize +
+            " reallink=" + realLinkOk +
             " content=" + JSON.stringify(content) +
-            (err ? (" err=" + err) : ""));
+            (err ? (" err=" + err) : "") +
+            (realLinkErr ? (" realLinkErr=" + realLinkErr) : ""));
 JSEOF
 
 run_one() {
@@ -178,6 +212,22 @@ FAIL=0
 [ "$nlink" = "2" ]    || { echo "  ❌ st_nlink 应为 2，实得 $nlink"; FAIL=1; }
 [ "$islink" = "false" ] || { echo "  ❌ lstat 不应把它看成符号链接（实得 islink=$islink）"; FAIL=1; }
 [ "$content" = '"hello"' ] || { echo "  ❌ 内容应为 \"hello\"，实得 $content"; FAIL=1; }
+
+# size 必须等于内容长度（"hello" = 5），且 stat/lstat 两条路一致
+lsize=$(echo "$GOT" | sed -n 's/.* size=\([0-9-]*\).*/\1/p')
+ssize=$(echo "$GOT" | sed -n 's/.* stsize=\([0-9-]*\).*/\1/p')
+reallink=$(echo "$GOT" | sed -n 's/.* reallink=\([a-z]*\).*/\1/p')
+
+[ "$lsize" = "5" ] || { echo "  ❌ lstat size 应为 5（真实内容长度），实得 $lsize"
+                        echo "     （若为 60+ 说明返回的是符号链接目标字符串长度 —— 见"
+                        echo "       docs/l2s-真实工具链缺陷-tar与lstat-size.md）"; FAIL=1; }
+[ "$ssize" = "5" ] || { echo "  ❌ stat size 应为 5，实得 $ssize"; FAIL=1; }
+[ "$lsize" = "$ssize" ] || { echo "  ❌ stat/lstat 两条路的 size 不一致（$ssize vs $lsize）"; FAIL=1; }
+
+# 真符号链接的 readlink 必须仍正常 —— 防止修复时"一刀切关掉 readlink"
+[ "$reallink" = "true" ] || { echo "  ❌ 真符号链接的 readlink 失效（reallink=$reallink）"
+                              echo "     ★ 这是修复\"伪造链接 readlink 返回 EINVAL\"时最容易破坏的点："
+                              echo "       一刀切会让正常符号链接也读不出来"; FAIL=1; }
 
 # ---------------------------------------------------------------------
 # 2) 官方对照（可选 —— 拿不到官方 runtime 就只做绝对判据）
