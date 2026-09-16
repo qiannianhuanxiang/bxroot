@@ -32,7 +32,7 @@ TARGETS = \
 	$(BUILD_DIR)/libbxroot-bridge.so \
 	$(BUILD_DIR)/libbxroot-stub-loader.so
 
-.PHONY: all clean install install-dsha debug runtime
+.PHONY: all clean install install-dsha debug runtime test test-quick
 
 all: $(TARGETS)
 
@@ -137,5 +137,17 @@ debug: clean
 debug: all
 
 # === 测试 ===
-test: all
-	bash test/full_test.sh
+#
+# ★ 修正 ★ 原规则写的是 `bash test/full_test.sh`，而**该文件从不存在** ——
+# 也就是说过去谁执行 `make test` 都只会拿到 "No such file or directory"，
+# 全量回归实际上从没从 make 入口跑起来过（历史"全绿"记录均来自手敲的
+# gcc 命令）。现指向真实的回归入口 test/RUN_ALL.sh，它串起 9 组测试：
+# 告警门禁 / l2s / 协同 / fakeroot / 参数位置 / crash / D4 / wait / 构建。
+#
+# `make test-quick` 跳过耗时的运行时构建。
+
+test:
+	sh test/RUN_ALL.sh
+
+test-quick:
+	sh test/RUN_ALL.sh --quick

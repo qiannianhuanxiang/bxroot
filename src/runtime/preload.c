@@ -3735,7 +3735,7 @@ int getrlimit(__rlimit_resource_t resource, struct rlimit *rlim) {
  * 【官方怎么做】反汇编 runtime 的 setrlimit(+0xa228) / setrlimit64(+0xa4a8)
  * 与 prlimit(+0xa324) / prlimit64(+0xa38c)，四个入口共用同一段判定：
  *
- *     rc = syscall(261 /*prlimit64* /, 0, res, new, 0, 0);
+ *     rc = syscall(261, 0, res, new, 0, 0);   // 261 = prlimit64
  *     if (rc == 0)                     return 0;
  *     if (res != RLIMIT_NOFILE)        { errno 原样; return -1; }
  *     if (errno != EPERM)              { errno 原样; return -1; }

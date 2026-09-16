@@ -252,7 +252,43 @@ static int path_arg_index(long nr)
     case 276:  return 1;   /* renameat2: 只翻 oldpath                 */
     case 260:  return 1;   /* linkat:    只翻 oldpath                 */
     case 38:   return 1;   /* renameat:  只翻 oldpath                 */
-    case 36:   return 1;   /* symlinkat: a1 是 linkpath（a0 是目标）  */
+
+    /*
+     * ★ case 36 (symlinkat) —— **刻意不列入**。
+     *
+     * 这是我自己引入过的一次致命回归，记录在此防止重犯：
+     *
+     *   symlinkat(const char *target, int newdirfd, const char *linkpath)
+     *                ↑ x0              ↑ x1            ↑ x2
+     *
+     * 我先前按"a1 是路径"列了 `case 36: return 1` —— **错**。
+     * a1 是 `newdirfd`（一个 int）。本表的表达能力只有 a0/a1 二选一，
+     * 于是 guard 会把 `AT_FDCWD`（= -100 = 0xffffffffffffff9c）
+     * **当成路径指针解引用** → 每一次走裸 syscall 的 symlinkat 都 SIGSEGV。
+     *
+     * 实测证据（本机）：
+     *     syscall(36, target, AT_FDCWD, linkpath) → errno=ENOTDIR
+     *     说明 x1 确实被内核当作目录 fd 解释。
+     *
+     * 后果尤其严重：symlinkat 是**创建符号链接**的入口，而 l2s 层
+     * （硬链接模拟）大量依赖它。一旦客户走裸 syscall 形态，就是整进程
+     * 静默消失，而且现场无任何输出。
+     *
+     * 【为什么选"不列入"而不是"改翻 a2"】
+     * 本表只能返回 0 或 1（表示 a0 或 a1）。symlinkat 的 linkpath 在 a2，
+     * 表**表达不了**。硬塞会再次翻错。正确做法是把手头的翻译分支改成
+     * 显式 switch（已具备该结构），或把接口升级为位掩码 —— 那是后续工作。
+     * 当前选择"不翻译"而非"翻错"：不翻译只是该调用绕过翻译（链接建到
+     * 宿主路径），翻错则是**崩溃**。两害相权取其轻。
+     *
+     * 【同类核对结论】其余带 dirfd 的调用 a1 确实是路径，均正确：
+     *     linkat(olddirfd, oldpath, ...)     → a1 = oldpath ✅
+     *     renameat(olddirfd, oldpath, ...)   → a1 = oldpath ✅
+     *     renameat2(olddirfd, oldpath, ...)  → a1 = oldpath ✅
+     *     faccessat2(dfd, path, ...)         → a1 = path    ✅
+     *     execveat(dfd, path, ...)           → a1 = path    ✅
+     * symlinkat 是**唯一**把 target 放 a0、linkpath 放 a2 的，所以只有它特殊。
+     */
 
     default:   return -1;
     }

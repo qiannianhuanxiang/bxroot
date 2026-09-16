@@ -56,7 +56,18 @@ SRC="src/runtime/preload.c \
      src/runtime/fakeroot.c src/runtime/crash.c src/runtime/sigsys.c \
      src/runtime/syscall_guard.c src/runtime/livepatch.c"
 
-CFLAGS="-shared -fPIC -w -D_GNU_SOURCE"
+# 警告策略：原先的 -w 会把**全部**警告静默掉 —— 包括 -Wformat=2。
+# 真实教训：launcher.c 里一处 fprintf 少传两个实参（栈上取垃圾指针），
+# 就是被 -w 掩盖的（现已修）。这里改为精确开启，只压掉确认无意义的类别。
+#   -Wnonnull-compare：我们对所有防御性判空都会触发，属误报（函数声明带
+#     __nonnull，gcc 认为判空是死代码，但这些判空正是防上层乱传 NULL 的）。
+#   -Wunused-parameter：大量 hook 签名必须与 libc 原型逐字一致，用不到也得留。
+#   -D_GNU_SOURCE=（空定义）：部分编译单元（l2s.c / proc.c / fakeroot.c）
+#     依赖命令行提供该宏，而另一些（preload.c / sigsys.c / …）在文件头
+#     自行 #define，两边一撞就是 "redefined" 告警。写成空定义后，
+#     需要它的文件照样拿到特性，自备定义的文件也不再报重复。
+WARN="-Wall -Wextra -Wformat=2 -Wno-nonnull-compare -Wno-unused-parameter"
+CFLAGS="-shared -fPIC $WARN -D_GNU_SOURCE="
 INCS="-Isrc/l2s -Isrc/runtime"
 DEFS="-DFAKEROOT_PURE_LOGIC -DPX_PURE_LOGIC=0"
 LDFLAGS="-ldl -nostartfiles"

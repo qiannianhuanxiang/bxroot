@@ -9,8 +9,15 @@
 #
 # 又：本容器 aarch64 gcc 13.3.0 会**间歇性**内部编译器错误（ICE），
 # 同一个命令重试几次往往就过。所以下面每个编译都带重试循环。
+#
+# ★ 路径修正（重要）★
+# 本脚本原先 cd 到 test/ 后直接引用 `fakeroot.c` / `fakeroot.h`，
+# 那是 **D4 之前的老布局**（源码曾与测试同目录）。源码迁到
+# src/runtime/ 之后，这两条引用就再也找不到了 —— 脚本一直是坏的，
+# 只是没人从脚本入口跑过（全绿记录其实来自手敲的 gcc 命令行）。
+# 现在改为以**仓库根**为工作目录，显式带上 -Isrc/runtime。
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 retry_build() {
     # $1 = 输出文件；其余 = 编译参数
@@ -33,14 +40,16 @@ retry_build() {
 
 case "${1:-}" in
 ubsan)
-    retry_build test_fakeroot.ub -std=c11 -O1 -g -D_GNU_SOURCE \
+    retry_build test/test_fakeroot.ub -std=c11 -O1 -g -D_GNU_SOURCE \
+        -Isrc/runtime -DFAKEROOT_PURE_LOGIC \
         -fsanitize=undefined -fno-sanitize-recover=all \
-        test_fakeroot.c fakeroot.c
-    exec ./test_fakeroot.ub
+        test/test_fakeroot.c src/runtime/fakeroot.c
+    exec ./test/test_fakeroot.ub
     ;;
 *)
-    retry_build test_fakeroot -std=c11 -O1 -Wall -Wextra -D_GNU_SOURCE \
-        test_fakeroot.c fakeroot.c
-    exec ./test_fakeroot
+    retry_build test/test_fakeroot -std=c11 -O1 -Wall -Wextra -D_GNU_SOURCE \
+        -Isrc/runtime -DFAKEROOT_PURE_LOGIC \
+        test/test_fakeroot.c src/runtime/fakeroot.c
+    exec ./test/test_fakeroot
     ;;
 esac
