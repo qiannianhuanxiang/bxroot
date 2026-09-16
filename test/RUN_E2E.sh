@@ -130,7 +130,21 @@ fi
 #            "deps: failed to preload … proroot-ldso: failure rc=2"。
 #
 # 所以：用 STAGE_MKDIR 建目录，用 STAGE_LOAD 引用文件。
-STAGE_MKDIR="/tmp/bxroot-e2e"                 # 容器视角，供 mkdir/cp 使用
+#
+# ★ 落地目录按进程隔离（实测教训）★
+#
+# 这里原先是**固定路径** `/tmp/bxroot-e2e`，而且下面有一句
+# `rm -rf "$STAGE_MKDIR"`。后果：任何人跑本脚本都会**删掉别人放在那里
+# 的工作文件**。本项目并行开发时实际发生过 —— 三个探针被删了三次，
+# 有个 agent 的官方 runtime 副本也被清掉，导致"官方对照"一度跑不起来
+# （报 `deps: failed to preload ...`），排查方向被带偏。
+#
+# 固定共享路径 + 无条件 rm -rf，是并行环境里的一个**协作陷阱**：
+# 它不报错，只是让别人的东西静默消失。
+#
+# 改为带 $$ 的私有目录后：可以并发跑、互不干扰；`rm -rf` 也
+# 只删自己的。需要保留现场的，用 BXROOT_STAGE 显式指定路径。
+STAGE_MKDIR="${BXROOT_STAGE:-/tmp/bxroot-e2e-$$}"   # 容器视角，供 mkdir/cp 使用
 STAGE_LOAD="$ROOTFS/tmp/bxroot-e2e"           # 内核视角，供 --preload 使用
 
 # ---------------------------------------------------------------------
@@ -149,6 +163,15 @@ esac
 [ -f "$DSH_JS" ]   || die "找不到 dsh 入口: $DSH_JS"
 [ -f "$BXROOT_SO" ] || die "找不到 bxroot 运行时: $BXROOT_SO"
 
+#
+# ★ rm -rf 的护栏 ★
+# 只允许删「名字里含 bxroot-e2e」的目录。如果用户用 BXROOT_STAGE 指了
+# 别的路径（比如想复用现场），一个手滑的变量就会删掉无关目录 ——
+# 这类脚本级误删没有回收站，所以宁可拒绝执行。
+case "$STAGE_MKDIR" in
+    *bxroot-e2e*) ;;
+    *) die "拒绝删除 $STAGE_MKDIR：路径不含 bxroot-e2e，疑似误配 BXROOT_STAGE" ;;
+esac
 rm -rf "$STAGE_MKDIR" 2>/dev/null
 mkdir -p "$STAGE_MKDIR" || die "无法创建落地目录 $STAGE_MKDIR"
 # mkdir 返回 0 不代表成功（见上文双重翻译说明），必须实测
