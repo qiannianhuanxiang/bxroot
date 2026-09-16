@@ -97,6 +97,43 @@
 - 是**用真实工具链（`tar`/`cp -a`）探针**才暴露的 —— 又一次印证：
   **单一入口、单一指标的覆盖不全**（与 `fstatat` 漏接那次同一类问题）
 
+## 追加证据：`readlink` 让 `cp -a` 报 ELOOP
+
+用常用工具逐个实测（bxroot 下）：
+
+```
+[readlink]     /data/data/com.dsh.client/files/linux/ubuntu/tmp/tl-1/a
+[realpath -s]  /tmp/tl-1/a
+[cat]          hello
+[cp -a]        /usr/bin/cp: cannot open '/tmp/tl-1/a' for reading:
+               Too many levels of symbolic links        ← ★ ELOOP ★
+               FAIL
+```
+
+**这不是"看起来像自环"，而是下游真的踩到了 `ELOOP`。**
+
+### 一个被推翻的判断
+
+定位过程中我曾认为："`readlink` 返回的看起来像自环，但 `cat` 能正常读，所以只是看起来像。"
+
+**那个判断是错的**：
+- `cat` 能读 —— 因为它走 `open`，内核解析时用的是**磁盘真值**
+- `cp -a` 失败 —— 因为它**读 `readlink` 的结果再自己解析**，于是踩到 `ELOOP`
+
+所以 `readlink` 返回"指向客户自身的路径"是**真实的功能性破坏**，
+不只是"与官方语义不同"。
+
+### 两项缺陷互相加剧
+
+```
+cp -a 的判定链：
+  ① 看 st_mode  → S_IFREG ✅（l2s 已修好）
+  ② 看 readlink → 有结果 → 判定为符号链接 ❌
+  ③ 解析该路径 → 自环 → ELOOP ❌
+```
+
+`st_size` 与 `readlink` **两者都必须修**。
+
 ## PRoot 的权威做法（逐行对照）
 
 根因确认后，我把 PRoot 的 `link2symlink` 实现挖了出来
