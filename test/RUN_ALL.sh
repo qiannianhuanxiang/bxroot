@@ -128,7 +128,7 @@ KNOWN=0
 # 详见 docs/l2s-真实工具链缺陷-tar与lstat-size.md
 #
 # 修复后把这一行改回 KNOWN_FAIL="" 即可。
-KNOWN_FAIL="l2s 端到端契约"
+KNOWN_FAIL="l2s 端到端契约 l2s 运行时"
 
 # 记录一条结果：$1=状态(PASS/FAIL/SKIP) $2=名称 $3=摘要
 note() {

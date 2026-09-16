@@ -430,6 +430,85 @@ static void t_no_rename_regression(void)
 /* A4. readlink 反转译                                                  */
 /* ================================================================== */
 
+/*
+ * A11. `patch_stat` 必须回填**真实文件大小**，而不是符号链接自身的长度。
+ *
+ * 【为什么这条必须单独测】
+ *
+ * `l2s_rt_patch_stat` 修的是「让伪造链接看起来像真实硬链接」。此前的实现
+ * 只改 `st_nlink` 与 `st_mode` 的 S_IFLNK 位，**其余字段保持内核给的** ——
+ * 而内核给的是**符号链接的** stat，于是：
+ *
+ *     st_size = 符号链接目标字符串的长度（几十字节）
+ *     真实文件可能只有 5 字节
+ *
+ * 【后果（实测，不是理论）】
+ * 用真实工具链探针发现的：
+ *     tar tvf → 把伪造链接按**符号链接**归档，并把**宿主绝对路径**写进归档
+ *     cp -a  → 直接失败
+ * 官方 proroot 在同场景下 `tar` 输出的是普通文件、大小正确。
+ *
+ * 【PRoot 的做法（权威参照）】
+ * `src/extension/link2symlink/link2symlink.c:860-890` —— 它是**整体替换**
+ * 客户的 `struct stat` 为**数据文件的**，只保留 `mode` / `uid` / `gid`。
+ * 所以 `st_size` / `st_ino` / `st_blocks` 全部来自数据文件。
+ *
+ * 【本测试钉住什么】
+ *   ① `st_size` 等于真实内容长度（不是链接目标的长度）
+ *   ② 普通文件不受影响（其 size 本就是对的）
+ *   ③ `st_nlink` / `st_mode` 的既有行为不回归
+ */
+static void t_stat_size_is_real(void)
+{
+    l2s_config cfg = cfg_beside();
+    char a[PATH_MAX], b[PATH_MAX];
+    struct stat st;
+    const char *content = "hello";     /* 5 字节 —— 与链接目标长度差别明显 */
+
+    CASE("A11 patch_stat 回填真实 size（不是链接长度）");
+    sandbox_make("statsize");
+    l2s_rt_init(&REAL_OPS, &cfg);
+    l2s_rt_reset_stats();
+
+    sp(a, sizeof(a), "s.txt");
+    sp(b, sizeof(b), "t.txt");
+    write_file(a, content);
+    CHECK_EQ_I(l2s_rt_link(a, b), 0);
+
+    /* 内核视角：符号链接，其 st_size 是**目标字符串长度**（远大于 5） */
+    CHECK(lstat(a, &st) == 0);
+    CHECK(S_ISLNK(st.st_mode));
+    {
+        /*
+         * 先确认"内核给的 size 确实不等于内容长度" —— 否则本测试没有
+         * 判别力（若链接目标恰好 5 字节，就测不出回填是否发生）。
+         * 这是一个**前提断言**：它保证下面的断言有意义。
+         */
+        CHECK(st.st_size != (off_t)strlen(content));
+    }
+
+    /* 客户视角：普通文件，size 必须是真实内容长度 */
+    l2s_rt_patch_stat(&st, a);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_I(st.st_nlink, 2);
+    CHECK_EQ_I(st.st_size, (off_t)strlen(content));
+
+    /* 普通文件不受影响 */
+    {
+        char plain[PATH_MAX];
+        struct stat pst;
+        sp(plain, sizeof(plain), "plainfile");
+        write_file(plain, content);
+        CHECK(lstat(plain, &pst) == 0);
+        l2s_rt_patch_stat(&pst, plain);
+        CHECK(S_ISREG(pst.st_mode));
+        CHECK_EQ_I(pst.st_size, (off_t)strlen(content));
+        CHECK_EQ_I(pst.st_nlink, 1);
+    }
+
+    sandbox_drop();
+}
+
 static void t_readlink_rewrite(void)
 {
     l2s_config cfg = cfg_beside();
@@ -1031,6 +1110,7 @@ int main(void)
     t_no_rename_regression();
     t_readlink_rewrite();
     t_stat_patch();
+    t_stat_size_is_real();
     t_central_dir();
     t_link_from_fake();
     t_dir_refused();
