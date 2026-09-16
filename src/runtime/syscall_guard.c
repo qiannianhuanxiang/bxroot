@@ -202,23 +202,44 @@ static int should_block(long nr)
 /* ------------------------------------------------------------------ */
 
 /*
- * 返回该系统调用的"路径参数在第几个寄存器"，-1 表示不是路径型调用。
+ * 返回该系统调用的**路径参数位掩码**：bit N 置位表示 aN 是路径指针，
+ * 返回 0 表示不是路径型调用。
  *
- * 只列出**参数位置确定**的那些。不猜、不试探 —— 猜错会把非指针参数
- * 当路径解引用，那是比"不翻译"严重得多的故障（整进程静默消失）。
+ * 只列出**参数位置实测确定**的那些。不猜、不试探 —— 猜错会把非指针参数
+ * （典型是 dirfd，一个 int）当路径解引用，那是比"不翻译"严重得多的故障
+ * （整进程静默消失，现场无任何输出）。
+ *
+ * ====================================================================
+ * 为什么是位掩码而不是"一个下标"
+ * ====================================================================
+ *
+ * 早先这里返回 `int`（0 或 1），表达能力只有"a0 或 a1"。这带来两个后果：
+ *
+ * ① renameat / renameat2 / linkat 各有**两个**路径参数
+ *    （oldpath 在 a1、newpath 在 a3），旧接口只能表达一个，
+ *    于是 newpath 长久没被翻译 —— 跨目录改名、建硬链接时目标路径
+ *    落到宿主真实命名空间，客户看到"文件没动"或 ENOENT。
+ *
+ * ② symlinkat 的 linkpath 在 **a2**，旧接口完全表达不了。当时为了
+ *    不出错，选择**整条不列入**（见下面 case 36 的长注释）——
+ *    也就是"创建符号链接"这个入口在裸 syscall 形态下一直没有翻译，
+ *    而 l2s 层（硬链接模拟）大量依赖它。
+ *
+ * 位掩码同时解决这两件事，并且把"表能表达什么"和"有哪些调用"解耦：
+ * 再出现 a2/a3 上的路径参数时，只需改一行，不必重构调用方。
  */
-static int path_arg_index(long nr)
+static unsigned path_arg_mask(long nr)
 {
     switch (nr) {
     /* ---- 传统接口（逐条核对过参数位置）---- */
-    case 291:  return 1;   /* statx(dfd, path, flags, mask, buf)      */
-    case 79:   return 1;   /* newfstatat(dfd, path, buf, flags)       */
-    case 78:   return 1;   /* readlinkat(dfd, path, buf, sz)          */
-    case 48:   return 1;   /* faccessat(dfd, path, mode)              */
-    case 56:   return 1;   /* openat(dfd, path, flags, mode)          */
-    case 35:   return 1;   /* unlinkat(dfd, path, flags)              */
-    case 34:   return 1;   /* mkdirat(dfd, path, mode)                */
-    case 221:  return 0;   /* execve(path, argv, envp) —— a0 是路径   */
+    case 291:  return 1u << 1;  /* statx(dfd, path, flags, mask, buf)  */
+    case 79:   return 1u << 1;  /* newfstatat(dfd, path, buf, flags)   */
+    case 78:   return 1u << 1;  /* readlinkat(dfd, path, buf, sz)      */
+    case 48:   return 1u << 1;  /* faccessat(dfd, path, mode)          */
+    case 56:   return 1u << 1;  /* openat(dfd, path, flags, mode)      */
+    case 35:   return 1u << 1;  /* unlinkat(dfd, path, flags)          */
+    case 34:   return 1u << 1;  /* mkdirat(dfd, path, mode)            */
+    case 221:  return 1u << 0;  /* execve(path, argv, envp) —— a0 是路径 */
 
     /*
      * ---- 现代内核新增的路径型接口 ----
@@ -227,13 +248,41 @@ static int path_arg_index(long nr)
      * 的静态链接程序**（本层存在的全部理由）会用新接口。不列进来 =
      * 那些调用绕过路径翻译，客户看到宿主路径不存在。
      *
-     * 【编号逐个实测过】本机（Android 6.1 内核 + aarch64）：
-     *     439 faccessat2 → ENOENT（存在）
-     *     281 execveat   → EINVAL（存在）
-     *     276 renameat2  → EINVAL（存在）
-     *     260 linkat     → EPERM （存在）
-     *      38 renameat   → EFAULT（存在）
-     *      36 symlinkat  → EFAULT（存在）
+     * 【编号逐个实测核对】本机（Android 6.1 内核 + aarch64）。
+     *
+     * ★ 本轮把整张表拿本机头文件常量逐条重新核对了一遍，因为发现了
+     *   一处**真错误**（见下）。核对方法与结果：
+     *     gcc 编译期打印 SYS_xxx，与表中号码比对；再对可疑项做行为判决。
+     *     291 statx == SYS_statx ✅      79 newfstatat == SYS_newfstatat ✅
+     *      78 readlinkat ✅              48 faccessat ✅   56 openat ✅
+     *      35 unlinkat ✅                34 mkdirat ✅    221 execve ✅
+     *     439 faccessat2 ✅             281 execveat ✅   276 renameat2 ✅
+     *      38 renameat ✅                36 symlinkat ✅
+     *
+     * ★★ case 260 曾是**错的**，已删除 ★★
+     *
+     * 原表把它当 linkat 并翻译其 a1。实测（行为判决，不是查表）：
+     *
+     *     fork 一个 _exit(42) 的子进程，
+     *     syscall(260, pid, &wstatus, 0, NULL)
+     *       → 返回 pid，wstatus 被内核写入，WIFEXITED=1、WEXITSTATUS=42
+     *
+     * 只有 wait4 会写 wstatus，所以 **260 是 wait4**（asm-generic 编号），
+     * 而本机 `SYS_linkat == 37`。原注释里那句"260 linkat → EPERM（存在）"
+     * 是把"随便发一个号得到 EPERM"当成了存在性证据 —— 那个推论是无效的。
+     *
+     * 后果不是"少翻译一条"，而是**主动制造故障**，机制值得记录：
+     *   wait4 的 a1 是 `int *wstatus`。guard 的 looks_like_guest_abs_path()
+     *   只看首字节是不是 '/'。而被信号 47 终止的子进程 wstatus 恰好是
+     *   47 = 0x2F = '/' —— 实测复现：
+     *       wstatus=0x0000002f 首字节=0x2f('/') → 判定为路径 → 送去翻译
+     *   于是内核把退出状态**写进了 guard 的临时缓冲**，调用方那个
+     *   wstatus 永远保持原值。表现是"wait 拿到的退出状态莫名其妙"，
+     *   而这个故障只在信号号恰好让首字节变成 '/' 时出现 —— 极难排查。
+     *
+     * 这正是"猜参数位置比不翻译更危险"的实例：非路径参数被当路径，
+     * 不只是崩溃一条路，还可能是**静默的数据错写**。
+     *
      *     437 openat2    → **ENOSYS** ← 本内核不支持，故**不列入**
      *    1024 (旧 open)  → **ENOSYS** ← aarch64 无此编号（那是 i386 的）。
      *                              原表里的这一项已按实测**删除**。
@@ -241,45 +290,103 @@ static int path_arg_index(long nr)
      *                              `nr > __NR_syscalls` 挡掉，永不进入本函数；
      *                              但它会让人误以为 open 已被覆盖。
      *
-     * 【已知不足：双路径参数的调用】
-     * renameat2 / linkat / renameat 各有**两个**路径参数（oldpath + newpath），
-     * 而本函数只能表达"一个位置"，当前只翻 oldpath。这是**已知未覆盖**，
-     * 不是遗漏 —— 覆盖它需要把接口改成返回位掩码。优先保证单路径调用
-     * （statx/openat 等，覆盖绝大多数实际使用）正确。
+     * 【双路径参数：本轮已覆盖】
+     * renameat2 / renameat / linkat 各有**两个**路径参数
+     * （oldpath 在 a1、newpath 在 a3），旧接口表达不了，长久只翻 oldpath。
+     * 现在用位掩码一次表达两个，见下面各自的注释。
      */
-    case 439:  return 1;   /* faccessat2(dfd, path, mode, flags)      */
-    case 281:  return 1;   /* execveat(dfd, path, argv, envp, flags)  */
-    case 276:  return 1;   /* renameat2: 只翻 oldpath                 */
-    case 260:  return 1;   /* linkat:    只翻 oldpath                 */
-    case 38:   return 1;   /* renameat:  只翻 oldpath                 */
+    case 439:  return 1u << 1;          /* faccessat2(dfd, path, mode, flags) */
+    case 281:  return 1u << 1;          /* execveat(dfd, path, argv, envp, flags) */
 
     /*
-     * ★ case 36 (symlinkat) —— **刻意不列入**。
+     * ---- 双路径调用：a1 = oldpath，a3 = newpath ----
+     *
+     *   renameat (int olddirfd, const char *oldpath,
+     *             int newdirfd, const char *newpath)
+     *                a0              a1            a2            a3
+     *   renameat2(... 同上 ..., unsigned int flags)               a4 = flags
+     *   linkat   (... 同上 ..., int flags)                        a4 = flags
+     *
+     * 【实测锁定 a3（本轮新增的关键证据）】只翻 a1 是不够的，
+     * 但 a3 的位置**必须实测**而不能照抄。本机实测（见下表"方法"列）：
+     *
+     *   ① 效果：syscall(276, AT_FDCWD, SRC, AT_FDCWD, DST, 0)
+     *           → r=0，DST 出现且内容等于 SRC 原内容、SRC 消失。
+     *           证明 a3 是被创建/被写入的那个名字。
+     *   ② a2 是 dirfd 而非路径：syscall(276, AT_FDCWD, SRC, 999999, "rel", 0)
+     *           → r=-1 errno=EBADF。若 a2 是路径指针，内核会 EFAULT。
+     *   ③ a3 相对于 a2 解析：a2=真实目录 fd、a3="c_in_sub"
+     *           → r=0 且文件落在该目录里（而不是 cwd）。
+     *           这条同时证明 a3 是路径、a2 是 dirfd，且二者配对。
+     *   ④ a1 相对于 a0 解析：a0=真实目录 fd、a1="d_src"
+     *           → r=0，证明 a1 与 a0 配对。
+     *   ⑤ a4 是 flags：syscall(276, ..., 1 即 RENAME_NOREPLACE) 且目标已存在
+     *           → errno=EEXIST；换成 0 则成功。证明 a4 是 flags。
+     *   38 (renameat) 用 ①③⑤ 同法复核，结论一致。
+     *
+     * 【a0 / a2 永远不是路径 —— 不许"顺手也翻一下"】
+     * 它们是 dirfd，合法值 AT_FDCWD 是 **-100**（0xffffffffffffff9c）。
+     * 把 -100 当指针解引用就是历史上 symlinkat 那次整进程静默消失的
+     * 同一个 bug。所以掩码里**只有 a1 与 a3**，a0/a2 绝不出现在掩码中。
+     * 传 AT_FDCWD 时走"相对路径、由 dirfd 决定"的逻辑，我们原样透传。
+     */
+    case 276:  return (1u << 1) | (1u << 3);   /* renameat2: oldpath + newpath */
+    case 38:   return (1u << 1) | (1u << 3);   /* renameat:  oldpath + newpath */
+
+    /*
+     * ---- linkat 的**号码**：37，不是 260 ----
+     *
+     * 本机 SYS_linkat == 37。判定用效果证据而非查表：
+     *     syscall(37, AT_FDCWD, A, AT_FDCWD, B, 0)
+     *       → r=0，A 与 B 的 st_ino 相同、st_nlink 都是 2（真硬链接）。
+     *
+     * 【linkat 的翻译有一处必须写清的偏差】
+     * linkat 的 a3 在语义上不是"新路径"而是**新链接的名字**，
+     * 它和 a1 一样受 dirfd 规则支配；两个路径**都要翻译**，
+     * 与 renameat 同构。实测 ③④ 两条对 37 同样成立
+     * （a2 伪 dirfd → EBADF；a3 相对 a2 解析）。
+     * a4 是 flags（实测 AT_SYMLINK_FOLLOW=0x400 被接受）。
+     */
+    case 37:   return (1u << 1) | (1u << 3);   /* linkat: oldpath + newlinkpath */
+
+    /*
+     * ★ case 36 (symlinkat) —— 曾经**刻意不列入**，本轮改为列入，且只翻 a2。
      *
      * 这是我自己引入过的一次致命回归，记录在此防止重犯：
      *
      *   symlinkat(const char *target, int newdirfd, const char *linkpath)
-     *                ↑ x0              ↑ x1            ↑ x2
+     *                ↑ a0              ↑ a1            ↑ a2
      *
      * 我先前按"a1 是路径"列了 `case 36: return 1` —— **错**。
-     * a1 是 `newdirfd`（一个 int）。本表的表达能力只有 a0/a1 二选一，
-     * 于是 guard 会把 `AT_FDCWD`（= -100 = 0xffffffffffffff9c）
-     * **当成路径指针解引用** → 每一次走裸 syscall 的 symlinkat 都 SIGSEGV。
+     * a1 是 `newdirfd`（一个 int）。于是 guard 会把 `AT_FDCWD`
+     * （= -100 = 0xffffffffffffff9c）**当成路径指针解引用**
+     * → 每一次走裸 syscall 的 symlinkat 都 SIGSEGV。
      *
-     * 实测证据（本机）：
-     *     syscall(36, target, AT_FDCWD, linkpath) → errno=ENOTDIR
-     *     说明 x1 确实被内核当作目录 fd 解释。
+     * 【实测证据 —— 注意取证方式】
+     * 我第一次写的证据是 "syscall(36, target, AT_FDCWD, linkpath) → ENOTDIR"，
+     * 那是**错的、复现不出来**：绝对 linkpath 时内核**忽略 dirfd**，
+     * 该调用会成功。后来者照抄会得到相反结果，从而怀疑结论。
      *
-     * 后果尤其严重：symlinkat 是**创建符号链接**的入口，而 l2s 层
-     * （硬链接模拟）大量依赖它。一旦客户走裸 syscall 形态，就是整进程
-     * 静默消失，而且现场无任何输出。
+     * 能确证 a1 是 dirfd 的最小实验必须用**相对 linkpath**（本轮复跑一致）：
+     *     syscall(36, "tgt", 999999, "rel-l")  → EBADF   （伪 dirfd 被拒）
+     *     syscall(36, "tgt", <文件fd>, "rel-l") → ENOTDIR（不是目录）
+     * 两条都说明 a1 被当作目录 fd，而不是路径。
      *
-     * 【为什么选"不列入"而不是"改翻 a2"】
-     * 本表只能返回 0 或 1（表示 a0 或 a1）。symlinkat 的 linkpath 在 a2，
-     * 表**表达不了**。硬塞会再次翻错。正确做法是把手头的翻译分支改成
-     * 显式 switch（已具备该结构），或把接口升级为位掩码 —— 那是后续工作。
-     * 当前选择"不翻译"而非"翻错"：不翻译只是该调用绕过翻译（链接建到
-     * 宿主路径），翻错则是**崩溃**。两害相权取其轻。
+     * 【为什么当初选"不列入"】旧接口只能返回 0 或 1（表示 a0 或 a1），
+     * symlinkat 的 linkpath 在 a2，表**表达不了**；硬塞会再次翻错。
+     * 当时的取舍是"不翻译"胜过"翻错"（不翻译只是绕过，翻错是崩溃）。
+     *
+     * 【本轮为什么可以列入了】接口已升级为位掩码，能精确表达 a2。
+     * 于是这条从"已知缺口"变成"已覆盖"：
+     *
+     *     case 36: return 1u << 2;   ← 只翻 linkpath（a2）
+     *
+     * ★ target（a0）**刻意不翻**：它是**链接内容**，不是待解析的路径。
+     *   若在建立时把它改写成宿主路径，客户 readlink 就会看到宿主路径
+     *   （例如 /data/local/tmp/rootfs/usr/lib），泄漏翻译层内部布局，
+     *   而且同一个链接在 guest 里表示的含义就错了。
+     *   这一点与 preload.c 的 symlinkat 钩子**逐字一致**：
+     *   那个钩子同样只翻 linkpath、原样保留 target。两处必须同语义。
      *
      * 【同类核对结论】其余带 dirfd 的调用 a1 确实是路径，均正确：
      *     linkat(olddirfd, oldpath, ...)     → a1 = oldpath ✅
@@ -289,9 +396,44 @@ static int path_arg_index(long nr)
      *     execveat(dfd, path, ...)           → a1 = path    ✅
      * symlinkat 是**唯一**把 target 放 a0、linkpath 放 a2 的，所以只有它特殊。
      */
+    case 36:   return 1u << 2;         /* symlinkat: 只翻 linkpath（a2），target(a0) 是链接内容，不翻 */
 
-    default:   return -1;
+    default:   return 0;
     }
+}
+
+/*
+ * ★ 测试钩子 —— 让"路径参数表"这件最要命的事变得可回归 ★
+ *
+ * 背景：本项目出过两次**同类致命缺陷**，都在这张表上：
+ *   1. `case 36 (symlinkat): return 1` —— a1 其实是 `newdirfd`（int），
+ *      于是 guard 把 `AT_FDCWD`(-100) 当指针解引用，**每一次**裸 syscall
+ *      的 symlinkat 都 SIGSEGV；
+ *   2. `case 260` 被当成 linkat —— aarch64 上 260 是 **wait4**，它的 a1
+ *      是 `int *wstatus`。被信号 47 终止的子进程 wstatus==0x2f，首字节
+ *      恰好是 `'/'` → guard 判定为路径 → 内核把退出状态写进 guard 的
+ *      临时缓冲，**调用方的 wstatus 永远不被写入**（静默数据错写，
+ *      比 SIGSEGV 更难查）。
+ *
+ * 而当时的回归**测不到这张表**：`test/test_syscall_argpos.c` 只编自己，
+ * 从不链接本文件（实测 `nm` 里 0 个 guard 符号），它测的是**内核 ABI**，
+ * 不是我们的表。红队复核时把 `path_arg_index()` 改回 `return 1`
+ * （历史缺陷本体），该项仍然 PASS、门禁 0 条、全回归绿 ——
+ * **这套回归声称能防的那个具体缺陷，它防不住**。
+ *
+ * 这个钩子就是为此而加：把 `path_arg_mask` 暴露成可链接、可断言的入口，
+ * 让测试能直接钉住"哪些参数位置是路径"。
+ *
+ * ★ 命名与导出 ★
+ * 用 `bxroot_test_` 前缀并在头文件里声明，生产代码不调用它。
+ * 它不改变任何行为（纯查表），只是把 static 函数转出来。
+ * 之所以不直接把 `path_arg_mask` 改成非 static：那会让它进入动态符号
+ * 表，而本项目有一条硬约束 —— **不要导出无意义的符号**（官方符号表里
+ * 那些空壳就是反例）。
+ */
+unsigned bxroot_test_path_arg_mask(long nr)
+{
+    return path_arg_mask(nr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -302,7 +444,9 @@ long syscall(long number, ...)
 {
     va_list ap;
     long a0, a1, a2, a3, a4, a5;
-    int pidx;
+    long *args[6];
+    unsigned pmask;
+    int i;
 
     init_trace();
 
@@ -315,6 +459,14 @@ long syscall(long number, ...)
     a5 = va_arg(ap, long);
     va_end(ap);
 
+    /*
+     * 参数寄存器数组 —— 让"第 i 个参数"可以用下标寻址。
+     * 翻译分支据此按下标回写，不必为每个位置写一条 if。
+     * a0..a5 都是局部变量，取地址安全，且不会逃逸出本函数。
+     */
+    args[0] = &a0; args[1] = &a1; args[2] = &a2;
+    args[3] = &a3; args[4] = &a4; args[5] = &a5;
+
     if (should_block(number)) {
         g_blocked++;
         if (g_trace)
@@ -323,10 +475,84 @@ long syscall(long number, ...)
         return -1;
     }
 
-    pidx = path_arg_index(number);
-    if (pidx >= 0) {
-        const char *pth = (pidx == 0) ? (const char *)(uintptr_t)a0
-                                      : (const char *)(uintptr_t)a1;
+    pmask = path_arg_mask(number);
+    if (pmask != 0) {
+        /*
+         * ============================================================
+         * 逐个处理被标记为路径的寄存器
+         * ============================================================
+         *
+         * 【为什么是循环而不是把 a1 / a3 写死】
+         * 掩码是"哪些参数是路径"的**唯一**表述处，翻译逻辑只写一份。
+         * 将来再遇到多路径调用，只需改表一行，不必在翻译分支里
+         * 再补一条 if —— 而"补 if"正是 newpath 长久漏翻的成因：
+         * 当初只有一个 `pidx == 0 ? a0 : a1` 的三目表达式，
+         * a3 根本没有位置可写。
+         *
+         * 【顺序】i 从小到大（对 renameat 即 a1 先于 a3），与客户
+         * 传参顺序一致。两条路径各自独立取缓冲槽位，互不覆盖。
+         */
+        for (i = 0; i < 6; i++) {
+            const char *pth;
+
+            if (!(pmask & (1u << i)))
+                continue;
+
+            /*
+             * ★ dirfd 永远不在掩码里 ★
+             * 掩码只由 path_arg_mask() 产生，而该表对每个带 dirfd 的
+             * 调用都只标路径位（a1/a2/a3），绝不标 a0/a2 里的 dirfd。
+             * 这是历史事故（symlinkat 把 AT_FDCWD=-100 当指针）的防线：
+             * 一旦有人往掩码里加了 dirfd 位，这里就会解引用 -100。
+             */
+            pth = (const char *)(uintptr_t)*args[i];
+
+            /*
+             * ============================================================
+             * ★ NULL 路径：直接回 EFAULT，不交给翻译层 ★
+             * ============================================================
+             *
+             * 【为什么必须在这里判，而不是靠下面的 looks_like_guest_abs_path】
+             * 那个函数对 NULL 返回 0（"不是 guest 绝对路径"），于是控制流
+             * 会**跳过翻译、把 NULL 原样发给内核**。绝大多数情况下这没错
+             * —— 实测内核对这些调用的 NULL 路径统一返回 EFAULT：
+             *
+             *     renameat (AT_FDCWD, NULL, AT_FDCWD, p)  → EFAULT
+             *     renameat (AT_FDCWD, p, AT_FDCWD, NULL)  → EFAULT
+             *     renameat2(同上两种)                     → EFAULT
+             *     linkat   (同上两种)                     → EFAULT
+             *     symlinkat("tgt", AT_FDCWD, NULL)        → EFAULT
+             *
+             * 但仍然显式判一次，理由有二：
+             *
+             * ① **不要把正确性寄托在"下面那个函数恰好返回 0"上。**
+             *    这是隐式契约：将来若有人把 looks_like_guest_abs_path
+             *    改成对 NULL 返回 1（例如"NULL 当空路径处理"这种看起来很
+             *    合理的改动），翻译层就会去读 NULL → SIGSEGV。
+             *    显式判空把这条依赖变成**代码里看得见**的事实。
+             *
+             * ② 语义精确。EFAULT 是内核给 NULL 路径的**规范答复**，
+             *    我们提前给出同一个 errno，客户观察到的行为完全一致；
+             *    而"不翻译直接透传"在**两个路径参数**的新形态下还有个
+             *    副作用：若 a1 是 NULL 而 a3 是有效 guest 路径，
+             *    透传会让 a3 不被翻译，客户拿到 ENOENT 而不是 EFAULT ——
+             *    错误码就与原生行为**不一致**了。显式判空后，
+             *    errno 与原生逐位一致。
+             *
+             * 【为什么返回 -1 而不是继续处理另一个路径】
+             * 内核先解 oldpath，oldpath 为 NULL 时立即 EFAULT，
+             * 第二个路径根本不看（已实测）。提前返回复刻这一顺序，
+             * 也避免为一个注定失败的调用做无用的翻译。
+             *
+             * 注：这里**不**设置 errno 后继续 —— 直接 return -1。
+             * 与 raw_syscall6 的约定一致（返回 -1、errno 已设）。
+             */
+            if (*args[i] == 0) {
+                if (g_trace)
+                    log_num("[bxroot] syscall_guard: a", i, " 路径为 NULL -> EFAULT\n");
+                errno = EFAULT;
+                return -1;
+            }
 
         /*
          * ============================================================
@@ -354,7 +580,7 @@ long syscall(long number, ...)
          * 不是嵌套。这道守卫因此**没有**解决当初的段错误 —— 保留它
          * 是因为它防的是另一件事（理论上的递归），而且成本可忽略。
          *
-         * 【为什么必须是 thread_local】
+         * 【为什么必须是 thread_local（历史说明，当前实现已改池化）】
          * `syscall` 会被多线程并发调用。用**全局**标志的话：
          * A 线程正在翻译时，B 线程的翻译会被误判为重入而跳过 ——
          * 表现为"随机某些路径不翻译"，比崩溃更难排查。
@@ -363,6 +589,9 @@ long syscall(long number, ...)
          * 这是 LD_PRELOAD 层，构造函数极早期就可能被调用，
          * 那时 pthread_key_create 未必可用。`_Thread_local` 由
          * TLS 直接支撑，无此问题。
+         *
+         * 注：下面这段"重入守卫"的**叙述**保留（它是判据的由来），
+         * 但目标缓冲最终没有采用 TLS —— 见紧接着的缓冲选型说明。
          */
         /*
          * ============================================================
@@ -473,22 +702,21 @@ long syscall(long number, ...)
             int tr = bxroot_translate_path(pth, tbuf, need);
 
             if (tr > 0) {
-                if (pidx == 0) a0 = (long)(uintptr_t)tbuf;
-                else           a1 = (long)(uintptr_t)tbuf;
+                *args[i] = (long)(uintptr_t)tbuf;
                 if (g_trace) {
-                    log_str("[bxroot] syscall_guard: 翻译 ");
+                    log_num("[bxroot] syscall_guard: 翻译 a", i, " ");
                     log_str(pth);
                     log_str(" -> ");
                     log_str(tbuf);
                     log_str("\n");
                 }
             }
-        }
-    }
+        }   /* if (looks_like_guest_abs_path(pth)) */
+        }   /* for (i = 0; i < 6; i++) */
+    }       /* if (pmask != 0) */
 
     return raw_syscall6(number, a0, a1, a2, a3, a4, a5);
 }
-
 unsigned long bxroot_syscall_guard_blocked(void)
 {
     return g_blocked;

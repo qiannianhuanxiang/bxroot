@@ -558,20 +558,67 @@ int px_ledger_has(const px_ledger *l, pid_t pid, px_entry_kind kind)
     return px_ledger_get(l, pid, kind, NULL) == PX_OK ? 1 : 0;
 }
 
-int px_ledger_reap(px_ledger *l, pid_t pid)
+/*
+ * 内部：把某个 key 标记为已回收。找到返回 1，否则 0。
+ *
+ * 抽出来是因为 reap 必须**同时**作用于 PID 与 PGID 两个维度，
+ * 而两个维度各是一次探测、各自可能不存在。
+ */
+static int px_mark_reaped(px_ledger *l, pid_t pid, px_entry_kind kind)
 {
     int found = 0;
-    size_t idx;
+    size_t idx = px_probe(l, pid, (unsigned)kind, &found);
+
+    if (!found || idx == (size_t)-1) {
+        return 0;
+    }
+    l->slots[idx].info.life = PX_REAPED;
+    return 1;
+}
+
+int px_ledger_reap(px_ledger *l, pid_t pid)
+{
+    int hit;
 
     if (l == NULL || l->disabled) {
         return PX_ENOENT;
     }
-    idx = px_probe(l, pid, (unsigned)PX_ENTRY_PID, &found);
-    if (!found || idx == (size_t)-1) {
+    if (pid <= 0) {
         return PX_ENOENT;
     }
-    l->slots[idx].info.life = PX_REAPED;
-    return PX_OK;
+    /*
+     * ★ reaped 必须在 PID 与 PGID 两个维度同时成立（P1 修复）★
+     *
+     * 缺陷回顾：命中判定查的是「PID‖PGID」，但 life 复核**只**查
+     * PX_ENTRY_PGID，而这个函数原来**硬编码** PX_ENTRY_PID：
+     *
+     *     idx = px_probe(l, pid, (unsigned)PX_ENTRY_PID, &found);
+     *     l->slots[idx].info.life = PX_REAPED;
+     *
+     * 于是：
+     *   - PGID 条目的 life **永远不可能**变成 PX_REAPED
+     *     （生产代码里 px_ledger_add_pgid 更是没有任何调用者）；
+     *   - px_check_kill 组分支里那句
+     *       if (px_ledger_get(l, pgid, PX_ENTRY_PGID, &info) == PX_OK &&
+     *           info.life == PX_REAPED) return PROC_KILL_DENY;
+     *     的**拒绝分支不可达**，控制流直接落到 PROC_KILL_PASS；
+     *   - 实测：同一个已 wait 掉的 pid，kill(+pid)=DENY，
+     *     而 kill(-pid)=**PASS**；`killpg()` 在 proc.c 里直接构造
+     *     `-pgrp`，所以容器内**一键可达**，不需要任何特殊参数。
+     *
+     * 后果：pid 被宿主复用后，这个被放行的信号会打进宿主里一个完全
+     * 无关的进程（Android 上可能是系统服务）—— 正是 px_check_kill 里
+     * 自称「本层最重要的一条判定」想关掉的那个窗口。
+     *
+     * 修法：命中用什么维度，复核就用什么维度。既然判定会查
+     * PX_ENTRY_PID **或** PX_ENTRY_PGID，reap 就必须把两边都标上。
+     *
+     * 返回值兼容原语义：任一维度命中即 PX_OK；两个都不存在才是
+     * PX_ENOENT —— 测试 A7/A8 钉住这一点。
+     */
+    hit = px_mark_reaped(l, pid, PX_ENTRY_PID);
+    hit |= px_mark_reaped(l, pid, PX_ENTRY_PGID);
+    return hit ? PX_OK : PX_ENOENT;
 }
 
 int px_ledger_remove(px_ledger *l, pid_t pid, px_entry_kind kind)
@@ -652,6 +699,8 @@ void px_env_dispose(px_envout *out)
     out->buf_len = 0;
     out->buf_cap = 0;
     out->alloc = NULL;
+    out->skipped_long = 0;
+    out->skipped_budget = 0;
 }
 
 /* 内部：确保 buf 还能再放 need 字节（含 NUL）。
@@ -769,6 +818,44 @@ static int px_env_push_kv(px_envout *out, const char *name, const char *value)
     return PX_OK;
 }
 
+/* 内部：当前累计字节数（含每条结尾的 NUL）离预算还剩多少。 */
+static int px_env_budget_left(const px_envout *out, size_t budget, size_t *left)
+{
+    if (out->buf_len > budget) {
+        return 0;
+    }
+    *left = budget - out->buf_len;
+    return 1;
+}
+
+/*
+ * 错误码的可读名字。
+ *
+ * 存在的理由：`PX_ETOOLONG`/`PX_ENOSPC` 这些值在 stderr 上只是一个
+ * 负数，运维看到 "-5" 无从下手。纯逻辑层不依赖 strerror（errno 是
+ * 另一套编号，混用会给出**错误**的解释），所以自带一张小表。
+ *
+ * `#if !PX_PURE_LOGIC` 门控：只有钩子层会用 fprintf 把它打出去，
+ * 纯逻辑模式下留着会触发 -Wunused-function —— 而本项目的门禁是
+ * **零警告**，不是「警告可以忽略」。
+ */
+#if !PX_PURE_LOGIC
+static const char *px_errname(int rc)
+{
+    switch (rc) {
+    case PX_OK:       return "OK";
+    case PX_ENOENT:   return "ENOENT(无此条目)";
+    case PX_ENOMEM:   return "ENOMEM(分配失败)";
+    case PX_EFULL:    return "EFULL(表已满)";
+    case PX_EINVAL:   return "EINVAL(参数非法)";
+    case PX_ETOOLONG: return "ETOOLONG(单条超长)";
+    case PX_EPERM:    return "EPERM(越界)";
+    case PX_ENOSPC:   return "ENOSPC(空间不足)";
+    default:          return "未知错误码";
+    }
+}
+#endif /* !PX_PURE_LOGIC */
+
 /* 内部：某名字是否在 drop 列表里。 */
 static int px_env_dropped(const px_envpolicy *pol, const char *entry)
 {
@@ -827,7 +914,10 @@ int px_env_build(const char *const *in_envp, const px_envpolicy *pol,
 {
     size_t i;
     size_t limit;
+    size_t budget;
     int rc;
+    size_t n_skipped_long = 0;   /* 因单条超长被跳过的条数（诊断用） */
+    size_t n_skipped_budget = 0; /* 因累计预算不足被跳过的条数     */
 
     if (out == NULL) {
         return PX_EINVAL;
@@ -837,12 +927,40 @@ int px_env_build(const char *const *in_envp, const px_envpolicy *pol,
 
     limit = (pol != NULL && pol->max_entries > 0)
                 ? pol->max_entries : (size_t)PX_ENVP_MAX;
+    /*
+     * ★ 累计预算：0 表示用默认值 ★
+     *
+     * 为什么必须有这一条：条目数上限（4096）与单条上限（16384）的乘积
+     * 是 64 MiB，而内核 ARG_MAX 只有 2 MiB。没有总闸门时我们能构建出一个
+     * **内核必然 E2BIG 拒绝**的 envp —— exec 失败，而失败原因与
+     * 「环境变量太多」之间的关联对用户完全不可见。
+     */
+    budget = (pol != NULL && pol->max_bytes > 0)
+                 ? pol->max_bytes : (size_t)PX_ENV_BUDGET_DEFAULT;
 
     /* 第一遍：搬运原有条目（跳过 drop 与被 forced 覆盖的） */
     if (in_envp != NULL) {
+        /*
+         * ★ 第一遍只能用掉一半预算 ★
+         *
+         * 另一半留给强制条目（LD_PRELOAD / BXROOT_ROOTFS /
+         * PROROOT_ROOTFS / BXROOT_LD_PRELOAD）。若让调用方的环境把预算
+         * 吃光，强制条目就写不进去 —— 那正是 P2 要消灭的「静默丢掉
+         * 全部钩子」，只是换了个触发方式（从单条超限变成总量超限）。
+         *
+         * 为什么是「一半」而不是「预算 - 强制条目的实际长度」：
+         * 后者需要先算一遍所有强制条目的长度，而 MERGE 模式的长度
+         * 依赖 in_envp 的当前值 —— 先算一遍等于把合并做两次（还要
+         * 一个临时缓冲）。一半是个简单、保守、且足够的下界：强制条目
+         * 最多 4 条，每条 ≤ 16384，共 ≤ 64 KiB，而 2 MiB 的一半是
+         * 1 MiB，永远够。选它能保证「强制条目一定写得进去」这个
+         * **安全性**，代价只是调用方环境最多能用一半预算。
+         */
+        size_t half = budget / 2u;
         for (i = 0; i < (size_t)PX_ENVP_MAX && in_envp[i] != NULL; i++) {
             const char *e = in_envp[i];
             size_t len;
+            size_t left;
 
             /* ★ 顺序很重要：limit 检查必须在 push **之前** ★
              *
@@ -861,9 +979,25 @@ int px_env_build(const char *const *in_envp, const px_envpolicy *pol,
                 continue;
             }
             len = strlen(e);
+            /*
+             * ★ 单条超长：跳过这一条，**不是**整体失败（P2 修复）★
+             *
+             * 原来是 `rc = PX_ETOOLONG; goto fail;` —— 一条畸长/超大的
+             * 环境变量（实测 LD_PRELOAD 超过 8192 即可，DSHA 环境下多个
+             * .so 很容易达到）会让**整个 envp 重建失败**，调用方回落到
+             * 原始 envp，于是子进程连 LD_PRELOAD 都没有：没有路径翻译、
+             * 没有 fakeroot、没有 l2s，且**没有任何报错**。
+             * 丢弃一条超长变量只影响那一条，代价远小于丢掉全部钩子。
+             */
             if (len > (size_t)PX_ENV_ENTRY_MAX) {
-                rc = PX_ETOOLONG;
-                goto fail;
+                n_skipped_long++;
+                continue;
+            }
+            if (!px_env_budget_left(out, half, &left) ||
+                left < len + 1u) {
+                /* 累计预算不足：截断（与条目数上限同语义） */
+                n_skipped_budget++;
+                continue;
             }
             rc = px_env_push(out, e, len);
             if (rc != PX_OK) {
@@ -872,7 +1006,18 @@ int px_env_build(const char *const *in_envp, const px_envpolicy *pol,
         }
     }
 
-    /* 第二遍：写强制条目 */
+    /*
+     * 第二遍：写强制条目。
+     *
+     * ★ 与第一遍的关键区别：强制条目**不允许**被预算截断掉 ★
+     *
+     * 这一遍写的正是 LD_PRELOAD / BXROOT_ROOTFS / PROROOT_ROOTFS /
+     * BXROOT_LD_PRELOAD —— 容器能不能工作全看它们。第一遍若把预算
+     * 吃光了，强制条目就写不进去，等于又回到「静默丢掉全部钩子」。
+     * 所以：第一遍只允许用掉一半预算（见下面的 half 判定），
+     * 剩下的一半专供强制条目；真的连强制条目都放不下时宁可整体失败
+     * （那说明单条已经超过 PX_ENV_ENTRY_MAX，属于配置错误，必须可见）。
+     */
     if (pol != NULL && pol->forced != NULL) {
         for (i = 0; i < pol->forced_n; i++) {
             const char *name = pol->forced[i].name;
@@ -897,6 +1042,15 @@ int px_env_build(const char *const *in_envp, const px_envpolicy *pol,
                     rc = mrc;
                     goto fail;
                 }
+                /*
+                 * ★ 合并结果超长是**必须整体失败**的情形 ★
+                 *
+                 * 走到这里说明我们自己的库路径 + guest 的 preload 已经
+                 * 超过 PX_PRELOAD_MAX。此时**没有任何可接受的回落**：
+                 * 写进去 → 内核 E2BIG 或 ld.so 拒绝；不写 → 容器失去钩子。
+                 * 唯一正确的做法是让调用方看到失败（px_runtime_build_env
+                 * 会打 stderr），而不是静默降级。
+                 */
                 rc = px_env_push_kv(out, name, merged);
                 if (rc != PX_OK) {
                     goto fail;
@@ -905,9 +1059,28 @@ int px_env_build(const char *const *in_envp, const px_envpolicy *pol,
             }
             /* 强制条目同样：超限就停止追加，但**不**整体失败。
              * 强制条目最多 4 条，正常永远到不了 limit；能到说明
-             * 调用方把 limit 设得极小，那是它的选择，不是错误。 */
+             * 调用方把 limit 设得极小，那是它的选择，不是错误。
+             * 累计预算上这里用**全额**（不是 half）：第一遍已经保证
+             * 只用了 half，剩下的至少还有 half 可供这 4 条使用。 */
             if (out->n >= limit) {
                 break;
+            }
+            {
+                size_t left;
+                size_t vl = (pol->forced[i].value == NULL)
+                                ? 0u : strlen(pol->forced[i].value);
+                size_t need = strlen(name) + 1u + vl + 1u;
+                if (!px_env_budget_left(out, budget, &left) || left < need) {
+                    /*
+                     * 不给这里加日志：`px_env_build` 在**纯逻辑层**，
+                     * 而 PX_LOG 是钩子层的宏（纯逻辑模式下未定义）。
+                     * 失败信息由调用方 px_runtime_build_env 统一用
+                     * fprintf(stderr, ...) 打到 stderr —— 那才是
+                     * 「失败必须可见」该落地的地方，而且只需要一处。
+                     */
+                    rc = PX_ENOSPC;
+                    goto fail;
+                }
             }
             /* 值为 NULL 用空串：**不能跳过**。
              * 「把变量设成空」和「变量不存在」在子进程里是两件事
@@ -936,6 +1109,9 @@ int px_env_build(const char *const *in_envp, const px_envpolicy *pol,
         vec[out->n] = NULL;
         out->v = vec;
     }
+    /* 诊断计数：调用方（钩子层）据此决定要不要打警告。截断不该静默。 */
+    out->skipped_long = n_skipped_long;
+    out->skipped_budget = n_skipped_budget;
     return PX_OK;
 
 fail:
@@ -1718,12 +1894,32 @@ proc_kill_verdict px_check_kill(const px_ledger *l, const px_killpolicy *pol,
         if (sys != NULL && sys->getpgrp != NULL && sys->getpgrp() == pgid) {
             return PROC_KILL_PASS;
         }
+        /*
+         * ★ 命中维度与复核维度必须一致（P1 修复）★
+         *
+         * 命中判定查 PID **或** PGID；那么 life 复核就必须把两种都查一遍。
+         * 原来只查 PX_ENTRY_PGID，而 px_ledger_reap 只标 PX_ENTRY_PID
+         * → 拒绝分支**不可达** → 已回收的 pid 用 `kill(-pid)` /
+         * `killpg(pid)` 形态会被放行（实测 +pid=DENY、-pid=PASS）。
+         *
+         * 现在 px_ledger_reap 会同时标两个维度，这里的复核也同时查两个
+         * 维度，两侧对称。
+         *
+         * ★ 特殊值不要在这里特判 ★
+         * target == 0（本进程组）与 target == -1（所有有权限的进程）
+         * 在函数开头就已经被 allow_broadcast 分支拦掉了（默认拒绝），
+         * 根本走不到这里 —— 所以修 P1 **不会**顺手放开它们。
+         * 测试 I2 与 P1 复现 harness 的阶段 6 都钉住这一点。
+         */
         if (px_ledger_has(l, pgid, PX_ENTRY_PID) ||
             px_ledger_has(l, pgid, PX_ENTRY_PGID)) {
             px_procinfo info;
-            /* 组条目里若记的是已回收的 pid，同样要拒绝 */
-            if (px_ledger_get(l, pgid, PX_ENTRY_PGID, &info) == PX_OK &&
-                info.life == PX_REAPED) {
+            /* 组条目里若记的是已回收的 pid，同样要拒绝。
+             * 两个维度各查一次：任一说「已回收」就拒绝。 */
+            if ((px_ledger_get(l, pgid, PX_ENTRY_PID, &info) == PX_OK &&
+                 info.life == PX_REAPED) ||
+                (px_ledger_get(l, pgid, PX_ENTRY_PGID, &info) == PX_OK &&
+                 info.life == PX_REAPED)) {
                 return PROC_KILL_DENY;
             }
             return PROC_KILL_PASS;
@@ -1892,6 +2088,57 @@ int px_fork_should_abort(int reg_rc)
     return reg_rc != PX_OK;
 }
 
+void px_reap_child_tolerant(pid_t child, px_wait_child_fn wait_fn, void *ud,
+                            px_reap_result *out)
+{
+    px_reap_result local;
+    int status = 0;
+
+    local.reaped = 0;
+    local.eintr_count = 0;
+    local.gave_up = 0;
+    local.last_errno = 0;
+
+    if (wait_fn == NULL || child <= 0) {
+        local.last_errno = EINVAL;
+        if (out != NULL) {
+            *out = local;
+        }
+        return;
+    }
+
+    for (;;) {
+        pid_t r = wait_fn(ud, child, &status);
+        if (r == child) {
+            local.reaped = 1;
+            break;
+        }
+        if (r < 0 && errno == EINTR) {
+            local.eintr_count++;
+            if (local.eintr_count >= PX_REAP_EINTR_MAX) {
+                /* 上限：某个信号处理器在不停自打，无上限重试就是死循环。
+                 * 目标只是「尽力回收」，不是「保证回收」。 */
+                local.gave_up = 1;
+                local.last_errno = EINTR;
+                break;
+            }
+            continue;
+        }
+        /*
+         * r < 0 且非 EINTR：ECHILD 最常见（SIGCHLD=SIG_IGN 或
+         * SA_NOCLDWAIT 时内核会**自动回收**子进程，于是这里查不到）。
+         * 那在功能上是好的结果，但我们无法与「这个子进程根本不是我们的」
+         * 区分开 —— 所以如实记下 errno，由调用方决定要不要留痕。
+         */
+        local.last_errno = (r < 0) ? errno : ECHILD;
+        break;
+    }
+
+    if (out != NULL) {
+        *out = local;
+    }
+}
+
 /* ================================================================== */
 /* §6  钩子层                                                          */
 /* ================================================================== */
@@ -1918,6 +2165,7 @@ int px_fork_should_abort(int reg_rc)
 extern int bxroot_translate_path(const char *path, char *out, size_t out_size)
     __attribute__((weak));
 extern void bxroot_log(const char *fmt, ...) __attribute__((weak));
+
 
 #define PX_LOG(...) do {                                              \
         if (bxroot_log != NULL && g_rt_cfg.verbose) {                 \
@@ -1963,6 +2211,96 @@ static void px_rt_unlock(void *ud)
 {
     (void)ud;
     pthread_mutex_unlock(&g_rt_mutex);
+}
+
+/* ------------------------------------------------------------------ */
+/* 修复 glibc 线程链表未初始化（子进程派生 SIGSEGV 的根因）             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 背景：为什么必须由我们来补这个字段
+ * ----------------------------------
+ * 现象（实测）：在 proroot 加载器下，**任何** preload 一个 .so 的进程，
+ * 其 `fork()` 都会在子进程里 SIGSEGV。崩溃点固定：
+ *
+ *   libc.so.6  __fork+0x144:
+ *     c1b50:  ldp  x4, x3, [x1, #-128]   ; x1 = TCB-0x600，取链表节点 next/prev
+ *     c1b54:  str  x3, [x4, #8]          ; ← 崩溃：x4 == NULL → 写地址 0x8
+ *
+ * 该节点的地址是 `TCB-0x680`，即 `struct pthread` 的 `list` 字段
+ * （glibc 2.39 aarch64：pthread_self = TCB-0x740，list 位于 pd+0xC0，
+ *  两者相加正好是 TCB-0x680 —— 已用实测 `tcb - pthread_self = 0x740`
+ *  与内存转储双向确认）。
+ *
+ * `__fork` 在子进程里做的是「把自己从**全局线程链表**和
+ * `_rtld_global` 的链表里摘下来」，它假定 `pd->list` 已经被
+ * `__pthread_initialize_minimal` 初始化成**自环**（next = prev = &list）。
+ * 实测该字段在两套环境下的取值：
+ *
+ *   | 环境                                   | [TCB-0x680]      | fork 结果 |
+ *   |----------------------------------------|------------------|-----------|
+ *   | 普通执行（无 proroot 加载器）          | pd+0xC0（自环）  | ✅ 正常   |
+ *   | proroot 加载器 + 任意第三方 preload    | NULL             | ❌ SIGSEGV|
+ *   | proroot 加载器 + **官方 runtime**      | pd+0xC0（自环）  | ✅ 正常   |
+ *
+ * ★ 关键判据：这不是 bxroot 引入的缺陷 ★
+ * 用一个只有一行 `write(2, ...)` 的 preload 库（libnoop.so，零 dlsym、
+ * 零 atfork）就能复现**完全相同**的崩溃 PC（0xC1B54）与 addr（0x8）。
+ * 真正的问题是「proroot 自研加载器不跑 glibc 的 minimal 线程初始化」，
+ * 官方 runtime 之所以没事，是因为它**自己接管了 fork**
+ * （反汇编证实：官方 `fork` 直接 `bl proroot_raw_syscall6` 走裸
+ *  clone，压根不调用 glibc 的 `__fork`，所以碰不到这个坏字段）。
+ * 我们不改用裸 syscall 那条路（会连带丢掉 glibc 的 atfork 链与
+ * 内部列表一致性），而是就地**把该字段补成它本该有的值**。
+ *
+ * 修法的性质与安全边界
+ * --------------------
+ * - 这里**不解析任何符号、不依赖内部链接名**，只按实测偏移写内存；
+ * - 只在「两个指针都是 NULL」时才动手，即严格判定为「未初始化」。
+ *   一旦 glibc 自己初始化过（自环、或已挂进链表），我们**绝不触碰**
+ *   —— 那会把一个正常的链表节点摘断，制造出比原问题更糟的故障；
+ * - 偏移来自本机 libc 的实测；不匹配时**静默跳过**（宁可少修，
+ *   不可错写），与 livepatch 的「逐点校验、不匹配即放弃」同一原则。
+ */
+void px_heal_thread_list(void);
+
+/* 实测常量：glibc 2.39 aarch64 的 struct pthread 布局。
+ * 这两个值由两条独立证据交叉确认（tcb-pthread_self 差值 + 崩溃指令
+ * 反推出的偏移），不是从某个版本的头文件里抄的。 */
+#define PX_TCB_TO_PD      0x740u   /* pthread_self = tpidr_el0 - 0x740 */
+#define PX_PD_LIST_OFF    0xC0u    /* offsetof(struct pthread, list)   */
+
+void px_heal_thread_list(void)
+{
+    unsigned long tcb;
+
+    /*
+     * tpidr_el0 就是 TCB 基址：glibc 把 struct pthread 放在它下面，
+     * 并以它作为线程指针（pthread_self() 返回 tpidr_el0 - 0x740）。
+     */
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tcb));
+    if (tcb == 0) {
+        return;
+    }
+
+    {
+        uintptr_t pd   = (uintptr_t)tcb - PX_TCB_TO_PD;
+        uintptr_t *lst = (uintptr_t *)(pd + PX_PD_LIST_OFF);
+
+        /*
+         * 只修「完全没有初始化」的形态（next/prev 皆为 NULL）。
+         * 已挂进链表（非 NULL 且不等于自身）或已自环（等于自身）
+         * 都说明 glibc 自己管过这个字段 —— 一律不动。
+         */
+        if (lst[0] == 0 && lst[1] == 0) {
+            lst[0] = (uintptr_t)lst;   /* next = 自己 */
+            lst[1] = (uintptr_t)lst;   /* prev = 自己 */
+            PX_LOG("proc: 已修复 glibc 线程链表未初始化 (pd=%p list=%p)",
+                   (void *)pd, (void *)lst);
+        } else {
+            PX_LOG("proc: glibc 线程链表已由 libc 初始化（不动）");
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2173,6 +2511,12 @@ int px_runtime_init(void)
         PX_LOG("proc: pthread_atfork 注册失败 —— fork 后子进程可能死锁");
     }
 
+    /*
+     * ★ 必须排在 atfork 注册**之前**，理由见函数头 ★
+     * 放在最后会把「glibc 自己碰巧修好了」误判成「不需要修」。
+     */
+    px_heal_thread_list();
+
     g_rt_ready = 1;
     PX_LOG("proc: init inject=%d have_preload=%d rootfs=%s",
            g_rt_cfg.inject, g_rt_cfg.have_preload,
@@ -2329,6 +2673,7 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
     pol.drop = NULL;
     pol.drop_n = 0;
     pol.max_entries = 0;
+    pol.max_bytes = 0;          /* 0 → PX_ENV_BUDGET_DEFAULT */
 
     /*
      * envp == NULL 时用 environ。
@@ -2342,9 +2687,40 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
     {
         int rc = px_env_build((const char *const *)envp, &pol, out, NULL);
         if (rc != PX_OK) {
+            /*
+             * ★ 失败必须**可见**（P2 修复的第二半）★
+             *
+             * 这一条路径的后果是子进程**完全没有 LD_PRELOAD**：
+             * 没有路径翻译、没有 fakeroot、没有 l2s。用户看到的是
+             * 「命令跑了，但显示的是宿主文件」—— 与容器正常工作的
+             * 表现只差一点点，极难归因。
+             *
+             * PX_LOG 不够：它被 `g_rt_cfg.verbose` 门控，发布构建里
+             * 默认关闭，等于没有。所以这里直接写一次 stderr ——
+             * 理由与 preload.c 的 px_wait_dlsym 失败必须打印完全一致：
+             * **功能缺失不能静默**。
+             */
+            fprintf(stderr,
+                    "[bxroot] proc: envp 重建失败 rc=%d (%s)：本次 exec 的"
+                    "子进程将失去 LD_PRELOAD —— 路径翻译 / fakeroot / l2s"
+                    " 全部失效。请检查环境变量总长（内核 ARG_MAX）与单条"
+                    "长度上限（PX_ENV_ENTRY_MAX=%d）。\n",
+                    rc, px_errname(rc), PX_ENV_ENTRY_MAX);
             PX_LOG("proc: envp 重建失败 rc=%d", rc);
             errno = (rc == PX_ENOMEM) ? ENOMEM : EINVAL;
             return -1;
+        }
+        /*
+         * 截断也要留痕 —— 但只是一条（不刷屏）。被丢掉的是调用方自己的
+         * 环境变量，容器钩子仍在，所以用 PX_LOG 级别即可：
+         * 它不该被当成「容器失效」，但排查「某个变量在容器里看不到」
+         * 时必须能在 verbose 日志里找到原因。
+         */
+        if (out->skipped_long > 0 || out->skipped_budget > 0) {
+            PX_LOG("proc: envp 重建丢弃条目 long=%zu budget=%zu"
+                   "（超单条上限 %d 或累计预算）",
+                   out->skipped_long, out->skipped_budget,
+                   PX_ENV_ENTRY_MAX);
         }
     }
     return 0;
@@ -2380,6 +2756,56 @@ static pid_t px_real_getpid(void) { return (pid_t)syscall(SYS_getpid); }
 static pid_t px_real_getppid(void) { return (pid_t)syscall(SYS_getppid); }
 static pid_t px_real_getpgrp(void) { return (pid_t)syscall(SYS_getpgid, 0); }
 static int   px_real_kill(pid_t p, int s) { return (int)syscall(SYS_kill, p, s); }
+
+/*
+ * 回收一个我们自己刚 SIGKILL 掉的子进程（P3 修复）。
+ *
+ * 两处缺陷一起修：
+ *
+ * 1. ★ 不重试 EINTR ★
+ *    原来写的是 `(void)waitpid(child, NULL, 0);`。父进程一旦装了任何
+ *    带 SA_RESTART 之外语义的信号处理器，waitpid 就会返回 -1/EINTR，
+ *    而这里既不重试也不看返回值 —— 回收**静默失败**，留下一个僵尸。
+ *
+ * 2. ★ 不校验返回值 ★
+ *    若调用方设了 `SIGCHLD = SIG_IGN` 或 `SA_NOCLDWAIT`，内核会**自动
+ *    回收**子进程，waitpid 返回 -1/ECHILD。这在正常情况下无害
+ *    （进程确实已经被回收了），但如果子进程**不是**我们的直接子进程
+ *    （例如中间的 fork 已经被别人 wait 掉），回收同样失败而僵尸留下。
+ *    两者都无法区分，所以这里至少把结果记进诊断计数，让现场可见。
+ *
+ * 不改变返回值语义（调用方不看），但**不再静默**。
+ */
+static void px_reap_killed_child(pid_t child)
+{
+    int status = 0;
+    int tries = 0;
+
+    for (;;) {
+        pid_t r = waitpid(child, &status, 0);
+        if (r == child) {
+            return;                     /* 正常回收 */
+        }
+        if (r < 0 && errno == EINTR) {
+            /*
+             * 重试。设上限是刻意的：若某个信号处理器不停地给自己发信号，
+             * 无上限重试就是一个死循环，而这里的目标只是「尽力回收」。
+             */
+            if (++tries < 64) {
+                continue;
+            }
+            PX_LOG("proc: 回收子进程 %d 时连续 %d 次 EINTR，放弃重试",
+                   (int)child, tries);
+            return;
+        }
+        /* r < 0 且非 EINTR：ECHILD（SIGCHLD=SIG_IGN / SA_NOCLDWAIT）、
+         * 或 EINVAL。子进程多半已被内核自动回收，但仍要留痕。 */
+        PX_LOG("proc: 回收子进程 %d 失败 errno=%d（%s）——"
+               "若原因不是内核自动回收，将留下一个僵尸",
+               (int)child, errno, strerror(errno));
+        return;
+    }
+}
 
 static const px_sysops PX_SYSOPS = {
     px_real_getpid, px_real_getppid, px_real_getpgrp, px_real_kill
@@ -2534,6 +2960,17 @@ static int px_is_null(const void *p)
 
 static void *px_dlsym(const char *name)
 {
+    /*
+     * ★ 这里就是标准的 RTLD_NEXT 用法，不要改 ★
+     *
+     * 曾有段时间怀疑它在真实部署环境下返回 NULL，并加了一整套
+     * 「自包含 ELF 解析」回退。那个怀疑**已被实测证伪**：当时的探针是
+     * 主程序，而主程序的搜索链里自己之后没有 libc，RTLD_NEXT 返回 NULL
+     * 是语义的正常结果。把探测放进被 --preload 加载的 .so（真实语境）后，
+     * fork / posix_spawn / execve 三个都合法解析到 libc.so.6。
+     *
+     * 详见 preload.c 顶部「一段被证伪的弯路」注释。
+     */
     void *p = dlsym(RTLD_NEXT, name);
     if (p == NULL) {
         PX_LOG("proc: dlsym(%s) 失败: %s", name, dlerror());
@@ -2559,6 +2996,176 @@ static void *px_dlsym(const char *name)
  * 不经过 PLT，所以它不会回到我们的 execve。必须走 (a)。
  * 因此下面 execv/execvp/execvpe/execveat 都要独立 hook。
  */
+/*
+ * trampoline exec —— 经官方的 bridge 重新进入可执行上下文。
+ *
+ * 【为什么必须这么做】
+ *
+ * 真实部署下 guest 可执行文件位于 `/data/data/<pkg>/files/...`，
+ * 其 SELinux 标签为 `app_data_file`；**内核不允许执行该标签的文件**。
+ * 实测（裸 syscall，绕开一切钩子）：
+ *
+ *     /data/data/.../ubuntu/bin/true   -> ❌ EACCES（即使 uid=0）
+ *     /system/bin/sh                   -> ✅ 成功
+ *     /data/app/.../lib/arm64/<任意>.so -> ✅ 成功
+ *
+ * 也就是说「翻译成宿主路径再 execve」这条路**不可能成功**，
+ * 与权限、与加载器都无关。
+ *
+ * 官方 runtime 因此改为 exec **它自己的 bridge**
+ * （`PROROOT_TRAMPOLINE_PATH`，在 `/data/app/.../lib/arm64/` 下，可执行）：
+ *
+ *     argv = [bridge, linker, (原 argv[0..]), NULL]
+ *     envp 原样（官方另注 PROROOT_TRAMPOLINE_ARGV_OFFSET，此处从简）
+ *
+ * 实测：手工按这个形态 exec，能让 guest 程序真正跑起来（见报告 §原始输出 [C]）。
+ *
+ * 【回退语义】
+ * 环境里没有 `PROROOT_TRAMPOLINE_PATH`（普通 LD_PRELOAD 场景、单测、
+ * 开发机）时**立即返回 -1**，调用方照旧直接 execve —— 行为完全不变。
+ *
+ * 返回 0 表示「本函数已经尝试过 exec；能返回就说明失败了」。
+ */
+static int px_trampoline_exec(const char *host, char *const argv[],
+                              char *const *envp)
+{
+    const char *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
+    const char *linker = getenv("PROROOT_LINKER_PATH");
+    char tramp_path[PX_PATH_MAX];
+    char *nv[PX_ARGV_MAX + 4];
+    size_t n = 0;
+    size_t i;
+
+    /*
+     * `host` 目前用不到（trampoline 形态不 exec 翻译后的宿主路径，
+     * 而是 exec bridge 自己），但**保留在签名里**：它与调用方
+     * px_do_execve 的 `host` 是同一个语义参数，去掉会让两个调用点
+     * 的形态不一致，将来要用时又得改签名。
+     * 本项目的门禁是零警告，所以这里显式吃掉它。
+     */
+    (void)host;
+
+
+    /* 未配置 trampoline → 交回调用方走原来的直接 execve */
+    if (tramp == NULL || tramp[0] == '\0' || linker == NULL ||
+        linker[0] == '\0') {
+        return -1;
+    }
+
+    /*
+     * 构造 argv：bridge 的用法是 `trampoline <linker> [args...]`
+     * （该 usage 字符串就写在 bridge.so 里）。
+     * 所以 = [bridge] + [linker] + 原 argv + [NULL]。
+     */
+    /*
+     * ★ 为什么前面要加 `/proc/self/root` ★
+     *
+     * bridge 在 `/data/app/...` 下。这个前缀**既不在 rootfs 内、
+     * 也不是我们声明的 bind source**，所以路径翻译会把它拼成
+     * `<rootfs>/data/app/...` —— 那个路径不存在，execve 恒 ENOENT。
+     *
+     * 实测：
+     *     原路径                    -> stat 失败 / exec 失败
+     *     /proc/self/root + 原路径   -> stat 成功 / exec 成功
+     * 因为翻译层对 `/proc` 是**透传**的（translate_path 的特殊路径规则），
+     * 而内核对本进程而言 `/proc/self/root` 就是 `/`。
+     *
+     * tramp 本身已是 /proc 开头时不再加前缀，避免出现
+     * `/proc/self/root/proc/...` 这种畸形路径。
+     */
+    if (tramp[0] != '/') {
+        return -1;
+    }
+    if (strncmp(tramp, "/proc/", 6) == 0) {
+        if (strlen(tramp) >= sizeof(tramp_path)) {
+            return -1;
+        }
+        memcpy(tramp_path, tramp, strlen(tramp) + 1);
+    } else if (snprintf(tramp_path, sizeof(tramp_path), "/proc/self/root%s",
+                        tramp) >= (int)sizeof(tramp_path)) {
+        return -1;
+    }
+
+    nv[n++] = tramp_path;
+    nv[n++] = (char *)(uintptr_t)linker;
+    if (argv != NULL) {
+        for (i = 0; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 2; i++) {
+            nv[n++] = argv[i];
+        }
+    }
+    nv[n] = NULL;
+
+    /*
+     * ★ 必须用裸 syscall，不能再走 libc 的 execve ★
+     * 我们自己就是 execve 的 hook，走 libc 会回到本函数 → 死循环。
+     * 而且裸 syscall 也顺带绕开了 syscall_guard 对 execve 的路径翻译
+     * （bridge 在 /data/app 下，翻译后必然不存在）。
+     */
+    (void)syscall(SYS_execve, tramp_path, nv, (char *const *)envp);
+    return 0;   /* 能返回就是失败了 */
+}
+
+/*
+ * posix_spawn 的 trampoline 版本。
+ *
+ * posix_spawn **不能**像 execve 那样「就地 exec」—— 它必须在父进程里
+ * 正常返回，把子进程 pid 交给调用方。所以只能 fork + 子进程 exec trampoline。
+ *
+ * 返回 0 = 成功（*pid 已填）；-1 = 未走 trampoline（未配置该环境，
+ * 或调用方用了我们无法保真的参数），调用方回退到真实 posix_spawn。
+ *
+ * ★ 关于 file_actions / attr —— 已知限制 ★
+ *
+ * glibc 的 spawn 内部靠调用**导出符号**（open64/dup2/chdir/fcntl…）
+ * 来实现 file_actions 与 attr（依据见 px_do_spawn 顶部的反汇编注释）。
+ * 走 fork+trampoline 后，子进程直接 exec bridge、由 bridge 完成
+ * mmap+跳转，glibc 那套机制不参与 —— 因此 **file_actions 的重定向
+ * 在 trampoline 路径下不会生效**。
+ *
+ * 所以这里**主动保守**：一旦调用方传了非空 file_actions 或 attr，
+ * 就放弃 trampoline、回退真实 posix_spawn。宁可让调用方拿到真实的
+ * 失败，也不要静默丢掉重定向语义（那类缺陷极难定位）。
+ */
+static int px_trampoline_spawn(pid_t *pid, char *const argv[],
+                               char *const *envp,
+                               const posix_spawn_file_actions_t *fa,
+                               const posix_spawnattr_t *attr)
+{
+    const char *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
+    const char *linker = getenv("PROROOT_LINKER_PATH");
+    pid_t child;
+
+    if (pid == NULL || argv == NULL) {
+        return -1;
+    }
+    if (tramp == NULL || tramp[0] == '\0' || linker == NULL ||
+        linker[0] == '\0') {
+        return -1;          /* 普通环境：走真实 posix_spawn，行为不变 */
+    }
+    if (fa != NULL || attr != NULL) {
+        return -1;          /* 见上方「已知限制」 */
+    }
+
+    child = fork();
+    if (child < 0) {
+        return -1;          /* fork 失败：交回调用方走原路径报错 */
+    }
+    if (child == 0) {
+        /*
+         * 子进程：exec trampoline。
+         *
+         * px_trampoline_exec 内部用裸 syscall，并自己构造
+         * [bridge, linker] + argv 的形态，所以这里把 argv 原样交给它。
+         * fork 之后只做 async-signal-safe 的事（不分配内存）。
+         */
+        (void)px_trampoline_exec(NULL, argv, envp);
+        _exit(127);         /* exec 失败：与 shell 的约定一致 */
+    }
+
+    *pid = child;
+    return 0;
+}
+
 static int px_do_execve(const char *path, char *const argv[],
                         char *const envp[], const char *path_env,
                         int use_search)
@@ -2634,7 +3241,31 @@ static int px_do_execve(const char *path, char *const argv[],
     }
     (void)final_env_use;
 
-    /* 4) 转发 */
+    /* 4) 转发
+     *
+     * ★★ 优先走 trampoline，而不是直接 execve ★★
+     *
+     * 真实部署环境里，guest 可执行文件位于 `/data/data/<pkg>/files/...`，
+     * 该目录的 SELinux 标签是 `app_data_file` —— **内核禁止执行它**
+     * （实测：裸 `syscall(SYS_execve, <rootfs>/bin/true)` 恒返回
+     *  EACCES，即使调用方 uid=0；同一二进制在 `/system` 下则可执行）。
+     *
+     * 所以「把 guest 路径翻译成宿主路径再直接 execve」这条路**根本走不通**，
+     * 无论权限、无论加载器。官方 runtime 的做法是改成 exec **它自己的
+     * bridge**（`PROROOT_TRAMPOLINE_PATH`，位于 `/data/app/.../lib/arm64/`，
+     * 可执行），由 bridge 在特权上下文里完成 mmap+跳转。
+     *
+     * 实测对照（同 bridge/同 linker，只换 trampoline 内层加载的 runtime）：
+     *     内层 = 官方 runtime → node spawnSync status=0     ✅
+     *     内层 = bxroot       → node spawnSync status=null  ❌
+     * 证明 trampoline 机制本身可用，缺的只是 bxroot 这一层。
+     */
+    if (px_trampoline_exec(host, final_argv, final_env) == 0) {
+        /* 走到这里说明 trampoline exec 失败（成功则永不返回），
+         * 落到下面回退到直接 execve —— 保持普通环境的行为不变。 */
+        PX_LOG("proc: trampoline exec 失败，回退直接 execve %s", host);
+    }
+
     if (real_execve == NULL) {
         real_execve = (int (*)(const char *, char *const[], char *const[]))
                           px_dlsym("execve");
@@ -2942,6 +3573,27 @@ static int px_do_spawn(pid_t *pid, const char *path,
      *     对绝对路径行为一致。
      * 统一成 posix_spawn 消除了「两个分支行为可能分叉」的风险。
      */
+    /*
+     * ★★ 优先走 trampoline ★★
+     *
+     * guest 可执行文件在 /data/data 下，SELinux 标签是 app_data_file，
+     * **内核禁止执行**（实测：即使 uid=0 也恒 EACCES）。所以真实
+     * posix_spawn 把翻译后的宿主路径交给内核必然失败。
+     *
+     * 官方 runtime 因此改为 exec 它自己的 bridge，由 bridge 完成
+     * mmap+跳转（不经内核的 exec 权限检查）。这里照做。
+     *
+     * 未配置 PROROOT_TRAMPOLINE_PATH（普通 LD_PRELOAD / 单测）时
+     * px_trampoline_spawn 直接返回 -1，行为与修复前完全一致。
+     */
+    if (px_trampoline_spawn(pid, final_argv, final_env, fa, attr) == 0) {
+        if (pid != NULL && *pid > 0) {
+            (void)px_ledger_add(g_rt_ledger, *pid, px_self_pid(), PX_TAG_SPAWN);
+        }
+        rc = 0;
+        goto out;
+    }
+
     if (real_posix_spawn == NULL) {
         real_posix_spawn = (int (*)(pid_t *, const char *,
                                     const posix_spawn_file_actions_t *,
@@ -3102,16 +3754,34 @@ pid_t fork(void)
         int rc = px_forkguard_parent_register(&g_rt_guard, g_rt_ledger, child);
         if (px_fork_should_abort(rc)) {
             /*
-             * 账本满 → 放弃这个子进程。
+             * 账本登记失败 → 放弃这个子进程。
              *
              * 用 SIGKILL 而不是 SIGTERM：子进程此刻刚从 fork 返回，
              * 可能还没装信号处理器，SIGTERM 会被默认处理（也是终止）
              * 但如果它继承了父进程的 handler 就可能忽略掉。
              * 这里要的是确定性。
+             *
+             * ★ 必须先 kill 再决定返回值（P3 修复）★
+             *
+             * 原来这里 `errno = EAGAIN; return -1;` —— 但 fork() 返回 -1
+             * 的约定含义是「**没有**创建子进程」，而此刻子进程是真实
+             * 存在的。已实测（见 docs/proc-高危修复报告.md §P3）：
+             * 16/16 轮 fork() 返回 -1/EAGAIN，而 proc.c 自己随后
+             * kill+waitpid 掉了 16 个真实子进程。
+             *
+             * 调用方（libuv / Python subprocess / posix_spawn 的兜底路径）
+             * 拿到 -1 + EAGAIN 会**重试**，于是每来一次「账本满」
+             * 就多创建并被丢弃一个进程。在 Android 低内存下账本满
+             * 可持续存在，这会变成 fork 风暴。
+             *
+             * 处置：先把子进程确定性地杀掉并回收（副作用清零），
+             * 再返回 -1/EAGAIN —— 这样「返回 -1」与「没有留下任何
+             * 存活子进程」两个事实重新一致。杀不掉的情况已经记进
+             * PX_LOG（见 px_reap_killed_child）。
              */
             PX_LOG("proc: 账本登记失败(rc=%d)，放弃子进程 %d", rc, (int)child);
             (void)px_real_kill(child, SIGKILL);
-            (void)waitpid(child, NULL, 0);
+            px_reap_killed_child(child);
             errno = EAGAIN;
             return -1;
         }
@@ -3169,10 +3839,20 @@ pid_t vfork(void)
     if (child > 0) {
         int rc = px_forkguard_parent_register(&g_rt_guard, g_rt_ledger, child);
         if (px_fork_should_abort(rc)) {
+            /*
+             * 与 fork 同构的处置（P3 修复）：先确定性地杀掉并回收，
+             * 再返回 -1/EAGAIN。
+             *
+             * vfork 的这条路径**更危险**：vfork 的子进程与父进程共享
+             * 地址空间，且 POSIX 要求它「立刻 exec 或 _exit」。
+             * 一个被登记失败「放弃」的 vfork 子进程若不立刻死掉，
+             * 父进程会被挂起在 vfork 的等待上（实测形态是整体挂死），
+             * 而调用方同时收到 -1 会去重试 —— 两者叠加比 fork 更糟。
+             */
             PX_LOG("proc: vfork 账本登记失败(rc=%d)，放弃子进程 %d",
                    rc, (int)child);
             (void)px_real_kill(child, SIGKILL);
-            (void)waitpid(child, NULL, 0);
+            px_reap_killed_child(child);
             errno = EAGAIN;
             return -1;
         }

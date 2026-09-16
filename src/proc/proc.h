@@ -86,11 +86,83 @@ extern "C" {
  */
 #define PX_ENVP_MAX 4096
 
-/* 单条环境变量（含名字与 '='）的长度上限。 */
-#define PX_ENV_ENTRY_MAX 8192
+/* ------------------------------------------------------------------ */
+/* ★ 三个限额必须自洽（P2 修复，见 docs/proc-高危修复报告.md）★        */
+/* ------------------------------------------------------------------ */
+/*
+ * 缺陷回顾：`PX_ENV_ENTRY_MAX`(8192) < `PX_PRELOAD_MAX`(16384) 时，
+ * 构造函数（px_cfg_merge_preload）按 16384 校验合并后的 LD_PRELOAD
+ * 并 setenv 成功，但每次 exec 重建 envp 时 px_env_push_kv 按 8192
+ * 拒收单条 → px_env_build 整体失败 → 子进程**完全没有 LD_PRELOAD**
+ * （无路径翻译 / fakeroot / l2s），且没有任何报错。
+ *
+ * 修法不是「把 8192 改大」，而是让三个数**由同一个来源推导**，
+ * 并且让「装不下」不再等价于「构建失败」：
+ *
+ *   1. `PX_ENV_ENTRY_MAX` == `PX_PRELOAD_MAX` —— 单条上限至少要和
+ *      我们自己会写出去的最大单条一样大，否则限额自相矛盾。
+ *      16384 与内核 `MAX_ARG_STRLEN`(32 页 = 128 KiB，见 binfmt_elf.c)
+ *      相差一个数量级，既安全又远离边界。
+ *
+ *   2. `PX_ENV_BUDGET_DEFAULT` —— envp 的**累计**上限，取值对齐内核
+ *      `_STK_LIM/4 = 2 MiB`（本机 `getconf ARG_MAX` = 2097152）。
+ *      条目数上限 PX_ENVP_MAX(4096) × 单条上限(16384) = 64 MiB，
+ *      远超内核真的会接受的量 → **单靠前两个数保证不了「交给内核的
+ *      envp 内核收得下」**，必须再有一条总量闸门。这正是「检查所有
+ *      相关上限是否自洽」里最容易被漏掉的一环。
+ *
+ *   3. 超限时**跳过并截断**（behave like PX_ENVP_MAX 的截断语义），
+ *      而不是让整个构建失败 —— 环境变量多不是错误，不该让 exec 失败。
+ *      但强制条目（LD_PRELOAD / BXROOT_*）必须**优先占位**，且失败时
+ *      px_runtime_build_env 会写一条 stderr 警告（失败可见）。
+ *
+ * 三者的一致性由 test_proc.c 的 C16/C17 用**编译期断言**钉住：
+ * 任何人日后单独改其中一个数都会让测试编不过。
+ */
 
-/* LD_PRELOAD 合并结果的长度上限。 */
+/* 单条环境变量（含名字与 '='）的长度上限。
+ *
+ * ★ 必须 > PX_PRELOAD_MAX，不能等于 ★
+ *
+ * 两个数限定的东西不同：
+ *   - `PX_PRELOAD_MAX` 限的是 LD_PRELOAD 的**值**（px_merge_preload 的
+ *     outsz 就是这个数，所以可产出的值最长 PX_PRELOAD_MAX-1 个字符）；
+ *   - `PX_ENV_ENTRY_MAX` 限的是整条 `NAME=VALUE`。
+ * 于是「值刚好用满」时整条 = strlen("LD_PRELOAD=") + (PX_PRELOAD_MAX-1)。
+ * 若两者相等，构造函数的**合法输出**必然被 px_env_build 拒收 ——
+ * 这正是 P2 的成因，只是原来相差得更多（8192 vs 16384）。
+ * 这里留一个名字长度的余量，并把关系写成编译期断言。 */
+#define PX_ENV_NAME_MAX 32
+
+/* LD_PRELOAD 合并结果（值）的长度上限。 */
 #define PX_PRELOAD_MAX 16384
+
+#define PX_ENV_ENTRY_MAX ((PX_PRELOAD_MAX) + (PX_ENV_NAME_MAX))
+
+/*
+ * envp 累计字节上限（含所有条目的 NUL）。对齐内核 `ARG_MAX`（2 MiB）——
+ * 超过它内核会 E2BIG，还不如我们在本地就截断掉。
+ */
+#define PX_ENV_BUDGET_DEFAULT (2u * 1024u * 1024u)
+
+/*
+ * 编译期自洽断言。用「数组大小为负」这个经典技巧而不是 static_assert，
+ * 是为了在 C11 之外的方言下也能生效。
+ *
+ * ★ 这三条是 P2 的回归护栏 ★
+ * 任何人日后单独调整其中一个数（正是 P2 的成因）都会让测试**编不过**，
+ * 而不是等到线上出现「命令跑了但显示宿主文件」才发现。
+ */
+#define PX_LIMITS_MUST_BE_CONSISTENT                                      \
+    typedef char px_limit_check_entry_covers_preload[                     \
+        ((PX_ENV_ENTRY_MAX) >= (PX_PRELOAD_MAX) + (PX_ENV_NAME_MAX))      \
+            ? 1 : -1];                                                    \
+    typedef char px_limit_check_entry_le_budget[                          \
+        ((PX_ENV_ENTRY_MAX) <= (PX_ENV_BUDGET_DEFAULT)) ? 1 : -1];        \
+    typedef char px_limit_check_budget_le_argmax[                         \
+        ((PX_ENV_BUDGET_DEFAULT) <= (2u * 1024u * 1024u)) ? 1 : -1]
+
+PX_LIMITS_MUST_BE_CONSISTENT;
 
 /* 一次 argv 翻译最多改写多少条参数。 */
 #define PX_ARGV_MAX 4096
@@ -309,6 +381,14 @@ typedef struct {
     const char *const *drop;      /* 需要剔除的名字（不含 '='） */
     size_t           drop_n;
     size_t           max_entries; /* 结果条数上限；0 用 PX_ENVP_MAX */
+    /*
+     * 结果累计字节上限（含所有条目结尾的 NUL）；0 用
+     * PX_ENV_BUDGET_DEFAULT（= 内核 ARG_MAX = 2 MiB）。
+     *
+     * 单有 max_entries 不足以保证「交给内核的 envp 内核收得下」：
+     * 4096 条 × 16384 字节 = 64 MiB，而内核 ARG_MAX 只有 2 MiB。
+     */
+    size_t           max_bytes;
 } px_envpolicy;
 
 /*
@@ -333,6 +413,13 @@ typedef struct {
     size_t  cap;
     size_t *offs;     /* 内部：每条在 buf 里的字节偏移 */
     const px_alloc *alloc;
+    /*
+     * 诊断：因为「单条超过 PX_ENV_ENTRY_MAX」/「累计超过预算」而被
+     * 跳过的条数。截断是刻意容忍的（环境变量多不该让 exec 失败），
+     * 但**不能静默** —— 钩子层据此打一次警告。
+     */
+    size_t  skipped_long;
+    size_t  skipped_budget;
 } px_envout;
 
 /*
@@ -819,6 +906,44 @@ int px_forkguard_parent_register(px_forkguard *g, px_ledger *l, pid_t child);
 
 /* 登记失败时是否应当放弃这个子进程。 */
 int px_fork_should_abort(int reg_rc);
+
+/*
+ * 一个「wait 一个特定子进程」的注入式原语（P3 修复）。
+ *
+ * 语义与 `waitpid(pid, status, 0)` 一致：返回子 pid 表示回收成功，
+ * 返回 -1 时 errno 有意义（EINTR = 被信号打断，应重试；ECHILD = 没有
+ * 这个子进程，内核已经自动回收）。
+ *
+ * 之所以做成注入式，与 px_alloc / px_sysops / px_lockops 同一个理由：
+ * **EINTR 分支在生产里无法确定性触发**（要靠信号恰好落在 waitpid 上），
+ * 而不可达的分支没人测、必然写错。注入之后它可以被 100% 可重复地断言，
+ * 而生产侧只是把它接到真实的 waitpid 上。
+ */
+typedef pid_t (*px_wait_child_fn)(void *ud, pid_t child, int *status);
+
+/* 回收结果。 */
+typedef struct {
+    int           reaped;        /* 1 = 确实回收到了这个子进程 */
+    int           eintr_count;   /* 被信号打断并重试的次数       */
+    int           gave_up;       /* 1 = 连续 EINTR 超上限后放弃  */
+    int           last_errno;    /* 最终失败时的 errno（reaped=0 时有效） */
+} px_reap_result;
+
+/* 连续 EINTR 的重试上限。设上限是为了避免「信号处理器不停自打」时的死循环。 */
+#define PX_REAP_EINTR_MAX 64
+
+/*
+ * 尽力回收一个我们已经决定放弃的子进程。
+ *
+ * 与原来的 `(void)waitpid(child, NULL, 0);`（不重试、不校验）相比：
+ *   - EINTR 会重试到 PX_REAP_EINTR_MAX 次；
+ *   - 返回值与 errno 都记进 px_reap_result，调用方可以据此留痕
+ *     （「回收失败」不能再是静默的）。
+ *
+ * 返回 *out（允许为 NULL）。
+ */
+void px_reap_child_tolerant(pid_t child, px_wait_child_fn wait_fn, void *ud,
+                            px_reap_result *out);
 
 /*
  * 只做「重置 pid 相关缓存」的部分，不碰锁。

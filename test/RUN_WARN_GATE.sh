@@ -21,8 +21,14 @@
 #
 # 判据
 # ----
-# 对每个编译单元做 `-fsyntax-only`（不产出目标文件，快），
+# 对每个编译单元做**真实编译**（`-c -o /dev/null`，与构建同级别 -O1），
 # 统计 `warning:` 行数。任何一条都算失败。
+#
+# ★ 为什么不是 -fsyntax-only ★
+# 实测：同一份 launcher.c，-fsyntax-only 报 0 条，-c -O1 报 3 条。
+# 后端才产生的告警（-Wformat-truncation / -Wstringop-truncation 等）
+# 全部漏掉。本门禁的价值就是"不让告警被静默"，用 -fsyntax-only 等于
+# 自己把同一类问题又静默了一遍。详见下方循环里的注释。
 #
 # 已知的两类"假告警"及其处理
 # --------------------------
@@ -131,12 +137,25 @@ for f in $UNITS; do
     CHECKED=$((CHECKED + 1))
 
     # gcc 13.3.0 在本环境有随机 ICE（RTL / IRA / sched-deps），重试即可。
-    # 与构建脚本同样的三级重试，但这里只做语法检查，不涉及链接。
+    #
+    # ★ 必须真的编译，不能用 -fsyntax-only ★
+    #
+    # 这是一处**实测出来的漏洞**（红队复核发现）：-fsyntax-only 只跑前端，
+    # 任何在后端才产生的告警**全部漏报**。实测同一份 launcher.c：
+    #     -fsyntax-only           → 0 条告警   ← 门禁看到的
+    #     -c -O1 -o /dev/null     → 3 条告警   ← 真实情况
+    # 也就是说本门禁"唯一卖点是拦住告警"，却自己静默了 3 条现存告警。
+    # 典型受害者是 -Wformat-truncation / -Wstringop-truncation —— 它们的
+    # 数据流分析在后端做，前端根本不报。
+    #
+    # 同时补上 -O1：gcc 的 -O2 才有的那批告警（如 bridge.c 的
+    # -Wstringop-truncation）在 -O0 下不报，而构建脚本实际用 -O2/-O1。
+    # 门禁的优化级别必须与真实构建**对齐**，否则策略漂移。
     rc=1
     i=1
     while [ "$i" -le 3 ]; do
         # shellcheck disable=SC2086
-        "$CC" $BASE -I"${PROC_DIR:-.}" $DEFS -fsyntax-only "$f" \
+        "$CC" $BASE -O1 -I"${PROC_DIR:-.}" $DEFS -c -o /dev/null "$f" \
             >/dev/null 2>"/tmp/bxroot-warn-$$.txt"
         rc=$?
         grep -q 'internal compiler error' "/tmp/bxroot-warn-$$.txt" || break

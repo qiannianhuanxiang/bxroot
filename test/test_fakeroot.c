@@ -21,6 +21,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>   /* makedev/major/minor：B6 要构造与内核同型的 dev_t */
 #include <unistd.h>
 
 #include "fakeroot.h"
@@ -506,10 +507,107 @@ static void t_mode_faked(void)
     }
 }
 
+/*
+ * B6 —— statx 的 dev 键必须与写侧同型（F3 回归）。
+ *
+ * 缺陷：statx 路径把 stx_dev_major（只有主设备号）当 dev_t 去查 by_inode，
+ * 而写侧存的是完整 st.st_dev。minor 非零时两个键永不相等，查询恒 MISS。
+ * 本机实测 st_dev=0xfe3e vs stx_dev_major=0xfe。
+ *
+ * 这里**不碰文件系统**：dev_t 由 makedev() 直接构造，statx 结构体手工填，
+ * 走的是 fakeroot_patch_statx_ex(rec == NULL, fd < 0) —— 三条调用路径里
+ * 唯一让这个查询成为**唯一**信息来源的那条（另两条：rec != NULL 不查；
+ * fd >= 0 由 fakeroot_lookup_fd 兜底）。
+ *
+ * 为了让「记账丢失」可观测，必须把启发式关掉（FR_HEURISTIC_OFF）：
+ * 否则 OWNER 启发式会把 == real_uid 的属主也改写成假身份，掩盖掉差异。
+ * 这正是审计报告说「被掩盖」的机制在纯记账层的对应物。
+ */
+static void t_patch_statx_dev_key(void)
+{
+    fakeroot_state fs;
+    struct statx   stx;
+    fr_record      rec;
+    dev_t          dev;
+    const unsigned major_n = 254;    /* 本机 /data 所在分区的真实主设备号 */
+    const unsigned minor_n = 62;     /* 非零 —— 正是 F3 暴露的必要条件 */
+
+    CASE("B6 statx 补丁：dev 键必须还原成完整 dev_t（minor 不能丢）");
+
+    memset(&fs, 0, sizeof(fs));
+    fs.enabled   = true;
+    fs.heuristic = FR_HEURISTIC_OFF;      /* 记账是唯一信息来源 */
+    fs.ruid = fs.euid = fs.suid = fs.fsuid = 9999;   /* 假身份 */
+    fs.rgid = fs.egid = fs.sgid = fs.fsgid = 9999;
+    fs.real_uid = fs.real_euid = 2000;               /* 真实身份 */
+    fs.real_gid = fs.real_egid = 2000;
+    state_attach_maps(&fs);
+    if (fs.by_inode == NULL) { state_detach_maps(&fs); return; }
+
+    dev = makedev(major_n, minor_n);
+    CHECK(minor(dev) != 0);               /* 前提：minor 必须非零 */
+    CHECK(dev != (dev_t)major_n);         /* 前提：major 单独 != 完整 dev_t */
+
+    /* 写侧：与 fr_record_inode_for_path 完全一致 —— 存完整 st_dev */
+    memset(&rec, 0, sizeof(rec));
+    CHECK_EQ_I(fakeroot_record_owner_inode(&fs, dev, (ino_t)123456, 1234, 1234),
+               FR_OK);
+
+    /* 读侧：手工构造 statx 结果（内核报属主 0，既非真实也非假身份） */
+    memset(&stx, 0, sizeof(stx));
+    stx.stx_dev_major = major_n;
+    stx.stx_dev_minor = minor_n;
+    stx.stx_ino       = 123456;
+    stx.stx_uid       = 0;
+    stx.stx_gid       = 0;
+    stx.stx_mode      = 0100644;
+    stx.stx_mask      = STATX_UID | STATX_GID | STATX_MODE;
+
+    /* 三条调用路径的对照：rec==NULL && fd<0 是唯一能被这条查询救的 */
+    fakeroot_patch_statx_ex(&stx, &fs, NULL, -1);
+    CHECK_EQ_I(stx.stx_uid, 1234);        /* 修复前是 0（记账丢失） */
+    CHECK_EQ_I(stx.stx_gid, 1234);
+
+    /* 反向对照：major 单独当 dev_t 必须查不到 —— 证明断言不是侥幸通过 */
+    {
+        fr_record got;
+        CHECK(fakeroot_lookup(&fs, NULL, (dev_t)major_n, (ino_t)123456, &got)
+              != FR_OK);
+        CHECK_EQ_I(fakeroot_lookup(&fs, NULL, dev, (ino_t)123456, &got), FR_OK);
+    }
+
+    /* fd >= 0 那条路径：本 harness 没记 fd 键 ⇒ 兜底不成立，
+     * 结果与 rec==NULL && fd<0 一致（都是记账生效，因为 inode 那路已修好） */
+    {
+        struct statx s2 = stx;
+        s2.stx_uid = 0;
+        s2.stx_gid = 0;
+        fakeroot_patch_statx_ex(&s2, &fs, NULL, 0);
+        CHECK_EQ_I(s2.stx_uid, 1234);
+    }
+
+    /* rec != NULL：调用方预取，与 inode 查询无关，必须同样生效 */
+    {
+        struct statx s3;
+        fr_record r3;
+        memset(&s3, 0, sizeof(s3));
+        s3.stx_dev_major = major_n;
+        s3.stx_dev_minor = minor_n;
+        s3.stx_ino = 123456;
+        s3.stx_mask = STATX_UID | STATX_GID;
+        memset(&r3, 0, sizeof(r3));
+        r3.uid = 4321; r3.gid = 4321;
+        r3.uid_faked = true; r3.gid_faked = true;
+        fakeroot_patch_statx_ex(&s3, &fs, &r3, -1);
+        CHECK_EQ_I(s3.stx_uid, 4321);
+    }
+
+    state_detach_maps(&fs);
+}
+
 /* ================================================================== */
 /* C. access 判定                                                      */
 /* ================================================================== */
-
 static void t_access_model(void)
 {
     struct stat st;
@@ -681,6 +779,7 @@ int main(void)
     t_patch_stat_null();
     t_patch_statx();
     t_mode_faked();
+    t_patch_statx_dev_key();
 
     printf("\n[C] access 判定\n");
     t_access_model();

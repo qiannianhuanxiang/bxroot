@@ -171,10 +171,30 @@ echo "   产物: $OUT"
 echo "   大小: $SIZE 字节"
 echo "   导出符号（nm -D --defined-only）: $NSYM"
 
-# D4 的 19 个符号必须在**动态符号表**里（LD_PRELOAD 靠它插入）
+# D4 的进程管理符号必须在**动态符号表**里。
+#
+# ★ 为什么这一条必须让构建失败（而不是打个 ⚠️ 就走）★
+#
+# 这处是回归第 9 项唯一的实质内容，而它此前**永远不会让构建变红**：
+# `MISSING` 非空时只打印一行 ⚠️ 然后 `exit 0`。实测（红队复核）：往清单里
+# 塞一个不存在的符号 `THIS_SYMBOL_DOES_NOT_EXIST_ZZZ`，得到
+#     ⚠️  未导出的 D4 符号: THIS_SYMBOL_DOES_NOT_EXIST_ZZZ
+# 而退出码是 **0**。
+#
+# 后果不是"少个功能"而是**静默失效**：LD_PRELOAD 靠动态符号表插入，符号
+# 漏导出意味着那个钩子根本没被装上，而进程照样能跑 —— 容器在那条路径上
+# 悄悄失去翻译/fakeroot/进程管理能力，现象离原因极远。
+# 这正是本文档自己点名"只有构建期检查能拦住"的那类缺陷，所以这里必须
+# 硬失败。
+#
+# 顺带修正一处**文档错误**：注释原写"19 个符号"，实际清单是 23 个。
+# 用下面的计数自动核对，避免以后再漂移。
 D4="fork vfork posix_spawn posix_spawnp kill killpg tgkill tkill system popen \
     execve execv execvp execvpe execl execlp execle execveat fexecve \
     waitpid wait4 wait3 waitid"
+D4_N=0
+for s in $D4; do D4_N=$((D4_N + 1)); done
+
 MISSING=""
 for s in $D4; do
     if ! nm -D --defined-only "$OUT" 2>/dev/null | awk '{print $3}' | grep -qx "$s"; then
@@ -182,8 +202,11 @@ for s in $D4; do
     fi
 done
 if [ -n "$MISSING" ]; then
-    echo "   ⚠️  未导出的 D4 符号:$MISSING"
-else
-    echo "   ✅ D4 进程管理符号全部导出（含 waitpid/wait4/wait3/waitid）"
+    echo "   ❌ 未导出的 D4 符号:$MISSING"
+    echo "      （共核对 $D4_N 个；漏导出 = 对应钩子静默失效，容器照样能启动，"
+    echo "        只是那条路径上不再有翻译/fakeroot/进程管理）"
+    echo "      构建按失败处理。"
+    exit 1
 fi
+echo "   ✅ D4 进程管理符号全部导出（$D4_N/$D4_N，含 waitpid/wait4/wait3/waitid）"
 exit 0

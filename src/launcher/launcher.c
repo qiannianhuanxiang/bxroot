@@ -169,6 +169,49 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
     return 0;
 }
 
+/*
+ * 把 `dir` 与 `name` 拼成 `dir/name` 写进 `out`。
+ *
+ * ★ 为什么不用一行 snprintf ★
+ *
+ * `snprintf(out, sizeof(out), "%s/%s", dir, name)` 在 dir 与 out 同宽
+ * （都是 PATH_MAX = 4096）时**必然**触发 -Wformat-truncation：编译器
+ * 无法证明 dir 的实际长度，只能按最坏情况（4095 字节）推演，于是得出
+ * "可能截断"的结论。
+ *
+ * 那个警告不是误报 —— 超长时 snprintf 会**静默截断**，得到一个指向
+ * 别处的路径（例如 `.../libbxroot-runtim`），随后 access() 失败、
+ * 功能静默降级。所以正确的做法不是关掉警告，而是**显式检查长度**：
+ * 超长就报错退出，让配置问题可见。
+ *
+ * 返回 0 成功，-1 表示放不下（不写 out 的内容，调用方据此报错）。
+ */
+static int join_dir_name(char *out, size_t out_size,
+                         const char *dir, const char *name)
+{
+    size_t dl, nl;
+
+    if (out == NULL || dir == NULL || name == NULL || out_size == 0) {
+        return -1;
+    }
+    dl = strlen(dir);
+    nl = strlen(name);
+
+    /* dir + '/' + name + '\0' */
+    if (dl > out_size - 1) {
+        return -1;
+    }
+    if (nl > out_size - 2 - dl) {
+        return -1;
+    }
+
+    memcpy(out, dir, dl);
+    out[dl] = '/';
+    memcpy(out + dl + 1, name, nl);
+    out[dl + 1 + nl] = '\0';
+    return 0;
+}
+
 int main(int argc, char **argv) {
     launcher_config_t cfg = {0};
 
@@ -202,6 +245,7 @@ int main(int argc, char **argv) {
         snprintf(lib_dir, sizeof(lib_dir), ".");
     }
 
+
     /* 构建 runtime 库路径：优先使用 BXROOT_LIB_PATH（DSHA 设置），否则用本目录同名文件 */
     const char *env_lib_path = getenv("BXROOT_LIB_PATH");
     char runtime_lib[PATH_MAX];
@@ -209,18 +253,36 @@ int main(int argc, char **argv) {
         snprintf(runtime_lib, sizeof(runtime_lib), "%s", env_lib_path);
         cfg.runtime_lib = strdup(runtime_lib);
     } else {
-        snprintf(runtime_lib, sizeof(runtime_lib), "%s/%s", lib_dir, LIBBXROOT_RUNTIME);
+        if (join_dir_name(runtime_lib, sizeof(runtime_lib),
+                          lib_dir, LIBBXROOT_RUNTIME) != 0) {
+            fprintf(stderr, "[bxroot-launcher] 运行时库路径过长（%s + %s > %d）\n",
+                    lib_dir, LIBBXROOT_RUNTIME, (int)sizeof(runtime_lib));
+            return 1;
+        }
         cfg.runtime_lib = strdup(runtime_lib);
     }
 
     /* 构建 linker 和 stub-loader 路径（如果存在） */
     char linker_lib[PATH_MAX], stub_lib[PATH_MAX];
-    snprintf(linker_lib, sizeof(linker_lib), "%s/%s", lib_dir, LIBBXROOT_LINKER);
-    snprintf(stub_lib, sizeof(stub_lib), "%s/%s", lib_dir, LIBBXROOT_STUB_LOADER);
-    if (access(linker_lib, F_OK) == 0)
-        cfg.linker_lib = strdup(linker_lib);
-    if (access(stub_lib, F_OK) == 0)
-        cfg.stub_loader = strdup(stub_lib);
+    /*
+     * linker / stub-loader 是**可选**组件：放不下就跳过（不致命），
+     * 但要让用户看见，不能静默。
+     */
+    if (join_dir_name(linker_lib, sizeof(linker_lib),
+                      lib_dir, LIBBXROOT_LINKER) == 0) {
+        if (access(linker_lib, F_OK) == 0)
+            cfg.linker_lib = strdup(linker_lib);
+    } else {
+        fprintf(stderr, "[bxroot-launcher] 跳过 linker：路径过长\n");
+    }
+
+    if (join_dir_name(stub_lib, sizeof(stub_lib),
+                      lib_dir, LIBBXROOT_STUB_LOADER) == 0) {
+        if (access(stub_lib, F_OK) == 0)
+            cfg.stub_loader = strdup(stub_lib);
+    } else {
+        fprintf(stderr, "[bxroot-launcher] 跳过 stub-loader：路径过长\n");
+    }
 
     /* 设置环境变量 */
     setenv("BXROOT_ROOTFS", cfg.rootfs, 1);

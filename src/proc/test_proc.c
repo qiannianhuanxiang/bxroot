@@ -761,6 +761,161 @@ static void test_env_build(void)
         CHECK(out.v == NULL);
         CHECK(out.buf == NULL);
     }
+
+    CASE("C16 ★P2 回归★：限额自洽（编译期断言 + 运行期核对）");
+    {
+        /*
+         * 缺陷回顾（P2）：PX_ENV_ENTRY_MAX(8192) < PX_PRELOAD_MAX(16384)。
+         * 构造函数按 16384 校验合并后的 LD_PRELOAD 并 setenv 成功，
+         * 但每次 exec 重建 envp 时按 8192 拒单条 → px_env_build 整体
+         * 失败 → 子进程**完全没有 LD_PRELOAD**（无路径翻译/fakeroot/l2s），
+         * 且无任何报错。实测 8400 字节即触发。
+         *
+         * 这里两条一起钉：
+         *   1. 编译期：proc.h 的 PX_LIMITS_MUST_BE_CONSISTENT 会在
+         *      限额不自洽时产生负长度数组 → **编不过**；
+         *   2. 运行期：把「构造函数能产出的最大 LD_PRELOAD」真的走一遍
+         *      px_env_build，必须成功且钩子还在。
+         */
+        CHECK(PX_ENV_ENTRY_MAX >= PX_PRELOAD_MAX + PX_ENV_NAME_MAX);
+        CHECK(PX_ENV_ENTRY_MAX <= PX_ENV_BUDGET_DEFAULT);
+        CHECK(PX_ENV_BUDGET_DEFAULT <= 2u * 1024u * 1024u);
+    }
+
+    CASE("C17 ★P2 回归★：PX_PRELOAD_MAX-1 的 LD_PRELOAD 必须能构建成功");
+    {
+        /*
+         * 这是 P2 的**判决性**断言：构造 px_merge_preload 能产出的
+         * 最长值（PX_PRELOAD_MAX-1 个字符），交给 px_env_build，
+         * 结果必须是 PX_OK 且 LD_PRELOAD 真的在结果里。
+         *
+         * 修复前：len=8190 起就 PX_ETOOLONG（-5）→ 整体失败。
+         */
+        static char val[PX_PRELOAD_MAX];
+        px_env_kv fm[1];
+        px_envpolicy pm;
+        const char *const in[] = { "PATH=/usr/bin", NULL };
+        size_t k;
+
+        /* 造一条长度 = PX_PRELOAD_MAX-1 的值，形如真实的多 .so 列表 */
+        for (k = 0; k + 1u < sizeof(val); k++) {
+            val[k] = (k % 32u == 31u) ? ':' : 'a';
+        }
+        val[PX_PRELOAD_MAX - 1u] = '\0';
+        CHECK_EQ((int)strlen(val), PX_PRELOAD_MAX - 1);
+
+        fm[0].name = "LD_PRELOAD";
+        fm[0].value = val;
+        fm[0].mode = PX_ENV_SET;
+        memset(&pm, 0, sizeof(pm));
+        pm.forced = fm;
+        pm.forced_n = 1;
+
+        CHECK_EQ(px_env_build(in, &pm, &out, NULL), PX_OK);
+        {
+            const char *got = px_env_lookup((const char *const *)out.v,
+                                            "LD_PRELOAD");
+            /*
+             * ★ 不能直接 strlen(got) ★
+             *
+             * 修复前 px_env_build 返回 -5、px_env_dispose 把 out.v 置空，
+             * 于是 got == NULL —— 若这里无保护地 strlen，测试自己会
+             * SIGSEGV，而崩溃会把「限额不自洽」这个真正的失败掩盖掉
+             * （现场只剩「测试段错误」，归因方向完全跑偏）。
+             */
+            CHECK(got != NULL);
+            if (got != NULL) {
+                CHECK_EQ((int)strlen(got), PX_PRELOAD_MAX - 1);
+            }
+        }
+        CHECK_EQ(out.skipped_long, 0u);      /* 没有任何条目被丢弃 */
+        if (out.v != NULL) {
+            CHECK_STR(px_env_lookup((const char *const *)out.v, "PATH"),
+                      "/usr/bin");
+        }
+        px_env_dispose(&out);
+    }
+
+    CASE("C18 ★P2 回归★：单条超长只丢那一条，不整体失败（钩子必须保住）");
+    {
+        /*
+         * 语义变更点：原来「任一条超长」→ 整个 px_env_build 失败
+         * （goto fail），于是调用方回落到原始 envp，**连 LD_PRELOAD
+         * 都没有**。现在改成「跳过那一条、继续构建」。
+         *
+         * 断言：畸长变量被丢掉、被计入 skipped_long，
+         *       而强制条目 LD_PRELOAD 与其它正常条目都还在。
+         */
+        static char huge[PX_ENV_ENTRY_MAX + 512];
+        px_env_kv fm[1];
+        px_envpolicy pm;
+        const char *in[3];
+
+        memset(huge, 'x', sizeof(huge) - 1u);
+        huge[0] = 'H';
+        huge[1] = '=';
+        huge[sizeof(huge) - 1u] = '\0';       /* 远长于 PX_ENV_ENTRY_MAX */
+
+        fm[0].name = "LD_PRELOAD";
+        fm[0].value = "/ours.so";
+        fm[0].mode = PX_ENV_SET;
+        memset(&pm, 0, sizeof(pm));
+        pm.forced = fm;
+        pm.forced_n = 1;
+
+        in[0] = huge;
+        in[1] = "KEEP=1";
+        in[2] = NULL;
+
+        CHECK_EQ(px_env_build(in, &pm, &out, NULL), PX_OK);
+        CHECK_EQ(out.skipped_long, 1u);
+        CHECK(px_env_lookup((const char *const *)out.v, "H") == NULL);
+        CHECK_STR(px_env_lookup((const char *const *)out.v, "KEEP"), "1");
+        CHECK_STR(px_env_lookup((const char *const *)out.v, "LD_PRELOAD"),
+                  "/ours.so");
+        px_env_dispose(&out);
+    }
+
+    CASE("C19 ★P2 回归★：累计预算截断但不失败，且强制条目优先占位");
+    {
+        /*
+         * 单有 max_entries 保证不了「内核收得下」：4096 × 16384 = 64 MiB
+         * 而内核 ARG_MAX 只有 2 MiB。max_bytes 是那条总量闸门。
+         *
+         * 断言：调用方环境被截断（不失败），而强制条目仍然写进去了。
+         * 「第一遍只用一半预算」的规则保证了这一点。
+         */
+        static char blob[2048];
+        px_env_kv fm[1];
+        px_envpolicy pm;
+        const char *in[9];
+        int i;
+
+        memset(blob, 'v', sizeof(blob) - 1u);
+        blob[0] = 'B';
+        blob[1] = '=';
+        blob[sizeof(blob) - 1u] = '\0';
+
+        for (i = 0; i < 8; i++) { in[i] = blob; }
+        in[8] = NULL;
+
+        fm[0].name = "LD_PRELOAD";
+        fm[0].value = "/ours.so";
+        fm[0].mode = PX_ENV_SET;
+        memset(&pm, 0, sizeof(pm));
+        pm.forced = fm;
+        pm.forced_n = 1;
+        pm.max_bytes = 4096u;         /* 只够放 2 条 blob（每条 2047+1） */
+
+        CHECK_EQ(px_env_build(in, &pm, &out, NULL), PX_OK);
+        CHECK(out.skipped_budget > 0u);          /* 确实截断了 */
+        CHECK(out.n < 9u);                       /* 不是全部载入 */
+        /* ★ 关键：强制条目必须还在 ★ */
+        CHECK_STR(px_env_lookup((const char *const *)out.v, "LD_PRELOAD"),
+                  "/ours.so");
+        CHECK_EQ(out.skipped_long, 0u);
+        px_env_dispose(&out);
+    }
 }
 
 /* ================================================================== */
@@ -1342,6 +1497,14 @@ static void test_bump(void)
 static pid_t fake_getpid(void) { return 500; }
 static pid_t fake_getppid(void) { return 400; }
 static pid_t fake_getpgrp(void) { return 500; }
+/*
+ * 第二个 getpgrp：返回 700。
+ *
+ * 存在的理由见 I14 —— `fake_getpgrp() == 500` 会让 `kill(-500)` 命中
+ * 「自己的进程组」那条无条件放行分支，于是 P1 的组分支根本走不到，
+ * 断言会假通过。测组安全边界时必须换一个不撞车的前台进程组号。
+ */
+static pid_t fake_getpgrp_700(void) { return 700; }
 static int   fake_kill(pid_t p, int s) { (void)p; (void)s; return 0; }
 
 static const px_sysops FAKE_SYS = {
@@ -1467,12 +1630,132 @@ static void test_kill(void)
     CHECK_EQ(px_check_kill(l, pol, &FAKE_SYS, 0, 99999, SIGTERM),
              PROC_KILL_DENY);
 
+    CASE("I14 ★P1 回归★：reaped 状态必须在 PID 与 PGID 两个维度都成立");
+    {
+        /*
+         * 缺陷回顾（P1）：命中判定查「PID‖PGID」，但 life 复核只查 PGID，
+         * 而 px_ledger_reap 硬编码 PX_ENTRY_PID → 拒绝分支**不可达**。
+         * 实测：同一已回收 pid，kill(+pid)=DENY 而 kill(-pid)=PASS；
+         * killpg(pgrp) 在 proc.c 里直接构造 -pgrp，容器内一键可达。
+         *
+         * 本用例把不变量钉死：reap 之后**两种形态都必须拒绝**。
+         *
+         * ★ 两个测试陷阱，第一版用例都踩到了 ★
+         *
+         *  1. self_pid 不能与被测 pid 相同 —— `px_check_kill` 的
+         *     protect_self 分支会无条件放行，让断言假通过。
+         *     所以这里传 self_pid=900。
+         *  2. fake_getpgrp() 返回 500，而「自己的进程组」分支同样无条件
+         *     放行 —— 于是 `kill(-500)` 会走那条分支而不是被测的组分支。
+         *     必须换一个 getpgrp 不返回被测 pid 的 sysops。
+         *
+         * 这两点也是审计文档那个判决实验里「+pid=DENY、-pid=PASS」
+         * 之所以成立的**同一个**原因域：放行分支太多，实验必须
+         * 逐个排除，否则结论会指向错误的根因。
+         */
+        px_ledger *l2 = px_ledger_create(64, NULL);
+        /* getpgrp 返回 700（既不是 self_pid=900，也不是被测 pid 500） */
+        px_sysops sys900_700;
+
+        sys900_700 = FAKE_SYS;
+        sys900_700.getpgrp = fake_getpgrp_700;
+
+        CHECK_EQ(px_ledger_add(l2, 500, 0, PX_TAG_FORK), PX_OK);
+        /*
+         * ★ 必须显式登记 PGID 条目 ★
+         *
+         * px_ledger_add 只写 PX_ENTRY_PID。命中判定里 `has(PID)` 单独
+         * 就足以进入组分支，所以下面的 kill(-500) 会走到 life 复核 ——
+         * 而复核必须能查到「500 的 PGID 维度也被标了 reaped」。
+         * 这正是 P1 的行星对齐点：reap 要标两个维度。
+         */
+        CHECK_EQ(px_ledger_add_pgid(l2, 500, PX_TAG_FORK), PX_OK);
+
+        /* LIVE：两种形态都放行（不能矫枉过正） */
+        CHECK_EQ(px_check_kill(l2, pol, &sys900_700, 900, 500, SIGKILL),
+                 PROC_KILL_PASS);
+        CHECK_EQ(px_check_kill(l2, pol, &sys900_700, 900, -500, SIGKILL),
+                 PROC_KILL_PASS);
+
+        /* REAPED：两种形态都必须拒绝 —— 这是 P1 的核心断言 */
+        CHECK_EQ(px_ledger_reap(l2, 500), PX_OK);
+        CHECK_EQ(px_check_kill(l2, pol, &sys900_700, 900, 500, SIGKILL),
+                 PROC_KILL_DENY);
+        CHECK_EQ(px_check_kill(l2, pol, &sys900_700, 900, -500, SIGKILL),
+                 PROC_KILL_DENY);
+        CHECK_EQ(px_check_kill(l2, pol, &sys900_700, 900, -500, SIGTERM),
+                 PROC_KILL_DENY);
+
+        /* reap 必须把 PGID 维度也标上（否则上面的拒绝可能是假通过） */
+        CHECK_EQ(px_ledger_has(l2, 500, PX_ENTRY_PGID), 1);
+
+        /* 显式 add_pgid 的组条目同样能被 reap 到 */
+        CHECK_EQ(px_ledger_add_pgid(l2, 501, PX_TAG_SPAWN), PX_OK);
+        CHECK_EQ(px_ledger_reap(l2, 501), PX_OK);
+        CHECK_EQ(px_check_kill(l2, pol, &sys900_700, 900, -501, SIGKILL),
+                 PROC_KILL_DENY);
+
+        /* ★ 修 P1 绝不能顺手放开广播形态 ★ */
+        CHECK_EQ(px_check_kill(l2, pol, &sys900_700, 900, 0, SIGKILL),
+                 PROC_KILL_DENY);
+        CHECK_EQ(px_check_kill(l2, pol, &sys900_700, 900, -1, SIGKILL),
+                 PROC_KILL_DENY);
+
+        /* 返回值兼容：两个维度都不存在才是 ENOENT */
+        CHECK_EQ(px_ledger_reap(l2, 600), PX_ENOENT);
+        px_ledger_destroy(l2);
+    }
+
     px_ledger_destroy(l);
 }
 
 /* ================================================================== */
 /* J  atfork 协议                                                      */
 /* ================================================================== */
+
+/*
+ * 注入式 wait 原语（P3 回归用）。
+ *
+ * 它存在的理由与 fail_alloc 完全相同：**EINTR 分支在生产里无法确定性
+ * 触发**（要靠信号恰好落在 waitpid 的窗口里），而不可达的分支没人写、
+ * 没人测、必然写错。注入之后 EINTR / ECHILD / 一直被打断 这三种形态
+ * 都能被 100% 可重复地断言。
+ *
+ *   eintr_left > 0  → 先返回该次数的 -1/EINTR
+ *   eintr_left < 0  → **永远**返回 -1/EINTR（测重试上限）
+ *   final_errno != 0 → EINTR 用完后返回 -1 并把 errno 置为该值
+ *   final_errno == 0 → EINTR 用完后返回 pid（成功回收）
+ */
+static int g_inj_eintr_left;
+static int g_inj_final_errno;
+
+static void inj_wait_reset(int eintr_left, int final_errno)
+{
+    g_inj_eintr_left = eintr_left;
+    g_inj_final_errno = final_errno;
+}
+
+static pid_t inj_wait_fn(void *ud, pid_t child, int *status)
+{
+    (void)ud;
+    if (status != NULL) {
+        *status = 0;
+    }
+    if (g_inj_eintr_left > 0) {
+        g_inj_eintr_left--;
+        errno = EINTR;
+        return -1;
+    }
+    if (g_inj_eintr_left < 0) {
+        errno = EINTR;
+        return -1;
+    }
+    if (g_inj_final_errno != 0) {
+        errno = g_inj_final_errno;
+        return -1;
+    }
+    return child;
+}
 
 /* 可观测锁：记录加解锁的嵌套深度与最大深度 */
 typedef struct {
@@ -1654,12 +1937,63 @@ static void test_forkguard(void)
         px_ledger_destroy(l2);
     }
 
+    CASE("J11 ★P3 回归★：EINTR 打断 waitpid 时必须重试，且失败不再静默");
+    {
+        /*
+         * 缺陷回顾（P3 第二半）：fork/vfork 的「放弃子进程」分支里写的是
+         *     (void)waitpid(child, NULL, 0);
+         * —— **不重试 EINTR、也不校验返回值**。
+         * 差分实测（注入 1 次 EINTR × 8 轮）：baseline 留下 **8 个僵尸**，
+         * 修复后 **0 个**（见 docs/proc-高危修复报告.md §P3）。
+         *
+         * 这里用注入式 wait 原语把 EINTR 分支做成**确定性可测**的 ——
+         * 真去和信号赛跑是不确定的，而不可达/不确定的分支必然写错。
+         */
+        px_reap_result rr;
+
+        /* 1) 一次成功 */
+        inj_wait_reset(0, 0);
+        px_reap_child_tolerant(4242, inj_wait_fn, NULL, &rr);
+        CHECK_EQ(rr.reaped, 1);
+        CHECK_EQ(rr.eintr_count, 0);
+        CHECK_EQ(rr.gave_up, 0);
+
+        /* 2) 被打断 3 次后成功 —— 这正是生产里的 EINTR 形态 */
+        inj_wait_reset(3, 0);
+        px_reap_child_tolerant(4242, inj_wait_fn, NULL, &rr);
+        CHECK_EQ(rr.reaped, 1);
+        CHECK_EQ(rr.eintr_count, 3);
+        CHECK_EQ(rr.gave_up, 0);
+
+        /* 3) 一直被打断 → 到上限后放弃，且**必须留下痕迹**（give_up） */
+        inj_wait_reset(-1, 0);
+        px_reap_child_tolerant(4242, inj_wait_fn, NULL, &rr);
+        CHECK_EQ(rr.reaped, 0);
+        CHECK_EQ(rr.gave_up, 1);
+        CHECK_EQ(rr.eintr_count, PX_REAP_EINTR_MAX);
+        CHECK_EQ(rr.last_errno, EINTR);
+        printf("    （连续 EINTR %d 次后放弃并置 gave_up —— "
+               "不再像原来那样静默）\n", rr.eintr_count);
+
+        /* 4) ECHILD（SIGCHLD=SIG_IGN / SA_NOCLDWAIT）：内核已自动回收，
+         *    不算成功回收，但要如实记下 errno */
+        inj_wait_reset(0, ECHILD);
+        px_reap_child_tolerant(4242, inj_wait_fn, NULL, &rr);
+        CHECK_EQ(rr.reaped, 0);
+        CHECK_EQ(rr.last_errno, ECHILD);
+        CHECK_EQ(rr.gave_up, 0);
+
+        /* 5) 非法输入不崩 */
+        px_reap_child_tolerant(0, inj_wait_fn, NULL, &rr);
+        CHECK_EQ(rr.reaped, 0);
+        CHECK_EQ(rr.last_errno, EINVAL);
+        px_reap_child_tolerant(4242, NULL, NULL, &rr);
+        CHECK_EQ(rr.reaped, 0);
+        px_reap_child_tolerant(4242, inj_wait_fn, NULL, NULL);   /* out 可空 */
+    }
+
     px_ledger_destroy(l);
 }
-
-/* ================================================================== */
-/* K  真实 FS / 真实内核 端到端                                        */
-/* ================================================================== */
 
 /*
  * 真实验证：我们把 envp 交给内核后，子进程**真的**看到了它。

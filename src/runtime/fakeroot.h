@@ -283,6 +283,35 @@ void fakeroot_map_set_eviction(fakeroot_map *m, bool enabled);
 bool fakeroot_map_eviction_enabled(const fakeroot_map *m);
 
 /* ------------------------------------------------------------------ */
+/* 可观测性 / 自检（诊断用，不参与记账语义）                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 这张表**一生中**成功执行过多少次全表重哈希（fr_map_compact）。
+ *
+ * 为什么需要它：压实是 O(cap) 的隐式开销，装载率判据（count + tombs）
+ * 与压实阈值（tombs > cap/4）都只看内部计数器 —— 一旦计数器漂了
+ * （例如复用墓碑槽位时忘了 tombs--），退化会表现为「此后每次插入都
+ * 重哈希」，而外部完全无从察觉。有了这个计数器，测试可以直接断言
+ * 「50 次插入 0 次重哈希」，不必依赖链接期的 --wrap=calloc。
+ *
+ * 单调递增；fakeroot_map_clear 不清零（它统计的是历史，不是当前状态）。
+ */
+size_t fakeroot_map_rehash_count(const fakeroot_map *m);
+
+/* 当前墓碑槽位数。用于断言「复用墓碑后 tombs 回落」。 */
+size_t fakeroot_map_tomb_count(const fakeroot_map *m);
+
+/* fr_map_compact 失败（ENOMEM / EFULL）的次数，同样是历史累计量。 */
+size_t fakeroot_map_compact_fail_count(const fakeroot_map *m);
+
+/*
+ * 不变式自检：count / tombs 必须与槽位真实状态逐一吻合。
+ * 成立返回 true；表为 NULL 时返回 false。
+ */
+bool fakeroot_map_check_invariants(const fakeroot_map *m);
+
+/* ------------------------------------------------------------------ */
 /* 键构造（纯函数；只有 path 版本会 malloc）                            */
 /* ------------------------------------------------------------------ */
 
@@ -317,7 +346,14 @@ int fakeroot_map_get(fakeroot_map *m, const fr_key *k, fr_record *out);
 /* 只判存在，不取内容，但同样刷新时戳。 */
 bool fakeroot_map_has(fakeroot_map *m, const fr_key *k);
 
-/* 删除。删掉 FR_OK，本来就不在 FR_ENOENT。 */
+/* 删除。删掉 FR_OK，本来就不在 FR_ENOENT。
+ *
+ * ⚠ 所有权与 fakeroot_map_put **不同**：k 是 const 指针，本函数只读取它
+ * 做探测，**不接管**、也不释放它。它释放的是**表内**那一份键
+ * （fr_slot_release ⇒ fakeroot_key_dispose(&m->slots[idx].key)）。
+ * 调用方对 k 仍然负全责 —— 由 fakeroot_key_path() 造出来的 k 必须
+ * 由调用方 fakeroot_key_dispose()。不 dispose 就是每次调用漏一份路径副本
+ * （命中漏一份，未命中同样漏一份）。 */
 int fakeroot_map_remove(fakeroot_map *m, const fr_key *k);
 
 /* 强制淘汰 n 个最久未使用的条目，返回实际淘汰数。 */

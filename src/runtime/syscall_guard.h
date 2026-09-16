@@ -18,3 +18,13 @@
 unsigned long bxroot_syscall_guard_blocked(void);
 
 #endif /* BXROOT_SYSCALL_GUARD_H */
+
+/*
+ * 测试钩子：返回该 syscall 号上"第几个参数是路径"的位掩码
+ * （bit N 表示 aN 是路径；0 表示不在表内）。
+ *
+ * 仅供测试使用，生产代码不调用。详见 syscall_guard.c 里的说明 ——
+ * 这张表出过两次致命缺陷，而当时的回归测不到它。
+ */
+unsigned bxroot_test_path_arg_mask(long nr);
+

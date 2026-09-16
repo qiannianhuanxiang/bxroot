@@ -542,6 +542,45 @@ static int detranslate_binds(const char *path, char *out, size_t out_size)
 void *__dso_handle __attribute__((visibility("hidden"))) = &__dso_handle;
 
 /*
+ * 真实符号解析：`dlsym(RTLD_NEXT, name)`。
+ *
+ * ★ 一段被证伪的弯路，记录在此以免重蹈 ★
+ *
+ * 曾观察到「bxroot 运行时下 dlsym(RTLD_NEXT,…) 全部返回 NULL」，并据此
+ * 写了一大套回退解析（先 dlopen，后来自包含 ELF 解析）。**那个观察是
+ * 探针假象**：
+ *
+ *   - 当时用的探针是**主程序**。主程序的搜索链里，它自己之后**没有**
+ *     libc（libc 在它之前），所以 RTLD_NEXT 必然返回 NULL —— 这是
+ *     RTLD_NEXT 语义的正常结果，与 bxroot 无关。
+ *   - 把同一段探测放进**被 --preload 加载的 .so 的构造函数**里
+ *     （也就是本文件真实的运行语境），实测：
+ *
+ *         fork        RTLD_NEXT=0x7bcab03a10  obj=libc.so.6
+ *         posix_spawn RTLD_NEXT=0x7bcab181c0  obj=libc.so.6
+ *         execve      RTLD_NEXT=0x7bcaaffcc0  obj=libc.so.6
+ *
+ *     三个都**合法且解析到 libc**。而且同一个纯 preload 探针里
+ *     `posix_spawn` 直接 `rc=0` 成功。
+ *
+ * 也就是说本文件的写法本来就是对的；那套回退解析修的不是真问题。
+ * 教训：**RTLD_NEXT 的结果取决于"谁在调"**，用它做判据时必须确认
+ * 探针的链接位置与被测代码一致。
+ *
+ * ★ 唯一仍然成立的限制：IFUNC ★
+ * `dlsym` 对 IFUNC 符号（strlen / memcpy / memset 等）返回的是 resolver
+ * 地址而不是实现地址，直接调用会得到垃圾（实测 strlen("hello") 返回
+ * 480563740352）。但本文件 hook 的都是路径/进程/权限类函数，它们都是
+ * 普通 STT_FUNC，不涉及 IFUNC，所以不受影响。
+ */
+/*
+ * 注意：这里**不再**提供 bxroot_real_symbol 的转发定义。
+ * 那个函数由 realsym.c 自己导出（同名），在本文件里再定义一个会
+ * multiple definition 链接失败。proc.c 通过 weak 引用它，直接链到
+ * realsym.c 的实现。
+ */
+
+/*
  * 供 proc.c（D4 进程管理层）使用的翻译器与日志桥。
  *
  * proc.c 用 **weak 符号**引用这两个名字，缺失时自动回落（翻译器缺失 →
@@ -629,7 +668,7 @@ void bxroot_log(const char *fmt, ...) {
  *   - ERR 判断用 `rc > 0` / `si_pid > 0`，**不用** `< 0`：只要 id 类型
  *     比 pid_t 宽（某些 ABI 下 id_t 是 int），`rc < 0` 就永远为假，
  *     于是失败路径被当成成功、把不存在的 pid 标成 reaped。
- *   - 转发走的 `dlsym(RTLD_NEXT, ...)` 懒加载每次判空：LD_PRELOAD 里
+ *   - 转发走的 `bxroot_real_symbol(...)` 懒加载每次判空：LD_PRELOAD 里
  *     一次空指针解引用 = 整个容器进程 SIGSEGV。
  */
 
@@ -2599,7 +2638,7 @@ int ioctl(int fd, unsigned long request, ...) {
  * 同理，本文件顶部原先的 `real_execve` / `real_execvpe` 两个函数指针
  * 与 ensure_real_functions() 里的两行 dlsym 也一并删除 ——
  * 删掉上面 4 个钩子后它们无人引用（-Wunused-variable），
- * 且 proc.c 内部自己用 `dlsym(RTLD_NEXT, "execve")` 懒加载。
+ * 且 proc.c 内部自己用 `bxroot_real_symbol("execve")` 懒加载。
  */
 
 /* ------------------------------------------------------------------ */
@@ -2832,16 +2871,16 @@ void *dlopen(const char *filename, int flags) {
  *     void *dlsym(void *handle, const char *symbol) {
  *         static void *(*fn)(void *, const char *) = NULL;
  *         if (fn == NULL)
- *             fn = (void *(*)(void *, const char *))dlsym(RTLD_NEXT, "dlsym");
+ *             fn = (void *(*)(void *, const char *))bxroot_real_symbol("dlsym");
  *         ...
  *     }
  *
  * **这是一个必然无限递归的结构**：
  *
- *   - `dlsym(RTLD_NEXT, "dlsym")` 的语义是"从本库**之后**的搜索顺序里
+ *   - `bxroot_real_symbol("dlsym")` 的语义是"从本库**之后**的搜索顺序里
  *     找 dlsym"。但解析 `RTLD_NEXT` 这件事本身就要调用 `dlsym` ——
  *     而符号解析先命中**我们自己**（本 .so 在搜索顺序最前面）。
- *   - 于是进入本函数 → fn 仍为 NULL → 再次调用 `dlsym(RTLD_NEXT,...)`
+ *   - 于是进入本函数 → fn 仍为 NULL → 再次调用 `bxroot_real_symbol(...)`
  *     → 又进本函数 …… 每层吃一个栈帧，直到栈耗尽。
  *
  * 实测证据（core dump，非推测）：
@@ -2864,7 +2903,7 @@ void *dlopen(const char *filename, int flags) {
  *        - 官方符号表里有它们，是因为官方有 `ldso_service_*`
  *          基础设施（它自研加载器），与我们的架构不同；
  *        - "程序会探测 dlsym" 这个需求，**libc 原生实现本来就满足**。
- *   2. 更关键：本文件内部有 **144 处 `dlsym(RTLD_NEXT, ...)`**
+ *   2. 更关键：本文件内部有 **144 处 `bxroot_real_symbol(...)`**
  *      用于解析真实函数。这些调用**全部依赖 libc 的原生 `dlsym`**。
  *      我们导出一个包装器，恰恰把这条主路径也污染了 —— 不只是
  *      递归自伤，还会让所有钩子的真实函数解析变脆。

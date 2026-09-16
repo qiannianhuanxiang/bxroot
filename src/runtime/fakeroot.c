@@ -19,6 +19,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysmacros.h>  /* makedev：把 stx_dev_major/minor 还原成 dev_t（F3） */
 #include <unistd.h>   /* F_OK / R_OK / W_OK / X_OK（纯逻辑部分只用到这四个宏） */
 
 /* ================================================================== */
@@ -189,6 +190,15 @@ struct fakeroot_map {
     uint64_t clock;      /* 逻辑时钟，每次命中/插入 ++ */
     bool     disabled;   /* 关掉后插入 no-op、查询 ENOENT */
     bool     eviction;   /* 是否允许自动 LRU 淘汰 */
+    /*
+     * 可观测计数器（只增不减，fakeroot_map_clear 也不清零 —— 它统计的是
+     * 「这张表一生做过几次全表重哈希」，是诊断量而不是状态量）。
+     * 存在的理由：fr_map_compact 是 O(cap) 的隐式开销，从外部完全看不见。
+     * 没有它，F2 那类「tombs 虚高 ⇒ 每次插入都重哈希」的退化只能靠
+     * --wrap=calloc 这类链接期手法间接测出来，测试无法在库内自断言。
+     */
+    size_t   rehashes;   /* fr_map_compact 成功执行的次数 */
+    size_t   compact_fail; /* fr_map_compact 因 ENOMEM/EFULL 失败的次数 */
 };
 
 /* 向上取整到 2 的幂；0 与 1 都返回 1。溢出返回 0。 */
@@ -325,6 +335,48 @@ bool fakeroot_map_eviction_enabled(const fakeroot_map *m)
     return (m == NULL) ? false : m->eviction;
 }
 
+size_t fakeroot_map_rehash_count(const fakeroot_map *m)
+{
+    return (m == NULL) ? 0 : m->rehashes;
+}
+
+size_t fakeroot_map_tomb_count(const fakeroot_map *m)
+{
+    return (m == NULL) ? 0 : m->tombs;
+}
+
+size_t fakeroot_map_compact_fail_count(const fakeroot_map *m)
+{
+    return (m == NULL) ? 0 : m->compact_fail;
+}
+
+/*
+ * 自检：这张表的不变式是否成立。
+ *   tomb 数 == 实际处于 TOMB 状态的槽位数
+ *   live 数 == 实际处于 LIVE 状态的槽位数
+ * 两者都是「计数器必须与槽位真实状态一致」的直接检查 ——
+ * F2 正是这条不变式被破坏（tombs 只增不减）。
+ * 表指针为 NULL 时返回 false（没有表就没有不变式可言）。
+ */
+bool fakeroot_map_check_invariants(const fakeroot_map *m)
+{
+    size_t i;
+    size_t live = 0;
+    size_t tomb = 0;
+
+    if (m == NULL || m->slots == NULL) {
+        return false;
+    }
+    for (i = 0; i < m->cap; i++) {
+        if (m->slots[i].state == FR_SLOT_LIVE) {
+            live++;
+        } else if (m->slots[i].state == FR_SLOT_TOMB) {
+            tomb++;
+        }
+    }
+    return live == m->count && tomb == m->tombs;
+}
+
 int fakeroot_key_path(fr_key *out, const char *p)
 {
     size_t len;
@@ -454,6 +506,7 @@ static int fr_map_compact(fakeroot_map *m)
 
     new_slots = (fr_slot *)calloc(m->cap, sizeof(*new_slots));
     if (new_slots == NULL) {
+        m->compact_fail++;
         return FR_ENOMEM;
     }
 
@@ -480,6 +533,7 @@ static int fr_map_compact(fakeroot_map *m)
                         m->tombs++;
                     }
                 }
+                m->compact_fail++;
                 return FR_EFULL;
             }
             m->slots[idx].state     = FR_SLOT_LIVE;
@@ -495,6 +549,7 @@ static int fr_map_compact(fakeroot_map *m)
     }
 
     free(old_slots);
+    m->rehashes++;      /* 只统计**成功**的全表重哈希 */
     return FR_OK;
 }
 
@@ -597,6 +652,20 @@ int fakeroot_map_put(fakeroot_map *m, fr_key k, const fr_record *rec)
         return FR_OK;
     }
 
+    /* ⚠ 复用墓碑槽位时必须把 tombs 计回来。
+     * fr_map_probe 有**两条**返回墓碑槽位的路径（EMPTY 未命中分支之前的
+     * 第一遍扫描不会返回 TOMB，但「整圈无 EMPTY」时的第二遍扫描会返回
+     * 第一个 TOMB），命中覆盖分支（found == true）只会拿到 LIVE 槽，
+     * 所以这里是唯一的复用点 —— 但判定必须基于**槽位当前状态**，
+     * 而不是基于「probe 走了哪条路」：这样无论将来 probe 怎么改，
+     * tombs 都不会漂。
+     *
+     * 不修的话 tombs 只增不减 → fr_map_overloaded()（用 count + tombs 判）
+     * 与压实阈值（tombs > cap/4）**永久为真** → 此后每次插入都做一次
+     * 全表重哈希。 */
+    if (m->slots[idx].state == FR_SLOT_TOMB) {
+        m->tombs--;
+    }
     m->slots[idx].state     = FR_SLOT_LIVE;
     m->slots[idx].key       = k;       /* 所有权转移 */
     m->slots[idx].rec       = *rec;
@@ -966,7 +1035,17 @@ int fakeroot_forget_path(fakeroot_state *fs, const char *p)
     if (rc != FR_OK) {
         return rc;
     }
-    return fakeroot_map_remove(fs->by_path, &k);
+    /* ⚠ 所有权：k 由 fakeroot_key_path 深拷贝而来（malloc），所有权在调用方。
+     * fakeroot_map_remove 与 put 不同 —— 它**不接管** k，只释放表内那份键
+     * （fr_slot_release 释放的是 m->slots[idx].key，不是这里的 k）。
+     * 所以命中与未命中两条路径都必须由我们 dispose，否则每次调用漏一份
+     * 路径副本（命中时漏 1 份、未命中时也漏 1 份）。
+     * 注意不能先 dispose 再 remove：remove 还要用 k 去探测。 */
+    {
+        int rc2 = fakeroot_map_remove(fs->by_path, &k);
+        fakeroot_key_dispose(&k);
+        return rc2;
+    }
 }
 
 int fakeroot_record_create_path(fakeroot_state *fs, const char *p, mode_t mode,
@@ -1199,8 +1278,41 @@ void fakeroot_patch_statx_ex(struct statx *stx, fakeroot_state *fs,
         local    = *rec;
         have_rec = true;
     } else {
-        if (fakeroot_lookup(fs, NULL, stx->stx_dev_major, stx->stx_ino,
-                            &local) == FR_OK) {
+        /*
+         * ⚠ 键必须与写侧同型。
+         *
+         * 写侧（fr_record_inode_for_path / fr_record_inode_for_fd，以及
+         * fakeroot_record_owner_inode 的全部调用点）存的是**完整的
+         * `st.st_dev`**，而 statx 只把 dev 拆成 stx_dev_major / stx_dev_minor
+         * 两个 __u32。原来这里直接传 stx_dev_major 当 dev_t ——
+         * **丢掉了 minor**，于是读侧键与写侧键永不相等（本机实测
+         * 0xfe3e vs 0xfe），这次查询就成了死代码。
+         *
+         * 修法是按内核的编码把两者重新拼回 dev_t。不能写成
+         * `stx_dev_major << 32 | minor`：dev_t 的编码是与架构相关的
+         * （glibc 的 makedev 在 64 位上把 major 放在高 32 位，但它同时会
+         * 向两个位置散列，并由用户态 gnulib 协助解码），手写位移在
+         * 不同 libc 上不等价。用 <sys/sysmacros.h> 的 makedev() 才是
+         * 与 stat() 那条路径**逐位一致**的还原。
+         *
+         * 输入类型匹配，无截断：makedev 收 unsigned int，
+         * stx_dev_major/minor 是 __u32。
+         *
+         * 可达性（已实测，见 docs/fakeroot-修复报告.md §F3）：
+         *   - rec != NULL        → 不走这里（调用方已按路径预取）；
+         *   - rec == NULL, fd>=0 → 本查询 MISS 后由 fakeroot_lookup_fd 兜底，
+         *                          功能上被掩盖，但多付一次必然失败的探测；
+         *   - rec == NULL, fd<0  → 本查询是**唯一**信息来源。此时修复前
+         *                          have_rec 恒为 false，记账里的属主被丢给
+         *                          启发式（或直接丢失）→ 同一个文件用 stat
+         *                          和 statx 查会得到**不同属主**。
+         *                          用「假身份 uid=1000、内核 uid=2000、
+         *                          记账 uid=1000」实测：修复前 stx_uid=2000
+         *                          （错），修复后 1000（与 stat 一致）。
+         */
+        dev_t dev = makedev((unsigned int)stx->stx_dev_major,
+                            (unsigned int)stx->stx_dev_minor);
+        if (fakeroot_lookup(fs, NULL, dev, stx->stx_ino, &local) == FR_OK) {
             have_rec = true;
         } else if (fd >= 0 && fakeroot_lookup_fd(fs, fd, &local) == FR_OK) {
             have_rec = true;
@@ -1887,6 +1999,7 @@ static bool in_init      = false;
  * newfstatat / __xstat（见 readelf --dyn-syms 结果），那几项必然是 NULL，
  * 但其余几十项都能用。某一路为 NULL 时对应钩子退化成 errno=ENOSYS。
  */
+
 static void ensure_real(void)
 {
     if (real_resolved) {
