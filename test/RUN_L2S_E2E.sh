@@ -175,11 +175,30 @@ JSEOF
 
 run_one() {
     # $1 = runtime 的 .so 路径（容器视角）
+    #
+    # ★ BXROOT_L2S_DIR 必须设 —— 否则测的不是生产路径 ★
+    #
+    # 实测教训（本测试自己踩的）：本脚本直接 exec bridge，**绕过 launcher**，
+    # 而 launcher 会默认把 l2s 中间文件放进集中目录：
+    #
+    #     launcher.c:999-1002
+    #     snprintf(fallback, ..., "%s/.l2s", cfg.rootfs);   ← 集中目录
+    #     setenv("BXROOT_L2S_DIR", fallback, 1);
+    #
+    # 少了这个变量，运行时退化成"中间文件生成在客户文件旁边"的散落布局，
+    # 两种布局在**目录可见性**上表现不同：
+    #
+    #     散落布局    : 客户 `ls -a` 能看到 .l2s.*        ❌ 与生产不符
+    #     集中目录布局: 客户 `ls -a` 看不到（在另一个目录）✅ 生产实况
+    #
+    # 也就是说，缺了这行，测试验证的是一条**生产不会走**的路径 ——
+    # 典型的"测试通过但生产出问题"。与 launcher 的默认值对齐：
     BXROOT_ROOTFS="$ROOTFS" \
     BXROOT_TMP_DIR="$STAGE_LOAD/tmp" \
     BXROOT_WORKDIR="/" \
     BXROOT_FAKEROOT=1 \
     BXROOT_LINK2SYMLINK=1 \
+    BXROOT_L2S_DIR="$ROOTFS/.l2s" \
     BXROOT_GUEST_EXE="$NODE" \
     timeout 150 "$APP_LIB/libproroot-bridge.so" "$APP_LIB/libproroot-linker.so" \
         --argv0 node \

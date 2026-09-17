@@ -5545,6 +5545,192 @@ int uname(struct utsname *buf) {
 
 /* 构造函数：库加载时执行 */
 /* ------------------------------------------------------------------ */
+/* Hook: libaudit 桩家族（audit_open / audit_close / audit_log_*）      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ====================================================================
+ * 为什么需要这 5 个符号
+ * ====================================================================
+ *
+ * rootfs 里**大量**程序是动态链接 libaudit.so.1 的，而它们在动态未定义
+ * 符号表里引用 audit_*。以 rootfs 为准的实测统计（readelf -sW --dyn-syms）：
+ *
+ *     usr/bin/passwd  usr/bin/gpasswd  usr/bin/chsh   usr/bin/chfn
+ *     usr/bin/chage   usr/bin/login    usr/bin/newgrp usr/bin/lastlog
+ *     usr/bin/dbus-daemon              usr/sbin/{faillock,groupadd,
+ *     groupdel,groupmod,useradd,userdel,usermod,pam_extrausers_chkpwd,
+ *     unix_chkpwd}                     —— 共 20 个程序引用 audit_open
+ *
+ * ====================================================================
+ * 官方把这一族做成了**桩**
+ * ====================================================================
+ *
+ * 反汇编官方 `work/parity/off/libproroot-runtime.so`（符号表给的地址）：
+ *
+ *   audit_open @0x239ec（48 字节）
+ *       239ec: stp  x29, x30, [sp, #-16]!
+ *       239f0: mov  w3, #0x0                  ; arg4 = 0
+ *       239f4: mov  w2, #0x1                  ; arg3 = 1 == O_WRONLY
+ *       239f8: mov  x29, sp
+ *       239fc: adrp x1, 0x36000               ; 字符串常量页基址
+ *       23a00: add  x1, x1, #0xda8            ; → 0x36da8
+ *       23a04: mov  w0, #0xffffff9c           ; AT_FDCWD == -100
+ *       23a08: bl   0x27f80                   ; → 内部 syscall(56=openat,...)
+ *       23a0c: cmp  w0, #0x0
+ *       23a10: csinv w0, w0, wzr, ge
+ *       23a14: ldp  x29, x30, [sp], #16
+ *       23a18: ret
+ *
+ *   ★ 0x36da8 处的字符串常量 —— 实测核实过程（不采信任何推断）★
+ *       readelf -SW 给出 .rodata vaddr=0x33d10 fileoff=0x33d10（恒等映射），
+ *       故 0x36da8 直接对应文件偏移 0x36da8。用 python 读原始字节：
+ *           b'/dev/null\x00\x00\x00\x00\x00\x00\x00'
+ *       objdump -s -j .rodata 同一位置的 ASCII 转写亦为 `2f6465762f6e756c`
+ *       = "/dev/nul" + "l"。**确认为 "/dev/null"**。
+ *
+ *   ★★ `csinv w0, w0, wzr, ge` 的真实语义 ★★
+ *
+ *   本文件作者最初的推断是「失败返回 0」。**这个推断是错的**，实测判定如下
+ *   （用本机 aarch64 gcc 13.3.0 编译候选 C 表达式，看它生成哪条指令）：
+ *
+ *       C 表达式                      -O2 生成         与官方是否一致
+ *       ----------------------------  ---------------  --------------
+ *       return fd >= 0 ? fd : 0;      csel  w0,w0,wzr  ✗（csel，不是 csinv）
+ *       return fd >= 0 ? fd : -1;     csinv w0,w0,wzr  ✅ 完全一致
+ *       if (fd >= 0) return fd;       csel  w0,w0,wzr  ✗
+ *       return 0;
+ *
+ *   逐条验证命令与原始输出见 docs/audit符号桩实现.md。
+ *
+ *   原理：`CSINV w0, w0, wzr, ge` = 「条件成立(ge)取 w0；否则取 ~wzr = ~0 = -1」。
+ *   即 **成功返回 fd，失败返回 -1** —— 与 C 的 `fd >= 0 ? fd : -1` 等价。
+ *
+ *   所以官方 audit_open 的语义与**真实 libaudit 一致**（失败回 -1），
+ *   唯一与真实 libaudit 不同的是它**不做多路径回退**：真实 libaudit 会依次
+ *   尝试 /var/run/auditd.pid 等多个目标，官方只对 `/dev/null` 调一次 openat。
+ *
+ *   audit_close @0x23a20（40 字节）
+ *       23a20: tbz  w0, #31, 23a28        ; fd >= 0 才继续
+ *       23a24: ret                        ; fd < 0 → 直接返回
+ *       23a28: sxtw x1, w0                ; fd 符号扩展到 64 位
+ *       23a2c..23a3c: x2..x6 = 0          ; 其余参数清零
+ *       23a40: mov  x0, #0x39             ; 57 == __NR_close
+ *       23a44: b    0x8740                ; 尾调用内部 syscall shim
+ *
+ *   audit_log_acct_message @0x23a48（8 字节）
+ *   audit_log_user_command @0x23a50（8 字节）
+ *   audit_log_user_message @0x23a60（8 字节）
+ *       三者形状完全相同：`mov w0, #1; ret` —— 恒返回 1。
+ *       （1 == 真实 libaudit 的 "success"；调用方据此认为审计消息已投递。）
+ *
+ * ====================================================================
+ * bxroot 为什么要逐条照抄
+ * ====================================================================
+ *
+ * 1. **符号存在性**是硬需求。LD_PRELOAD 只能插入**已导出**的符号；这 5 个
+ *    符号一旦缺一个，引用它的程序就在符号解析阶段失败，进程根本起不来。
+ *    这正是本任务的全部理由。
+ *
+ * 2. **行为必须逐字节等价**，不是"合理即可"。上面那处 `-1 vs 0` 就是反例：
+ *    两者在"打开审计 socket 失败"这一条路径上给出不同返回值，而
+ *    `dbus-daemon` 之类的调用方对返回值有分支（它把 0 当"无审计 fd"，
+ *    把 -1 当"审计不可用"）。照抄官方 = 与官方跑出同样的分支，
+ *    否则就是"bxroot 下能跑但这个程序行为变了"，属于隐性回归。
+ *
+ * 3. **不能转发给 rootfs 里的真 libaudit.so.1**。实测确认 rootfs 里
+ *    `/usr/lib/aarch64-linux-gnu/libaudit.so.1.0.0` **确实导出了**这 5 个
+ *    符号（audit_open @0x4314、audit_close @0x4420、…）。但真版本的
+ *    audit_open 会**真的去连 netlink 审计套接字**、失败后逐级回退到
+ *    `/var/run/auditd.pid` 等真实文件。在 Android 沙箱里那是**副作用**：
+ *    既可能拿到一个真的 fd（于是程序真的去写审计日志），也可能因为
+ *    内核审计子系统被 selinux 挡住而长时间阻塞。官方选择"发一个
+ *    /dev/null 就返回"，本实现照抄 —— 这是**刻意的行为对齐**，
+ *    不是偷懒。
+ *
+ * 4. 注意这三个 log 函数**恒返回 1 而不真发消息**：照抄官方，所以
+ *    审计日志在 bxroot 容器里同样是"报告成功但不落盘"。这与官方
+ *    完全一致；反过来若我们真去发，就会引入官方没有的副作用。
+ *
+ * 【实现口径】
+ *   audit_open 走 `syscall(SYS_openat, ...)` 而不是 libc 的 `openat()`：
+ *     - 官方内核路径是 raw syscall（0x27f80 尾部是 svc #0，不设 errno）；
+ *     - 走 libc 就会进到**本文件自己的 openat hook**，于是 "/dev/null"
+ *       会被根路径翻译成 "<rootfs>/dev/null"。实测 rootfs 里**没有**
+ *       /dev/null（它由 `-b /dev:/dev` 之类的 bind 才可见），
+ *       翻译后必定 ENOENT → 官方返回有效 fd 而我们返回 -1，行为就不等价了。
+ *     注意差别仅在 errno：官方 shim 是短路径不设 errno。本实现用
+ *     `syscall()`（glibc 版本会设 errno），errno 是**额外**信息、
+ *     返回值逐字节相同，且 errno 本就不在契约内。
+ */
+int audit_open(const char *path, int flags, int mode)
+{
+    /*
+     * 参数名与真实 libaudit 对齐（libaudit.h: `int audit_open(const char *path)`），
+     * 但官方桩**只认第一个参数**：flags 被硬编码成 O_WRONLY、mode 硬编码 0，
+     * 路径被硬编码成 "/dev/null"。所以这里显式忽略后两个入参 ——
+     * 这是照抄官方，不是为了省事。
+     */
+    (void)flags;
+    (void)mode;
+    (void)path;   /* 官方同样忽略调用方给的 path */
+
+    long fd = syscall(SYS_openat, AT_FDCWD, "/dev/null", O_WRONLY, 0);
+
+    /*
+     * 与官方 `csinv w0, w0, wzr, ge` 逐位等价：fd >= 0 保留，否则 -1。
+     * 写成 `fd >= 0 ? (int)fd : -1` 而不是 `fd < 0 ? -1 : (int)fd`，
+     * 是为了让 gcc 生成同一条 csinv（见文件上方注释里的编译验证）。
+     */
+    return (int)(fd >= 0 ? fd : -1);
+}
+
+/*
+ * audit_close：fd < 0 直接返回（官方 `tbz w0, #31`），否则 close(fd)。
+ *
+ * 官方是**尾调用**（`b 0x8740` 而不是 `bl`），即不复用返回地址、
+ * 自身不产生栈帧 —— 语义上完全等价于 `close(fd); return;`。
+ * 这里同样用 raw syscall：走 libc 的 close 会进本文件的 close hook，
+ * 而那层带资源清理记账，既非官方行为也带来无谓开销。
+ */
+void audit_close(int fd)
+{
+    if (fd < 0)
+        return;
+    syscall(SYS_close, fd);
+}
+
+/*
+ * 三个 log 函数：恒返回 1，不看任何入参、不产生任何副作用。
+ * 官方三个桩的机器码完全一样（`mov w0, #1; ret`），这里也保持参数
+ * 全忽略 —— 用可变参数/固定参数都无所谓，因为一个都不会被读。
+ */
+int audit_log_acct_message(int type, int pid, const char *user,
+                           const char *operation, const char *acct,
+                           int result, const char *hostname, ...)
+{
+    (void)type; (void)pid; (void)user; (void)operation;
+    (void)acct; (void)result; (void)hostname;
+    return 1;
+}
+
+int audit_log_user_command(int type, int pid, const char *cmd,
+                           int result, const char *hostname, int tbl)
+{
+    (void)type; (void)pid; (void)cmd; (void)result; (void)hostname; (void)tbl;
+    return 1;
+}
+
+int audit_log_user_message(int type, int pid, const char *message,
+                           const char *hostname, const char *addr,
+                           const char *tty, int result)
+{
+    (void)type; (void)pid; (void)message; (void)hostname;
+    (void)addr; (void)tty; (void)result;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
 /* fakeroot 状态与初始化                                               */
 /* ------------------------------------------------------------------ */
 
@@ -5652,6 +5838,79 @@ static void init_l2s(void) {
     cfg.l2s_dir = getenv("BXROOT_L2S_DIR");
     if (cfg.l2s_dir != NULL && cfg.l2s_dir[0] == '\0')
         cfg.l2s_dir = NULL;
+
+    /*
+     * ★ 集中目录必须存在，否则 l2s 会**静默失效** —— 所以这里自建 ★
+     *
+     * 【实测缺陷（2026-09-17，由 RUN_L2S_E2E.sh 变红暴露）】
+     *
+     * 把 BXROOT_L2S_DIR 指向一个**不存在**的目录时，l2s 不是报错也不是
+     * 回退到散落布局，而是**整条链失效**：
+     *
+     *     link(a, b)  → 失败
+     *     stat(a)     → nlink=1（伪装没生效）
+     *     客户的 link() 调用直接 ENOENT
+     *
+     * 原因：`l2s_make_paths_ex()` 只按 l2s_dir 拼中间层路径，不去建它；
+     * 真正创建中间层的那次 symlink/rename 落在不存在的目录里 → ENOENT。
+     * 而且 link() 返回失败时**没有明确指向"目录不存在"**，排查者会以为
+     * 是 l2s 本身坏了。
+     *
+     * 【为什么必须在这里建，而不是指望调用方】
+     *
+     * launcher 会默认设 `BXROOT_L2S_DIR=<rootfs>/.l2s`（launcher.c:999），
+     * **但它自己不建那个目录** —— 生产环境靠 DSHA 的 Java 侧
+     * `l2s.mkdirs()`（ContainerRuntime.java）兜底。于是：
+     *
+     *     经 DSHA 启动   : 目录已由 Java 建好 → 正常
+     *     经 launcher 直启: 目录不存在       → 静默失效   ❌
+     *     测试脚本直调 bridge: 同上           → 静默失效   ❌
+     *
+     * 三条入口里两条是坏的，且坏得无声无息。运行时是**唯一**知道
+     * l2s_dir 会被真正用到的地方，由它保证目录存在最可靠。
+     *
+     * 【为什么不是"目录不存在就报错退出"】
+     *
+     * 那会让"用户配错一个路径"升级成"整个容器起不来"。建一个目录是
+     * 无副作用的幂等操作（EEXIST 直接忽略），比中断启动合理。
+     *
+     * 【为什么不是"回退到散落布局"】
+     *
+     * 散落布局会把 `.l2s.*` 中间文件撒进客户的目录，客户 `ls -a` /
+     * `tar .` 全都能看到（见 docs/两处控制实验缺陷更正.md）。生产
+     * 已经明确选择集中布局，回退等于悄悄改变了用户可见行为。
+     *
+     * 用 syscall 直接调 mkdir（构造函数阶段 dlsym 尚不可用，且现在
+     * 正处于 ensure_real_functions 之前的窗口）。EEXIST 视为成功。
+     */
+    if (cfg.l2s_dir != NULL) {
+        char mkdir_path[MAX_PATH_LEN];
+        const char *target = cfg.l2s_dir;
+
+        /*
+         * 集中目录在 rootfs 内时要做正向翻译 —— 否则会把目录建到
+         * 宿主视角的路径上（容器视角与内核视角的经典分歧）。
+         * 翻译失败就退回原样：宁可在原路径上建，也不要什么都不建。
+         */
+        if (translate_path(cfg.l2s_dir, mkdir_path, sizeof(mkdir_path)) > 0)
+            target = mkdir_path;
+
+        /*
+         * 用 `mkdirat` 而不是 `mkdir`：**aarch64 上没有 mkdir 系统调用**，
+         * 只有 mkdirat（`SYS_mkdir` 在此平台未定义，实测编译报
+         * "'SYS_mkdir' undeclared; did you mean 'SYS_mkdirat'?"）。
+         * 这正是本项目反复出现的"同一功能在不同路径上覆盖不全"的又一例 ——
+         * x86_64 上两种都有，照搬那边的写法在这里编不过。
+         */
+        if (syscall(SYS_mkdirat, AT_FDCWD, target, 0700) < 0 && errno != EEXIST) {
+            /*
+             * 建不出来就**明确说出来**。静默失效正是本缺陷最难查的地方：
+             * 用户看到的是"link() 莫名其妙失败"，而不是"目录建不出来"。
+             */
+            LOG("l2s: 无法创建集中目录 %s: %s —— link() 将失效",
+                target, strerror(errno));
+        }
+    }
 
     /*
      * 用 bxroot 方案（哈希键控元数据树 + .cnt 旁路计数），而不是
