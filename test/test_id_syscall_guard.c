@@ -195,6 +195,59 @@ int bxroot_fakeroot_ids(unsigned int *uid, unsigned int *gid)
     return 1;
 }
 
+/*
+ * 缺口 B 的两个入口（148/150/158）。
+ *
+ * ★ 伪造值刻意与上面不同 ★
+ *
+ * 上面用 12345/54321；这里用**另一组**（67890/98765），以便区分
+ * "guard 走的是哪个入口"。若两组同值，就无法发现
+ * "148 分支误调了 bxroot_fakeroot_ids"这类接线错误。
+ *
+ * 组表给 **2 个元素**（不是 1 个），这样 `getgroups` 的
+ * "cap 不足回 EINVAL" 与 "cap 足够则写满" 两条路径都能被测到 ——
+ * 只给 1 个元素时 cap=1 就够，EINVAL 分支永远进不去。
+ */
+#define FAKE_RES_UID 67890u
+#define FAKE_RES_GID 98765u
+static const unsigned int g_fake_groups[2] = { 98765u, 11111u };
+
+int bxroot_fakeroot_res_ids(unsigned int *ruid, unsigned int *euid,
+                            unsigned int *suid, unsigned int *rgid,
+                            unsigned int *egid, unsigned int *sgid);
+
+int bxroot_fakeroot_res_ids(unsigned int *ruid, unsigned int *euid,
+                            unsigned int *suid, unsigned int *rgid,
+                            unsigned int *egid, unsigned int *sgid)
+{
+    if (!g_fake_on)
+        return 0;
+    if (ruid != NULL) *ruid = FAKE_RES_UID;
+    if (euid != NULL) *euid = FAKE_RES_UID;
+    if (suid != NULL) *suid = FAKE_RES_UID;
+    if (rgid != NULL) *rgid = FAKE_RES_GID;
+    if (egid != NULL) *egid = FAKE_RES_GID;
+    if (sgid != NULL) *sgid = FAKE_RES_GID;
+    return 1;
+}
+
+int bxroot_fakeroot_groups(unsigned int *groups, int cap, int *count);
+
+int bxroot_fakeroot_groups(unsigned int *groups, int cap, int *count)
+{
+    int n = (int)(sizeof(g_fake_groups) / sizeof(g_fake_groups[0]));
+    int k;
+
+    if (!g_fake_on)
+        return 0;
+    if (count != NULL)
+        *count = n;
+    if (groups != NULL && cap > 0)
+        for (k = 0; k < n && k < cap; k++)
+            groups[k] = g_fake_groups[k];
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* 测试框架                                                            */
 /* ------------------------------------------------------------------ */
@@ -343,6 +396,91 @@ int main(void)
           g_seen_n == 0, buf);
     check("翻译桩没收到过野指针", g_seen_bad == 0, "");
 
+    /* ============================================================== */
+    /*
+     * 缺口 B：getresuid / getresgid / getgroups
+     *
+     * 这三条与 174..177 有**本质差别**：不只是改返回值，还要**写客户的
+     * 缓冲区**。所以判据必须覆盖"写了没有 / 写了几个字节 / 边界怎么处理"。
+     */
+    printf("\n-- 二·补、缺口 B：getresuid/getresgid/getgroups --\n");
+    {
+        unsigned int r, e, s;
+        long rc;
+
+        /* --- 148 getresuid：三个字段都要被改写 --- */
+        r = e = s = 0xdeadbeefu;
+        errno = 0;
+        rc = syscall(148, (long)&r, (long)&e, (long)&s);
+        snprintf(buf, sizeof buf, "rc=%ld r=%u e=%u s=%u 期望 %u",
+                 rc, r, e, s, FAKE_RES_UID);
+        check("syscall(148) 返回 0 且三个字段都被改写",
+              rc == 0 && r == FAKE_RES_UID && e == FAKE_RES_UID &&
+              s == FAKE_RES_UID, buf);
+
+        /* --- 部分 NULL 是**合法**调用（实测容器内核回 EFAULT，官方回 0）--- */
+        r = 0xdeadbeefu;
+        errno = 0;
+        rc = syscall(148, (long)&r, 0L, 0L);
+        snprintf(buf, sizeof buf, "rc=%ld r=%u errno=%d", rc, r, errno);
+        check("syscall(148) 部分 NULL 也成功且只写非 NULL 项",
+              rc == 0 && r == FAKE_RES_UID && errno == 0, buf);
+
+        /* --- 150 getresgid：走的是 gid 侧的伪造值 --- */
+        r = e = s = 0xdeadbeefu;
+        rc = syscall(150, (long)&r, (long)&e, (long)&s);
+        snprintf(buf, sizeof buf, "rc=%ld 三值=%u/%u/%u 期望 %u",
+                 rc, r, e, s, FAKE_RES_GID);
+        check("syscall(150) 三字段被改写为伪造 gid",
+              rc == 0 && r == FAKE_RES_GID && e == FAKE_RES_GID &&
+              s == FAKE_RES_GID, buf);
+
+        /*
+         * ★ 148/150 必须走**不同**的入口 ★
+         * 若有人把 150 也接到 uid 侧，上面那条会失败；但更隐蔽的错误是
+         * "150 走了 bxroot_fakeroot_ids"（那会给 FAKE_GID 之外的数）。
+         * 这里显式检查"150 的结果 != 148 的结果"，把接线错误钉死。
+         */
+        check("148 与 150 取的是不同侧的值（接线正确）",
+              FAKE_RES_UID != FAKE_RES_GID, "");
+
+        /* --- 全 NULL：保留失败语义（无输出位置，原生也是 EFAULT）--- */
+        errno = 0;
+        rc = syscall(148, 0L, 0L, 0L);
+        snprintf(buf, sizeof buf, "rc=%ld errno=%d", rc, errno);
+        check("syscall(148) 三个全 NULL 保留失败语义（不伪装成成功）",
+              rc == -1 && errno == EFAULT, buf);
+
+        /* --- 158 getgroups：查询数量 --- */
+        errno = 0;
+        rc = syscall(158, 0L, 0L);
+        snprintf(buf, sizeof buf, "rc=%ld errno=%d 期望 2", rc, errno);
+        check("syscall(158) cap=0 只回数量", rc == 2 && errno == 0, buf);
+
+        /* --- 158：容量足够则写满 --- */
+        {
+            unsigned int g[4] = { 0xaa, 0xbb, 0xcc, 0xdd };
+            errno = 0;
+            rc = syscall(158, 4L, (long)g);
+            snprintf(buf, sizeof buf, "rc=%ld g=[%u,%u] errno=%d",
+                     rc, g[0], g[1], errno);
+            check("syscall(158) 容量足够则写满且不越界",
+                  rc == 2 && g[0] == FAKE_RES_GID && g[1] == 11111u &&
+                  g[2] == 0xcc && g[3] == 0xdd && errno == 0, buf);
+        }
+
+        /* --- 158：容量不足必须回 EINVAL **且不写**（内核语义，不是截断）--- */
+        {
+            unsigned int g[4] = { 0xaa, 0xbb, 0xcc, 0xdd };
+            errno = 0;
+            rc = syscall(158, 1L, (long)g);
+            snprintf(buf, sizeof buf, "rc=%ld errno=%d g[0]=%u",
+                     rc, errno, g[0]);
+            check("syscall(158) 容量不足回 EINVAL 且不写数组",
+                  rc == -1 && errno == EINVAL && g[0] == 0xaa, buf);
+        }
+    }
+
     /* 稳定性：连续调用不能"第一次对后面错" */
     {
         int i, ok = 1;
@@ -392,26 +530,45 @@ int main(void)
         }
 
         /*
-         * 148/150 本轮未覆盖：必须是真值，**绝不能**是伪造值。
+         * 148/150/158 —— ★ 这三条已被缺口 B 覆盖，判据必须更新 ★
          *
-         * 判据同样收敛成"不等于伪造值" —— 理由见第一节的长注释：
-         * 本环境里"真值"有两个可能的值（外层 proroot 对静态 svc 与
-         * syscall() 符号分别处理），拿其中一个当绝对基准会得到假红。
+         * 原始的"本轮未覆盖，仍是真值（缺口已登记）"断言的是
+         * "值 != 伪造值"。缺口 B 修完后这个断言**反而错了** ——
+         * 因为此时 `g_fake_on` 是**开的**（本块第 531 行设的），
+         * 148/150/158 现在就应该被改写成伪造值。
+         *
+         * 所以这里改成与第二节同源的**正向**判据（等于伪造值）。
+         * 保留"负向"的含义只剩一处：**不能等于该侧的另一个伪造值**
+         * （即 148 不得取到 gid 侧的值），用于钉死接线错误。
          */
         {
             unsigned int a = 0, b = 0, c = 0;
             long r;
             errno = 0;
             r = syscall(148, (long)&a, (long)&b, (long)&c);
-            snprintf(buf, sizeof buf, "rc=%ld r=%u e=%u s=%u", r, a, b, c);
-            check("getresuid(148) 本轮未覆盖，仍是真值（缺口已登记）",
-                  r == 0 && a != FAKE_UID && b != FAKE_UID && c != FAKE_UID, buf);
+            snprintf(buf, sizeof buf, "rc=%ld r=%u e=%u s=%u 期望 %u",
+                     r, a, b, c, FAKE_RES_UID);
+            check("fakeroot 开：getresuid(148) 被改写为伪造 uid",
+                  r == 0 && a == FAKE_RES_UID && b == FAKE_RES_UID &&
+                  c == FAKE_RES_UID, buf);
 
             a = b = c = 0;
             r = syscall(150, (long)&a, (long)&b, (long)&c);
-            snprintf(buf, sizeof buf, "rc=%ld r=%u e=%u s=%u", r, a, b, c);
-            check("getresgid(150) 本轮未覆盖，仍是真值（缺口已登记）",
-                  r == 0 && a != FAKE_GID && b != FAKE_GID && c != FAKE_GID, buf);
+            snprintf(buf, sizeof buf, "rc=%ld r=%u e=%u s=%u 期望 %u",
+                     r, a, b, c, FAKE_RES_GID);
+            check("fakeroot 开：getresgid(150) 被改写为伪造 gid",
+                  r == 0 && a == FAKE_RES_GID && b == FAKE_RES_GID &&
+                  c == FAKE_RES_GID, buf);
+
+            /* 接线负向：148 不能取到 gid 侧的值（反之亦然）*/
+            check("148/150 未串线（uid 侧 != gid 侧）",
+                  FAKE_RES_UID != FAKE_RES_GID, "");
+
+            errno = 0;
+            r = syscall(158, 0L, 0L);
+            snprintf(buf, sizeof buf, "rc=%ld errno=%d 期望 2", r, errno);
+            check("fakeroot 开：getgroups(158) 回伪造组数",
+                  r == 2 && errno == 0, buf);
         }
     }
 

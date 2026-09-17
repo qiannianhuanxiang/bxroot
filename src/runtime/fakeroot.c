@@ -1492,6 +1492,29 @@ void fakeroot_state_set_enabled(fakeroot_state *fs, bool enabled)
         fs->rgid = fs->egid = fs->sgid = fs->fsgid = (gid_t)0;
         fs->caps_active = true;
         fs->keep_caps   = false;
+
+        /*
+         * ★ 补充组表：默认 **1 个元素 [0]**，不是空表 ★
+         *
+         * 【实测依据】官方在 fakeroot 下的三侧对照（见
+         * docs/身份查询与降权族-原始数据.md）：
+         *
+         *     getgroups(0, NULL)  官方 = 1      原生 = 6
+         *     getgroups(1, buf)   官方 = 1 [0]  原生 = 6
+         *
+         * 也就是说官方伪造出的身份**自洽**：uid=gid=0 且补充组里也有 0
+         * （即"我是 root，主组是 root"）。而 bxroot 之前 `ngroups = 0`，
+         * 于是 `id` 的输出是 `gid=0 groups=0`（官方是 `groups=0(root)`）
+         * —— 少了一个组，程序做组查询时会看到不一致。
+         *
+         * 为什么不是"空表"：真实的 root 进程在主组之外通常还有补充组，
+         * 但**官方选择只给一个 [0]**，我们与官方对齐而不是与真实内核对齐
+         * （这是 fakeroot 的语义 —— 让程序看到"它以为的那个身份"）。
+         *
+         * 注意组表可以被 `setgroups` 覆盖（见 fr_setgroups），这里只设初值。
+         */
+        fs->groups[0]  = (gid_t)0;
+        fs->ngroups    = 1;
     }
 }
 

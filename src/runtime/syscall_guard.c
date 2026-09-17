@@ -95,6 +95,41 @@ __attribute__((weak))
 int bxroot_fakeroot_ids(unsigned int *uid, unsigned int *gid);
 
 /*
+ * 缺口 B：`getresuid`/`getresgid`/`getgroups` 的**结果改写**入口。
+ *
+ * 【为什么不能复用 bxroot_fakeroot_ids】
+ *
+ * 那一个入口只给**一个** uid 和一个 gid。而 `getresuid` 要写**三个各不相同**
+ * 的值（`setresuid(-1, 1000, -1)` 之后 r/e/s 互不相等），`getgroups` 要写
+ * **一整个数组**。用单值入口填三个字段会让 `getgid` 也拿到 uid 的值 ——
+ * 本项目刚在别处踩过"同一套规则写两处、两边漂移"。
+ * 所以要**并列新增**入口，而不是改旧的。
+ *
+ * 【为什么不让 guard 自己写死"假身份就是 0"】
+ *
+ * 与 bxroot_fakeroot_ids 同一原则：guard 只**搬运**，判断属于 fakeroot 层。
+ * fakeroot 状态里的 ruid/rgid 就是伪造值，将来若支持 `-i 1000:1000`
+ * 之类，改 fakeroot 层即可，guard 不用动。
+ *
+ * 返回值：非 0 = 已填好（guard 可写回客户缓冲区）；0 = 未启用 fakeroot。
+ */
+__attribute__((weak))
+int bxroot_fakeroot_res_ids(unsigned int *ruid, unsigned int *euid,
+                            unsigned int *suid, unsigned int *rgid,
+                            unsigned int *egid, unsigned int *sgid);
+
+/*
+ * `getgroups` 的伪造组表。
+ *
+ * `groups` 可为 NULL（此时只查询数量），`cap` 是客户给的容量（元素个数）。
+ * 返回：非 0 = 已填好/已给出数量；0 = 未启用 fakeroot（原样透传）。
+ * 填好后 `*count` 是**真实的组数**（可能 > cap，与内核语义一致：
+ * 内核在 cap 不足时返回 EINVAL 而不是截断，见下方调用点的注释）。
+ */
+__attribute__((weak))
+int bxroot_fakeroot_groups(unsigned int *groups, int cap, int *count);
+
+/*
  * STATX_NLINK：避免为一个常量引入 <linux/stat.h>（见上面的耦合说明）。
  *
  * ★ 值必须是 0x4，不要写成 0x200 ★
@@ -912,15 +947,24 @@ long syscall(long number, ...)
          * （我们改写的那条）根本不碰 errno，所以"改写身份"不会污染它。
          *
          * 【覆盖范围与已知缺口】
-         * 本轮覆盖 174..177。**未覆盖**：
-         *   - 148/150（getresuid/getresgid）—— 它们是"一次写三个字段"，
-         *     必须判空+逐个写回，风险与工作量都更高，单列一项；
-         *   - 158（getgroups）—— 要伪造整个数组，且长度必须自洽；
+         * 本轮覆盖 174..177、148/150（getresuid/getresgid）、158（getgroups）。
+         * **未覆盖**：
          *   - 降权族（setuid/setgid/setgroups…，见"降权族"一节）。
-         * 这些缺口已逐条登记在 docs/裸syscall身份伪造修复.md，并有
-         * test/test_id_syscall_guard.c 的边界用例钉住"当前未覆盖"这一事实。
+         * 这些缺口已逐条登记在 docs/裸syscall身份伪造回归.md。
+         *
+         * ★ 门控为什么分成两层 ★
+         *
+         * 174..177 是"内核成功 → 改写返回值"，所以要求 `ret >= 0`。
+         * 但 148/150 有个**关键差异**：容器内核对"部分 NULL"返回
+         * -EFAULT，而官方**返回 0**（实测，见下）。若沿用 `ret >= 0`，
+         * 那条路径永远进不来，客户的 `getresuid(&r, NULL, NULL)` 会拿到
+         * EFAULT 而官方给 0 —— 行为不一致。
+         *
+         * 所以 148/150 单独走一个分支，**不看 ret**：
+         * 我们自己有完整的伪造值，根本不需要内核的答复；
+         * 只要能证明"这次调用合法"，就自己填好并返回 0。
          */
-        if (ret >= 0 && bxroot_fakeroot_ids != NULL) {
+        if (bxroot_fakeroot_ids != NULL) {
             unsigned int fuid = 0, fgid = 0;
 
             switch (number) {
@@ -931,7 +975,13 @@ long syscall(long number, ...)
              */
             case 174:   /* getuid  */
             case 175:   /* geteuid */
-                if (bxroot_fakeroot_ids(&fuid, NULL)) {
+                /*
+                 * ★ 这两条仍要求 `ret >= 0` ★
+                 * 与 148/150 不同：这里没有"客户缓冲区"要填，纯粹是改写
+                 * 内核给的返回值。内核失败时（理论不会，但可以回 -EPERM）
+                 * 必须保留失败语义，不能把错误伪装成成功。
+                 */
+                if (ret >= 0 && bxroot_fakeroot_ids(&fuid, NULL)) {
                     if (g_trace)
                         log_num("[bxroot] syscall_guard: 伪装 uid ", number, " ");
                     ret = (long)fuid;
@@ -939,12 +989,198 @@ long syscall(long number, ...)
                 break;
             case 176:   /* getgid  */
             case 177:   /* getegid */
-                if (bxroot_fakeroot_ids(NULL, &fgid)) {
+                if (ret >= 0 && bxroot_fakeroot_ids(NULL, &fgid)) {
                     if (g_trace)
                         log_num("[bxroot] syscall_guard: 伪装 gid ", number, " ");
                     ret = (long)fgid;
                 }
                 break;
+
+            /*
+             * ========================================================
+             * 缺口 B：getresuid / getresgid（一次写三个字段）
+             * ========================================================
+             *
+             * 【语义（实测，三侧对照见 docs/身份查询与降权族-原始数据.md）】
+             *
+             *   1. 三个指针**可以任意组合为 NULL** —— 内核只写非 NULL 的。
+             *      `getresuid(&r, NULL, NULL)` 是**合法**调用。
+             *   2. ★ 容器内核对"部分 NULL"返回 **-EFAULT**（实测 -14），
+             *      而**官方返回 0**。这个差异来自外层 proroot 容器对
+             *      syscall 的处理，不是内核规范行为（容器外原生返回 0）。
+             *      所以本分支**不看 `ret`** —— 我们自己有完整的伪造值，
+             *      只要能证明"调用合法"就直接填好并返回 0，与官方对齐。
+             *   3. 唯一要保留的失败语义：**三个指针全 NULL** —— 那种调用
+             *      没有任何输出位置，原生也是 EFAULT。保留它，避免把
+             *      "调用方写错了"伪装成成功。
+             *   4. 返回值是 0，失败为负 errno。
+             *
+             * 【为什么必须逐项判空 + 逐个写回】
+             *
+             * 客户的三个指针是**客户地址空间**的地址。写之前必须判 NULL；
+             * 且**只写 4 字节**（`uid_t` 是 unsigned int），不能写成 8 字节
+             * （`long`）—— 那会破坏相邻内存。这是本项目"数宽度写错"的
+             * 同类风险（statx 的 stx_mode 是 u16 也踩过）。
+             *
+             * 【为什么不用 memcpy 一次写三个】
+             *
+             * 客户传的**不是**一个连续数组，而是三个**独立**指针，
+             * 可以指向任意位置（实测 `&r` 与 `&e` 可以相隔很远）。
+             * 所以只能逐个解引用写。
+             *
+             * 【为什么不用 `ret >= 0` 做门控】
+             *
+             * 那会让"部分 NULL"这条**合法**调用永远进不来（容器内核给
+             * -EFAULT），于是客户拿到 EFAULT 而官方给 0 —— 正是我们要
+             * 消灭的那类不一致。
+             */
+            case 148:   /* getresuid */
+            case 150:   /* getresgid */
+            {
+                unsigned int fr = 0, fe = 0, fs = 0;
+                int ok;
+
+                /*
+                 * ★ 每个 weak 符号都要单独判 NULL ★
+                 *
+                 * 这是**实测踩到的崩溃**：本文件有三种编译方式，其中
+                 * 单测（test_syscall_argpos.c / test_rename_link_argpos.c）
+                 * **不链 preload.c**，于是**所有** bxroot_fakeroot_* 都是 NULL。
+                 * 而身份单测 test_id_syscall_guard.c 只提供
+                 * bxroot_fakeroot_ids 的强定义 —— 另两个仍是 NULL。
+                 *
+                 * 若只在最外层判 `bxroot_fakeroot_ids != NULL` 就进来，
+                 * 这里对 NULL 函数指针的调用会**跳到地址 0**：
+                 *     [proroot] SIGSEGV pc=0x0 ... x8=0x94(=148)
+                 * 外层那个判据**不能**替代内层的 —— 三个符号是独立解析的。
+                 */
+                if (bxroot_fakeroot_res_ids == NULL)
+                    break;
+
+                /*
+                 * 全 NULL → 没有任何输出位置，是调用方的错误。
+                 * 原生语义是 EFAULT，保留它（不伪装成成功）。
+                 */
+                if (a0 == 0 && a1 == 0 && a2 == 0)
+                    break;
+
+                if (number == 148)
+                    ok = bxroot_fakeroot_res_ids(&fr, &fe, &fs,
+                                                 NULL, NULL, NULL);
+                else
+                    ok = bxroot_fakeroot_res_ids(NULL, NULL, NULL,
+                                                 &fr, &fe, &fs);
+                if (ok) {
+                    /*
+                     * 逐个写：指针来自客户，可能是 NULL 表达"不关心这一项"。
+                     * 用 volatile 让编译器**不要**把"解引用客户指针"优化掉
+                     * （它是可观测副作用），也不要合并多次写。
+                     */
+                    if (a0 != 0) *(volatile unsigned int *)(uintptr_t)a0 = fr;
+                    if (a1 != 0) *(volatile unsigned int *)(uintptr_t)a1 = fe;
+                    if (a2 != 0) *(volatile unsigned int *)(uintptr_t)a2 = fs;
+                    /*
+                     * ★ 必须自己把 ret 归零并清 errno ★
+                     *
+                     * 容器内核对"部分 NULL"回了 -EFAULT，ret 此刻是负的；
+                     * 我们已经自己填好了所有输出位置，这次调用就是**成功**。
+                     * 不清 errno 会留下"函数返回 0 但 errno=EFAULT"的怪异
+                     * 状态 —— 严格的程序（或 -D_FORTIFY 的检查）可能据此
+                     * 判失败。
+                     */
+                    ret = 0;
+                    errno = 0;
+                    if (g_trace)
+                        log_num("[bxroot] syscall_guard: 伪装 res-id ", number,
+                                " ");
+                }
+                break;
+            }
+
+            /*
+             * ========================================================
+             * 缺口 B：getgroups（双重返回语义）
+             * ========================================================
+             *
+             * 【内核语义（实测）】
+             *
+             *   1. `cap == 0`（且 list 可为 NULL）→ 返回**组数**，不写任何数组。
+             *      容器内实测 `getgroups(0,NULL)` = 6（真值），
+             *      官方 = **1**（伪造出一个 root 主组）。
+             *   2. `cap > 0` → 返回组数，并把组写进 list。
+             *      实测 `getgroups(1,buf)` 在真实组数为 6 时返回 **-EINVAL**
+             *      （**不是**截断！内核要求 cap 足够大，否则报错）。
+             *
+             * 【为什么不能直接返回伪造组数就完事】
+             *
+             * 要同时满足两条：
+             *   - 查询（cap==0）：返回伪造组数
+             *   - 取值（cap>0）：写进伪造组表，且 cap 不足时**回 EINVAL**、
+             *     不写任何内容
+             * 只做前半会得到"数出来 1 个，取出来还是 6 个"的自相矛盾 ——
+             * 正是本项目反复出现的"两层给出不同答案"。
+             *
+             * 【为什么失败时要保留 ret 而不是强行写成成功】
+             *
+             * cap 不足时客户拿到 EINVAL 是**正确行为**（内核就这么做），
+             * 我们要复刻它，而不是"帮客户成功"。
+             */
+            case 158:   /* getgroups */
+            {
+                unsigned int gbuf[64];
+                int gcount = 0;
+
+                /* 同 148/150：独立 weak 符号，必须单独判 NULL（见那里的崩溃记录） */
+                if (bxroot_fakeroot_groups == NULL)
+                    break;
+
+                if (bxroot_fakeroot_groups(NULL, 0, &gcount) && gcount >= 0) {
+                    if (a0 == 0) {
+                        /* 查询模式：只返回数量 */
+                        ret = (long)gcount;
+                        errno = 0;      /* 见下方"errno 必须清"的说明 */
+                        if (g_trace)
+                            log_num("[bxroot] syscall_guard: 伪装 group 数 ",
+                                    gcount, " ");
+                    } else if ((long)gcount > a0) {
+                        /*
+                         * 容量不足：内核语义是 EINVAL，且**不写数组**。
+                         * 实测容器内核 `getgroups(1,buf)` 在真实组数为 6 时
+                         * 返回 -22，所以这里复刻它而不是"帮客户成功"。
+                         * ★ 但注意：伪造后的组数是 1，所以正常客户传 cap=1
+                         *   就够 —— 只有 cap=0 以外的过小值才触发。★
+                         */
+                        errno = EINVAL;
+                        ret = -1;
+                    } else {
+                        int filled = 0;
+                        if (bxroot_fakeroot_groups(gbuf, 64, &filled) &&
+                            filled == gcount && a1 != 0) {
+                            unsigned int *dst =
+                                (unsigned int *)(uintptr_t)a1;
+                            int k;
+                            for (k = 0; k < gcount; k++)
+                                *(volatile unsigned int *)(dst + k) = gbuf[k];
+                        }
+                        ret = (long)gcount;
+                        /*
+                         * ★ errno 必须清 ★
+                         *
+                         * 内核刚才那次真实 getgroups 很可能**失败**了
+                         * （我们在伪造前已经发过一次 syscall），于是
+                         * raw_syscall6 写了 errno。我们既然自己给出了
+                         * 正确结果，这次调用就是成功的 —— 留着陈旧的
+                         * errno 会得到"返回 1 但 errno=EINVAL"的怪异状态。
+                         */
+                        errno = 0;
+                        if (g_trace)
+                            log_num("[bxroot] syscall_guard: 伪装 group 表 ",
+                                    gcount, " ");
+                    }
+                }
+                break;
+            }
+
             default:
                 /*
                  * 走到这里说明 number 不是身份调用 —— **不动 ret**。

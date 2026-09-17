@@ -6814,3 +6814,68 @@ int bxroot_fakeroot_ids(unsigned int *uid, unsigned int *gid)
     if (gid != NULL) *gid = (unsigned int)g_fakeroot_state.rgid;
     return 1;
 }
+
+/*
+ * 缺口 B 的两个入口 —— 给 syscall_guard.c 的 `syscall(148/150/158)` 用。
+ *
+ * 【为什么不复用上面的单值入口】
+ *
+ * `getresuid` 要写**三个各不相同**的值，`getgroups` 要写**一整个数组**。
+ * 用 bxroot_fakeroot_ids 填三个字段会让 getgid 也拿到 uid 的值 ——
+ * 本项目刚在 statx 的 stx_mode 宽度、fakeroot 初始化顺序上踩过
+ * "同一套规则写两处、两边漂移"。所以**并列新增**，不改旧的。
+ *
+ * 【取值来源与符号层钩子完全同源】
+ *
+ * 与上面 getresuid/getresgid/getgroups 三个**符号钩子**读的是同一份
+ * g_fakeroot_state 字段。这是硬要求：符号层与 syscall 层若各读一处，
+ * 就会出现"同一个程序用两种方式问出两个不同答案"—— 正是本轮要消灭的
+ * 那类缺陷。
+ */
+int bxroot_fakeroot_res_ids(unsigned int *ruid, unsigned int *euid,
+                            unsigned int *suid, unsigned int *rgid,
+                            unsigned int *egid, unsigned int *sgid)
+{
+    if (!g_fakeroot_on)
+        return 0;
+
+    if (ruid != NULL) *ruid = (unsigned int)g_fakeroot_state.ruid;
+    if (euid != NULL) *euid = (unsigned int)g_fakeroot_state.euid;
+    if (suid != NULL) *suid = (unsigned int)g_fakeroot_state.suid;
+    if (rgid != NULL) *rgid = (unsigned int)g_fakeroot_state.rgid;
+    if (egid != NULL) *egid = (unsigned int)g_fakeroot_state.egid;
+    if (sgid != NULL) *sgid = (unsigned int)g_fakeroot_state.sgid;
+    return 1;
+}
+
+/*
+ * getgroups 的伪造组表。
+ *
+ * `groups == NULL` 或 `cap <= 0` → 只回数量（写 `*count`）。
+ * 否则把组表填进 `groups`（最多 `cap` 个），`*count` 是**真实组数**。
+ *
+ * ★ `*count` 恒为真实组数，不因 cap 不足而截断 ★
+ * 因为调用方（syscall_guard）要据此判断"容量够不够"并按内核语义回
+ * EINVAL。若这里返回截断后的数量，guard 就无法区分"组本来就这么少"
+ * 与"客户缓冲区太小"—— 那会让 `getgroups(1, buf)` 静默返回 1 而不是
+ * EINVAL，与内核行为不符（实测内核回 -22）。
+ */
+int bxroot_fakeroot_groups(unsigned int *groups, int cap, int *count)
+{
+    int n;
+    int k;
+
+    if (!g_fakeroot_on)
+        return 0;
+
+    n = g_fakeroot_state.ngroups;
+    if (n < 0)
+        n = 0;
+    if (count != NULL)
+        *count = n;
+    if (groups != NULL && cap > 0) {
+        for (k = 0; k < n && k < cap; k++)
+            groups[k] = (unsigned int)g_fakeroot_state.groups[k];
+    }
+    return 1;
+}
