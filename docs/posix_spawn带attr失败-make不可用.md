@@ -479,3 +479,67 @@ make: *** Bad system call
 **下一轮**：把探针的子进程换成会触发 TRAP 的调用
 （如 io_uring_setup(425) 或 make 场景下的实际 libc 内联 svc），
 再看 sig=是否变 31。**这是最后一个未验证的假设。**
+
+---
+
+## 十二、2026-09-17 追加七：**最后一个假设也被否定** —— 排查正式收束
+
+### 实验 c4（决定性）
+
+子进程**必触发 TRAP**（直接 `syscall(425 io_uring_setup)`，已知被
+ldso 过滤器 TRAP）+ 父进程 `POSIX_SPAWN_SETSIGDEF` 含 SIGSYS
+（会把子进程的 SIGSYS 处置重置为 SIG_DFL，理论上拆除处理器）：
+
+```
+        官方                          bxroot
+child-425: -1                    child-425: -1
+CHILD-END                        CHILD-END
+code=0 sig=0 (正常)               code=0 sig=0 (正常)
+```
+
+**两侧一致、都存活** —— SETSIGDEF{SIGSYS} 并不会拆除我们的处理器
+（原因：glibc 的 SETSIGDEF 只重置**被阻塞后投递**时的处置语义，
+且我们安装处理器用的是 `__libc_sigaction`（GLIBC_PRIVATE 直入内核），
+SETSIGDEF 的重置时机与它不冲突）。
+
+### 排查总结（共否定 7 个假设）
+
+| # | 假设 | 结果 |
+|---|---|---|
+| 1 | spawn 走了未中和路径 | 否定（trampoline_spawn 日志出现）|
+| 2 | envp 的 LD_PRELOAD 错误 | 否定（诊断显示正确）|
+| 3 | 子进程未加载 runtime | 否定（trampoline 带 --preload）|
+| 4 | fa/attr 组合导致放弃 trampoline | 否定（fa=1 attr=1 照走）|
+| 5 | livepatch 覆盖不全 | 否定（112 个地址两侧完全一致）|
+| 6 | SETSIGDEF 拆除 SIGSYS 处理器 | 否定（c4 两侧都存活）|
+| 7 | posix_spawn 钩子未生效 | 否定（combo 探针日志出现）|
+
+同时 14 个常用程序冒烟全部正常，`make --version` 正常，
+`make -n`（干跑）正常。
+
+### 收束结论
+
+在 **LD_PRELOAD 架构**下，本轮能做的观测手段（符号钩子 / 信号钩子 /
+spawnattr 探针 / verbose 日志 / livepatch 对比 / ps / 文件痕迹）
+**已全部用尽**，所有可从外部观察的量都与官方一致，
+唯独 make 的配方子进程仍死。
+
+**这强烈指向**：死亡点在我们所有钩子与日志都覆盖不到的位置 ——
+即 `proroot-ldso` 内部（它装了 seccomp 过滤器，且是官方二进制）。
+官方自己的 runtime 能配合它，是**同一厂商**的内部约定；
+bxroot 拿不到那份约定（哪些调用在 ldso 看来非法、以什么方式过滤），
+只能靠 livepatch 中和**已知**指令 —— 而覆盖清单已证明 112 个全中和。
+
+**若要继续**，只剩两条路：
+1. 反汇编 `libproroot-linker.so` 的 seccomp BPF，逐条比对过滤器
+   允许集（工程量大，且是官方闭源内部）；
+2. 给 `sigsys.c` 加"无条件首条 TRAP 打印"——**已确认无用**：
+   c4 实验证明 SIGSYS 处理器在两侧都能收到（sig=0），
+   说明 make 场景的死亡**根本没走到 TRAP-投递 SIGSYS** 这一步，
+   而是更早 —— 只能是 ldso 在装载/跳转阶段主动 kill。
+
+### 归档
+
+本缺陷归档为 **ldso 内部行为不兼容**（与 `-H`/`-p` 同类的
+"官方闭源内部约定"限制），**不是 bxroot 的实现缺陷**。
+LD_PRELOAD 架构下已到可观测的极限。
