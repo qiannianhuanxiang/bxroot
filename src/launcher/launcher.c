@@ -175,7 +175,7 @@ static void usage(const char *prog) {
         "  -b, --bind <h>:<g>    bind mount (可多次)\n"
         "  -m, --mount <h>:<g>   同 -b\n"
         "  -0, --root-id         fakeroot 模式\n"
-        "      --link2symlink    硬链接模拟为符号链接\n"
+        "  -l, --link2symlink    硬链接模拟为符号链接\n"
         "  -v, --verbose         调试模式\n"
         "  -V, --version         打印版本\n"
         "  -h, --help            帮助\n\n"
@@ -333,7 +333,22 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
         } else if (strcmp(argv[i], "-0") == 0 ||
                    strcmp(argv[i], "--root-id") == 0) {
             cfg->fakeroot = 1;
-        } else if (strcmp(argv[i], "--link2symlink") == 0) {
+        } else if (strcmp(argv[i], "--link2symlink") == 0 ||
+                   strcmp(argv[i], "-l") == 0) {
+            /*
+             * `-l` 是 `--link2symlink` 的**官方短别名**：上游选项表里
+             * 两者同属一个 arguments[] 组、共用同一个 handler，所以
+             * "只支持长名"不算兼容。
+             *
+             * 缺它的后果不是"报错"而是**静默不生效** —— 用户的启动脚本
+             * 写 `-l`，参数落进未识别分支，l2s 全程没开，之后所有硬链接
+             * 在 f2fs/SELinux 上失败，而错误现场离原因很远（tar 解包
+             * 报 EPERM、pnpm install 崩在无关步骤）。
+             *
+             * ★ 大小写必须分开 ★ `-L`（大写）是**另一个**扩展
+             * （fix_symlink_size，修正 lstat 的符号链接 size），语义
+             * 完全不同。绝不能把这两个判断合并成大小写不敏感匹配。
+             */
             cfg->link2symlink = 1;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             cfg->verbose = 1;
