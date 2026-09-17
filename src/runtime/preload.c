@@ -5318,16 +5318,18 @@ int prlimit64(pid_t pid, __rlimit_resource_t resource,
  * ------------------------------------------------------------------
  * 本实现（与官方语义对齐）
  * ------------------------------------------------------------------
- *   - 判据用"**是否设置了显式栈区**"，而不是"addr 是否非空"。
- *     glibc 的 attr 里根本没有"显式栈区"这个概念：只要设过 stacksize，
- *     getstack 就会返回上面那个派生值。若照报告 §2.4 用 `addr != NULL`
- *     当判据，**每一次**线程创建都会被替换成全新 attr，
- *     把调用方通过 attr 设置的 guard size 等语义一起丢掉 ——
+ *   - 判据用"**是否真的带了显式栈区**"，而不是"addr 是否非空"。
+ *     glibc 的 attr 里没有"显式栈区"这个独立标志位，它只能从
+ *     `pthread_attr_getstack` 的返回值反推（见更正 1 的字段标定）：
+ *     只要设过 stacksize，`stackaddr 字段` 恒为 0，getstack 就会返回
+ *     `addr = -stacksize, region = stacksize` 这个派生值（addr 非空！）。
+ *     若照报告 §2.4 的骨架用 `addr != NULL` 当判据，**每一次**线程创建
+ *     都会被当成"有显式栈区"，于是永远走不到修正段（或反过来被无故替换），
+ *     把调用方通过 attr 设的 guard size 等语义一起丢掉 ——
  *     这属于"修一个边缘情况而破坏正常路径"，必须避免。
- *     真正要区分的是"调用方给了 attr 但只设了 stacksize"（→ 可安全替换）
- *     与"调用方给了 attr 且真的带了显式栈区"（→ 原样转发，别动）。
- *     后者在 glibc 里表现为 setstack(addr,size) 设过之后
- *     `[attr+16]` 变成 size、region 非 0 且 addr+region != 0。
+ *     真正的区分依据是 **addr + region 是否为 0**：
+ *       - 只设 stacksize：addr = -size, region = size → 和为 0
+ *       - 真显式栈区    ：addr = base,  region = size → 和为 base ≠ 0
  *
  *   - 下限取 `max(2 * sysconf(_SC_THREAD_STACK_MIN), 262144)`。
  *     实测本环境 `_SC_THREAD_STACK_MIN = 131072`（PAGESIZE=4096），
@@ -5450,14 +5452,19 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     /*
      * ★ 判据：区分"只设了 stacksize"与"真的带了显式栈区"。
      *
-     * glibc 里没有"显式栈区"这个独立字段，只能这样判别：
-     *   - 只设过 stacksize：region 是 guardsize、addr = stacksize - guardsize，
-     *     于是 region != 0 但 **addr + region == 0**（见文件上方更正 1）。
-     *   - 真设过显式栈区（pthread_attr_setstack）：[attr+16] 变成 size，
-     *     addr + region == size != 0。
+     * 先看清 libc 的 pthread_attr_getstack 到底返回什么（见文件上方更正 1）：
+     *     region = [attr+32] = stacksize
+     *     addr   = [attr+24] - [attr+32] = stackaddr字段 - stacksize
      *
-     * 官方 0x10540 的 `cmn x7,x6 / b.eq` 判的正是同一件事
-     * （它据此决定要不要先记日志，两条路都做修正 —— 见更正 2）。
+     * 于是两种情形自然分开：
+     *   - 只设过 stacksize：stackaddr 字段恒为 0
+     *       → addr = -stacksize，region = stacksize，**addr + region == 0**
+     *   - 真设过显式栈区（pthread_attr_setstack）：
+     *       [attr+24] = base + size ≠ 0
+     *       → addr = base，**addr + region == base ≠ 0**
+     *
+     * 官方 0x10540 的 `cmn x7,x6`（addr + region == 0 ?）判的正是同一件事，
+     * 两条路都做修正，`b.eq` 只决定要不要先记日志 —— 见更正 2。
      *
      * 真显式栈区**必须原样转发**：那种调用方自己管内存，
      * 我们替它换栈会破坏它的语义（它可能已经把栈指针/映射交给别处）。

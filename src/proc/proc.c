@@ -4458,6 +4458,19 @@ FILE *popen(const char *cmd, const char *mode)
     g_rt_stats.popen_calls++;
 
     /*
+     * ★ 必须自己保证 init 跑过，不能只依赖构造函数 ★
+     *
+     * `popen` 是我们**导出**的符号，调用方在任何时刻都可能进来 ——
+     * 包括构造函数还没跑到的极早阶段（本单元可能晚于调用方的
+     * 构造函数被加载）。而下面所有判据都读 `g_rt_cfg`，未初始化时
+     * `have_rootfs` 为 0 → 直接落进 fallback → 又回到「宿主 /bin/sh
+     * 带着容器视角 LD_PRELOAD 起不来」那条缺陷路径，且是**静默**的。
+     *
+     * px_runtime_init 自带 g_rt_ready 幂等检查，重复调用无副作用。
+     */
+    px_runtime_init();
+
+    /*
      * 慢路径条件（任一命中 → 用真实 popen）：
      *   - cmd 为 NULL（POSIX 未定义，交给 glibc 去报它自己的错）
      *   - 没有 rootfs 配置（开发机、单测：我们不翻译路径，接管无意义）
