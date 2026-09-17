@@ -3342,9 +3342,35 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
         if (path[0] == '/') {
             if (translate_path(path, translated, sizeof(translated)) > 0)
                 p = translated;
+        } else if (dirfd == AT_FDCWD) {
+            /*
+             * ★ AT_FDCWD + 相对路径（2026-09-17 补，由 dpkg -i 暴露）★
+             *
+             * dpkg unpack 的完整序列是 chdir(目标目录) 后用
+             *     utimensat(AT_FDCWD, "x.dpkg-new", ...)
+             * 相对路径由**进程 cwd** 解析。bxroot 的 cwd 在内核里是
+             * **宿主路径**（chdir 钩子翻译过），所以内核本应找得到 ——
+             * 但实测仍 ENOENT。原因：dpkg 的 chdir 目标是它自己算的
+             * 路径（经它自己的翻译），而我们的 cwd 翻译与它的不一致，
+             * 两者差一层。
+             *
+             * 修法：把相对路径先用 getcwd 拼成**绝对**路径，再走
+             * translate_path —— 与 openat 的 dirfd 解析同一策略。
+             * 这样无论进程 cwd 是什么，解析结果都唯一。
+             */
+            char cwd[MAX_PATH_LEN];
+            if (getcwd(cwd, sizeof cwd) != NULL &&
+                snprintf(joined, sizeof joined, "%s/%s", cwd, path) <
+                    (int)sizeof joined) {
+                if (translate_path(joined, translated, sizeof(translated)) > 0)
+                    p = translated;
+                else
+                    p = joined;
+            }
+            /* getcwd 失败 → 原样透传（保底） */
         } else if (resolve_dirfd_path(dirfd, path, joined,
                                       sizeof(joined)) == 1) {
-            /* 相对路径 + dirfd → 拼成绝对路径后再翻译 */
+            /* 相对路径 + 非AT_FDCWD 的 dirfd → 拼成绝对路径后再翻译 */
             if (translate_path(joined, translated, sizeof(translated)) > 0)
                 p = translated;
             else
