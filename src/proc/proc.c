@@ -2403,6 +2403,52 @@ static void px_detect_self_lib(char *dst, size_t cap)
  * 构造函数执行时 environ 里已经有 ld.so 处理过的 LD_PRELOAD 原值，
  * 所以这里直接读是对的。但要注意区分「guest 设的」与「上一级容器设的」：
  * 两者我们都要保留（合并而非覆盖），所以不需要区分，直接合并即可。
+ *
+ * ★★ `environ` 里的 LD_PRELOAD 与 g_rt_cfg.preload 是**两个不同视角** ★★
+ *
+ * 这是本函数最容易踩错的地方，实测代价是「所有 exec 出来的子进程全部
+ * 起不来」。两者各自的用途不可互换：
+ *
+ *   `g_rt_cfg.preload`（= 本函数的 merged）
+ *       用途：经 `px_runtime_build_env` 写进**子进程 envp**。子进程是
+ *       容器里的程序，由 `PX_ROOTFS` 内的 ld.so 加载，所以这里必须是
+ *       **容器视角**路径。dladdr 返回内核视角路径，两者恰好同形（实测
+ *       `<rootfs>/...` 在容器视角下 `access(X_OK)` 也成立，因为翻译层
+ *       对已带 rootfs 前缀的路径是幂等的），所以这一条不用改。
+ *
+ *   `environ` 里的 `LD_PRELOAD`
+ *       用途：glibc 的 `system()`/`popen()` 会硬编码宿主世界的
+ *       `/bin/sh`（见 system/popen 区顶部注释），那个 shell 由**宿主**
+ *       linker 加载，只能认**宿主视角**的路径。
+ *
+ * 原实现把容器视角的值 `setenv` 进 environ，于是宿主 shell 拿
+ * `<rootfs>/...` 去解析 → 它 `DT_NEEDED` 的 `libc.so.6` 不在宿主
+ * 搜索路径里 → `CANNOT LINK EXECUTABLE ... library "libc.so.6" not found`。
+ *
+ * 判别实验（决定性，见报告）：只把 LD_PRELOAD 从 environ 删掉、其余
+ * 全不动，`system()` 立刻从 rc=256 恢复成 rc=0。
+ *
+ * 【修法】两条路各自走自己的机制，互不依赖：
+ *   - environ 里的 `LD_PRELOAD` **只保留 guest 自己原有的值**，不再
+ *     把我们的库塞进去。宿主 shell 因此不再被我们的路径毒害。
+ *   - 子进程带上运行时的职责**完全交给 `px_runtime_build_env`**（它写
+ *     的是正确的容器视角路径），覆盖 `execve`/`execvp`/`posix_spawn`/
+ *     我们自研的 `system`/`popen` 全部路径。
+ *
+ * 为什么这样仍然满足「子进程必须带上运行时」：本文件所有能派生进程的
+ * 出口（exec 家族、posix_spawn 家族、system、popen）都经
+ * `px_runtime_build_env` 注入 envp，且真机上它们全部走 trampoline
+ * （args 里带 `--preload`）。官方同样**完全不设 LD_PRELOAD**（实测
+ * 三件套里 `LD_PRELOAD` 字符串出现 0 次），走的就是这条「argv 重写 +
+ * 显式 --preload」路线 —— 我们的 trampoline 复用的正是官方那套 bridge
+ * 与 linker。
+ *
+ * 对照测试：`test/RUN_SYSTEM_POPEN.sh`（两侧 A/B，检查 rc、输出、
+ * 子进程仍在容器视角）。test_proc.c 的 C13「只有一条 LD_PRELOAD」
+ * 断言钉的是**纯逻辑层** `px_env_build` 的合并语义（ours 在前、不重复），
+ * 与 environ 里放什么是两件事 —— 那条断言的意图（guest 自己设的
+ * preload 不被静默丢弃）在本修法下**依然成立**：它由
+ * `px_runtime_build_env` 的 MERGE 模式保证。
  */
 static void px_cfg_merge_preload(void)
 {
@@ -2444,16 +2490,49 @@ static void px_cfg_merge_preload(void)
     g_rt_cfg.have_preload = 1;
 
     /*
-     * 就地同步进程环境。
+     * ★★ environ 里**不再**写我们的库路径 ★★
      *
-     * 这一步覆盖了 `system()`/`popen()`：已实证它们的子进程环境取自
-     * environ（见 exp/EVIDENCE.md E5、exp/environ_probe.c），
-     * 所以只要 environ 里有了 LD_PRELOAD，即使我们完全不 hook system，
-     * 它的子进程也会带上我们的运行时。
+     * 原实现在这里 `setenv("LD_PRELOAD", <容器视角路径>, 1)`，理由是
+     * 「已实证 system()/popen() 的子进程环境取自 environ，所以只要
+     * environ 里有了 LD_PRELOAD，即使完全不 hook system 也能覆盖」。
+     *
+     * 那个推理的**前提是错的**：system()/popen() 的子进程是 glibc
+     * 硬编码的**宿主** `/bin/sh`，它按**宿主视角**解析 LD_PRELOAD。
+     * 容器视角的路径在宿主 linker 眼里指向一个 `DT_NEEDED libc.so.6`
+     * 找不到的库 → 子进程**连起来都起不来**。
+     *
+     * 实测（真机，bxroot 运行时）：
+     *     CANNOT LINK EXECUTABLE "sh": library "libc.so.6" not found:
+     *       needed by <rootfs>/.../libbxroot-runtime.so in namespace (default)
+     *     system rc=256 errno=13
+     *
+     * 修法的正确形态是「**两条路各走各的机制**」，而不是「想办法让一条
+     * 路径同时对两个视角有效」—— 后者在本题里**无解**：宿主 linker 的
+     * 搜索路径里根本没有容器的 libc.so.6，换成宿主视角的库路径同样
+     * 找不到（那需要容器自己的 libc，而宿主世界有它自己的）。
+     * 官方从侧面印证了这一点：它完全不设 LD_PRELOAD。
+     *
+     * 所以：guest 自己原有的 LD_PRELOAD 我们**原样保留**（不丢），
+     * 但不再追加我们自己的库。子进程带运行时的职责交给
+     * px_runtime_build_env（exec/spawn/system/popen 四条路全覆盖）。
      */
-    if (setenv("LD_PRELOAD", merged, 1) != 0) {
-        PX_LOG("proc: setenv(LD_PRELOAD) 失败");
+    (void)merged;
+    if (existing != NULL && existing[0] != '\0') {
+        /* 已有值 → 原样留着，什么都不做（避免把 guest 的 preload 洗掉） */
+        PX_LOG("proc: 保留 guest 原有的 LD_PRELOAD=%s（不追加自身路径）",
+               existing);
+    } else {
+        /*
+         * 原本没有 → 显式 unset，清掉可能由上一级容器留下的**容器视角**
+         * 值。不清的后果与缺陷本身相同（宿主 /bin/sh 起来就 CANNOT LINK）。
+         */
+        if (unsetenv("LD_PRELOAD") != 0) {
+            PX_LOG("proc: unsetenv(LD_PRELOAD) 失败");
+        }
     }
+
+    /* BXROOT_LD_PRELOAD 是**容器视角**的记录，供 px_trampoline_* 与
+     * px_runtime_build_env 使用；它不进宿主 shell 的解析路径，安全。 */
     if (setenv("BXROOT_LD_PRELOAD", ours, 1) != 0) {
         PX_LOG("proc: setenv(BXROOT_LD_PRELOAD) 失败");
     }
@@ -3004,6 +3083,7 @@ static int (*real_fork)(void) = NULL;
  */
 static int (*real_system)(const char *) = NULL;
 static FILE *(*real_popen)(const char *, const char *) = NULL;
+static int (*real_pclose)(FILE *) = NULL;
 static int (*real_kill)(pid_t, int) = NULL;
 
 /*
@@ -3369,21 +3449,6 @@ static int px_do_execve(const char *path, char *const argv[],
         final_env = env.v;
         final_env_use = env.v[0];
         g_rt_stats.exec_env_injected++;
-
-        /*
-         * 同时就地同步 environ。
-         *
-         * 这不是冗余：exec 成功后映像被替换，本进程的 environ 已经消失，
-         * 同步是为了**exec 失败**的情形 —— 失败后程序继续运行，
-         * 而它接下来调的 system()/popen() 会读 environ。
-         * 不同步的话，「exec 失败 → 回落 system」这条路径上又会漏掉钩子。
-         */
-        if (env.v[0] != NULL) {
-            const char *pl = px_env_lookup((const char *const *)env.v, "LD_PRELOAD");
-            if (pl != NULL) {
-                (void)setenv("LD_PRELOAD", pl, 1);
-            }
-        }
     } else {
         final_env = envp;      /* 注入被禁用/失败 → 沿用调用方的 */
     }
@@ -4034,7 +4099,7 @@ pid_t vfork(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * system() 与 popen() 的处理（结论来自反汇编实证，见 EVIDENCE.md E4）
+ * system() / popen() / pclose() 的处理（结论来自反汇编实证，见 EVIDENCE.md E4）
  * -------------------------------------------------------------------
  * glibc 的 `do_system` 与 `_IO_proc_open` 都**硬编码宿主字面量 `/bin/sh`**
  * （rodata @0x15d0c0），并直接 `bl` 到 `posix_spawn` 的**内部地址**
@@ -4044,19 +4109,42 @@ pid_t vfork(void)
  *   - hook `execve` **也不会**；
  *   - 两者都用 `environ` 作为子进程环境（实证见 environ_probe.c）。
  *
- * 由此得到两条互补的处置：
+ * ★★ 一段被实测证伪的旧处置（务必读完再改）★★
  *
- *   1. **环境**：已在 px_cfg_merge_preload 里 `setenv("LD_PRELOAD", ...)`
- *      就地改写 environ。于是 system/popen 的子进程**自动**带上钩子，
- *      不需要我们做任何事。这是实证支持的、成本最低的修法。
+ * 本区原先写的是「**环境**：已在 px_cfg_merge_preload 里
+ * setenv("LD_PRELOAD", ...) 就改写 environ，于是 system/popen 的子进程
+ * 自动带上钩子，不需要我们做任何事」。这条推理**是错的**，而且后果
+ * 是灾难性的 —— 它让**所有** exec 出来的子进程全部起不来：
  *
- *   2. **路径**：environ 修不了 `/bin/sh` 这个字面量。所以要**整体接管**
- *      system/popen，用容器内的 shell（`<rootfs>/bin/sh`）自己实现。
- *      不接管的后果：容器里 `system("ls")` 用的是**宿主的 /bin/sh 与
- *      宿主 PATH**，在宿主世界里跑 —— 完整越狱。
+ *     CANNOT LINK EXECUTABLE "sh": library "libc.so.6" not found:
+ *       needed by <rootfs>/.../libbxroot-runtime.so in namespace (default)
+ *     system rc=256 errno=13
  *
- * 下面实现了接管。仍保留「直接转发」的回落分支，条件是：
- * 翻译器不可用，或 rootfs 内没有可用的 shell。
+ * 错在「视角」：那个子进程是**宿主世界**的 `/bin/sh`，由**宿主**
+ * linker 加载，只能认宿主视角的路径。而 environ 里被 `setenv` 的是
+ * **容器视角**路径 → 宿主 linker 按自己的搜索路径找不到该库
+ * `DT_NEEDED` 的 `libc.so.6` → 链接失败，shell 根本没起来。
+ *
+ * 判别实验（决定性）：只把 `LD_PRELOAD` 从 environ 删掉、其余全不动，
+ * `system()` 立刻从 rc=256 恢复成 rc=0。所以坏的是**那条环境变量**，
+ * 与 shell 路径无关。
+ *
+ * 现在的处置（三条互补，缺一不可）：
+ *
+ *   1. **environ 不放我们的库**（`px_cfg_merge_preload`）：宿主 shell
+ *      因此不再被容器视角路径毒害。子进程带运行时的职责改由
+ *      `px_runtime_build_env` 承担 —— 它写的是正确的容器视角路径。
+ *
+ *   2. **整体接管 system/popen**，用容器内的 shell 自己实现。不接管的
+ *      后果不只是链接失败：容器里 `system("ls")` 会用**宿主的 /bin/sh
+ *      与宿主 PATH**，在宿主世界里跑 —— 完整越狱。
+ *
+ *   3. **走 trampoline 而不是直接 execve**（`px_system_via_guest` /
+ *      `popen` 内部）：guest shell 位于 `/data/data`（SELinux
+ *      `app_data_file`），内核禁止执行，直接 execve 恒 EACCES。
+ *
+ * 保留「直接转发」的回落分支，条件是：无 rootfs 配置（开发机 / 单测）、
+ * 翻译器不可用、或 rootfs 内没有可用的 shell。真机上这些分支都不会命中。
  */
 static int px_guest_shell(char *out, size_t cap)
 {
@@ -4092,6 +4180,36 @@ static int px_guest_shell(char *out, size_t cap)
  *   - 不改 SIGINT/SIGQUIT 处置（记录为差异，见 REPORT）。
  * 理由：这两项的完整实现需要在信号处置上做全局改动，风险高于收益，
  * 而它们影响的是「Ctrl-C 时 system 的子进程是否也被中断」这种边角行为。
+ *
+ * ★★ 本函数曾用 real_posix_spawn 直接起 guest shell —— 那是**错的** ★★
+ *
+ * 实测（真机，bxroot 运行时，`sysprobe` 探针）：
+ *
+ *     [DIAG] px_guest_shell OK sh=<rootfs>/bin/sh
+ *     [DIAG] build_env OK n=70
+ *     [DIAG] posix_spawn rc=13 pid=0          ← EACCES
+ *     system rc=256 errno=13
+ *
+ * 两条前置检查（shell 找得到、环境造得出）**全部通过**，失败发生在
+ * 最后一步 `posix_spawn(真 glibc, "<rootfs>/bin/sh", ...)`。
+ *
+ * 根因是 SELinux：guest 程序位于 `/data/data/<pkg>/files/...`，标签为
+ * `app_data_file`，**内核禁止执行该标签的文件**（与 uid 无关，uid=0 也
+ * 一样）。这一点 `px_do_execve` 的注释早已写明，它因此改走
+ * `px_trampoline_exec`（exec 官方 bridge，由 bridge 在特权上下文里
+ * mmap+跳转）。但 `px_system_via_guest` 这一处**漏改了**，仍在用
+ * 「直接 execve 翻译后的宿主路径」那条已证伪的路。
+ *
+ * 所以修法与 `px_do_execve` / `px_do_spawn` 保持一致：**优先走
+ * trampoline**，只有在 trampoline 不可用（普通 LD_PRELOAD 场景、单测、
+ * 开发机 —— 即没有 `PROROOT_TRAMPOLINE_PATH`）时才回落到真实
+ * posix_spawn。这条回落分支在开发机上仍是可用路径（那里没有 SELinux
+ * 限制），所以保留它而不是直接删掉。
+ *
+ * 为什么不再叠加 `LD_PRELOAD` 的视角问题：见 `px_cfg_merge_preload`
+ * 函数头的长注释 —— guest shell 的 `LD_PRELOAD` 必须由
+ * `px_runtime_build_env` 写成**容器视角**路径；而 `environ` 里留一份
+ * 宿主视角的值是给 glibc 硬编码的宿主 `/bin/sh` 用的。两者互不冲突。
  */
 static int px_system_via_guest(const char *cmd)
 {
@@ -4111,10 +4229,38 @@ static int px_system_via_guest(const char *cmd)
     }
     final_env = env.v;
 
-    argv[0] = sh;
+    /*
+     * argv[0] 用**容器视角**的 `/bin/sh`，不是 `sh` 那个宿主路径。
+     *
+     * 理由：trampoline 形态下 argv[0] 会经 `--argv0` 传给 linker，
+     * 成为 guest 进程看到的程序名。给宿主路径会让 `sh` 这类按 argv[0]
+     * 判行为的程序看到 `/data/data/.../bin/sh`；给裸 `sh` 则与
+     * glibc system() 的既有行为（`sh -c`）不一致。官方在同一位置放的
+     * 也是容器视角的 `/bin/sh`（实测 cmdline：`--argv0 sh`）。
+     * 这里用 `/bin/sh`：既脱离宿主路径，又保持「名字」语义。
+     */
+    argv[0] = (char *)(uintptr_t)"/bin/sh";
     argv[1] = (char *)(uintptr_t)"-c";
     argv[2] = (char *)(uintptr_t)cmd;
     argv[3] = NULL;
+
+    /*
+     * ★ 优先 trampoline ★ —— 与 px_do_execve / px_do_spawn 同一条路。
+     * `preload` 传 BXROOT_LD_PRELOAD（容器视角），由 px_trampoline_exec
+     * 在拿不到时回落 PROROOT_LIB_PATH；两者都没有时它会返回 -1。
+     */
+    if (px_trampoline_spawn(&pid, sh, argv, final_env, "/bin/sh",
+                            getenv("BXROOT_LD_PRELOAD"), NULL, NULL) == 0) {
+        px_env_dispose(&env);
+        (void)px_ledger_add(g_rt_ledger, pid, px_self_pid(), PX_TAG_SYSTEM);
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno != EINTR) {
+                return -1;
+            }
+        }
+        (void)px_ledger_reap(g_rt_ledger, pid);
+        return status;
+    }
 
     if (real_posix_spawn == NULL) {
         real_posix_spawn = (int (*)(pid_t *, const char *,
@@ -4128,6 +4274,7 @@ static int px_system_via_guest(const char *cmd)
         return -1;
     }
 
+    PX_LOG("proc: system 回落真实 posix_spawn（无 trampoline 配置）");
     rc = real_posix_spawn(&pid, sh, NULL, NULL, argv, final_env);
     px_env_dispose(&env);
     if (rc != 0) {
@@ -4186,10 +4333,271 @@ int system(const char *cmd)
     return real_system(cmd);
 }
 
+/*
+ * popen / pclose 的接管。
+ *
+ * ★★ 为什么必须自己接管（原实现明确「不接管」，那是错的）★★
+ *
+ * 原注释的理由是「环境注入已经由 environ 覆盖，所以不接管只损失 shell
+ * 路径正确性」。这个推理**漏掉了一件事**：glibc 的 `_IO_proc_open`
+ * 硬编码宿主世界的 `/bin/sh` 字面量（见本区顶部注释的实证），
+ * 而宿主世界里的 `/bin/sh` **不接受我们的 LD_PRELOAD**。
+ *
+ * 实测（真机，bxroot 运行时，`sysprobe`）：
+ *
+ *     CANNOT LINK EXECUTABLE "sh": library "libc.so.6" not found:
+ *       needed by <rootfs>/.../libbxroot-runtime.so in namespace (default)
+ *     pclose rc=256
+ *
+ * 也就是说 `LD_PRELOAD` 里那条**容器视角**路径被宿主 linker 拿去解析，
+ * 而宿主 linker 的默认搜索路径里没有容器的 `libc.so.6` → 子进程连
+ * 起来都起不来。这不是「损失一项边角收益」，而是 popen 100% 不可用。
+ *
+ * 判别实验（决定性）：只把 `LD_PRELOAD` 从 environ 删掉、其余不动，
+ * `system()` 立刻恢复 rc=0 —— 证明坏的就是这条环境变量的**视角**，
+ * 与 shell 路径无关。
+ *
+ * ★ 修法：自己建管道 + 走与 exec/spawn/system 同一条 trampoline 路径 ★
+ *
+ * 为什么不是「把 LD_PRELOAD 改成宿主视角」：宿主视角的路径要在宿主
+ * linker 的搜索路径里能找到 `libc.so.6`，而它根本不在（那是容器的库）。
+ * 所以「一条路径同时对两个视角有效」在本题里**不存在解** —— 官方
+ * 的做法也从侧面印证了这一点：它**完全不设 LD_PRELOAD**，靠 argv 重写
+ * 把子进程重新引到自己的 bridge+linker 上（三件套里 `LD_PRELOAD` 字符串
+ * 出现 0 次）。我们这里沿用同一思路，但复用 bxroot 已有的 trampoline。
+ *
+ * 为什么不 hook `__posix_spawn` 之类去拦 glibc 内部调用：本区顶部注释
+ * 已实证 glibc 的 do_system/_IO_proc_open `bl` 到 posix_spawn 的**内部
+ * 地址**（无重定位 → 不可插入），所以只能整体接管。
+ *
+ * 【已明确不覆盖的语义】（记录而非忽略）
+ *   - `type` 参数只支持 "r" / "w"（glibc 支持 "re"/"we" 设 O_CLOEXEC）。
+ *     带 'e' 的请求我们**回落真实 popen** —— 宁可让调用方拿到 glibc 的
+ *     真实行为，也不要静默丢掉 FD_CLOEXEC 语义（那类缺陷极难定位，
+ *     和 px_trampoline_spawn 对 file_actions 的保守处理同一理由）。
+ *   - 不支持嵌套 popen 超过 PX_POPEN_MAX 个并发流：超出回落真实 popen。
+ */
+#define PX_POPEN_MAX 256
+
+typedef struct {
+    int   used;     /* 槽位是否已占用（fork 之前就要占住，见 px_popen_reserve） */
+    FILE *fp;
+    pid_t pid;
+} px_popen_ent;
+
+static px_popen_ent g_popen_tab[PX_POPEN_MAX];
+static pthread_mutex_t g_popen_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * 预留一个空槽（fork **之前**调用）。
+ *
+ * ★ 为什么必须提前预留 ★
+ * 如果先 fork、再找槽位，槽位满时就只剩两条烂路：要么丢下不管
+ * （僵尸 + fd 泄漏），要么回落真实 popen。而回落真实 popen 会得到一个
+ * **宿主世界的 /bin/sh 子进程** —— 它带着我们的 `LD_PRELOAD` 起不来
+ * （正是本缺陷本身），调用方拿到一个立刻 EOF 的 FILE*，比明确失败
+ * 更难排查。提前预留则「槽位满」在 fork 之前就变成干净的返回值。
+ *
+ * 返回下标，或 -1 表示表满。
+ */
+static int px_popen_reserve(void)
+{
+    int i;
+
+    pthread_mutex_lock(&g_popen_mutex);
+    for (i = 0; i < PX_POPEN_MAX; i++) {
+        if (!g_popen_tab[i].used) {
+            g_popen_tab[i].used = 1;
+            g_popen_tab[i].fp = NULL;
+            g_popen_tab[i].pid = 0;
+            pthread_mutex_unlock(&g_popen_mutex);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&g_popen_mutex);
+    return -1;
+}
+
+/* 把预留的槽位提交（填上真正的 FILE* 与 pid）。 */
+static void px_popen_commit(int slot, FILE *fp, pid_t pid)
+{
+    if (slot < 0) {
+        return;
+    }
+    pthread_mutex_lock(&g_popen_mutex);
+    g_popen_tab[slot].fp = fp;
+    g_popen_tab[slot].pid = pid;
+    pthread_mutex_unlock(&g_popen_mutex);
+}
+
+/* 释放预留的槽位（fork 失败、fdopen 失败等路径）。 */
+static void px_popen_release(int slot)
+{
+    if (slot < 0) {
+        return;
+    }
+    pthread_mutex_lock(&g_popen_mutex);
+    g_popen_tab[slot].used = 0;
+    g_popen_tab[slot].fp = NULL;
+    g_popen_tab[slot].pid = 0;
+    pthread_mutex_unlock(&g_popen_mutex);
+}
+
 FILE *popen(const char *cmd, const char *mode)
 {
+    char sh[PX_PATH_MAX];
+    char *argv[4];
+    px_envout env = {0};
+    int fds[2];
+    int slot;
+    int read_end;
+    int cloexec = 0;
+    pid_t pid;
+    FILE *fp;
+
     g_rt_stats.popen_calls++;
 
+    /*
+     * 慢路径条件（任一命中 → 用真实 popen）：
+     *   - cmd 为 NULL（POSIX 未定义，交给 glibc 去报它自己的错）
+     *   - 没有 rootfs 配置（开发机、单测：我们不翻译路径，接管无意义）
+     *   - mode 不是本函数能忠实实现的形态（见下）
+     */
+    if (cmd == NULL || mode == NULL || px_is_null(cmd) ||
+        !g_rt_cfg.have_rootfs) {
+        goto fallback;
+    }
+
+    /*
+     * mode 解析：接受 "r" / "w"，以及带 'e' 的 "re" / "we"。
+     *
+     * glibc 的 'e' 语义是「父进程这一端的 fd 带 FD_CLOEXEC」。我们
+     * 自己 fdopen 父进程那一端，所以用 fcntl 设一下即可，**不需要**
+     * 因此回落（少一条回落路径 = 少一种「子进程跑到宿主世界」的可能）。
+     * 其它任何形态（含 "r+"）都不认识 → 回落，宁可让调用方拿到 glibc
+     * 的真实行为，也不要静默给出语义不同的流。
+     */
+    if (mode[0] == 'r' && (mode[1] == '\0' ||
+                           (mode[1] == 'e' && mode[2] == '\0'))) {
+        cloexec = (mode[1] == 'e');
+    } else if (mode[0] == 'w' && (mode[1] == '\0' ||
+                                  (mode[1] == 'e' && mode[2] == '\0'))) {
+        cloexec = (mode[1] == 'e');
+    } else {
+        goto fallback;
+    }
+
+    if (px_guest_shell(sh, sizeof(sh)) != 0) {
+        goto fallback;
+    }
+    /*
+     * 环境里**只放容器视角的 LD_PRELOAD**（px_runtime_build_env 负责），
+     * 这样 guest shell 由容器自己的 ld.so 加载时能找到对应的 libc。
+     */
+    if (px_runtime_build_env(NULL, &env) != 0) {
+        goto fallback;
+    }
+
+    slot = px_popen_reserve();
+    if (slot < 0) {
+        px_env_dispose(&env);
+        errno = EMFILE;
+        return NULL;
+    }
+
+    if (pipe(fds) != 0) {
+        int save = errno;
+        px_popen_release(slot);
+        px_env_dispose(&env);
+        errno = save;
+        return NULL;
+    }
+
+    /*
+     * 管道方向：与 glibc 一致。
+     *   "r" → 子进程写 fds[1]，父进程从 fds[0] 读
+     *   "w" → 子进程读 fds[0]，父进程写 fds[1]
+     * 父进程保留的那一端（read_end）就是 "r" ? fds[0] : fds[1]。
+     */
+    read_end = (mode[0] == 'r') ? fds[0] : fds[1];
+
+    argv[0] = (char *)(uintptr_t)"/bin/sh";
+    argv[1] = (char *)(uintptr_t)"-c";
+    argv[2] = (char *)(uintptr_t)cmd;
+    argv[3] = NULL;
+
+    pid = fork();
+    if (pid < 0) {
+        int save = errno;
+        close(fds[0]);
+        close(fds[1]);
+        px_popen_release(slot);
+        px_env_dispose(&env);
+        errno = save;
+        return NULL;
+    }
+    if (pid == 0) {
+        /* 子进程：只做 async-signal-safe 的事，不分配内存 */
+        if (mode[0] == 'r') {
+            if (dup2(fds[1], STDOUT_FILENO) < 0) {
+                _exit(127);
+            }
+        } else {
+            if (dup2(fds[0], STDIN_FILENO) < 0) {
+                _exit(127);
+            }
+        }
+        close(fds[0]);
+        close(fds[1]);
+        /*
+         * ★ 走 trampoline（与 exec/spawn/system 同一条路）★
+         * 真机上直接 execve 翻译后的宿主路径必然 EACCES（SELinux
+         * app_data_file），只有 bridge 能在特权上下文里 mmap+跳转。
+         */
+        (void)px_trampoline_exec(sh, argv, env.v, "/bin/sh",
+                                 getenv("BXROOT_LD_PRELOAD"));
+        /*
+         * trampoline 不可用（开发机、单测）→ 回落直接 execve。
+         * 注意 env.v 里的 LD_PRELOAD 是**容器视角**，在开发机上与
+         * 宿主世界同源，所以这条回落也是安全的。
+         */
+        execve(sh, argv, env.v);
+        _exit(127);
+    }
+
+    /* 父进程：关掉子进程那一端，把保留端包成 FILE* */
+    close((mode[0] == 'r') ? fds[1] : fds[0]);
+    px_env_dispose(&env);
+
+    if (cloexec) {
+        int fl = fcntl(read_end, F_GETFD);
+        if (fl >= 0) {
+            (void)fcntl(read_end, F_SETFD, fl | FD_CLOEXEC);
+        }
+    }
+
+    fp = fdopen(read_end, (mode[0] == 'r') ? "r" : "w");
+    if (fp == NULL) {
+        int save = errno;
+        int st;
+        close(read_end);
+        (void)kill(pid, SIGKILL);
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {
+            /* 重试 */
+        }
+        px_popen_release(slot);
+        errno = save;
+        return NULL;
+    }
+
+    px_popen_commit(slot, fp, pid);
+    (void)px_ledger_add(g_rt_ledger, pid, px_self_pid(), PX_TAG_SYSTEM);
+    return fp;
+
+fallback:
+    if (env.v != NULL) {
+        px_env_dispose(&env);
+    }
     if (real_popen == NULL) {
         real_popen = (FILE *(*)(const char *, const char *))px_dlsym("popen");
     }
@@ -4197,17 +4605,80 @@ FILE *popen(const char *cmd, const char *mode)
         errno = ENOSYS;
         return NULL;
     }
+    return real_popen(cmd, mode);
+}
+
+/*
+ * pclose：配对上面自己建的流。
+ *
+ * 【为什么必须一起接管】
+ * 官方把 popen 与 pclose 做成**共用一张 fd→pid 表**的实现（见
+ * docs/高频符号缺口调查.md §2.5 的反汇编），所以「popen 自研 + pclose
+ * 用 glibc」会立刻坏：glibc 的 pclose 在**它自己的**表里查不到我们
+ * 建的流 → 返回 ECHILD。原实现只接管 popen（还是薄的），等于把这个
+ * 坑留在原地。
+ *
+ * 【不认识这个流怎么办】
+ * 落到真实 pclose。这不是「兜底」而是**正确行为**：调用方可能把
+ * glibc 自己 popen 出来的流交给我们（比如它在我们接管之前就建好了，
+ * 或走了上面那条 fallback 分支），那种流只有 glibc 知道它的 pid。
+ */
+int pclose(FILE *stream)
+{
+    int slot = -1;
+    pid_t pid = 0;
+    int i;
+    int status = 0;
+    int rc;
+
+    if (stream == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_popen_mutex);
+    for (i = 0; i < PX_POPEN_MAX; i++) {
+        if (g_popen_tab[i].used && g_popen_tab[i].fp == stream) {
+            slot = i;
+            pid = g_popen_tab[i].pid;
+            g_popen_tab[i].used = 0;
+            g_popen_tab[i].fp = NULL;
+            g_popen_tab[i].pid = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_popen_mutex);
+
+    if (slot < 0) {
+        if (real_pclose == NULL) {
+            real_pclose = (int (*)(FILE *))px_dlsym("pclose");
+        }
+        if (real_pclose == NULL) {
+            errno = ENOSYS;
+            return -1;
+        }
+        return real_pclose(stream);
+    }
 
     /*
-     * popen 的完整接管（自己建管道 + spawn guest shell）代价明显更高
-     * （要复制 FILE 对象的构造、处理 pclose 的 wait 语义、fd 生命周期），
-     * 而收益只有「shell 路径正确」这一项 —— 环境注入已经由 environ 覆盖。
+     * 顺序与 glibc 一致：**先 fclose 再 waitpid**。
      *
-     * 因此这里**明确不接管**，只记录为「不覆盖项」。这是一个有意识的
-     * 取舍，不是遗漏：见 REPORT.md 的覆盖矩阵。
-     * 触发条件与验证方法都已写入 REPORT。
+     * 反过来的后果是死锁：子进程可能还在往管道里写，而我们已经在等它
+     * 退出；它写满管道缓冲区后阻塞，我们再等它 → 双方互等。
+     * 先 fclose 会关闭读端，子进程拿到 SIGPIPE/EPIPE 后正常退出。
      */
-    return real_popen(cmd, mode);
+    (void)fclose(stream);
+
+    rc = waitpid(pid, &status, 0);
+    while (rc < 0 && errno == EINTR) {
+        rc = waitpid(pid, &status, 0);
+    }
+    (void)px_ledger_reap(g_rt_ledger, pid);
+
+    if (rc < 0) {
+        return -1;
+    }
+    return status;
 }
 
 /* ------------------------------------------------------------------ */

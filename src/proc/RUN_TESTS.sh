@@ -22,7 +22,27 @@
 set -u
 cd "$(dirname "$0")" || exit 1
 
-WARN="-Wall -Wextra -Wshadow -Wconversion -Wno-sign-conversion"
+# ★ 警告集必须与真实构建对齐 —— 否则就是"策略漂移" ★
+#
+# 实测缺陷（2026-09-17）：这里原先**没有** `-Wno-nonnull-compare`，而项目
+# 另外三处都有：
+#     BUILD_RUNTIME.sh:89        WARN="... -Wno-nonnull-compare ..."
+#     test/RUN_WARN_GATE.sh:94   同上
+#     test/RUN_ALL.sh:275        同上
+# 于是同一个 proc.c 在别的门禁里干净、在这里却报红：
+#
+#     proc.c:4611:8: warning: 'nonnull' argument 'stream' compared to NULL
+#                   [-Wnonnull-compare]
+#
+# 那条告警来自 `pclose` 钩子里的 `if (stream == NULL)`。**它是必须保留的
+# 防御性判空**：glibc 用 `__nonnull` 标注了这个参数，但那是**给编译器的
+# 承诺**，不是运行时的保证 —— 我们自己导出的 `pclose` 是公开符号，任何
+# 客户都能传 NULL 进来。项目对此的既定处置就是显式关掉这条告警
+# （见 test/RUN_WARN_GATE.sh:49 的说明），不是删掉判空。
+#
+# 四处警告集必须一致，否则"零告警门禁"会随入口不同而给出不同答案 ——
+# 这正是 RUN_WARN_GATE.sh 开头警告过的那种漂移。
+WARN="-Wall -Wextra -Wshadow -Wconversion -Wno-sign-conversion -Wno-nonnull-compare"
 BASE="-std=c11 -D_GNU_SOURCE -I."
 LOG=/tmp/proc-cc.err
 FAILED=0

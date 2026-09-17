@@ -34,6 +34,33 @@ pclose rc=256
 
 ## 二、根因（已定位到具体代码行）
 
+### 2.1 决定性对照：官方**根本不设置 `LD_PRELOAD`**
+
+用 `envprobe`（在容器里打印 `getenv("LD_PRELOAD")`）跑两侧：
+
+```
+### 官方 libproroot-runtime.so ###
+LD_PRELOAD=(unset)
+BXROOT_LD_PRELOAD=(unset)
+
+### bxroot runtime ###
+LD_PRELOAD=/data/data/com.dsh.client/files/linux/ubuntu/tmp/lp-30220/libbxroot-runtime.so
+BXROOT_LD_PRELOAD=/data/data/com.dsh.client/files/linux/ubuntu/tmp/lp-30220/libbxroot-runtime.so
+```
+
+**官方压根不走 `LD_PRELOAD` 这条注入路径。** 它是 ptrace/trampoline 架构
+（`--preload` 是 linker 的**加载期**机制，靠 `PROROOT_TRAMPOLINE_*` 转发给
+子进程），**不依赖环境变量**传钩子。
+
+所以"注入路径要同时对容器视角和宿主视角有意义"这个矛盾，
+**对官方不存在** —— 它不需要解决一个它没有的问题。
+
+> **这改变了修复的性质**：不是"照抄官方做法"，因为 bxroot 是
+> **LD_PRELOAD 架构**，它**必须**靠环境变量把钩子传给子进程。
+> 这个矛盾是 LD_PRELOAD 架构**自带的**，得自己设计解法。
+
+### 2.2 具体代码路径
+
 `src/proc/proc.c:2378-2399` 的 `px_detect_self_lib()`：
 
 ```c
@@ -53,15 +80,8 @@ static void px_detect_self_lib(char *dst, size_t cap)
 }
 ```
 
-`dladdr()` 返回的是**内核视角**路径。实测注入结果：
-
-```
-$ ./envprobe        # 在 bxroot 容器里打印环境
-LD_PRELOAD=/data/data/com.dsh.client/files/linux/ubuntu/tmp/lp-30220/libbxroot-runtime.so
-BXROOT_LD_PRELOAD=/data/data/com.dsh.client/files/linux/ubuntu/tmp/lp-30220/libbxroot-runtime.so
-```
-
-然后 `px_cfg_merge_preload()`（`proc.c:2407-2460`）把它 `setenv("LD_PRELOAD", ...)` 写进环境。
+`dladdr()` 返回的是**内核视角**路径。然后 `px_cfg_merge_preload()`
+（`proc.c:2407-2460`）把它 `setenv("LD_PRELOAD", ...)` 写进环境。
 
 **问题在于**：`system()` / `popen()` 的子进程是 **glibc 硬编码的宿主世界 `/bin/sh`**
 （不是容器内的 shell），它按**宿主视角**解析 `LD_PRELOAD` 里的路径。
@@ -70,8 +90,14 @@ BXROOT_LD_PRELOAD=/data/data/com.dsh.client/files/linux/ubuntu/tmp/lp-30220/libb
 
 > 这正是本项目反复出现的**双视角陷阱**的又一例，但方向是反的：
 > 前面几次都是"该用内核视角却用了容器视角"，这次是
-> **"该用容器视角（或两者兼顾）却用了内核视角"**。
-> 注入给**宿主世界**子进程的路径，必须是宿主能解析的。
+> **"注入给宿主世界子进程的路径，必须是宿主能解析的"**。
+
+### 2.3 一个已排除的方向
+
+报告作者实测：**bxroot 的 `system()` 已经是真接管**（用的是容器内 shell），
+但它**同样坏了** —— 证明**坏的是环境变量，不是 shell 路径**。
+所以"改用容器内 shell"这条路不解决根因。
+
 
 ## 三、为什么之前没被发现
 

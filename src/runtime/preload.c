@@ -37,6 +37,13 @@
 #include <dirent.h>
 #include <signal.h>
 #include <sys/wait.h>
+/*
+ * pthread.h 在这里是**必需**的（pthread_create 钩子要用 pthread_t /
+ * pthread_attr_t / pthread_attr_* 的原型）。实测它可以与本文件已在用的
+ * 系统头文件共存，且在构建脚本那份严格警告集
+ * （-Wall -Wextra -Wformat=2 -D_GNU_SOURCE=）下**零告警**。
+ */
+#include <pthread.h>
 
 #include "config.h"
 #include "l2s-runtime.h"
@@ -5189,46 +5196,319 @@ int prlimit64(pid_t pid, __rlimit_resource_t resource,
 }
 
 /*
+ * ==================================================================
+ * pthread_create —— 线程栈下限修正（**已实现**，取代原先"不做"的结论）
+ * ==================================================================
+ *
+ * 官方 runtime 导出一个 pthread_create（+0x104b0），做的事是：
+ * **把"显式设过 stacksize 但小于 max(2*PTHREAD_STACK_MIN, 256K)"的
+ * attr 抬到那个下限**，其余情况原样转发。bxroot 原先不导出它，
+ * 于是所有"给小栈"的程序在 bxroot 下行为与官方不同（见下）。
+ *
+ * 下面先把**旧注释里被实测推翻的三条**逐条更正 —— 那三条当时都是
+ * 真跑出来的现象，但**归因错了**，留着会误导后来人。
+ *
  * ------------------------------------------------------------------
- * 【本轮实测·已回退】pthread_create 栈下限修正 —— **不做**
+ * 更正 1：`addr + region == 0` **不是** proroot 加载器的"溢出哨兵"
  * ------------------------------------------------------------------
+ * 旧注释把钩子入口读到的
  *
- * 本轮曾按官方 runtime 的 pthread_create(+0x104b0) 复刻一个"栈下限"
- * 钩子，**实现完成后实测无效，已整体回退**。回退理由（都是实测，不是推测）：
+ *     size=131072  addr=0xfffffffffffe0000  region=131072
  *
- * 1) **根因不在 bxroot，而在 proroot 加载器。**
- *    把 --preload 换成一个空的 libnoop.so（甚至**完全不加 --preload**），
- *    下面两个现象**一模一样复现**：
+ * 当成了"proroot 塞的坏地址"。**它是 glibc 自己的常态输出。**
  *
- *        pthread_attr_setstacksize(&at, 131072)  → pthread_create rc=22 EINVAL
- *        pthread_attr_setstacksize(&at, 135168)  → pthread_create rc=0 但随后 SIGSEGV
- *        （PAGESIZE=4096  PTHREAD_STACK_MIN=131072）
+ * 先把 pthread_attr_t 的字段偏移标定清楚（offsets 探针实测，
+ * sizeof(pthread_attr_t) = 64）：
  *
- *    既然不带任何 bxroot 代码时同样发生，它就不是 bxroot 与官方之间的
- *    **功能差距**，而是 proroot 自研加载器自身的缺陷。在 bxroot 里修它
- *    既超出"补齐 parity"的范围，也无法通过"加一个符号"解决。
+ *     attr+16 = guardsize     （attr_init 后 4096）
+ *     attr+24 = stackaddr 字段（未 setstack 时 **0**）
+ *     attr+32 = stacksize     （attr_init 后 8M）
  *
- * 2) **官方那套判据对这两个档位同样不生效。**
- *    实测钩子入口拿到的值（instrumented 构建，输出见 parity 报告）：
+ * 反汇编 libc 的 pthread_attr_getstack（@0x82f20）：
  *
- *        attr=0x...  size=131072  addr=0xfffffffffffe0000  region=131072
+ *     ldp  x4, x5, [x3, #24]     ; x4 = [attr+24] = stackaddr 字段
+ *     sub  x3, x4, x5            ; x5 = [attr+32] = stacksize
+ *     str  x3, [x1]              ; *addr   = stackaddr - stacksize
+ *     str  x5, [x2]              ; *region = stacksize
  *
- *    即 `addr + region == 0`（取反下溢）—— 正是官方 0x10540 那条
- *    `cmn x7,x6; b.eq skip` 要**跳过**的情况。也就是说：即便逐位照抄
- *    官方的判定，131072 也**不会被修正**；而官方之所以"看起来没问题"，
- *    是因为它的加载器本身不制造这个 EINVAL（见第 1 点）。
- *    → 结论：这条差距**无法靠复刻官方钩子关闭**。
+ * 即：**region 就是 stacksize 本身**，addr 是 `stackaddr 字段 - stacksize`。
+ * 只设过 stacksize 的 attr，stackaddr 字段恒为 0，于是
  *
- * 3) **正确的修法需要往下探一层。**
- *    真要让 131072 档位可用，得在钩子里**主动**给 addr/region 传
- *    "哨兵地址 + 合法长度"（如 addr=sizeof(void*)、region=262144），
- *    即伪造一个显式栈区。那是对**加载器缺陷**的绕过，且会改变 glibc
- *    的栈分配布局、影响 TLS/guard 语义 —— 属于高风险改动，
- *    本轮**没有**足够证据证明它安全，因此不做（宁缺勿错）。
+ *     addr   = 0 - 131072 = 0xfffffffffffe0000（补码）
+ *     region = 131072
+ *     addr + region == 0   ← 溢出为 0，**纯属 0 - size + size 的恒等式**
+ *
+ * 实测（offsets 探针，逐字段标定）：
+ *
+ *     attr_init            : +16=0x1000(guardsize)           getstack(addr=nil, region=0)
+ *     setstacksize(131072) : +16=0x1000  +32=0x20000         getstack(addr=-131072, region=131072)
+ *     setguardsize(8192)   : +16=0x2000  +32=0x20000         getstack(addr=-131072, region=131072) ← 与 guard 无关
+ *     setstack(buf,524288) : +24=base+size  +32=0x80000      getstack(addr=base, region=524288)   ← addr+region != 0
+ *
+ * ★ 关键：**官方 runtime 侧、noop 侧、原生侧读到的完全是同一个值**。
+ *   所以它既不是 bxroot 引入的，也不是加载器缺陷，更不带来任何危害 ——
+ *   pthread_create 只读 attr 里的 stacksize 字段，不看这个派生出来的 addr。
+ *   （原先"不带任何 bxroot 代码时也发生 → 是加载器缺陷"的推理，
+ *     前提为真、结论为假：那个现象在**没有 proroot 的原生环境里同样存在**。）
+ *
+ * ------------------------------------------------------------------
+ * 更正 2：官方 0x10540 的 `cmn x7,x6 / b.eq` 是【应用修正】，不是【跳过】
+ * ------------------------------------------------------------------
+ * 旧注释（以及调查报告 §2.4）都把它读成了"命中就跳过修正"。**读反了。**
+ * 看分支目标 0x105f4 的实际代码：
+ *
+ *     10540: cmn  x7, x6          ; addr + region == 0 ?
+ *     10544: b.eq 105f4           ; 是 → 去 105f4
+ *     ...
+ *     105f4: cbz  w21, 1064c      ; 日志关 → 1064c
+ *     1064c: cbnz w23, 10550      ; getstacksize 失败 → 直通
+ *     10650: mov  w0, #0x4b       ; _SC_THREAD_STACK_MIN
+ *     10654: bl   __sysconf
+ *     1065c: lsl  x23, x0, #1     ; 2 × PSM
+ *     10660: mov  x2, #0x40000    ; 256K
+ *     10668: csel x23, x23, x2, cs; 取较大者
+ *     10674: b.ls 10550           ; 已够大 → 直通
+ *     10678: ldp  q29,q28,[x19]   ; 复制整个 attr（64 字节）
+ *     10694: bl   pthread_attr_setstacksize  ; 把副本抬到 x23
+ *     106a0: mov  x19, x27        ; 用副本创建
+ *
+ * 0x105f4 正是**落地修正**的那条路。`b.eq` 在 `addr+region==0` 时**进入**
+ * 修正流程，`!b.eq`（真显式栈区）时在 0x10548/0x1054c 记日志后也汇到
+ * 0x10600 → 0x1064c → 同样的 10650 修正段。
+ * 换句话说：**两条路都做修正**，`b.eq` 只是决定了"要不要先记日志"。
+ * 这也解释了为什么"逐位照抄官方判据"在 131072 档位**照样 EINVAL** ——
+ * 因为照抄的那份把 `b.eq` 理解反了，命中了哨兵反而**提前 return 直通**，
+ * 根本没走到修正段。
+ *
+ * ------------------------------------------------------------------
+ * 更正 3：根因是 glibc 的守卫页下限，不是加载器；且 bxroot 侧**可修**
+ * ------------------------------------------------------------------
+ * 实测（bound，dlopen("libc.so.6") 绕过一切钩子后直调真 pthread_create）：
+ *
+ *     size=131072  rc=22 EINVAL      <- 原生、官方、bxroot 三侧**完全一致**
+ *     size=135168  rc=22 EINVAL
+ *     size=136192  rc=22 EINVAL
+ *     size=137216  rc=22 EINVAL
+ *     size=138240  rc=22 EINVAL
+ *     size=139264  rc=0  OK          <- 134K + 4K(guard) = 138K，向上取整
+ *
+ * 即 glibc 要求 `stacksize >= PTHREAD_STACK_MIN(128K) + guardsize(4K)`
+ * 再对齐到页，故真正的下界是 **139264（136K）**。这纯粹是 libc 的
+ * 既有语义 —— 与我们无关，官方 runtime 也**没有**改掉它（官方
+ * 139264 以下一样 EINVAL，只是它把 < 256K 的请求**抬到 256K**，
+ * 于是调用方根本碰不到那个下界）。
+ *
+ * ★ 官方与 bxroot 的真实差距（这才是要补的 parity）★
+ *
+ *   用 pthread_getattr_np 读回线程**真实**拿到的栈大小（realstack）：
+ *
+ *     请求       官方真实栈   bxroot 真实栈
+ *     131072     262144        rc=22 EINVAL（未创建）
+ *     135168     262144        rc=0 → **135168**
+ *     147456     262144        rc=0 → **147456**
+ *     262144     262144        262144
+ *     524288     524288        524288
+ *
+ *   官方把"小于 256K"的请求**静默抬到 256K**；bxroot 不给下限，
+ *   于是 131072 直接 EINVAL，135168~262143 则**真的**只给那么小的栈 ——
+ *   调用方的线程随后在深调用链上撞守卫页 → SIGSEGV。
+ *   这才是本符号必须补的理由，也解释了旧注释第 1 点观察到的
+ *   "135168 → rc=0 但随后 SIGSEGV"：**不是加载器坏，是栈真的不够用**。
+ *
+ * ------------------------------------------------------------------
+ * 本实现（与官方语义对齐）
+ * ------------------------------------------------------------------
+ *   - 判据用"**是否设置了显式栈区**"，而不是"addr 是否非空"。
+ *     glibc 的 attr 里根本没有"显式栈区"这个概念：只要设过 stacksize，
+ *     getstack 就会返回上面那个派生值。若照报告 §2.4 用 `addr != NULL`
+ *     当判据，**每一次**线程创建都会被替换成全新 attr，
+ *     把调用方通过 attr 设置的 guard size 等语义一起丢掉 ——
+ *     这属于"修一个边缘情况而破坏正常路径"，必须避免。
+ *     真正要区分的是"调用方给了 attr 但只设了 stacksize"（→ 可安全替换）
+ *     与"调用方给了 attr 且真的带了显式栈区"（→ 原样转发，别动）。
+ *     后者在 glibc 里表现为 setstack(addr,size) 设过之后
+ *     `[attr+16]` 变成 size、region 非 0 且 addr+region != 0。
+ *
+ *   - 下限取 `max(2 * sysconf(_SC_THREAD_STACK_MIN), 262144)`。
+ *     实测本环境 `_SC_THREAD_STACK_MIN = 131072`（PAGESIZE=4096），
+ *     故 2×PSM = 262144 = 256K，**与官方的 0x40000 完全吻合**；
+ *     两个取较大者的写法也和官方 10660~10668 逐位一致。
+ *     256K 这个值本身也是恰当的：它是 glibc 真实下界 139264 的 1.9 倍，
+ *     给线程留出了足够的深调用链余量（实测官方抬到 256K 后不再 SIGSEGV）。
+ *
+ *   - **必须用"副本"，且必须是逐字节复制**：官方在 10678~10690 把调用方
+ *     的整个 64 字节 attr **复制**到栈上、只改 stacksize，因为形参是
+ *     `const pthread_attr_t *`，就地改是 UB。
+ *     ★ 注意与调查报告 §2.4 的两处措辞差异：
+ *       ① 报告说"沿用原 attr 会把哨兵 addr 一起带过去，等于没修"——
+ *          **这句是错的**（attr 里根本没有哨兵，见更正 1）。
+ *          复制是对的，但理由只是"不能改调用方的 const 对象"。
+ *       ② 报告给的骨架用 `pthread_attr_init` 造"全新 attr"——
+ *          **这个写法与官方不等价**：init 会把 guardsize 重置成默认 4096，
+ *          而官方是复制，**保留调用方设的 guardsize**。实测（thredge，
+ *          请求 stacksize=128K + guardsize=16384）：
+ *
+ *            官方      : 真实栈=524288  guard=16384   ← 保留
+ *            init 写法 : 真实栈=524288  guard=4096    ← 被改掉
+ *
+ *          调用方特意放大 guard 是为了防栈溢出，被静默改回默认属于
+ *          "修边缘情况而破坏正常路径"，故本实现改为 memcpy 复制。
+ *     实测四条档位与官方逐位一致（见 docs/pthread_create栈哨兵修复.md）。
+ *
+ *   - 失败路径全部**保守直通**：getstacksize/getstack 报错、setstacksize
+ *     失败，一律转给真实现，绝不因为修边缘情况而挡住正常路径。
+ *     （memcpy 复制不需要 destroy —— 复制的是 POD，没有需要释放的资源。）
+ *
+ *   - **自递归防护**：真实现经 `bxroot_next_symbol` 解析（语义 = dlsym(RTLD_NEXT)，
+ *     走 linker 服务；**无服务环境**下它自己退回 libc 的 dlsym(RTLD_NEXT)，
+ *     同样正确跳过本库）。解析不到就返回 EAGAIN(11)，与官方 0x106fc 一致。
+ *     ★ 另需防"解析到自己"：本库导出 pthread_create，若 ldso 服务把
+ *     **我们自己**返回了，再调用就是无限递归炸栈（每层吃一个栈帧，
+ *     症状是 SIGSEGV 且 sp == x29）——另一 agent 在 dlerror 上踩过同样的坑。
+ *     这里显式比对函数地址，命中自己即判为解析失败 → EAGAIN。
+ *     ★ 刻意**不**补 `dlsym(RTLD_DEFAULT, …)` 兜底：RTLD_DEFAULT 从搜索链
+ *     最前面找，必然先命中本库自己；它既冗余（RTLD_NEXT 已覆盖非 proroot
+ *     环境），又会因调用本库自己的 dlsym 而**篡改 dlerror 状态**，
+ *     把一个本来可用的环境弄坏。详见函数体内那段注释。
  *
  * 附带说明：glob/freopen/utime 等同批探查的符号，实测 bxroot 与官方
  * **行为一致或同源失败**（见报告"实测 parity"一节），无需改动。
  */
+
+/*
+ * pthread_create —— 线程栈下限修正。
+ *
+ * 必须在文件作用域导出（LD_PRELOAD 靠动态符号表插入），所以这里没有
+ * 加 static。参数签名与 <pthread.h> 逐字一致，否则符号对不上。
+ */
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                   void *(*start_routine)(void *), void *arg)
+{
+    static int (*real_fn)(pthread_t *, const pthread_attr_t *,
+                          void *(*)(void *), void *) = NULL;
+    pthread_attr_t clean;
+    size_t size = 0, region = 0;
+    void *addr = NULL;
+    long psm;
+    size_t want;
+    int rc;
+
+    if (real_fn == NULL) {
+        void *p = bxroot_next_symbol("pthread_create");
+        /*
+         * ★ 自递归防护 ★
+         * 本库自己就导出 pthread_create。若解析结果等于本函数的地址，
+         * 说明拿到了自己 —— 再调用就是无限递归（每层吃一个栈帧直到炸栈，
+         * 症状是 SIGSEGV 且 sp == x29）。这里直接判定为"解析失败"。
+         * 对照：dlsym/dlopen 家族就是被这个坑炸过（见本文件 dl* 家族注释）。
+         */
+        if (p == (void *)(uintptr_t)&pthread_create)
+            p = NULL;
+        real_fn = (int (*)(pthread_t *, const pthread_attr_t *,
+                           void *(*)(void *), void *))p;
+    }
+
+    /*
+     * 解析不到真实现。
+     *
+     * ★ 这里**刻意不再**补一次 `dlsym(RTLD_DEFAULT, "pthread_create")` ★
+     *
+     * 曾经写过那次兜底，实测它是**有害**的：
+     *   1. 冗余。`bxroot_next_symbol` 在"无 linker 服务"的环境里
+     *      已经退回了 libc 的 `dlsym(RTLD_NEXT, …)`；而 RTLD_NEXT 的语义
+     *      正是"从**本库之后**开始找"，在 LD_PRELOAD 场景下会正确跳过我们
+     *      命中真 libc。那条路已经覆盖了非 proroot 环境。
+     *   2. 危险。RTLD_DEFAULT 是"从搜索链**最前面**开始找"，
+     *      而本库正是排在 LD_PRELOAD 最前面的那个 —— 于是它**必然**
+     *      先命中我们自己。虽然下面有"等于自己就置 NULL"的防护，
+     *      但结果是"本来能成功解析"的场合变成了 EAGAIN，
+     *      反而把一个可用环境弄坏。
+     *   3. 有副作用。本库的 dlsym 是**已实现**的钩子，调用它会去写
+     *      dl-error 状态（`bxroot_dl_error_set2`）。为了一个兜底去篡改
+     *      "上一次 dlerror 的内容"是错误的：调用方可能刚查过 dlerror。
+     *
+     * 所以只保留一条解析路径，与官方同构：
+     *   官方 106e8~10700 解析失败 → `mov w23, #0xb; ret`（EAGAIN）。
+     * 为什么是 EAGAIN(11) 而不是 ENOSYS：逐位保持官方语义。
+     */
+    if (real_fn == NULL)
+        return EAGAIN;
+
+    /* attr == NULL：默认属性（stacksize 由 libc 给 8M），无事可做 */
+    if (attr == NULL)
+        return real_fn(thread, attr, start_routine, arg);
+
+    /*
+     * 读 attr。两者任一失败就直通 —— 读不到就不该猜。
+     * 注意 pthread_attr_getstacksize 的返回值是错误码（不设 errno）。
+     */
+    if (pthread_attr_getstacksize(attr, &size) != 0)
+        return real_fn(thread, attr, start_routine, arg);
+    if (pthread_attr_getstack(attr, &addr, &region) != 0)
+        return real_fn(thread, attr, start_routine, arg);
+
+    /*
+     * ★ 判据：区分"只设了 stacksize"与"真的带了显式栈区"。
+     *
+     * glibc 里没有"显式栈区"这个独立字段，只能这样判别：
+     *   - 只设过 stacksize：region 是 guardsize、addr = stacksize - guardsize，
+     *     于是 region != 0 但 **addr + region == 0**（见文件上方更正 1）。
+     *   - 真设过显式栈区（pthread_attr_setstack）：[attr+16] 变成 size，
+     *     addr + region == size != 0。
+     *
+     * 官方 0x10540 的 `cmn x7,x6 / b.eq` 判的正是同一件事
+     * （它据此决定要不要先记日志，两条路都做修正 —— 见更正 2）。
+     *
+     * 真显式栈区**必须原样转发**：那种调用方自己管内存，
+     * 我们替它换栈会破坏它的语义（它可能已经把栈指针/映射交给别处）。
+     */
+    if (region != 0 && (uintptr_t)addr + region != 0)
+        return real_fn(thread, attr, start_routine, arg);
+
+    /*
+     * 下限 = max(2 × PTHREAD_STACK_MIN, 256K)，与官方 10650~10668 一致。
+     * sysconf 失败（返回 -1）时只用 256K —— 不能拿 -1 去乘。
+     */
+    psm = sysconf(_SC_THREAD_STACK_MIN);
+    want = 262144;
+    if (psm > 0 && (size_t)psm * 2 > want)
+        want = (size_t)psm * 2;
+
+    /* 已经够大 → 直通（官方 10674 的 b.ls 就是这条） */
+    if (size >= want)
+        return real_fn(thread, attr, start_routine, arg);
+
+    /*
+     * ★ 用**副本**，不能就地改调用方的 attr ★
+     * 形参是 `const pthread_attr_t *`，就地改是 UB。
+     *
+     * ★ 这里曾经写成 `pthread_attr_init(&clean)` + `setstacksize`，
+     *   实测**与官方不等价**：官方在 10678~10690 是把调用方的
+     *   整个 64 字节**逐字节复制**到栈上再改 stacksize，因此
+     *   **guardsize 等其它字段被原样保留**；而 init 会把 guardsize
+     *   重置成默认 4096。
+     *
+     *   实测（thredge，请求 stacksize=128K + guardsize=16384）：
+     *     官方   : 真实栈=524288  guard=**16384**  ← 保留调用方的设置
+     *     旧 init: 真实栈=524288  guard=**4096**   ← 把它改掉了
+     *
+     *   这正是"修一个边缘情况而破坏正常路径"的典型：
+     *   调用方特意放大 guard（防栈溢出）会被我们静默改回默认。
+     *   所以改为与官方同构的 memcpy 复制。
+     *
+     * memcpy 而不是直接传 `attr`：必须能改 stacksize 字段。
+     * 复制的是 pthread_attr_t（POD，64 字节），没有需要 destory 的资源，
+     * 故本路径**不需要**（也不应该）调用 pthread_attr_destroy。
+     */
+    memcpy(&clean, attr, sizeof(clean));
+    if (pthread_attr_setstacksize(&clean, want) != 0) {
+        /* setstacksize 失败：clean 是副本，无资源可释放，直通即可 */
+        return real_fn(thread, attr, start_routine, arg);   /* 保守直通 */
+    }
+
+    rc = real_fn(thread, &clean, start_routine, arg);
+    return rc;
+}
 
 /*
  * 为什么 socket 家族也要 hook：
