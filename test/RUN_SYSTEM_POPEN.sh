@@ -346,6 +346,71 @@ case "${hostst:-}" in
        FAIL=1 ;;
 esac
 
+# ---------------------------------------------------------------------
+# 判据 5：posix_spawn + spawnattr（带 sigmask）必须可用
+# ---------------------------------------------------------------------
+# px_trampoline_spawn 原先在 fa != NULL || attr != NULL 时直接放弃
+# trampoline，回退 real_posix_spawn —— 而那条路拿到 /data/data/... 下的
+# 宿主路径会被 SELinux 拒执行（恒 EACCES）。实测 `make` 因此完全不可用
+# （它总是传 attr）。修后由 glibc 自己应用 fa/attr，我们只把 executable
+# 换成 bridge。详见 docs/posix_spawn带attr失败-make不可用.md
+CC="${CC:-gcc}"
+if command -v "$CC" >/dev/null 2>&1; then
+    cat > "$STAGE_MK/spawnattr.c" <<'CEOF2'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <signal.h>
+extern char **environ;
+int main(void){
+    posix_spawnattr_t at; posix_spawnattr_init(&at);
+    sigset_t s; sigemptyset(&s); sigaddset(&s, SIGSYS);
+    posix_spawnattr_setsigmask(&at, &s);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK);
+    char *av[] = {"/bin/sh","-c","echo SPAWNATTR-CHILD-OK",NULL};
+    pid_t p; int rc = posix_spawn(&p, "/bin/sh", NULL, &at, av, environ);
+    if (rc != 0) { printf("SPAWNATTR rc=%d\n", rc); return 0; }
+    int st=0; waitpid(p,&st,0);
+    printf("SPAWNATTR rc=0 sig=%d\n", WIFSIGNALED(st)?WTERMSIG(st):0);
+    return 0;
+}
+CEOF2
+    if $CC -O1 -o "$STAGE_MK/spawnattr" "$STAGE_MK/spawnattr.c" 2>/dev/null; then
+        # ★ 不能用 run_side()：它写死了 --argv0 probe 与 $STAGE_LD/probe ★
+        # 那是给 system/popen 探针的；本判据的可执行文件是 spawnattr，
+        # 复用会让 spawnattr 根本不被执行（实测：SPAWN_OUT 为空）。
+        #
+        # ★ 也不用再复制：$STAGE_MK 与 $STAGE_LD 是**同一目录**（一个是
+        #   容器视角、一个是内核视角，见 $ROOTFS/root 与 /root 同 inode 的
+        #   实测记录）。重复 cp 会撞 SameFileError —— 本项目已记录的坑。
+        SPAWN_OUT=$(env \
+            BXROOT_ROOTFS="$ROOTFS" BXROOT_TMP_DIR="$STAGE_LD/tmp" \
+            BXROOT_WORKDIR="/" BXROOT_FAKEROOT=1 \
+            timeout 120 "$APP_LIB/libproroot-bridge.so" \
+                "$APP_LIB/libproroot-linker.so" \
+                --argv0 spawnattr --preload "$STAGE_LD/libbxroot-runtime.so" \
+                "$STAGE_LD/spawnattr" 2>&1)
+        # 输出里既有子进程的 SPAWNATTR-CHILD-OK，也有父进程的 SPAWNATTR rc=…，
+        # 所以必须用 **行首** 锚定且要求 "rc="，避免拿到子进程那一行。
+        SPAWN_LINE=$(printf '%s\n' "$SPAWN_OUT" | grep -E '^SPAWNATTR rc=' | head -1)
+        case "$SPAWN_LINE" in
+            'SPAWNATTR rc=0 sig=0')
+                echo "   ✅ posix_spawn+spawnattr(sigmask) 可用且子进程未被杀" ;;
+            'SPAWNATTR rc=13'*)
+                echo "   ❌ posix_spawn+spawnattr 仍回 EACCES（trampoline 放弃）"
+                FAIL=1 ;;
+            *)
+                echo "   ❌ posix_spawn+spawnattr 异常: $SPAWN_LINE"; FAIL=1 ;;
+        esac
+        case "$SPAWN_LINE" in
+            *'sig=31'*) echo "   ❌ 子进程被 SIGSYS 杀死"; FAIL=1 ;;
+        esac
+    else
+        echo "   ⏭️  无法编译 spawnattr 探针（缺编译器），跳过该判据"
+    fi
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "RESULT: PASS"

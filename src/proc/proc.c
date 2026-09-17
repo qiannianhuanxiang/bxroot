@@ -3339,17 +3339,42 @@ static int px_trampoline_exec(const char *host, char *const argv[],
  * 返回 0 = 成功（*pid 已填）；-1 = 未走 trampoline（未配置该环境，
  * 或调用方用了我们无法保真的参数），调用方回退到真实 posix_spawn。
  *
- * ★ 关于 file_actions / attr —— 已知限制 ★
+ * ★ file_actions / attr：**曾经**是已知限制，现已支持 ★
  *
- * glibc 的 spawn 内部靠调用**导出符号**（open64/dup2/chdir/fcntl…）
- * 来实现 file_actions 与 attr（依据见 px_do_spawn 顶部的反汇编注释）。
- * 走 fork+trampoline 后，子进程直接 exec bridge、由 bridge 完成
- * mmap+跳转，glibc 那套机制不参与 —— 因此 **file_actions 的重定向
- * 在 trampoline 路径下不会生效**。
+ * 【缺陷（实测，2026-09-17）】原实现是：
  *
- * 所以这里**主动保守**：一旦调用方传了非空 file_actions 或 attr，
- * 就放弃 trampoline、回退真实 posix_spawn。宁可让调用方拿到真实的
- * 失败，也不要静默丢掉重定向语义（那类缺陷极难定位）。
+ *     if (fa != NULL || attr != NULL) {
+ *         return -1;      // 放弃 trampoline
+ *     }
+ *
+ * 理由是"fork+trampoline 后 glibc 那套 file_actions 机制不参与，
+ * 重定向会静默丢失"。保守本身没错，但**后果被严重低估**：
+ *
+ *     $ make -C dir            # 任何带配方的 Makefile
+ *     make: *** [Makefile:2: all] Bad system call
+ *
+ * `make` 用 `posix_spawn` **并且总是传 attr**（它要设信号屏蔽集合），
+ * 于是永远走不到 trampoline，一路落到 `real_posix_spawn` —— 而
+ * `real_posix_spawn` 拿到的是 `/data/data/...` 下的宿主路径，
+ * SELinux `app_data_file` **禁止执行**（与 execve 同一个坑：
+ * 见 px_do_execve 里那段注释）→ 恒失败。
+ *
+ * 也就是说：这个"保守回退"在真实部署环境下**不是回退，是必然失败**。
+ * 保守的前提是"回退路径能用"，而那条路径根本不能用。
+ *
+ * 【修法】不再自己 fork，而是把 **bridge 当作 executable 交给
+ * `real_posix_spawn`** —— 这样：
+ *   - `file_actions` / `attr` 由 **glibc 自己**在 `real_posix_spawn`
+ *     内部应用（我们完全不碰），语义**天然保真**，不会静默丢失；
+ *   - 被执行的是 bridge（`/data/app/.../lib/arm64/`，可执行），
+ *     绕开 SELinux 对 `app_data_file` 的执行限制。
+ * 与 execve 路径的思路一致（那里是 exec bridge），只是这里必须
+ * 经过 libc 以保留 spawn 语义。
+ *
+ * 【为什么 `real_posix_spawn` 会应用我们的 attr/fa】
+ * 它们是**不透明结构**，由调用方构造、glibc 解析。我们只是原样把指针
+ * 转交给 `real_posix_spawn` —— 没有任何解析或重建，所以不存在
+ * "两处实现漂移"的风险。
  */
 static int px_trampoline_spawn(pid_t *pid, const char *host,
                                char *const argv[],
@@ -3360,7 +3385,11 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
 {
     const char *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
     const char *linker = getenv("PROROOT_LINKER_PATH");
-    pid_t child;
+    char tramp_path[PX_PATH_MAX];
+    char *nv[PX_ARGV_MAX + 8];
+    size_t n = 0;
+    size_t i;
+    int rc;
 
     if (pid == NULL || argv == NULL) {
         return -1;
@@ -3369,28 +3398,77 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
         linker[0] == '\0') {
         return -1;          /* 普通环境：走真实 posix_spawn，行为不变 */
     }
-    if (fa != NULL || attr != NULL) {
-        return -1;          /* 见上方「已知限制」 */
+    if (preload == NULL || preload[0] == '\0') {
+        preload = getenv("PROROOT_LIB_PATH");
     }
-
-    child = fork();
-    if (child < 0) {
-        return -1;          /* fork 失败：交回调用方走原路径报错 */
-    }
-    if (child == 0) {
+    if (preload == NULL || preload[0] == '\0') {
         /*
-         * 子进程：exec trampoline。
-         *
-         * px_trampoline_exec 内部用裸 syscall，并自己构造
-         * [bridge, linker, --argv0, <name>, --preload, <rt>, <host>, args...]
-         * 的形态（与官方 runtime 逐项对齐），所以这里把参数原样交给它。
-         * fork 之后只做 async-signal-safe 的事（不分配内存）。
+         * 装不上钩子 → 进 bridge 没有意义。回退（普通环境里那条能用）。
          */
-        (void)px_trampoline_exec(host, argv, envp, argv0, preload);
-        _exit(127);         /* exec 失败：与 shell 的约定一致 */
+        return -1;
+    }
+    if (tramp[0] != '/') {
+        return -1;
     }
 
-    *pid = child;
+    /* 与 execve 路径同款：/proc/self/root 前缀绕开路径翻译 */
+    if (strncmp(tramp, "/proc/", 6) == 0) {
+        if (strlen(tramp) >= sizeof(tramp_path)) {
+            return -1;
+        }
+        memcpy(tramp_path, tramp, strlen(tramp) + 1);
+    } else if (snprintf(tramp_path, sizeof(tramp_path), "/proc/self/root%s",
+                        tramp) >= (int)sizeof(tramp_path)) {
+        return -1;
+    }
+
+    /*
+     * argv 形态与 execve 路径**完全同构**：
+     *     [bridge, linker, --argv0 <name>, --preload <rt>, <host>, argv[1..]]
+     * 两条路径共用同一约定，避免"exec 能跑、spawn 不行"这类漂移。
+     */
+    nv[n++] = tramp_path;
+    nv[n++] = (char *)(uintptr_t)linker;
+    if (argv0 != NULL && argv0[0] != '\0') {
+        nv[n++] = (char *)(uintptr_t)"--argv0";
+        nv[n++] = (char *)(uintptr_t)argv0;
+    }
+    nv[n++] = (char *)(uintptr_t)"--preload";
+    nv[n++] = (char *)(uintptr_t)preload;
+    if (host != NULL && host[0] != '\0') {
+        nv[n++] = (char *)(uintptr_t)host;
+    }
+    for (i = 1; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 7; i++) {
+        nv[n++] = argv[i];
+    }
+    nv[n] = NULL;
+
+    if (real_posix_spawn == NULL) {
+        real_posix_spawn = (int (*)(pid_t *, const char *,
+                                    const posix_spawn_file_actions_t *,
+                                    const posix_spawnattr_t *,
+                                    char *const[], char *const[]))
+                               px_dlsym("posix_spawn");
+    }
+    if (real_posix_spawn == NULL) {
+        return -1;
+    }
+
+    /*
+     * ★ 把 file_actions / attr **原样**交给 glibc ★
+     * 我们不解构、不重建它们 —— 重定向与调度属性由 real_posix_spawn
+     * 在它内部应用，语义天然保真。这也是本修法相对"自己 fork 再手工
+     * 应用"的关键优势：没有第二份实现，也就没有漂移。
+     */
+    rc = real_posix_spawn(pid, tramp_path, fa, attr, nv, (char *const *)envp);
+    if (rc != 0) {
+        /*
+         * spawn 失败了 —— 回 -1 让调用方走原路径。
+         * 注意不要把 rc 丢掉：调用方会用**它自己**的方式重试，
+         * 那时拿到的错误更贴近它期望的语义。
+         */
+        return -1;
+    }
     return 0;
 }
 
