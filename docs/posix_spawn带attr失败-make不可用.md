@@ -431,3 +431,51 @@ make 的子进程死亡**不经我们的任何钩子**（无 spawn/execve 日志
 **验证方法（下一轮）**：hook `posix_spawn` 时打印**实际传给
 `real_posix_spawn` 的 envp 里的 LD_PRELOAD**（而非 `getenv` 的值），
 再跑 make 对照。这是一行日志的事。
+
+---
+
+## 十一、2026-09-17 追加六：**envp 假设被否定**，日志修正了此前误判
+
+给 `px_trampoline_spawn()` 加上 envp 诊断后重跑 make：
+
+```
+[bxroot] proc: trampoline_spawn host=.../bin/echo argv0=echo
+                preload=.../libbxroot-runtime.so fa=1 attr=1
+[bxroot] proc: trampoline_spawn envp LD_PRELOAD=.../libbxroot-runtime.so
+make: *** Bad system call
+```
+
+### 三个此前结论被修正
+
+1. **"日志从未出现"是错的** —— 此前 `grep trampoline_spawn` 用的模式
+   与实际字符串不一致（我打的日志是 `trampoline_spawn`，grep 的
+   也是，但**此前几轮根本没加这条日志**时就在 grep，等于在测一个
+   不存在的东西）。加了日志后它**立刻出现**。
+   **教训：先确认要 grep 的字符串真的存在于代码里。**
+2. **envp 假设否定** —— `envp` 里的 `LD_PRELOAD` **正确指向容器内
+   runtime**（与 `preload` 参数一致）。envp 不是根因。
+3. **"子进程没加载 runtime"否定** —— trampoline 带了 `--preload`，
+   envp 也带，runtime 必然加载。
+
+### 新的关键事实
+
+- `host=/data/data/.../bin/echo` —— **make 直接 exec 配方命令**，
+  不经 shell（`@` 前缀时）
+- `fa=1 attr=1` —— 两者都传
+- trampoline 走了、preload 传了、envp 正确 —— 但子进程仍死于 SIGSYS
+
+即：**SIGSYS 死亡发生在 runtime 已加载、SIGSYS 处理器已安装之后**，
+在 guest（`/bin/echo`）实际执行期间。
+
+### 剩下的假设（待下一轮）
+
+`attr` 的 `POSIX_SPAWN_SETSIGDEF` 会把集合内的信号处置**重置为 SIG_DFL**。
+若 make 的 sigdef 集合包含 SIGSYS，子进程的 SIGSYS 处理器会被
+**拆除** → TRAP 直接杀。这与"官方能活"一致：官方靠 **livepatch**
+（静态中和 svc 指令），**不依赖信号处理器**，SIGDEF 重置对它无影响。
+
+实测 `c3.c`（sigdef 含 SIGSYS）两侧都 `sig=0` —— **看似否定**，
+但该探针的子进程只做一次 `write` 后退出，可能**没触发任何 TRAP**。
+**下一轮**：把探针的子进程换成会触发 TRAP 的调用
+（如 io_uring_setup(425) 或 make 场景下的实际 libc 内联 svc），
+再看 sig=是否变 31。**这是最后一个未验证的假设。**
