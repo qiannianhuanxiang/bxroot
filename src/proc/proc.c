@@ -3477,7 +3477,16 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
            (preload != NULL && preload[0] != '\0') ? preload : "(none)",
            fa != NULL, attr != NULL);
 
-    rc = real_posix_spawn(pid, tramp_path, fa, attr, nv, (char *const *)envp);
+    /*
+     * 【2026-09-17 追加七的结论】本函数一切外部可观测的量
+     * （host/argv0/preload/envp/fa/attr/trampoline 是否走）都已实证
+     * 与官方一致，但 make 的配方子进程仍死于 SIGSYS。
+     * 7 个假设全部被否定，已归档为 ldso 内部行为不兼容（架构级限制）。
+     * 详见 docs/posix_spawn带attr失败-make不可用.md 追加七。
+     * 此处曾有一个 envp 诊断块，因假设被否定而移除 —— 保留本注释
+     * 作为"排查路径已收束"的路标，避免后来者重走。
+     */
+rc = real_posix_spawn(pid, tramp_path, fa, attr, nv, (char *const *)envp);
     if (rc != 0) {
         /*
          * spawn 失败了 —— 回 -1 让调用方走原路径。
