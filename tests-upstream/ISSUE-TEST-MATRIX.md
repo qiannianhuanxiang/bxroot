@@ -66,7 +66,7 @@ bxroot FAIL 行 > 对照行  → 1（劣化）
 |---|---|------|------|------|:--:|
 | T01 | **22** | readlinkat 分支/早期崩溃 | `readlinkat` 内 `strlen(x20)` 路径不崩 | 退出码 < 128，且 FAIL 行数 ≤ proot | ✅ |
 | T02 | **22** | 早期阶段哨兵 | constructor/preinit→main 全程存活 | 5 个 `--step` 全部输出 `SENTINEL-OK` | ✅ |
-| T03 | **22** | 崩溃诊断产物 | SIGSEGV 后生成 `*-sigsegv-maps.txt` | 文件存在 | ✅ |
+| T03 | **22** | 崩溃诊断产物 | SIGSEGV 后生成 `*-sigsegv-maps.txt` | 文件存在 | ⚠️ NOCTL（2026-09-17 实测：官方 kill -SEGV 下同样不生成，需额外开关才触发；原判 ✅ 的前提不成立，见脚本内注释）|
 | T04 | **23** | 大文件+mmap/mremap/MAP_SHARED | 32MB 写/共享映射/跨进程一致 | FAIL 行数 ≤ proot，无崩溃 | ✅ |
 | T05 | **23** | 大量目标文件链接 | 120 个 `.o` 一次性链接 | 输出 `BIGLINK-OK`，无 `undefined reference` | ✅ |
 | T06 | **24** | Node 原生模块 dlopen | NAPI 符号可解析 | 无 `napi_add_env_cleanup_hook has not been loaded` | ✅ |
@@ -328,6 +328,12 @@ bash issue-regression-test.sh --self-test     # 容器内可跑
    Chromium 系浏览器，条件苛刻。它更像"有则跑"的用例。
 3. **T03（崩溃 dump）依赖 bxroot 的实现细节** —— 判据是
    `*-sigsegv-maps.txt` 存在。若 bxroot 用了别的文件名，需要调整。
+   **2026-09-17 更新**：实测（两侧对照）官方 proroot 在 `kill -SEGV $$`
+   下**同样不生成** dump（全盘 find 无结果；runtime 内有
+   `%s/../proroot-sigsegv-maps.txt` 路径模板，但触发需额外开关，
+   本环境不满足）。故 T03 判定已从 ✅/FAIL 改为 **NOCTL**——
+   "官方能"的前提不成立，bxroot 与官方行为一致（都不生成）。
+   该 issue 的 dump 功能需在装有完整 proot 环境的真机上另测。
 4. **T09 需要网络** —— 无网络时 SKIP，不 FAIL。
 5. **`--only` 过滤在 `record()` 层生效** —— 被过滤的用例仍会执行
    （浪费一点时间），但不出现在结果里。若要真跳过，可后续把 issue 号
