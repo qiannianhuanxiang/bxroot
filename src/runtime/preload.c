@@ -3309,6 +3309,7 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
               int flags) {
     static int (*fn)(int, const char *, const struct timespec[2], int) = NULL;
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *p = path;
 
     if (fn == NULL)
@@ -3316,9 +3317,41 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
              bxroot_next_symbol("utimensat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    /* path 可以是 NULL（对 dirfd 本身操作），必须判空 */
-    if (path != NULL && translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /*
+     * ★ dirfd + 相对路径的解析（2026-09-17 补，由 dpkg -i 暴露）★
+     *
+     * 【实测缺陷】dpkg unpack 的时序是：
+     *     openat(dirfd, "x.dpkg-new")   ← dirfd 是已翻译的目录 fd
+     *     write / chown / ...
+     *     utimensat(dirfd, "x.dpkg-new") ← 相对路径 + 同一 dirfd
+     * 本钩子原先**只**调 translate_path（只认绝对路径），相对路径
+     * 原样透传。内核对相对路径按**进程 cwd** 解析 —— 而 bxroot 的
+     * cwd 已被设成 workdir，于是内核在 `<workdir>/x.dpkg-new` 下
+     * 找不到 → ENOENT → dpkg 报 "error setting timestamps"，
+     * **安装中止**。
+     *
+     * 【为什么 openat 同场景却正常】openat 也走 resolve_dirfd_path，
+     * 相对路径会被拼成 dirfd 的真实绝对路径 —— 所以**写**成功了、
+     * **改时间戳**失败，两个入口覆盖不全，正好卡在 dpkg 的序列中间。
+     *
+     * 【为什么先前没测出来】需要"先 openat(dirfd) 再 utimensat(dirfd)"
+     * 的真实程序（dpkg 正是）才会同时踩两条路径；单步探针各测一条
+     * 是看不出来的。
+     */
+    if (path != NULL) {
+        if (path[0] == '/') {
+            if (translate_path(path, translated, sizeof(translated)) > 0)
+                p = translated;
+        } else if (resolve_dirfd_path(dirfd, path, joined,
+                                      sizeof(joined)) == 1) {
+            /* 相对路径 + dirfd → 拼成绝对路径后再翻译 */
+            if (translate_path(joined, translated, sizeof(translated)) > 0)
+                p = translated;
+            else
+                p = joined;   /* 翻译层不动它（如 /proc 透传），用拼好的 */
+        }
+        /* path == NULL（对 dirfd 本身操作）不需要翻译 */
+    }
     return fn(dirfd, p, times, flags);
 }
 
