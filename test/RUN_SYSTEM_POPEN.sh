@@ -78,8 +78,22 @@ esac
 
 BXROOT_SO="${BXROOT_SO:-$ROOT/build/libbxroot-runtime.so}"
 OFFICIAL_SO="${OFFICIAL_SO:-$ROOT/work/parity/off/libproroot-runtime.so}"
-[ -f "$BXROOT_SO" ] || die "找不到 bxroot 运行时: $BXROOT_SO（先跑 BUILD_RUNTIME.sh）"
-[ -f "$OFFICIAL_SO" ] || die "找不到官方运行时: $OFFICIAL_SO"
+# ★ 缺产物属"环境不满足"(rc=2)，不是"契约被破坏"(rc=1) ★
+#
+# 本项目子测试的退出码约定（各脚本头部都写了）：
+#     0 = 通过      1 = 契约被破坏      2 = 环境不满足（无法测）
+# 这里原本用 die()（rc=1），于是干净克隆（无 build/ 产物）里 RUN_ALL 把它
+# 报成**失败**：
+#     ❌ system/popen 子进程  rc=1 错误: 找不到 bxroot 运行时
+#     通过 11 / 失败 2
+# 而同一环境限制在别的脚本里走 rc=2 就被正确归为 SKIP —— 约定不一致会让
+# "本机缺产物"伪装成"代码有问题"，把排查方向指向实现。
+# 用 skip() 且**明确显示原因**（不静默）。
+[ -f "$BXROOT_SO" ] || skip "找不到 bxroot 运行时: $BXROOT_SO（先跑 BUILD_RUNTIME.sh）"
+# 官方 runtime 只是对照，缺了不影响绝对判据 —— 但必须说出来，
+# 否则就变成"静默地把对照测成了没有对照"。
+HAVE_OFFICIAL=0
+[ -f "$OFFICIAL_SO" ] && HAVE_OFFICIAL=1
 
 # ---------------------------------------------------------------------
 # 暂存目录
@@ -105,13 +119,16 @@ trap cleanup EXIT INT TERM
 
 # ★ 在 ROOTFS 内建目录/复制一律用 python3 ★
 # 实测：shell 的 mkdir/cp 在这个文件系统上会「返回 0 但看不见」。
-python3 - "$STAGE_MK" "$BXROOT_SO" "$OFFICIAL_SO" <<'PY' || die "暂存目录准备失败"
+python3 - "$STAGE_MK" "$BXROOT_SO" "$OFFICIAL_SO" "$HAVE_OFFICIAL" <<'PY' || die "暂存目录准备失败"
 import os, shutil, sys
-stage, bx, off = sys.argv[1], sys.argv[2], sys.argv[3]
+stage, bx, off, have_off = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 os.makedirs(stage, exist_ok=True)
 os.makedirs(os.path.join(stage, "tmp"), exist_ok=True)
 shutil.copy(bx, os.path.join(stage, "libbxroot-runtime.so"))
-shutil.copy(off, os.path.join(stage, "libproroot-runtime.so"))
+if have_off == "1":
+    shutil.copy(off, os.path.join(stage, "libproroot-runtime.so"))
+else:
+    print("   ⚠️  无官方 runtime 副本 —— 只做绝对判据，跳过对照")
 print("   暂存目录就绪:", stage)
 PY
 
@@ -232,8 +249,13 @@ run_side() {
 }
 
 echo "== 官方（对照组）=="
-OFF_OUT=$(run_side off libproroot-runtime.so)
-echo "$OFF_OUT"
+if [ "$HAVE_OFFICIAL" = 1 ]; then
+    OFF_OUT=$(run_side off libproroot-runtime.so)
+    echo "$OFF_OUT"
+else
+    OFF_OUT=""
+    echo "⏭️  跳过：无官方 runtime 副本（绝对判据仍然有效）"
+fi
 
 echo
 echo "== bxroot（被测组）=="
@@ -248,11 +270,28 @@ echo "== 判据 =="
 FAIL=0
 
 # 判据 1：system/popen 的 rc 与关键输出两侧一致
+#
+# ★ 没有官方对照时必须退化成**绝对判据**，不能拿空串去比 ★
+# 否则 `[ "$o" != "$b" ]` 会因 $o 为空而**恒真** —— 一个必然失败的假红，
+# 与"静默跳过"同源（都是让判据的含义随环境漂移）。这里显式分两条路：
+#   有对照 → 两侧逐字一致
+#   无对照 → bxroot 侧必须出现预期的成功标记（绝对判据）
 for pat in 'system rc=' 'pclose rc=' 'SYSCALL-OK' 'POPEN-OK'; do
     o=$(printf '%s\n' "$OFF_OUT" | grep -F "$pat" | head -1)
     b=$(printf '%s\n' "$BX_OUT"  | grep -F "$pat" | head -1)
     if [ -z "$b" ]; then
         echo "   ❌ bxroot 缺少 '$pat'（官方: $o）"; FAIL=1
+    elif [ "$HAVE_OFFICIAL" != 1 ]; then
+        # 无对照：至少要求 bxroot 侧该模式非空（已由上面的 -z 保证），
+        # 且 rc 类判据必须是成功值。
+        case "$pat" in
+            *'rc='*)
+                case "$b" in
+                    *'rc=0'*) echo "   ✅ $pat 成功（无官方对照，绝对判据）: $b" ;;
+                    *)        echo "   ❌ $pat 非 0（无对照，绝对判据）: $b"; FAIL=1 ;;
+                esac ;;
+            *) echo "   ✅ $pat 出现（无官方对照，绝对判据）: $b" ;;
+        esac
     elif [ "$o" != "$b" ]; then
         echo "   ❌ '$pat' 不一致"; echo "      官方  : $o"; echo "      bxroot: $b"; FAIL=1
     else

@@ -58,8 +58,15 @@ if [ ! -d "$ROOTFS" ]; then
     exit 2
 fi
 if [ ! -f "$BXROOT_SO" ]; then
-    echo "❌ 找不到 bxroot 产物 $BXROOT_SO（先跑 sh BUILD_RUNTIME.sh）"
-    exit 1
+    # ★ 缺产物属"环境不满足"(rc=2)，不是"契约被破坏"(rc=1) ★
+    #
+    # 本项目子测试的退出码约定：0=通过 / 1=契约被破坏 / 2=环境不满足。
+    # 这里原本是 exit 1，于是干净克隆（无 build/ 产物）里 RUN_ALL 把它报成
+    # **失败**（通过 11 / 失败 2），把"本机缺产物"伪装成"代码有问题"。
+    # 同一个环境限制在紧邻的 rootfs 检查里走 exit 2 就被正确归为 SKIP ——
+    # 约定不一致会让排查方向指向实现。
+    echo "⏭️  跳过：找不到 bxroot 产物 $BXROOT_SO（先跑 sh BUILD_RUNTIME.sh）"
+    exit 2
 fi
 if [ ! -f "$OFFICIAL_SO" ]; then
     echo "❌ 找不到官方 runtime $OFFICIAL_SO"
