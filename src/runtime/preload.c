@@ -1950,6 +1950,9 @@ char *realpath(const char *path, char *resolved) {
  * 由它用 L2S_OPS 在宿主侧建链。这样 l2s 层的路径拼接与 bxroot/proot
  * 的编码规则保持一致（编码的是宿主路径）。
  */
+/* 前向声明：定义在本文件"l2s 启用核心"一节（init_l2s 之后）。 */
+static int l2s_autostart_on_link_failure(void);
+
 int link(const char *oldpath, const char *newpath) {
     static int (*fn)(const char *, const char *) = NULL;
     char told[MAX_PATH_LEN], tnew[MAX_PATH_LEN];
@@ -1971,7 +1974,28 @@ int link(const char *oldpath, const char *newpath) {
 
     if (fn == NULL) fn = (int (*)(const char *, const char *))bxroot_next_symbol("link");
     if (fn == NULL) { errno = ENOSYS; return -1; }
-    return fn(po, pn);
+    rc = fn(po, pn);
+    if (rc == 0)
+        return 0;
+
+    /*
+     * ★ 真实 link 被内核拒绝 → 自动启用 l2s 并重试一次 ★
+     *
+     * 只对"环境不允许硬链接"的三种 errno 回退；别的错误（ENOENT、
+     * EEXIST、EXDEV…）是**调用方自己的问题**，回退只会掩盖真实故障。
+     * 详见上方 l2s_autostart_on_link_failure() 的注释。
+     */
+    if ((errno == EACCES || errno == EPERM || errno == ENOSYS) &&
+        l2s_autostart_on_link_failure()) {
+        rc = l2s_rt_link(po, pn);
+        if (rc == 0)
+            return 0;
+        if (rc != L2S_RT_PASSTHRU) {
+            errno = -rc;
+            return -1;
+        }
+    }
+    return rc;
 }
 
 int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
@@ -1996,7 +2020,22 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
 
     if (fn == NULL) fn = (int (*)(int, const char *, int, const char *, int))bxroot_next_symbol("linkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
-    return fn(olddirfd, po, newdirfd, pn, flags);
+    rc = fn(olddirfd, po, newdirfd, pn, flags);
+    if (rc == 0)
+        return 0;
+
+    /* 与 link() 同理：环境禁硬链接时自动启用 l2s（见那里的注释） */
+    if ((errno == EACCES || errno == EPERM || errno == ENOSYS) &&
+        l2s_autostart_on_link_failure()) {
+        rc = l2s_rt_link(po, pn);
+        if (rc == 0)
+            return 0;
+        if (rc != L2S_RT_PASSTHRU) {
+            errno = -rc;
+            return -1;
+        }
+    }
+    return rc;
 }
 
 /* Hook: unlink —— 递减链长，归零才真正回收 */
@@ -6669,21 +6708,14 @@ static void init_fakeroot(void) {
  * 注意这里**不检查 dlsym 是否可用**：l2s 层完全通过 L2S_OPS 表操作，
  * 而这些包装函数内部各自懒加载，构造函数阶段拿不到符号也没关系。
  */
-static void init_l2s(void) {
-    const char *on = getenv("BXROOT_LINK2SYMLINK");
+/*
+ * 真正启用 l2s 的核心。init_l2s()（构造期，读环境变量）与
+ * link()/linkat() 的"自动回退"（见两处钩子内的注释）共用这一段，
+ * 保证两种启用方式的配置语义**完全一致** —— 这正是
+ * "同一套规则不写两处"的落点。
+ */
+static void l2s_enable_core(void) {
     l2s_config cfg;
-
-    /*
-     * -L 的开关独立于 l2s：proot 的 -L 与 --link2symlink 是两个各自
-     * 独立的选项，可以只开一个。所以这一行放在下面的提前 return **之前**。
-     */
-    {
-        const char *fss = getenv("BXROOT_FIX_SYMLINK_SIZE");
-        g_fix_symlink_size = (fss != NULL && fss[0] != '\0' && fss[0] != '0');
-    }
-
-    if (on == NULL || on[0] == '\0' || on[0] == '0')
-        return;
 
     cfg = (l2s_config)L2S_CONFIG_DEFAULT;
     /*
@@ -6781,6 +6813,64 @@ static void init_l2s(void) {
     l2s_rt_init(&L2S_OPS, &cfg);
     LOG("l2s enabled: dir=%s", cfg.l2s_dir ? cfg.l2s_dir : "(beside file)");
 }
+
+/*
+ * 构造期入口：读环境变量决定是否启用。
+ *
+ * 注意这里**只**负责"显式开关"路径；"自动回退"路径由 link()/linkat()
+ * 钩子在真实调用失败后调用 l2s_enable_core() 完成。
+ */
+static void init_l2s(void) {
+    const char *on = getenv("BXROOT_LINK2SYMLINK");
+
+    /*
+     * -L 的开关独立于 l2s：proot 的 -L 与 --link2symlink 是两个各自
+     * 独立的选项，可以只开一个。所以这一行放在下面的提前 return **之前**。
+     */
+    {
+        const char *fss = getenv("BXROOT_FIX_SYMLINK_SIZE");
+        g_fix_symlink_size = (fss != NULL && fss[0] != '\0' && fss[0] != '0');
+    }
+
+    if (on == NULL || on[0] == '\0' || on[0] == '0') {
+        LOG("l2s not enabled by env (link() 失败时会自动回退启用)");
+        return;
+    }
+
+    l2s_enable_core();
+}
+
+static int l2s_autostart_on_link_failure(void) {
+    if (l2s_rt_enabled())
+        return 1;                       /* 已经启用 */
+    LOG("link() 被内核拒绝 —— 自动启用 l2s（与官方 proroot 行为对齐）");
+    l2s_enable_core();
+    return l2s_rt_enabled();
+}
+
+/*
+ * ★ link 自动回退启用（2026-09-17）★
+ *
+ * 【实测差异】本容器里 proroot-ldso 的 seccomp 过滤器**禁止 linkat(265)**：
+ *     官方  : 裸 svc linkat = -38 (ENOSYS)，但 link() 符号返回成功
+ *             ——官方运行时在用户态模拟了 link（磁盘上留下的是真实文件，
+ *             两个路径各一份，用复写实现，不是符号链接）
+ *     bxroot: link() 透传到被禁的 linkat → EACCES，pnpm/npm 全挂
+ *
+ * 【为什么不能只在显式开关时启用 l2s】
+ * DSHA 生产走 --link2symlink 没问题；但"直接经 bridge 跑一个没带开关的
+ * 客户"（测试探针、用户手敲命令）link() 必失败。官方在**同样的环境**
+ * 下不需要开关就成功 —— 所以 bxroot 也应当自动启用，否则就是与官方
+ * 的可观测行为差异。
+ *
+ * 【为什么放在钩子里而不是构造函数】
+ * 构造期无法预知"内核是否真的禁了 linkat"（那是 ldso 装的过滤器，
+ * bxroot 读不到它的白名单）。只有真实调用失败才是权威信号。
+ *
+ * 【幂等】l2s_enable_core() 里 l2s_rt_init 可重复调用；g_enabled 置位后
+ * l2s_rt_enabled() 为真，后续 link() 直接走 l2s 分支，不再回到这里。
+ */
+
 
 __attribute__((constructor))
 static void constructor(void) {
