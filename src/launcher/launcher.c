@@ -154,6 +154,12 @@ typedef struct {
      */
     int kill_on_exit;
     char *kernel_release;
+    /*
+     * `-L`：proot 的 fix_symlink_size 扩展开关。默认 0（与 proot 一致）。
+     * 语义见解析处的长注释 —— 它修的是**真符号链接**的 st_size，
+     * 与 l2s 的 size 补丁是两件独立的事。
+     */
+    int fix_symlink_size;
     int change_id_set;      /* -i/--change-id 是否被显式指定 */
     char *runtime_lib;  /* 从 BXROOT_LIB_PATH 或自动探测 */
     char *linker_lib;
@@ -179,9 +185,11 @@ static void usage(const char *prog) {
         "  -i, --change-id 0:0   等价于 -0（其它取值未实现）\n"
         "  -k, --kernel-release <r>  伪造内核版本（uname 的 release 字段）\n"
         "      --kill-on-exit    退出时结束容器内进程（清理 pid 账本）\n"
+        "  -L                    修正 lstat 对符号链接返回的 size"
+                                  "（proot 的 fix_symlink_size）\n"
         "      --about / --usage 打印信息\n\n"
         "明确未实现（传入会报错，不会静默忽略）:\n"
-        "  -H -L -p -q/--qemu --sysvipc --ashmem-memfd\n\n"
+        "  -H -p -q/--qemu --sysvipc --ashmem-memfd\n\n"
         "示例:\n"
         "  %s -r /data/rootfs -b /sdcard:/sdcard /bin/sh\n"
         "  %s -R /data/rootfs -0 /usr/bin/node --version\n",
@@ -220,6 +228,7 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
     cfg->fakeroot = 0;
     cfg->verbose = 0;
     cfg->link2symlink = 0;
+    cfg->fix_symlink_size = 0;
     cfg->runtime_lib = NULL;
     cfg->linker_lib = NULL;
     cfg->stub_loader = NULL;
@@ -463,11 +472,36 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                     "      静默忽略会让用户以为隐藏已生效。\n");
             return -1;
         } else if (strcmp(argv[i], "-L") == 0) {
-            fprintf(stderr,
-                    "错误: -L 未实现。\n"
-                    "      proot 的 -L 是「修正 lstat 对符号链接返回的 size」\n"
-                    "      扩展；本实现没有该扩展。明确拒绝而非静默忽略。\n");
-            return -1;
+            /*
+             * `-L`：proot 的「修正 lstat 对符号链接返回的 size」扩展。
+             *
+             * ★ 它到底修什么（读 proot 源码确认，不是推测）★
+             *
+             * `cli/proot.c:322` 的 handle_option_L() 初始化 fix_symlink_size
+             * 扩展；该扩展只 filter PR_lstat/PR_lstat64（SYSEXIT），逻辑是：
+             *     if (!S_ISLNK(statl.st_mode)) return 0;   // 不是链接就不管
+             *     size = readlink(path, buf, PATH_MAX);
+             *     st_size = (off_t)size;                  // = 目标字符串长度
+             *
+             * 即：**对真符号链接，把 st_size 钉成 readlink 返回的长度**。
+             * 内核对符号链接本来给的就是这个值，所以它常常是恒等操作；
+             * 它的注释写明「l2s 应当已经解链完毕」，说明它排在
+             * link2symlink 之后，管的是 l2s **没**接管的普通符号链接
+             * （典型是 /proc 下的魔法链接：st_size 有时是 0，而 readlink
+             * 返回实际长度）。
+             *
+             * ★ 它与 l2s 的 size 缺陷是两件事，不要混为一谈 ★
+             *
+             * 本项目的「伪造链接 lstat 的 size 不对」由 l2s 层**无条件**
+             * 修正（官方默认就如此，与 -L 无关，已实测：官方不传 -L 时
+             * lstat 的 size 正确）。传不传 -L 都该对。早前把两者当成同一
+             * 件事，是看到 -L 的说明里写着 "lstat 的 size" 就下了结论 ——
+             * 实测证明那是两回事。
+             *
+             * 所以这里只置一个环境变量，**不改变任何默认行为**：
+             * 与 proot 一致，默认不开。
+             */
+            cfg->fix_symlink_size = 1;
         } else if (strcmp(argv[i], "-p") == 0) {
             fprintf(stderr,
                     "错误: -p 未实现。\n"
@@ -513,7 +547,7 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                         "错误: 未知选项 '%s'\n"
                         "      用 -h/--help 看支持的选项；\n"
                         "      若这是 proot 的选项，本实现可能明确未支持它\n"
-                        "      （-H / -L / -p / -q / --sysvipc / --ashmem-memfd）。\n",
+                        "      （-H / -p / -q / --sysvipc / --ashmem-memfd）。\n",
                         argv[i]);
                 return -1;
             }
@@ -974,6 +1008,20 @@ int main(int argc, char **argv) {
 
     /* 设置 LD_PRELOAD（替换已有值，避免与系统原有 proroot 冲突） */
     setenv("LD_PRELOAD", cfg.runtime_lib, 1);
+
+    /*
+     * `-L`（fix_symlink_size）。
+     *
+     * ★ 必须成对 setenv/unsetenv ★
+     *
+     * 与 -k/--kernel-release 同一个理由：环境变量会被子进程继承，
+     * 若只在"传了才设"，用户上一次传过 -L 而这次没传时，旧值还留在
+     * 环境里 —— 表现为"选项关了却仍生效"。所以没传时显式清掉。
+     */
+    if (cfg.fix_symlink_size)
+        setenv("BXROOT_FIX_SYMLINK_SIZE", "1", 1);
+    else
+        unsetenv("BXROOT_FIX_SYMLINK_SIZE");
 
     if (cfg.verbose) {
         fprintf(stderr, "[bxroot-launcher] rootfs=%s\n", cfg.rootfs);

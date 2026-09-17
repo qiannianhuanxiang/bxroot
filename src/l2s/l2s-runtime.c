@@ -290,6 +290,56 @@ static int resolve_final(const char *mid, char *out_final, size_t outsz)
     return 0;
 }
 
+/*
+ * 把一个伪造链接的路径解析成它背后的最终数据文件路径。
+ *
+ * 【为什么需要这个入口（实测缺陷）】
+ *
+ * 客户从 lstat 得知伪造链接是**普通文件**，于是 coreutils 的 `cp -a`
+ * 会用 `open(path, O_RDONLY|O_NOFOLLOW)` 打开它 —— 这是 cp 保护自己
+ * 不被 TOCTOU 掉包的标准做法。但内核看到的是**符号链接**，O_NOFOLLOW
+ * 直接回 ELOOP：
+ *
+ *     cp -a a c
+ *       → /usr/bin/cp: cannot open '/tmp/x/a' for reading:
+ *         Too many levels of symbolic links
+ *
+ * 官方 proroot 不会：它在系统调用入口就把路径换成了数据文件
+ * （link2symlink.c 的 translated_path()），内核根本见不到那条链接。
+ *
+ * 本层是 LD_PRELOAD 方案，只能在钩子里补：既然客户明确说了"别跟随
+ * 符号链接"，而这条路径在我们的模拟里**本来就是普通文件**，那就把它
+ * 换成真正的普通文件（数据文件）再交给内核。
+ *
+ * 【返回约定】
+ *   1  = 已解析，out 里是宿主侧的数据文件路径
+ *   0  = 该路径不是伪造链接，调用方原样使用
+ *  <0  = 出错（调用方按原路径继续，不要因此让客户的调用失败 ——
+ *         模拟层不该因为自己的内部状态把客户的操作弄坏）
+ *
+ * ★ 判据复用 probe_fake_link / resolve_final，不新造第二套规则 ★
+ */
+int l2s_rt_resolve_fake_link(const char *path, char *out, size_t outsz)
+{
+    char mid[L2S_PATH_MAX];
+    char final[L2S_PATH_MAX];
+
+    if (!l2s_rt_enabled() || path == NULL || out == NULL || outsz == 0)
+        return 0;
+
+    if (!probe_fake_link(path, mid, sizeof(mid)))
+        return 0;
+
+    if (resolve_final(mid, final, sizeof(final)) != 0)
+        return 0;
+
+    if (strlen(final) >= outsz)
+        return -ENAMETOOLONG;
+
+    memcpy(out, final, strlen(final) + 1);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* link()                                                             */
 /* ------------------------------------------------------------------ */
@@ -516,53 +566,151 @@ int l2s_rt_rename(const char *oldpath, const char *newpath)
 
 /*
  * 客户 readlink 一个伪造链接时，内核返回中间层路径（客户从没听说过这
- * 个名字）。两种改写：
+ * 个名字）。
  *
- *   1. raw_target 形如 "<dir>/.l2s.<name>0001"     -> 还原成客户视角
- *   2. raw_target 形如 "<dir>/.l2s.<name>0001.0002" -> 还原成客户视角
+ * ================================================================
+ * ★ 2026-09-16 语义反转：不再「还原成客户名」，而是报告 EINVAL ★
+ * ================================================================
  *
- * 客户视角是什么？PRoot 的做法是让 readlink 返回**它所指向的数据文件**
- * 的客户化名字，也就是把中间的 l2s 装饰剥掉。对一个真实的硬链接，
- * readlink 本来应当 EINVAL —— 但模拟层不能返回 EINVAL，因为上层
- * （如 coreutils 的 cp -l 探测）会据此判断；PRoot 选择返回解装饰后的路径。
+ * 【旧行为及其后果（实测，不是推理）】
+ * 旧实现把中间层名解装饰后返回成功，即 `readlink(a)` →
+ * "/data/data/.../tmp/x/a" —— 恰好等于客户查询的那个路径，形似自环。
+ * 当时的设计理由是「不把内部名泄露给客户」。
+ *
+ * 但那个返回值与 lstat 的伪装**自相矛盾**：
+ *
+ *     lstat(a) → st_mode = S_IFREG   （本层刚抹掉 S_IFLNK）
+ *     readlink(a) → 成功返回一个路径 （只有符号链接才会成功）
+ *
+ * 工具据此判定"它是符号链接"，于是：
+ *     tar cf  → 按符号链接归档，并把**宿主绝对路径**
+ *               （/data/data/com.dsh.client/files/...）写进归档
+ *     cp -a   → cannot open '...': Too many levels of symbolic links
+ *   （后者是因为 cp 会拿 readlink 的结果自己去解析，形成自环）
+ *
+ * 【官方 proroot 的实测行为】
+ * 它不刻意让 readlink 失败 —— 失败是**结构性**的：官方在系统调用入口
+ * 就把伪造链接替换成最终数据文件（link2symlink.c 的 translated_path()），
+ * 所以内核看到的已经是普通文件，readlink 自然回 EINVAL。这正是
+ * 「mode 与 readlink 自洽」的来源。
+ *
+ * 【本函数的契约】
+ *   命中伪造链接        → 返回 L2S_RT_READLINK_FAKE（调用方转 EINVAL）
+ *   不是伪造链接        → 返回 0，调用方原样返回内核结果
+ *                          （用户自己的真符号链接走这条，不受影响）
+ *
+ * ★ 为什么必须由调用方转 EINVAL，而不是这里直接返回 -EINVAL ★
+ * 本层不碰 errno（见文件头的设计铁律：不直接做任何系统操作）。而且
+ * 0 与负数在本层有既定含义，用 -EINVAL 会和"普通错误"混在一起，调用方
+ * 无法区分"该失败"与"出错了"。所以用一个专属的正数哨兵。
+ *
+ * out 参数保留但不再被写入 —— 签名不变，避免破坏既有调用方。
  */
 int l2s_rt_rewrite_readlink(const char *path, const char *raw_target,
                             char *out, size_t outsz)
 {
     l2s_info info;
     const char *base;
+    char mid[L2S_PATH_MAX];
     int rc;
+
+    (void)out;
+    (void)outsz;
 
     if (!l2s_rt_enabled())
         return 0;
-    if (path == NULL || raw_target == NULL || out == NULL || outsz == 0)
-        return -EINVAL;
+    if (path == NULL || raw_target == NULL)
+        return 0;
 
     base = base_of(raw_target);
 
     /*
-     * 只处理带 l2s 前缀的目标。不带前缀的是用户自己的符号链接，
-     * 原样返回。
+     * 判据一：内核返回的目标带 l2s 前缀（"<...>/.l2s.<name>0001" 或
+     * 数据文件 "<...>/.l2s.<name>0001.0002"）。不带前缀的是用户自己的
+     * 符号链接，原样返回 —— **这一条保证了 reallink=true 不回归**。
      */
     if (!has_prefix(base))
         return 0;
 
-    rc = l2s_decode_ex(&g_cfg, raw_target, NULL, &info);
-    if (rc != L2S_OK)
+    /*
+     * 判据二：raw_target 必须是**指向本 path 的那条**伪造链接，而不是
+     * 碰巧同名的东西。
+     *
+     * ★ 这里不能只靠 raw_target 的前缀判断 ★
+     *
+     * path 是客户查询的路径，raw_target 是内核告诉我们的链接目标。
+     * 对伪造链接，raw_target 指向中间层。但用户完全可能手工建一条
+     * 指向 ".l2s.xxx" 的符号链接 —— 那条在客户眼里就是**普通符号链接**，
+     * readlink 必须正常返回它的目标。
+     *
+     * 判据与 stat 补丁完全一致（复用 probe_fake_link，不新造第二套规则）：
+     * 它 lstat(path) 确认是符号链接、读它的目标、确认目标是带前缀的
+     * l2s 名。命中即"这条路径确实是伪造链接"。
+     *
+     * ★ 这道判据同时挡掉 /proc/self/fd/N 的误伤 ★
+     *
+     * 【实测缺陷】把 readlink 改成失败后，`readlink("/proc/self/fd/N")`
+     * 也跟着 EINVAL 了 —— 而那是**必须正常**的：它是客户拿 fd 反查名字
+     * 的标准手段（node 的 uv_exepath、coreutils 的多处都在用）。实测：
+     *     官方: readlink(/proc/self/fd/N 指向数据文件) = OK "/tmp/p5/a"
+     *     bxroot(误伤时)                              = EINVAL
+     *
+     * 为什么会误伤：l2s 把伪造链接**透传**给内核时，客户路径 a 在磁盘上
+     * 是符号链接，指向数据文件；内核对 /proc/self/fd/N 解析后返回的是
+     * 数据文件路径（<...>/.l2s.a0001.0002），它**带 l2s 前缀**，于是
+     * 只判前缀的实现就把它当成"伪造链接"了。
+     *
+     * 但 probe_fake_link(path=p, ...) 里的 p 是 /proc/self/fd/N ——
+     * 它不是符号链接（是魔法链接），lstat 得到的不是 S_ISLNK，于是
+     * 返回 0，本函数跟着返回 0，readlink 正常返回内核结果。**这正是
+     * 官方行为**。
+     */
+    if (!probe_fake_link(path, mid, sizeof(mid)))
+        return 0;
+
+    if (l2s_decode_ex(&g_cfg, raw_target, NULL, &info) != L2S_OK)
         return 0;
 
     /*
-     * 中间层与数据文件都还原成「原始 basename」。两者的区别只在于
-     * 链接数，而链接数是模拟的内部记账，客户不该看见。
+     * ★ 判据三：只有「指向**中间层**」的才是客户可见的伪造链接 ★
+     *
+     * 【为什么必须区分中间层与数据文件（实测缺陷）】
+     *
+     * 磁盘布局是两级：
+     *     a  ->  <dir>/.l2s.a0001            （中间层，KIND_INTERMEDIATE）
+     *     <dir>/.l2s.a0001 -> <dir>/.l2s.a0001.0002   （数据文件，KIND_FINAL）
+     *
+     * 客户查询 `readlink(a)` 时，内核返回的是 **a 自己的目标** —— 中间层，
+     * 即 KIND_INTERMEDIATE。这才是"客户正对着一条伪造链接"，应当 EINVAL。
+     *
+     * 但 `readlink("/proc/self/fd/N")` 不是：内核对 fd 做的解析会**穿透**
+     * 整条链，返回**数据文件**路径（KIND_FINAL）。若对它也回 EINVAL，
+     * 就误伤了 fd 反查名字这条标准手段 —— 实测（probe5）：
+     *
+     *     官方: readlink(/proc/self/fd/N) = OK   "/tmp/p5/a"
+     *     bxroot(误伤时)                  = EINVAL
+     *
+     * 同一个误伤也解释了为什么必须保留**还原成客户名**的能力：对
+     * KIND_FINAL 的情形，客户需要拿到一个它认识的名字。
+     */
+    if (info.kind == L2S_KIND_INTERMEDIATE) {
+        g_stats.readlink_fixed++;
+        return L2S_RT_READLINK_FAKE;
+    }
+
+    /*
+     * KIND_FINAL（/proc/self/fd/N 的解析结果）：还原成客户本来的名字。
+     *
+     * ★ 这与上面那条并不矛盾 ★
+     *
+     * 客户看到的 `a` 是**普通文件**，所以 `readlink(a)` 必须失败；
+     * 但 `/proc/self/fd/N` 是客户拿 fd 反查"这个 fd 是哪个文件"，
+     * 内核对 fd 的解析穿透了整条链，客户理应得到它自己用的那个名字。
+     * 官方两条都这么做（probe5 实测：前者 EINVAL，后者返回客户路径）。
      */
     if (info.orig_name[0] == '\0')
         return 0;
 
-    /*
-     * 原始文件所在的目录：只有「中间层与原文件同目录」的布局才能还原出
-     * 目录。集中目录布局下编码本身不记录原目录，此时退化成只返回
-     * basename —— 与 PRoot 自己的信息量相同，不假装知道得更多。
-     */
     if (info.dir_known && info.orig_dir[0] != '\0')
         rc = snprintf(out, outsz, "%s/%s", info.orig_dir, info.orig_name);
     else
@@ -608,11 +756,97 @@ void l2s_rt_patch_stat(struct stat *st, const char *path)
     if (read_nlink(final, &count) != 0)
         return;
 
-    if (l2s_patch_nlink_value(st, count) > 0) {
-        if (g_hide_symlink)
+    /*
+     * ★ 回填数据文件的真实元数据 ★
+     *
+     * 【为什么必须做】
+     *
+     * 此前这里只改 `st_nlink` 与 `st_mode` 的 S_IFLNK 位，**其余字段保留
+     * 内核给的** —— 而内核给的是**符号链接的** stat，于是：
+     *
+     *     st_size = 符号链接目标字符串的长度（几十字节）
+     *     真实文件可能只有 5 字节
+     *
+     * 实测后果（不是理论）：
+     *     tar tvf  → 把伪造链接按**符号链接**归档，并把**宿主绝对路径**
+     *                写进归档（/data/data/com.dsh.client/files/...）
+     *     cp -a    → ELOOP（Too many levels of symbolic links）
+     * 官方 proroot 在同场景下 tar 输出普通文件、cp -a 成功。
+     *
+     * 【PRoot 的权威做法】
+     * `src/extension/link2symlink/link2symlink.c:860-890` 是**整体替换**：
+     *     status = lstat(final, &finalStat);
+     *     finalStat.st_nlink = <链长>;
+     *     finalStat.st_mode = statl.st_mode;   // 保留客户原本的
+     *     finalStat.st_uid  = statl.st_uid;
+     *     finalStat.st_gid  = statl.st_gid;
+     *     write_data(..., &finalStat, sizeof(finalStat));
+     *
+     * 即：把客户的整个结构体换成**数据文件的**，只保留 mode/uid/gid。
+     *
+     * 【这里为什么不整体替换，而是逐字段回填】
+     *
+     * 因为调用方的顺序是「先 fakeroot 后 l2s」（见 preload.c 的钩子）：
+     *     fakeroot_patch_stat(buf, ...);   // 已把 uid/gid 伪装成 0
+     *     l2s_rt_patch_stat(buf, p);       // 本函数
+     * 若整体替换，`st_uid`/`st_gid` 会被数据文件的真实属主覆盖，
+     * **把 fakeroot 的伪装抹掉** —— 那会让依赖 uid=0 的场景（apt/dpkg/
+     * pnpm）出问题。所以 uid/gid 必须保留 `st` 当前值。
+     *
+     * 【回填哪些字段】
+     *   st_size / st_ino / st_blocks —— 来自数据文件（这是本次要修的）
+     *   st_nlink —— 用读出的链长（下面的 l2s_patch_nlink_value）
+     *   st_mode  —— ★ 权限位取数据文件的，类型位置 S_IFREG ★
+     *   st_uid / st_gid —— ★ 保留不动（fakeroot 的成果）
+     *   时间戳 / st_dev / st_rdev —— 数据文件的（与 PRoot 一致）
+     *
+     * ★ st_mode 的权限位为什么必须取数据文件的（实测缺陷）★
+     *
+     * 内核给符号链接的权限位**恒为 0777**（Linux 规定，S_IFLNK 的权限位
+     * 无意义）。早前这里只抹类型位、保留权限位，于是客户看到
+     *     0100777   ← 一个"权限全开"的普通文件
+     * 而官方是
+     *     0100600   ← 数据文件本身（0640 建、被 umask 收敛后）的权限
+     *
+     * 实测后果（不是理论）：
+     *     stat $D/a   → bxroot: -rwxrwxrwx  官方: -rw-------
+     *     tar cf      → bxroot: rc=2 "Cannot open: Too many levels of
+     *                   symbolic links"      官方: rc=0
+     * 权限位是 lstat 全字段里**唯一**与官方不一致的字段（逐字段 diff
+     * 确认过），也是 tar 判定异常的最后一环。
+     *
+     * 数据文件的 mode 就在手边 —— final_st 已经为了 size/ino/blocks
+     * lstat 过一次，直接用，不额外付代价。
+     */
+    {
+        struct stat final_st;
+
+        if (g_ops->lstat(final, &final_st) == 0) {
+            st->st_size   = final_st.st_size;
+            st->st_ino    = final_st.st_ino;
+            st->st_blocks = final_st.st_blocks;
+            st->st_blksize= final_st.st_blksize;
+            st->st_dev    = final_st.st_dev;
+            st->st_rdev   = final_st.st_rdev;
+            st->st_atim   = final_st.st_atim;
+            st->st_mtim   = final_st.st_mtim;
+            st->st_ctim   = final_st.st_ctim;
+            /*
+             * 权限位取数据文件的，类型位按 g_hide_symlink 决定。
+             * st_uid / st_gid 仍不在这里 —— 它们保留 fakeroot 的结果。
+             */
+            if (g_hide_symlink)
+                st->st_mode = (final_st.st_mode & ~(mode_t)S_IFMT) | S_IFREG;
+            else
+                st->st_mode = final_st.st_mode;
+        } else if (g_hide_symlink) {
+            /* 拿不到数据文件时退化成旧行为：只改类型位 */
             st->st_mode = (st->st_mode & ~(mode_t)S_IFMT) | S_IFREG;
-        g_stats.nlink_patched++;
+        }
     }
+
+    if (l2s_patch_nlink_value(st, count) > 0)
+        g_stats.nlink_patched++;
 }
 
 /* 公共实现：stx_mode 为 NULL 时只补 nlink（历史行为，向后兼容）。 */
@@ -643,28 +877,33 @@ static void patch_statx_impl(unsigned int *stx_nlink, unsigned int *stx_mask,
     *stx_nlink = count;
 
     /*
-     * ★ stx_mode 也要补 —— 只补 nlink 会被 lstatSync 一眼看穿 ★
+     * ★ stx_mode：类型位抹成 S_IFREG，权限位取数据文件的 ★
      *
-     * statx 的 stx_mode 与 stat 的 st_mode 是同一个东西。磁盘上伪造
-     * 链接是符号链接，客户眼里必须是普通文件。只改 nlink 而留 S_IFLNK，
-     * 客户一句 lstatSync().isSymbolicLink() 就得到 true ——
-     * 而这个 API 正是本模块要骗过的那一个。
+     * statx 的 stx_mode 与 stat 的 st_mode 是同一个东西。磁盘上伪造链接
+     * 是符号链接，客户眼里必须是普通文件。只改 nlink 而留 S_IFLNK，客户
+     * 一句 lstatSync().isSymbolicLink() 就得到 true —— 而这个 API 正是
+     * 本模块要骗过的那一个。
      *
      * 【实测证据】裸 syscall(291) 探针（node/libuv 走的正是这条路）：
      *     官方 proroot: mode=0100600 nlink=2 islnk=0
      *     bxroot      : mode=0120777 nlink=1 islnk=1   ← 修前
-     *                   mode=0100777 nlink=2 islnk=0   ← 修后
+     *                   mode=0100777 nlink=2 islnk=0   ← 只抹类型位
+     *                   mode=0100600 nlink=2 islnk=0   ← 权限位也取数据文件后
      *
-     * 【与 stat 那条路保持一致】
-     * l2s_rt_patch_stat() 早就在抹 S_IFLNK 了；statx 只是同一个语义
-     * 的现代接口，没有理由区别对待 —— 此前的差异纯属遗漏。
-     */
-    /*
+     * 最后那一跳的必要性与 l2s_rt_patch_stat() 完全相同（那里有完整实测）：
+     * 符号链接的权限位恒为 0777，客户看到的必须是数据文件的权限位。
+     *
      * 精确的 2 字节写（stx_mode 是 __u16）。见 l2s-runtime.h 的类型说明 ——
      * 早前按 4 字节写会越界覆盖 __spare0，属未定义行为。
      */
-    if (stx_mode != NULL && g_hide_symlink)
-        *stx_mode = (uint16_t)((*stx_mode & ~(uint16_t)S_IFMT) | (uint16_t)S_IFREG);
+    if (stx_mode != NULL && g_hide_symlink) {
+        struct stat final_st;
+
+        if (g_ops->lstat(final, &final_st) == 0)
+            *stx_mode = (uint16_t)((final_st.st_mode & ~(mode_t)S_IFMT) | S_IFREG);
+        else
+            *stx_mode = (uint16_t)((*stx_mode & ~(uint16_t)S_IFMT) | (uint16_t)S_IFREG);
+    }
 
     g_stats.nlink_patched++;
 }
@@ -673,6 +912,95 @@ static void patch_statx_impl(unsigned int *stx_nlink, unsigned int *stx_mask,
  * 4 参数版本：只补 nlink。**签名保持不变**，因为 preload.c 现有的
  * statx 钩子按这个签名调用，改签名会让别人的编译单元直接编不过。
  */
+/* ------------------------------------------------------------------ */
+/* statx：传整个结构体的版本                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * struct statx 的字段偏移（offsetof 实测，不是推算）。
+ *
+ * 这里**刻意不包含 <linux/stat.h>** —— 它会与 <sys/stat.h> 冲突
+ * （两者都定义 statx 相关类型）。本项目的 syscall_guard.c 早就采用了
+ * "只记偏移、不引头文件"的做法，这里保持一致。
+ */
+#define L2S_STX_MASK_OFF    0u
+#define L2S_STX_NLINK_OFF  16u
+#define L2S_STX_MODE_OFF   28u
+#define L2S_STX_INO_OFF    32u
+#define L2S_STX_SIZE_OFF   40u
+#define L2S_STX_BLOCKS_OFF 48u
+
+#define L2S_STX_U16(base, off) (*(uint16_t *)(void *)((unsigned char *)(base) + (off)))
+#define L2S_STX_U32(base, off) (*(uint32_t *)(void *)((unsigned char *)(base) + (off)))
+#define L2S_STX_U64(base, off) (*(uint64_t *)(void *)((unsigned char *)(base) + (off)))
+
+void l2s_rt_patch_statx_buf(void *sx, unsigned int statx_nlink_bit,
+                            const char *path)
+{
+    char mid[L2S_PATH_MAX];
+    char final[L2S_PATH_MAX];
+    unsigned int count;
+    struct stat final_st;
+    int have_final = 0;
+
+    if (!l2s_rt_enabled() || sx == NULL || path == NULL)
+        return;
+
+    /* mask 未声明 NLINK 时不该改写（与 statx 语义一致：
+     * 未声明的字段是未定义的，写进去会让客户读到垃圾）。 */
+    if ((L2S_STX_U32(sx, L2S_STX_MASK_OFF) & statx_nlink_bit) == 0)
+        return;
+
+    if (!probe_fake_link(path, mid, sizeof(mid)))
+        return;
+
+    if (resolve_final(mid, final, sizeof(final)) != 0)
+        return;
+
+    if (read_nlink(final, &count) != 0)
+        return;
+
+    /*
+     * 回填数据文件的真实元数据 —— 与 l2s_rt_patch_stat 同源同理由。
+     *
+     * 只改 nlink/mode 是不够的：`stx_size` 会是符号链接目标字符串的长度，
+     * 于是 `tar` 判断"这是链接"（它看 readlink 有结果 + size 异常），
+     * 把宿主绝对路径写进归档；`cp -a` 则直接 ELOOP。
+     *
+     * ★ 不改 stx_uid / stx_gid ★
+     * 调用方是「先 fakeroot 后 l2s」（preload.c 的钩子顺序），
+     * fakeroot 已经把 uid/gid 伪装成 0，覆盖它会抹掉伪装。
+     */
+    if (g_ops->lstat(final, &final_st) == 0) {
+        have_final = 1;
+        L2S_STX_U64(sx, L2S_STX_INO_OFF)    = (uint64_t)final_st.st_ino;
+        L2S_STX_U64(sx, L2S_STX_SIZE_OFF)   = (uint64_t)final_st.st_size;
+        L2S_STX_U64(sx, L2S_STX_BLOCKS_OFF) = (uint64_t)final_st.st_blocks;
+    }
+
+    L2S_STX_U32(sx, L2S_STX_NLINK_OFF) = count;
+
+    /*
+     * stx_mode 是 __u16（2 字节）—— 精确写，别越界覆盖其后的 padding。
+     *
+     * 权限位取数据文件的（与 patch_statx_impl / l2s_rt_patch_stat 同一
+     * 道理，那里有完整实测证据）：符号链接的权限位恒为 0777，只抹类型位
+     * 会让客户看到 0100777，而官方是数据文件的 0100600。
+     */
+    if (g_hide_symlink) {
+        if (have_final) {
+            L2S_STX_U16(sx, L2S_STX_MODE_OFF) =
+                (uint16_t)((final_st.st_mode & ~(mode_t)S_IFMT) | S_IFREG);
+        } else {
+            uint16_t m = L2S_STX_U16(sx, L2S_STX_MODE_OFF);
+            L2S_STX_U16(sx, L2S_STX_MODE_OFF) =
+                (uint16_t)((m & ~(uint16_t)S_IFMT) | (uint16_t)S_IFREG);
+        }
+    }
+
+    g_stats.nlink_patched++;
+}
+
 void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
                         unsigned int statx_nlink_bit, const char *path)
 {

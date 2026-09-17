@@ -118,6 +118,8 @@ static ssize_t l2s_real_readlink(const char *p, char *b, size_t sz);
 static int l2s_real_access(const char *p, int m);
 static int l2s_real_read_small(const char *p, char *b, size_t sz, size_t *len);
 static int l2s_real_write_small(const char *p, const char *b, size_t len);
+static int resolve_dirfd_path(int dirfd, const char *path,
+                              char *out, size_t outsz);
 
 static const l2s_rt_ops L2S_OPS = {
     l2s_real_lstat, l2s_real_symlink, l2s_real_rename, l2s_real_unlink,
@@ -136,6 +138,28 @@ static fakeroot_state g_fakeroot_state;
 
 /* fakeroot 是否可用（初始化成功且已启用）。热路径上用它做一次短路。 */
 static int g_fakeroot_on = 0;
+
+/*
+ * `-L`（proot 的 fix_symlink_size）是否启用。
+ *
+ * 语义（读 proot 的 fix_symlink_size.c 确认）：对**真符号链接**，
+ * 把 st_size 钉成 readlink() 返回的长度。默认关闭 —— 与 proot 一致。
+ *
+ * 与 l2s 的 size 补丁**互不相干**：伪造链接的 size 由 l2s 层无条件修正
+ * （官方默认就对，已实测；传不传 -L 都该对）。本开关管的是 l2s 没接管
+ * 的那些普通符号链接。
+ */
+static int g_fix_symlink_size = 0;
+
+/*
+ * 「工作目录已设过」的标记变量名。
+ *
+ * 本 .so 会在**每个** exec 出来的进程里重新加载，构造函数随之再跑一遍。
+ * BXROOT_WORKDIR 的语义是「容器启动时 cwd 设到哪里」，只在首个进程做一次；
+ * 用环境变量当跨 exec 的标记（环境变量会被 fork/exec 继承）。
+ * 详见构造函数里那段长注释的实测证据。
+ */
+#define BXROOT_WORKDIR_DONE_ENV "BXROOT_WORKDIR_DONE"
 
 /* 全局配置实例 */
 bxroot_config_t g_config = {0};
@@ -1045,6 +1069,107 @@ static int call_real_openat(int dirfd, const char *path, int flags, mode_t mode)
     return -1;
 }
 
+/*
+ * ====================================================================
+ * ★ O_NOFOLLOW + 伪造链接 = ELOOP ★
+ * ====================================================================
+ *
+ * 【缺陷（实测，2026-09-16）】
+ *
+ * 客户从 lstat 得知伪造链接是**普通文件**，于是 coreutils 的 `cp -a`
+ * 用 `open(path, O_RDONLY|O_NOFOLLOW)` 打开它 —— 这是 cp 防止
+ * TOCTOU 掉包的标准做法。但磁盘上那仍是**符号链接**，O_NOFOLLOW 让
+ * 内核直接回 ELOOP：
+ *
+ *     $ cp -a /tmp/x/a /tmp/x/c
+ *     /usr/bin/cp: cannot open '/tmp/x/a' for reading:
+ *     Too many levels of symbolic links
+ *
+ * 官方 proroot 不会：它在**系统调用入口**就把伪造链接替换成最终数据
+ * 文件（link2symlink.c 的 translated_path()），内核根本见不到那条链接，
+ * 所以 O_NOFOLLOW 看到的是一个货真价实的普通文件。
+ *
+ * 【本层怎么补】
+ * 客户说"别跟随符号链接"，而这条路径在模拟语义里**本来就是普通文件**
+ * —— 那就把路径换成真正的普通文件（数据文件）再交给内核。语义正好
+ * 对应：客户不想跟随链接，我们给它链接背后的那个文件本身。
+ *
+ * 【只对伪造链接生效】
+ * 用户自己的真符号链接必须保持 ELOOP（那是 O_NOFOLLOW 的正确语义）。
+ * 判据交给 l2s 层的 l2s_rt_resolve_fake_link —— 与新造一套"怎么认
+ * 伪造链接"的规则相比，复用是唯一不会产生第二套判据的做法。
+ *
+ * p 必须是**翻译后的宿主路径**（中间层与数据文件都在宿主侧）。
+ */
+static const char *l2s_open_path(const char *p, int flags,
+                                char *scratch, size_t scratchsz)
+{
+    if (p == NULL || (flags & O_NOFOLLOW) == 0)
+        return p;
+    if (l2s_rt_resolve_fake_link(p, scratch, scratchsz) == 1)
+        return scratch;
+    return p;
+}
+
+/*
+ * ====================================================================
+ * ★ -L：修正 lstat 对符号链接返回的 size ★
+ * ====================================================================
+ *
+ * proot 的 fix_symlink_size 扩展（src/extension/fix_symlink_size/）：
+ * 只 filter PR_lstat / PR_lstat64，成功返回后
+ *
+ *     if (!S_ISLNK(statl.st_mode)) return 0;   // 不是符号链接 → 不管
+ *     size = readlink(original, intermediate, PATH_MAX);
+ *     statl.st_size = (off_t)size;             // 钉成目标串长度
+ *
+ * 也就是说它把 st_size 设成 **readlink 返回的字节数**，而不是 st_size
+ * 原本的值。同架构下内核对符号链接给的通常就是同一个数，所以它多为
+ * 恒等操作；真正有差别的是 /proc 下的魔法链接 —— 例如
+ * /proc/self/cwd 的 st_size 是 0，而 readlink 返回实际路径长度。
+ *
+ * ★ 默认关闭 ★ 与 proot 一致（-L 是显式选项）。
+ *
+ * p 必须是**翻译后的宿主路径**（readlink 要用同一条路径去看目标）。
+ */
+static void l2s_fix_symlink_size(struct stat *st, const char *p)
+{
+    char target[MAX_PATH_LEN];
+    ssize_t n;
+
+    if (!g_fix_symlink_size || st == NULL || p == NULL)
+        return;
+
+    /* 只对符号链接生效 —— 与 proot 的 S_ISLNK 门控一致。 */
+    if (!S_ISLNK(st->st_mode))
+        return;
+
+    /*
+     * ★ /proc/self/exe 要用**客户可见**的长度，不是宿主真实长度 ★
+     *
+     * 这个路径被 readlink 钩子改写过（返回 g_config.guest_exe，那是客户
+     * 以为自己是哪个程序）。若这里仍按宿主真实目标算，客户会看到
+     *     st_size = strlen("<...>/libproroot-bridge.so") = 107
+     *     readlink()                                        = "/tmp/lprobe" (11)
+     * 两者不一致 —— 而"size 与 readlink 一致"正是 -L 要保证的东西。
+     * 本函数存在的全部意义就是让这两个数对得上，不能自己制造新的不一致。
+     */
+    if (p != NULL && g_config.guest_exe != NULL &&
+        g_config.guest_exe[0] != '\0' &&
+        (strcmp(p, "/proc/self/exe") == 0 ||
+         strcmp(p, "/proc/thread-self/exe") == 0)) {
+        st->st_size = (off_t)strlen(g_config.guest_exe);
+        return;
+    }
+
+    n = real_readlink != NULL ? real_readlink(p, target, sizeof(target))
+                              : readlink(p, target, sizeof(target));
+    if (n < 0)
+        return;                     /* 读不到目标就保持原值，不乱猜 */
+
+    st->st_size = (off_t)n;
+}
+
 /* Hook: open */
 int open(const char *path, int flags, ...) {
     ensure_real_functions();
@@ -1058,10 +1183,15 @@ int open(const char *path, int flags, ...) {
     }
 
     char translated[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    const char *q;
+
     if (translate_path(path, translated, sizeof(translated)) > 0) {
-        return call_real_open(translated, flags, mode);
+        q = l2s_open_path(translated, flags, resolved, sizeof(resolved));
+        return call_real_open(q, flags, mode);
     }
-    return call_real_open(path, flags, mode);
+    q = l2s_open_path(path, flags, resolved, sizeof(resolved));
+    return call_real_open(q, flags, mode);
 }
 
 /* Hook: open64 */
@@ -1077,10 +1207,101 @@ int open64(const char *path, int flags, ...) {
     }
 
     char translated[MAX_PATH_LEN];
+        char resolved[MAX_PATH_LEN];
+    const char *q;
+
     if (translate_path(path, translated, sizeof(translated)) > 0) {
-        return real_open64(translated, flags, mode);
+        q = l2s_open_path(translated, flags, resolved, sizeof(resolved));
+        return real_open64(q, flags, mode);
     }
-    return real_open64(path, flags, mode);
+    q = l2s_open_path(path, flags, resolved, sizeof(resolved));
+    return real_open64(q, flags, mode);
+}
+
+/*
+ * ====================================================================
+ * ★ (dirfd, 相对路径) → 绝对宿主路径 ★
+ * ====================================================================
+ *
+ * 【为什么需要这个统一入口（反复踩过的同一类缺陷）】
+ *
+ * 本项目已经**三次**因为"相对路径 + dirfd"这一形态漏处理而出缺陷：
+ *     ① fstatat 漏接 l2s 补丁（node 的 statSync 全走它）
+ *     ② readlinkat 相对名漏改写（tar 遍历目录时用）
+ *     ③ openat + O_NOFOLLOW 漏解链（tar 判断"是不是链接"时用）
+ *
+ * 三者的**根因完全相同**：translate_path() 对相对路径返回 0（它只翻
+ * 绝对路径），于是 p 保持相对名，后续一切"拿 p 去判据"的逻辑都按
+ * **进程 cwd** 解析，而客户的意思是**相对 dirfd**。cwd 恰好等于 dirfd
+ * 时看着是对的 —— 这就是它难以被单点测试发现的原因。
+ *
+ * 【统一怎么解】
+ * 用 /proc/self/fd/<dirfd> 读出目录的真实宿主路径，与 path 拼成绝对
+ * 路径，再交给 translate_path。l2s 层因此可以保持"只认绝对路径"这个
+ * 简单不变量（它所有判据都建立在宿主绝对路径上）。
+ *
+ * 【AT_FDCWD 是特例】
+ * 值 -100，**不是**真实 fd，不能拿去做 /proc/self/fd/-100。
+ * 它表示"相对于 cwd"，此时原样返回（调用方按既有逻辑走）。
+ *
+ * 返回 1 = 已拼成绝对路径（out 有效）；0 = 调用方按原样处理。
+ */
+static int resolve_dirfd_path(int dirfd, const char *path,
+                              char *out, size_t outsz)
+{
+    char proc[64];
+    char dir[MAX_PATH_LEN];
+    ssize_t n;
+    size_t dlen;
+
+    if (dirfd == AT_FDCWD || path == NULL || path[0] == '\0')
+        return 0;
+
+    /* 绝对路径与 dirfd 无关（内核也忽略 dirfd） */
+    if (path[0] == '/')
+        return 0;
+
+    snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dirfd);
+    n = real_readlink != NULL ? real_readlink(proc, dir, sizeof(dir) - 1)
+                              : readlink(proc, dir, sizeof(dir) - 1);
+    if (n <= 0)
+        return 0;                   /* 拿不到目录就退回原行为，不乱猜 */
+    dir[n] = '\0';
+
+    /*
+     * 去重斜杠：dir 以 '/' 结尾（根目录）时不要再插一个。
+     */
+    dlen = (size_t)n;
+    if (dlen > 0 && dir[dlen - 1] == '/')
+        snprintf(out, outsz, "%s%s", dir, path);
+    else
+        snprintf(out, outsz, "%s/%s", dir, path);
+
+    return 1;
+}
+
+/*
+ * 把 (dirfd, path) 统一解析成**绝对宿主路径**，供后续 l2s 判据使用。
+ *
+ * 顺序：先按 dirfd 拼绝对（若有 dirfd）→ 再 translate_path 加 rootfs 前缀。
+ * translate_path 是幂等的（已带前缀时返回 0 并原样拷贝），所以两条分支
+ * 都安全。
+ *
+ * 返回的指针可能是 out_host（拼好的宿主路径）或 path 本身。
+ */
+static const char *resolve_host_path(int dirfd, const char *path,
+                                     char *joined, size_t joinedsz,
+                                     char *out_host, size_t out_hostsz)
+{
+    const char *abs = path;
+
+    if (resolve_dirfd_path(dirfd, path, joined, joinedsz) == 1)
+        abs = joined;
+
+    if (abs != NULL && translate_path(abs, out_host, out_hostsz) > 0)
+        return out_host;
+
+    return abs;
 }
 
 /* Hook: openat */
@@ -1096,10 +1317,22 @@ int openat(int dirfd, const char *path, int flags, ...) {
     }
 
     char translated[MAX_PATH_LEN];
-    if (translate_path(path, translated, sizeof(translated)) > 0) {
-        return call_real_openat(dirfd, translated, flags, mode);
-    }
-    return call_real_openat(dirfd, path, flags, mode);
+    char joined[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    const char *q;
+
+    /*
+     * ★ 必须先把 (dirfd, 相对名) 拼成绝对宿主路径 ★
+     *
+     * 否则 translate_path 对相对名返回 0，q 停在 "a"，l2s 层就 probe
+     * 不到伪造链接 —— O_NOFOLLOW 会直接撞上磁盘上那条符号链接并回
+     * ELOOP。tar 正是用 openat(dirfd, name, O_NOFOLLOW) 判断"它是不是
+     * 链接"的，于是把中间层名字写进归档（实测）。
+     */
+    q = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
+    q = l2s_open_path(q, flags, resolved, sizeof(resolved));
+    return call_real_openat(dirfd, q, flags, mode);
 }
 
 /* Hook: openat64 */
@@ -1115,10 +1348,15 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     }
 
     char translated[MAX_PATH_LEN];
-    if (translate_path(path, translated, sizeof(translated)) > 0) {
-        return real_openat64(dirfd, translated, flags, mode);
-    }
-    return real_openat64(dirfd, path, flags, mode);
+    char joined[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    const char *q;
+
+    /* 与 openat 同理：先拼绝对路径，否则 O_NOFOLLOW 会撞上伪造链接 */
+    q = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
+    q = l2s_open_path(q, flags, resolved, sizeof(resolved));
+    return real_openat64(dirfd, q, flags, mode);
 }
 
 /* Hook: stat */
@@ -1199,11 +1437,23 @@ int newfstatat(int dirfd, const char *path, struct stat *buf, int flags) {
     }
 
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *p = path;
     int rc;
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /*
+     * ★ 必须按 dirfd 解析相对名 ★
+     *
+     * translate_path() 只翻绝对路径；相对名（tar 的
+     * openat+fstatat 组合、node 的 dirfd 用法）原样返回，
+     * 于是 l2s 层拿 "a" 去 probe —— 那是相对**进程 cwd**
+     * 解析的，不是相对 dirfd。cwd 恰好等于 dirfd 时看着
+     * 是对的，一旦不同就 probe 不到，伪造链接的 S_IFLNK
+     * 抹不掉 → 客户（tar）判定"这是符号链接" → 去 readlink
+     * → EINVAL → "Cannot readlink" 而失败。
+     */
+    p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
 
     rc = real_newfstatat(dirfd, p, buf, flags);
     if (rc == 0 && g_fakeroot_on)
@@ -1224,11 +1474,23 @@ int newfstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
     }
 
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *p = path;
     int rc;
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /*
+     * ★ 必须按 dirfd 解析相对名 ★
+     *
+     * translate_path() 只翻绝对路径；相对名（tar 的
+     * openat+fstatat 组合、node 的 dirfd 用法）原样返回，
+     * 于是 l2s 层拿 "a" 去 probe —— 那是相对**进程 cwd**
+     * 解析的，不是相对 dirfd。cwd 恰好等于 dirfd 时看着
+     * 是对的，一旦不同就 probe 不到，伪造链接的 S_IFLNK
+     * 抹不掉 → 客户（tar）判定"这是符号链接" → 去 readlink
+     * → EINVAL → "Cannot readlink" 而失败。
+     */
+    p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
 
     rc = real_newfstatat64(dirfd, p, buf, flags);
     if (rc == 0 && g_fakeroot_on)
@@ -1276,6 +1538,19 @@ int lstat(const char *path, struct stat *buf) {
     if (rc == 0)
         l2s_rt_patch_stat(buf, p);
 
+    /*
+     * ★ -L 必须在 l2s **之后** ★
+     *
+     * 顺序不能反：l2s 把伪造链接的 mode 从 S_IFLNK 改成 S_IFREG。若 -L
+     * 先跑，它会看到 S_ISLNK 并把 size 钉成目标串长度，把 l2s 刚回填的
+     * 真实大小覆盖掉 —— 正好退回本次要修的缺陷。
+     *
+     * 这个顺序与 proot 一致：它的 link2symlink 与 fix_symlink_size 都是
+     * 扩展，而 -L 的注释明确写着「l2s 应当已经解链完毕」，即它排在后面。
+     */
+    if (rc == 0)
+        l2s_fix_symlink_size(buf, p);
+
     return rc;
 }
 
@@ -1297,6 +1572,9 @@ int lstat64(const char *path, struct stat64 *buf) {
     /* l2s：与 lstat 一致 */
     if (rc == 0)
         l2s_rt_patch_stat((struct stat *)buf, p);
+    /* -L：同样必须在 l2s 之后（理由见 lstat 钩子） */
+    if (rc == 0)
+        l2s_fix_symlink_size((struct stat *)buf, p);
     return rc;
 }
 
@@ -1463,6 +1741,7 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
     ensure_real_functions();
 
     char translated[MAX_PATH_LEN];
+    const char *p = path;
     ssize_t n;
 
     /*
@@ -1579,7 +1858,17 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
         }
     }
 
+    /*
+     * ★ 必须把**翻译后的宿主路径**交给 l2s 层，不是客户给的 guest 路径 ★
+     *
+     * l2s 层的一切 FS 操作都在宿主侧（中间层、数据文件都在 rootfs 内），
+     * 它的 probe_fake_link() 会拿这个路径去 lstat。用 guest 路径它就
+     * probe 不到，readlink 于是原样漏出内部名 ".l2s.a0001"。
+     *
+     * 这与 stat/lstat 钩子处的做法一致（那里传的也是 p）。
+     */
     if (translate_path(path, translated, sizeof(translated)) > 0) {
+        p = translated;
         n = real_readlink(translated, buf, buf_size);
     } else {
         n = real_readlink(path, buf, buf_size);
@@ -1588,22 +1877,24 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
         return n;
 
     /*
-     * 反转译：内核可能回给我们的是 l2s 内部路径（中间层名），
-     * 客户从没见过这个名字，看到就等于看穿了模拟。
-     *
-     * 必须自己补 NUL 再交给 l2s 层 —— readlink 不保证结尾有 NUL，
-     * 而 l2s_rt_rewrite_readlink() 按 C 字符串处理。这也是历史上
-     * 官方实现出过越界读的地方（issue #22）。
+     * 伪造链接的 readlink 必须失败（EINVAL）—— 见 l2s_rt_rewrite_readlink
+     * 的长注释。判据在 l2s 层，这里只负责把哨兵转成 errno 语义。
      */
     {
         char raw[MAX_PATH_LEN];
         char fixed[MAX_PATH_LEN];
         size_t copy = (size_t)n < sizeof(raw) - 1 ? (size_t)n : sizeof(raw) - 1;
+        int lrc;
 
         memcpy(raw, buf, copy);
         raw[copy] = '\0';
 
-        if (l2s_rt_rewrite_readlink(path, raw, fixed, sizeof(fixed)) == 1) {
+        lrc = l2s_rt_rewrite_readlink(p, raw, fixed, sizeof(fixed));
+        if (lrc == L2S_RT_READLINK_FAKE) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (lrc == 1) {
             size_t flen = strlen(fixed);
             if (flen > buf_size)
                 flen = buf_size;          /* 截断，与 readlink(2) 语义一致 */
@@ -1746,6 +2037,7 @@ int unlink(const char *path) {
 int __open_2(const char *path, int flags) {
     static int (*fn)(const char *, int) = NULL;
     char translated[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
     const char *p = path;
 
     if (fn == NULL)
@@ -1754,12 +2046,25 @@ int __open_2(const char *path, int flags) {
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
+    /*
+     * ★ l2s 解链必须在这里也做一遍 ★
+     *
+     * __open_2 / __openat_2 是 glibc 的 _FORTIFY_SOURCE 变体，
+     * **完全绕过 open()/openat()**。tar 正是用它们打开成员的：
+     *     nm -D tar | grep open
+     *       U __open_2
+     *       U __openat_2
+     * 所以前一版只修 open/openat/open64/openat64 时，tar 走的这条
+     * 路完全没有解链，O_NOFOLLOW 直接撞上磁盘上的符号链接 → ELOOP。
+     */
+    p = l2s_open_path(p, flags, resolved, sizeof(resolved));
     return fn(p, flags);
 }
 
 int __open64_2(const char *path, int flags) {
     static int (*fn)(const char *, int) = NULL;
     char translated[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
     const char *p = path;
 
     if (fn == NULL)
@@ -1768,34 +2073,46 @@ int __open64_2(const char *path, int flags) {
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
+    /* 与 __open_2 同理：fortify 变体绕过 open64，也要解链 */
+    p = l2s_open_path(p, flags, resolved, sizeof(resolved));
     return fn(p, flags);
 }
 
 int __openat_2(int dirfd, const char *path, int flags) {
     static int (*fn)(int, const char *, int) = NULL;
     char translated[MAX_PATH_LEN];
-    const char *p = path;
+    char joined[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    const char *p;
 
     if (fn == NULL)
         fn = (int (*)(int, const char *, int))bxroot_next_symbol("__openat_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /* 与 __open_2 同理：fortify 变体绕过 openat，必须自己解链。
+     * 且相对名要先按 dirfd 拼成绝对路径，否则 O_NOFOLLOW 撞上
+     * 伪造链接 → ELOOP（tar 的 "Cannot open"）。 */
+    p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
+    p = l2s_open_path(p, flags, resolved, sizeof(resolved));
     return fn(dirfd, p, flags);
 }
 
 int __openat64_2(int dirfd, const char *path, int flags) {
     static int (*fn)(int, const char *, int) = NULL;
     char translated[MAX_PATH_LEN];
-    const char *p = path;
+    char joined[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    const char *p;
 
     if (fn == NULL)
         fn = (int (*)(int, const char *, int))bxroot_next_symbol("__openat64_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /* 与 __openat_2 同理：dirfd 拼绝对路径 + l2s 解链 */
+    p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
+    p = l2s_open_path(p, flags, resolved, sizeof(resolved));
     return fn(dirfd, p, flags);
 }
 
@@ -1824,16 +2141,22 @@ ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen) {
     if (n <= 0)
         return n;
 
-    /* 与 readlink 一致：把内核回给我们的 l2s 内部名反转译回客户视角 */
+    /* 与 readlink 一致：伪造链接必须 EINVAL（理由见 readlink 钩子） */
     {
         char raw[MAX_PATH_LEN];
         char fixed[MAX_PATH_LEN];
         size_t copy = (size_t)n < sizeof(raw) - 1 ? (size_t)n : sizeof(raw) - 1;
+        int lrc;
 
         memcpy(raw, buf, copy);
         raw[copy] = '\0';
 
-        if (l2s_rt_rewrite_readlink(path, raw, fixed, sizeof(fixed)) == 1) {
+        lrc = l2s_rt_rewrite_readlink(p, raw, fixed, sizeof(fixed));
+        if (lrc == L2S_RT_READLINK_FAKE) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (lrc == 1) {
             size_t flen = strlen(fixed);
             if (flen > len)
                 flen = len;
@@ -1864,14 +2187,29 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
         return n;
 
     {
+        char joined[MAX_PATH_LEN];
         char raw[MAX_PATH_LEN];
         char fixed[MAX_PATH_LEN];
         size_t copy = (size_t)n < sizeof(raw) - 1 ? (size_t)n : sizeof(raw) - 1;
+        int lrc;
+
+        /* 与 readlinkat 一致：相对名要靠 dirfd 拼成绝对路径（见那里的注释） */
+        if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1) {
+            if (translate_path(joined, translated, sizeof(translated)) > 0)
+                p = translated;
+            else
+                p = joined;
+        }
 
         memcpy(raw, buf, copy);
         raw[copy] = '\0';
 
-        if (l2s_rt_rewrite_readlink(path, raw, fixed, sizeof(fixed)) == 1) {
+        lrc = l2s_rt_rewrite_readlink(p, raw, fixed, sizeof(fixed));
+        if (lrc == L2S_RT_READLINK_FAKE) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (lrc == 1) {
             size_t flen = strlen(fixed);
             if (flen > len)
                 flen = len;
@@ -1935,7 +2273,23 @@ int __xstat(int ver, const char *path, struct stat *buf) {
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
 
-    rc = fn(ver, p, buf);
+    /*
+     * ★ ver 参数归一化为 0 ★
+     *
+     * `__xstat`/`__lxstat`/`__fxstat` 家族是 glibc 的旧 ABI，第一个
+     * 参数是「结构体版本」。aarch64 上 glibc 只认 `_STAT_VER == 0`
+     * （glibc 2.33+ 已把该宏从公开头文件移除，所以直接写字面量）。
+     *
+     * 调用方可能传别的值（旧约定/其他架构的习惯），此时 glibc 回
+     * EINVAL，客户于是以为 stat 失败、退化成 open 探测 —— 那正是
+     * `tar`/`dash` 走到 ELOOP 的那条路。
+     *
+     * 实测（/root/probe/ver.c，ver=0..3 逐个测）：
+     *     官方  : ver=0,1,2,3 全部 rc=0 OK
+     *     bxroot: ver=0 OK，ver=1,2,3 → EINVAL   ← 修前
+     * 官方对任意 ver 都接受，所以这里归一化成 0 与它对齐。
+     */
+    rc = fn(0, p, buf);
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat(buf, &g_fakeroot_state);
     /* l2s：旧 ABI 家族同样要接线，否则老程序看到 st_nlink=1 */
@@ -1957,13 +2311,32 @@ int __lxstat(int ver, const char *path, struct stat *buf) {
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
 
-    rc = fn(ver, p, buf);
+    /*
+     * ★ ver 参数归一化为 0 ★
+     *
+     * `__xstat`/`__lxstat`/`__fxstat` 家族是 glibc 的旧 ABI，第一个
+     * 参数是「结构体版本」。aarch64 上 glibc 只认 `_STAT_VER == 0`
+     * （glibc 2.33+ 已把该宏从公开头文件移除，所以直接写字面量）。
+     *
+     * 调用方可能传别的值（旧约定/其他架构的习惯），此时 glibc 回
+     * EINVAL，客户于是以为 stat 失败、退化成 open 探测 —— 那正是
+     * `tar`/`dash` 走到 ELOOP 的那条路。
+     *
+     * 实测（/root/probe/ver.c，ver=0..3 逐个测）：
+     *     官方  : ver=0,1,2,3 全部 rc=0 OK
+     *     bxroot: ver=0 OK，ver=1,2,3 → EINVAL   ← 修前
+     * 官方对任意 ver 都接受，所以这里归一化成 0 与它对齐。
+     */
+    rc = fn(0, p, buf);
     /* 与 lstat 保持一致：proot 同样对 lstat 家族做 owner 改写 */
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat(buf, &g_fakeroot_state);
     /* l2s：__lxstat 是 lstat 的旧 ABI 入口，同样要抹掉 S_IFLNK */
     if (rc == 0)
         l2s_rt_patch_stat(buf, p);
+    /* -L：__lxstat 是 lstat 的旧 ABI 入口，语义相同（必须在 l2s 之后） */
+    if (rc == 0)
+        l2s_fix_symlink_size(buf, p);
     return rc;
 }
 
@@ -1975,7 +2348,23 @@ int __fxstat(int ver, int fd, struct stat *buf) {
         fn = (int (*)(int, int, struct stat *))bxroot_next_symbol("__fxstat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    rc = fn(ver, fd, buf);
+    /*
+     * ★ ver 参数归一化为 0 ★
+     *
+     * `__xstat`/`__lxstat`/`__fxstat` 家族是 glibc 的旧 ABI，第一个
+     * 参数是「结构体版本」。aarch64 上 glibc 只认 `_STAT_VER == 0`
+     * （glibc 2.33+ 已把该宏从公开头文件移除，所以直接写字面量）。
+     *
+     * 调用方可能传别的值（旧约定/其他架构的习惯），此时 glibc 回
+     * EINVAL，客户于是以为 stat 失败、退化成 open 探测 —— 那正是
+     * `tar`/`dash` 走到 ELOOP 的那条路。
+     *
+     * 实测（/root/probe/ver.c，ver=0..3 逐个测）：
+     *     官方  : ver=0,1,2,3 全部 rc=0 OK
+     *     bxroot: ver=0 OK，ver=1,2,3 → EINVAL   ← 修前
+     * 官方对任意 ver 都接受，所以这里归一化成 0 与它对齐。
+     */
+    rc = fn(0, fd, buf);
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat(buf, &g_fakeroot_state);
     return rc;
@@ -1994,7 +2383,23 @@ int __xstat64(int ver, const char *path, struct stat64 *buf) {
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
 
-    rc = fn(ver, p, buf);
+    /*
+     * ★ ver 参数归一化为 0 ★
+     *
+     * `__xstat`/`__lxstat`/`__fxstat` 家族是 glibc 的旧 ABI，第一个
+     * 参数是「结构体版本」。aarch64 上 glibc 只认 `_STAT_VER == 0`
+     * （glibc 2.33+ 已把该宏从公开头文件移除，所以直接写字面量）。
+     *
+     * 调用方可能传别的值（旧约定/其他架构的习惯），此时 glibc 回
+     * EINVAL，客户于是以为 stat 失败、退化成 open 探测 —— 那正是
+     * `tar`/`dash` 走到 ELOOP 的那条路。
+     *
+     * 实测（/root/probe/ver.c，ver=0..3 逐个测）：
+     *     官方  : ver=0,1,2,3 全部 rc=0 OK
+     *     bxroot: ver=0 OK，ver=1,2,3 → EINVAL   ← 修前
+     * 官方对任意 ver 都接受，所以这里归一化成 0 与它对齐。
+     */
+    rc = fn(0, p, buf);
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat64(buf, &g_fakeroot_state);
     /* l2s：与 __xstat 家族一致 */
@@ -2016,12 +2421,31 @@ int __lxstat64(int ver, const char *path, struct stat64 *buf) {
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
 
-    rc = fn(ver, p, buf);
+    /*
+     * ★ ver 参数归一化为 0 ★
+     *
+     * `__xstat`/`__lxstat`/`__fxstat` 家族是 glibc 的旧 ABI，第一个
+     * 参数是「结构体版本」。aarch64 上 glibc 只认 `_STAT_VER == 0`
+     * （glibc 2.33+ 已把该宏从公开头文件移除，所以直接写字面量）。
+     *
+     * 调用方可能传别的值（旧约定/其他架构的习惯），此时 glibc 回
+     * EINVAL，客户于是以为 stat 失败、退化成 open 探测 —— 那正是
+     * `tar`/`dash` 走到 ELOOP 的那条路。
+     *
+     * 实测（/root/probe/ver.c，ver=0..3 逐个测）：
+     *     官方  : ver=0,1,2,3 全部 rc=0 OK
+     *     bxroot: ver=0 OK，ver=1,2,3 → EINVAL   ← 修前
+     * 官方对任意 ver 都接受，所以这里归一化成 0 与它对齐。
+     */
+    rc = fn(0, p, buf);
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat64(buf, &g_fakeroot_state);
     /* l2s：与 __xstat 家族一致 */
     if (rc == 0)
         l2s_rt_patch_stat((struct stat *)buf, p);
+    /* -L：__lxstat64 是 lstat64 的旧 ABI 入口（必须在 l2s 之后） */
+    if (rc == 0)
+        l2s_fix_symlink_size((struct stat *)buf, p);
     return rc;
 }
 
@@ -2033,7 +2457,23 @@ int __fxstat64(int ver, int fd, struct stat64 *buf) {
         fn = (int (*)(int, int, struct stat64 *))bxroot_next_symbol("__fxstat64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    rc = fn(ver, fd, buf);
+    /*
+     * ★ ver 参数归一化为 0 ★
+     *
+     * `__xstat`/`__lxstat`/`__fxstat` 家族是 glibc 的旧 ABI，第一个
+     * 参数是「结构体版本」。aarch64 上 glibc 只认 `_STAT_VER == 0`
+     * （glibc 2.33+ 已把该宏从公开头文件移除，所以直接写字面量）。
+     *
+     * 调用方可能传别的值（旧约定/其他架构的习惯），此时 glibc 回
+     * EINVAL，客户于是以为 stat 失败、退化成 open 探测 —— 那正是
+     * `tar`/`dash` 走到 ELOOP 的那条路。
+     *
+     * 实测（/root/probe/ver.c，ver=0..3 逐个测）：
+     *     官方  : ver=0,1,2,3 全部 rc=0 OK
+     *     bxroot: ver=0 OK，ver=1,2,3 → EINVAL   ← 修前
+     * 官方对任意 ver 都接受，所以这里归一化成 0 与它对齐。
+     */
+    rc = fn(0, fd, buf);
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat64(buf, &g_fakeroot_state);
     return rc;
@@ -2058,24 +2498,38 @@ int __fxstat64(int ver, int fd, struct stat64 *buf) {
  * 正确做法是把宿主路径**反向翻译**成客户视角：剥掉 rootfs 前缀。
  * 这也是反向翻译首次在本文件里出现 —— 之前所有 hook 都是正向的。
  */
-char *getcwd(char *buf, size_t size) {
-    static char *(*fn)(char *, size_t) = NULL;
-    char tmp[MAX_PATH_LEN];
-    char *r;
+/*
+ * getcwd 的反向翻译：剥 rootfs 前缀 + 反向 bind 映射。
+ *
+ * 【为什么抽成函数（实测缺陷）】
+ *
+ * 早前 getcwd() 只给 `buf != NULL` 分支做反向翻译，`buf == NULL` 分支
+ * 直接 `return fn(NULL, size)` —— 注释写着"glibc 会 malloc 一块，我们不能
+ * 用栈缓冲替代"，解释是对的，但结论是"什么都不做"，于是
+ * `getcwd(NULL, 0)` 把**未处理的宿主路径**交给了客户。
+ *
+ * 实测（/root/fsize/gwf.c，同一进程两个分支）：
+ *     官方  : getcwd(buf,size)=/tmp    getcwd(NULL,0)=/tmp
+ *     bxroot: getcwd(buf,size)=/tmp    getcwd(NULL,0)=/data/.../ubuntu/tmp  ❌
+ *
+ * 后果（真实，不是理论）：**dash 的内置 cd/pwd 用的正是 getcwd(NULL, 0)**。
+ * 它拿到带 rootfs 前缀的路径后，对 cwd 的认知就错了，于是
+ *     cd /tmp/d; ls      → 列出的是 **rootfs 根**（bin boot data ...）
+ * 而 `pwd` 看上去是对的（那是 dash 自己的记账）。
+ *
+ * 修法：把修整逻辑抽出来，两个分支都调它。glibc 的 getcwd(NULL, n)
+ * 分配的是"实际路径长度 + 余量"，而剥前缀只会让路径**更短**，
+ * 所以对 malloc 缓冲原地 memmove 一定放得下。
+ *
+ * 返回 0 成功；-ERANGE 表示调用方给的缓冲装不下（仅 buf != NULL 分支可能）。
+ */
+static int getcwd_fixup(char *buf, size_t size)
+{
     const char *rootfs;
     size_t rl;
 
-    if (fn == NULL)
-        fn = (char *(*)(char *, size_t))bxroot_next_symbol("getcwd");
-    if (fn == NULL) { errno = ENOSYS; return NULL; }
-
-    /* 允许 buf == NULL：glibc 会 malloc 一块，我们不能用栈缓冲替代 */
     if (buf == NULL)
-        return fn(NULL, size);
-
-    r = fn(buf, size);
-    if (r == NULL)
-        return NULL;
+        return 0;
 
     /*
      * 反向翻译：剥掉 rootfs 前缀。
@@ -2087,7 +2541,7 @@ char *getcwd(char *buf, size_t size) {
     rootfs = g_config.rootfs ? g_config.rootfs : "";
     rl = strlen(rootfs);
     if (rl == 0)
-        return r;
+        return 0;
 
     if (strncmp(buf, rootfs, rl) == 0 &&
         (buf[rl] == '\0' || buf[rl] == '/')) {
@@ -2096,14 +2550,14 @@ char *getcwd(char *buf, size_t size) {
 
         if (restlen == 0) {
             /* 正好在 rootfs 根 */
-            if (size < 2) { errno = ERANGE; return NULL; }
+            if (size < 2)
+                return -ERANGE;
             buf[0] = '/';
             buf[1] = '\0';
-            return buf;
+            return 0;
         }
         /* rest 以 '/' 开头，直接前移即可（含结尾 NUL） */
         memmove(buf, rest, restlen + 1);
-        (void)tmp;
     }
 
     /*
@@ -2126,12 +2580,56 @@ char *getcwd(char *buf, size_t size) {
         char reb[MAX_PATH_LEN];
         if (detranslate_binds(buf, reb, sizeof(reb)) == 1) {
             size_t need = strlen(reb) + 1;
-            if (need > size) {
-                errno = ERANGE;
-                return NULL;
-            }
+            if (need > size)
+                return -ERANGE;
             memcpy(buf, reb, need);
         }
+    }
+    return 0;
+}
+
+char *getcwd(char *buf, size_t size) {
+    static char *(*fn)(char *, size_t) = NULL;
+    char *r;
+
+    if (fn == NULL)
+        fn = (char *(*)(char *, size_t))bxroot_next_symbol("getcwd");
+    if (fn == NULL) { errno = ENOSYS; return NULL; }
+
+    /*
+     * ★ buf == NULL 也要修整 ★
+     *
+     * 不能用自己的栈缓冲替代 glibc 的 malloc（注释原本就说明了这点），
+     * 但**可以**在 glibc 返回的缓冲上原地修整 —— 那是它的堆内存，
+     * 剥前缀只会让路径更短，原地 memmove 安全。
+     *
+     * 这是 dash 的 cd/pwd 走的路径（它用 getcwd(NULL, 0)），不修就会
+     * 让 shell 对 cwd 的认知错位（`ls` 列 rootfs 根）。
+     */
+    if (buf == NULL) {
+        r = fn(NULL, size);
+        if (r == NULL)
+            return NULL;
+        /*
+         * size 传 0 时 glibc 按需分配；估算可用容量用已分配长度。
+         * 这里传 SIZE_MAX 语义上表示"缓冲足够大，不会 ENOSPC" ——
+         * 剥前缀只缩不涨，bind 反查的目标名也短于宿主前缀。
+         */
+        if (getcwd_fixup(r, SIZE_MAX) != 0) {
+            /* 理论上到不了；真到了也不能返回错的东西 */
+            errno = ERANGE;
+            return NULL;
+        }
+        return r;
+    }
+
+    r = fn(buf, size);
+    if (r == NULL)
+        return NULL;
+
+    if (getcwd_fixup(buf, size) != 0) {
+        errno = ERANGE;
+        return NULL;
     }
     return r;
 }
@@ -2199,6 +2697,7 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
     static int (*fn)(int, const char *, struct stat *, int) = NULL;
     static int (*fn_fx)(int, int, const char *, struct stat *, int) = NULL;
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *p = path;
     int rc;
 
@@ -2210,13 +2709,30 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
                     bxroot_next_symbol("__fxstatat");
     }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /*
+     * ★ 必须按 dirfd 解析相对名 ★
+     *
+     * translate_path() 只翻绝对路径；相对名（tar 的
+     * openat+fstatat 组合、node 的 dirfd 用法）原样返回，
+     * 于是 l2s 层拿 "a" 去 probe —— 那是相对**进程 cwd**
+     * 解析的，不是相对 dirfd。cwd 恰好等于 dirfd 时看着
+     * 是对的，一旦不同就 probe 不到，伪造链接的 S_IFLNK
+     * 抹不掉 → 客户（tar）判定"这是符号链接" → 去 readlink
+     * → EINVAL → "Cannot readlink" 而失败。
+     */
+    p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
 
     if (fn != NULL) {
         rc = fn(dirfd, p, buf, flags);
     } else if (fn_fx != NULL) {
-        rc = fn_fx(1 /* _STAT_VER */, dirfd, p, buf, flags);
+        /*
+         * _STAT_VER：aarch64 上是 **0**，不是 1。
+         * 早前硬编码成 1（x86_64 的值）—— 只因这条兜底分支在
+         * glibc 2.33+ 上从不被走到（fstatat 符号本身存在）才没暴露。
+         * 一旦走到，glibc 会因版本不符回 EINVAL。
+         */
+        rc = fn_fx(0, dirfd, p, buf, flags);
     } else {
         errno = ENOSYS;
         return -1;
@@ -2265,6 +2781,7 @@ int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
     static int (*fn)(int, const char *, struct stat64 *, int) = NULL;
     static int (*fn_fx)(int, int, const char *, struct stat64 *, int) = NULL;
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *p = path;
     int rc;
 
@@ -2276,13 +2793,30 @@ int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
                     bxroot_next_symbol("__fxstatat64");
     }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /*
+     * ★ 必须按 dirfd 解析相对名 ★
+     *
+     * translate_path() 只翻绝对路径；相对名（tar 的
+     * openat+fstatat 组合、node 的 dirfd 用法）原样返回，
+     * 于是 l2s 层拿 "a" 去 probe —— 那是相对**进程 cwd**
+     * 解析的，不是相对 dirfd。cwd 恰好等于 dirfd 时看着
+     * 是对的，一旦不同就 probe 不到，伪造链接的 S_IFLNK
+     * 抹不掉 → 客户（tar）判定"这是符号链接" → 去 readlink
+     * → EINVAL → "Cannot readlink" 而失败。
+     */
+    p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
 
     if (fn != NULL) {
         rc = fn(dirfd, p, buf, flags);
     } else if (fn_fx != NULL) {
-        rc = fn_fx(1 /* _STAT_VER */, dirfd, p, buf, flags);
+        /*
+         * _STAT_VER：aarch64 上是 **0**，不是 1。
+         * 早前硬编码成 1（x86_64 的值）—— 只因这条兜底分支在
+         * glibc 2.33+ 上从不被走到（fstatat 符号本身存在）才没暴露。
+         * 一旦走到，glibc 会因版本不符回 EINVAL。
+         */
+        rc = fn_fx(0, dirfd, p, buf, flags);
     } else {
         errno = ENOSYS;
         return -1;
@@ -2609,13 +3143,33 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
         return n;
 
     {
+        char joined[MAX_PATH_LEN];
         char raw[MAX_PATH_LEN];
         char fixed[MAX_PATH_LEN];
         size_t copy = (size_t)n < sizeof(raw) - 1 ? (size_t)n : sizeof(raw) - 1;
+        int lrc;
+
+        /*
+         * ★ 判据要用**绝对宿主路径** ★
+         *
+         * 相对名（tar 的 openat+readlinkat 组合）下 p 还是 "a"，
+         * l2s 层拿它 probe 不到任何东西 —— 这正是此前漏改写的根因。
+         */
+        if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1) {
+            if (translate_path(joined, translated, sizeof(translated)) > 0)
+                p = translated;
+            else
+                p = joined;
+        }
 
         memcpy(raw, buf, copy);
         raw[copy] = '\0';
-        if (l2s_rt_rewrite_readlink(path, raw, fixed, sizeof(fixed)) == 1) {
+        lrc = l2s_rt_rewrite_readlink(p, raw, fixed, sizeof(fixed));
+        if (lrc == L2S_RT_READLINK_FAKE) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (lrc == 1) {
             size_t flen = strlen(fixed);
             if (flen > bufsiz)
                 flen = bufsiz;
@@ -2796,9 +3350,23 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
          * 实测（libc statx 入口）：只补 nlink 时 mode=0120777（带着
          * S_IFLNK），抹掉后是 0100777 —— 与 stat/lstat 两条路一致。
          */
+        /*
+         * ★ 用 `_buf` 版本（传整个结构体），不是 `_full`（三指针）★
+         *
+         * 三指针版本**只能改 nlink/mask/mode** —— 它拿不到 stx_size /
+         * stx_ino / stx_blocks，而那些字段同样必须回填：
+         *
+         * 实测（`stat` 命令走的就是 statx 路径）：
+         *     bxroot lstat size = 符号链接目标字符串长度（几十字节）
+         *     官方   lstat size = 真实文件大小
+         * 后果是 `tar` 把伪造链接按符号链接归档（并写入宿主绝对路径）、
+         * `cp -a` 报 ELOOP。
+         *
+         * 字段偏移由 l2s 层按 offsetof 实测值访问，本文件不引
+         * <linux/stat.h>（会与 <sys/stat.h> 冲突）。
+         */
         if (rc == 0 && buf != NULL)
-            l2s_rt_patch_statx_full(&buf->stx_nlink, &buf->stx_mask,
-                                    &buf->stx_mode, STATX_NLINK, p);
+            l2s_rt_patch_statx_buf(buf, STATX_NLINK, p);
         return rc;
     }
 }
@@ -5064,6 +5632,15 @@ static void init_l2s(void) {
     const char *on = getenv("BXROOT_LINK2SYMLINK");
     l2s_config cfg;
 
+    /*
+     * -L 的开关独立于 l2s：proot 的 -L 与 --link2symlink 是两个各自
+     * 独立的选项，可以只开一个。所以这一行放在下面的提前 return **之前**。
+     */
+    {
+        const char *fss = getenv("BXROOT_FIX_SYMLINK_SIZE");
+        g_fix_symlink_size = (fss != NULL && fss[0] != '\0' && fss[0] != '0');
+    }
+
     if (on == NULL || on[0] == '\0' || on[0] == '0')
         return;
 
@@ -5176,23 +5753,64 @@ static void constructor(void) {
     bxroot_crash_install("bxroot");
     LOG("runtime library loaded");
 
-    /* 设置工作目录 - 使用 syscall 直接调用，因为 dlsym 在 ctor 中不可用 */
-    if (g_config.workdir) {
+    /*
+     * ================================================================
+     * 工作目录：**只在容器首个进程生效**，不要每次 exec 都重置
+     * ================================================================
+     *
+     * 【缺陷（实测，2026-09-16）】
+     *
+     * `BXROOT_WORKDIR` 表达的是「容器启动时把 cwd 设到哪里」。但本构造
+     * 函数在**每个**加载了本 .so 的进程里都会跑 —— 包括客户 fork/exec
+     * 出来的每一个子进程。于是子进程一启动就把 cwd 重置回 workdir，
+     * **父进程的 cwd 变更全部丢失**。
+     *
+     * 实测（/root/fsize/cdinherit.c，父 chdir("/tmp") 后 fork+exec /bin/pwd）：
+     *     官方  : 父 getcwd=/tmp  子 getcwd=/tmp  /bin/pwd → /tmp   ✅
+     *     bxroot: 父 getcwd=/tmp  子 getcwd=/tmp  /bin/pwd → /       ❌
+     *
+     * 注意"子进程 getcwd"那一步是**对的** —— 因为子进程在 exec 前用的是
+     * 父进程已经加载好的 .so，构造函数已经跑完了。真正出错的是 exec 之
+     * 后：新进程重新加载 .so，构造函数把 cwd 重置成了 workdir。
+     *
+     * 【真实后果（shell 里最明显）】
+     *     cd /tmp/d; ls      → 列出的是 **rootfs 根**（bin boot data ...）
+     *     stat ./a           → ENOENT
+     * 而 `pwd`（dash 内建，用自己的记账）看上去是对的 —— 所以现象是
+     * "pwd 对但 ls 错"，极易误判成 getcwd 的问题。
+     *
+     * 【修法】
+     * 用一个环境变量标记"首进程已经设过工作目录了"。环境变量会被
+     * fork/exec 继承，正是我们需要的"跨 exec 传递"语义：
+     *     首个进程（launcher 起的）：没有标记 → 设 cwd → 打标记
+     *     子进程（exec 出来的）：有标记 → **不动 cwd**（继承父进程的）
+     *
+     * 这与 proot 一致：proot 只在启动 tracee 时应用 -w，不会在每次
+     * execve 时重置子进程的工作目录。
+     */
+    if (g_config.workdir && getenv(BXROOT_WORKDIR_DONE_ENV) == NULL) {
         char translated[MAX_PATH_LEN];
         const char *target = NULL;
-        
+
         if (translate_path(g_config.workdir, translated, sizeof(translated)) > 0) {
             LOG("workdir: %s -> %s", g_config.workdir, translated);
             target = translated;
         } else {
             target = g_config.workdir;
         }
-        
-        /* 使用 syscall 直接调用 chdir */
+
+        /* 使用 syscall 直接调用 chdir（ctor 中 dlsym 不可用） */
         long ret = syscall(SYS_chdir, target);
-        if (ret < 0)
+        if (ret < 0) {
             LOG("workdir chdir failed: %s", strerror(errno));
-        else
+        } else {
             LOG("workdir chdir OK");
+            /*
+             * 打标记。放在成功之后：若 chdir 失败（workdir 不存在），
+             * 下次 exec 仍会再试一次 —— 那时目录可能已经建好了。
+             * 注意 libc 的 setenv 在本阶段可用（它不依赖 dlsym）。
+             */
+            setenv(BXROOT_WORKDIR_DONE_ENV, "1", 1);
+        }
     }
 }

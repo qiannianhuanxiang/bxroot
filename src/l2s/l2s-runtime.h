@@ -36,6 +36,16 @@
  */
 #define L2S_RT_PASSTHRU (-4096)
 
+/*
+ * l2s_rt_rewrite_readlink() 的第三个返回值：被 readlink 的东西是**伪造
+ * 链接**，客户看到的应当是一个**普通文件** —— 于是 readlink 必须失败并置
+ * errno=EINVAL，与 st_mode 的 S_IFREG 自洽。
+ *
+ * 调用方必须显式处理它（`errno = EINVAL; return -1;`）。**不能**把它当
+ * 普通负数错误吞掉，也不能继续返回内核给的目标字符串 —— 那正是缺陷本身。
+ */
+#define L2S_RT_READLINK_FAKE (-4095)
+
 /* ------------------------------------------------------------------ */
 /* 注入的操作表                                                        */
 /* ------------------------------------------------------------------ */
@@ -124,9 +134,50 @@ int l2s_rt_rename(const char *oldpath, const char *newpath);
  *   2. readlink("/proc/self/fd/N")    -- 内核对 fd 的解析结果
  *
  * 返回 1 表示已改写 out，0 表示无需改写（调用方用原值），负数为错误。
+ *
+ * ★ 2026-09-16 语义变更（两条分支，别一刀切）★
+ *
+ * 客户路径**直接**查询伪造链接（内核返回中间层名）时返回
+ * L2S_RT_READLINK_FAKE —— 调用方转 EINVAL。
+ *
+ * 旧行为是把中间层名「还原」成客户本来的名字再返回成功。实测证明那个
+ * 返回值会让客户判定"它是符号链接"，与 lstat 报的 S_IFREG **自相矛盾**，
+ * 后果是真实工具链损坏（`cp -a` 报 ELOOP、`tar` 按符号链接归档并把宿主
+ * 绝对路径写进归档）。官方 proroot 对同一路径返回 EINVAL，两者自洽。
+ *
+ * ★ 但第 2 条来源（/proc/self/fd/N）必须继续返回还原名 ★
+ *
+ * 那里内核已经把 fd 解析**穿透**整条链，返回的是**数据文件**路径 ——
+ * 不是"客户正对着一条伪造链接"，而是"客户拿 fd 反查这是哪个文件"，
+ * 理应拿到它自己用的名字。实测（官方）：`readlink(a)` → EINVAL，
+ * 而伪造链接的 `readlink(/proc/self/fd/N)` → 返回客户路径。两条都对。
+ * 一刀切成 EINVAL 会误伤 fd 反查名字（node 的 uv_exepath 等都在用）。
  */
 int l2s_rt_rewrite_readlink(const char *path, const char *raw_target,
                             char *out, size_t outsz);
+
+/* ------------------------------------------------------------------ */
+/* 路径解链                                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 把一个**伪造链接的客户路径**解析成它背后的最终数据文件路径。
+ *
+ * 用途：open/openat 带 O_NOFOLLOW 时不能让内核走到那条符号链接上
+ * （内核会回 ELOOP）。客户从 lstat 得知这是普通文件，于是 coreutils
+ * 的 `cp -a` 会用 O_NOFOLLOW 打开它 —— 内核看到的是符号链接，直接
+ * ELOOP，`cp -a` 失败。官方 proroot 不会：它在系统调用入口就把路径
+ * 换成了数据文件，内核根本见不到那条链接。
+ *
+ * 返回 1 = 已解析（out 里是宿主侧的数据文件路径）；
+ *      0 = 该路径不是伪造链接，调用方应原样使用；
+ *      -errno = 出错。
+ *
+ * ★ 判据只有这一处 ★
+ * 内部复用与 l2s_rt_patch_stat 完全相同的 probe_fake_link/resolve_final，
+ * 不新造第二套"怎么认伪造链接"的规则。
+ */
+int l2s_rt_resolve_fake_link(const char *path, char *out, size_t outsz);
 
 /* ------------------------------------------------------------------ */
 /* stat 补丁                                                           */
@@ -185,6 +236,32 @@ void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
 void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
                              uint16_t *stx_mode,
                              unsigned int statx_nlink_bit, const char *path);
+
+/*
+ * 传**整个 struct statx 缓冲**的版本。
+ *
+ * 【为什么需要它】
+ *
+ * 上面那个三指针版本的签名决定了它**只能改 nlink / mask / mode** ——
+ * 它拿不到 `stx_size` / `stx_ino` / `stx_blocks`。
+ *
+ * 而实测表明这些字段**必须改**：`statx` 是 coreutils 9.x / rsync / pnpm
+ * 的现代主路径（`stat` 命令与 node 都走它），只改 nlink/mode 的结果是
+ * `tar` 把伪造链接按符号链接归档（并写入宿主绝对路径）、`cp -a` 报 ELOOP。
+ *
+ * 【为什么不在调用方回填】
+ * 那会把"怎么找最终数据文件、链长多少"的判据复制到 preload.c 与
+ * syscall_guard.c 两处 —— 本项目已经因为"同一判据两处实现"出过多次缺陷
+ * （fstatat 漏接、patch_stat 无人调用、envp 兜底只写在注释里）。
+ *
+ * 【参数形态】
+ * `sx` 指向客户的 `struct statx`（调用方直接传它拿到的指针）。
+ * 本层按**偏移**访问字段（不包含 <linux/stat.h>，避免与 <sys/stat.h> 冲突）——
+ * 偏移经 offsetof 实测：stx_mask=0 stx_nlink=16 stx_mode=28
+ *                    stx_ino=32 stx_size=40 stx_blocks=48
+ */
+void l2s_rt_patch_statx_buf(void *sx, unsigned int statx_nlink_bit,
+                            const char *path);
 
 /* 默认 1（客户不该看出这是符号链接）。置 0 便于诊断。 */
 void l2s_rt_set_hide_symlink(int on);

@@ -149,7 +149,15 @@ do
 done
 
 # 无值选项
-for opt in --link2symlink --kill-on-exit -v --verbose; do
+#
+# `-L` 于 2026-09-16 从「明确拒绝」移到本组 —— 它已实现为 proot 的
+# fix_symlink_size（修**真符号链接**的 st_size，默认关闭）。详见
+# docs/proot--L选项实现.md。
+#
+# ★ 注意它与 l2s 的 size 缺陷是两件独立的事 ★
+# 「伪造链接的 lstat size 不对」由 l2s 层**无条件**修正（官方默认就对，
+# 与 -L 无关，已实测）。-L 管的是 l2s 没接管的普通符号链接。
+for opt in --link2symlink --kill-on-exit -v --verbose -L; do
     cls=$(classify "$opt" -r /tmp "$opt" /bin/true)
     [ "$cls" = "supported" ] && ok "$opt" "已支持" || bad "$opt" "被当成未实现/未知"
 done
@@ -159,7 +167,7 @@ done
 # ---------------------------------------------------------------------
 echo
 echo "--- C) 明确拒绝（不可静默忽略）---"
-for opt in -H -L -p --sysvipc --ashmem-memfd; do
+for opt in -H -p --sysvipc --ashmem-memfd; do
     cls=$(classify "$opt" -r /tmp "$opt" /bin/true)
     if [ "$cls" = "refused" ]; then
         ok "$opt" "明确拒绝"

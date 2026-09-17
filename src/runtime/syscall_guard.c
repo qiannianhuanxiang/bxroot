@@ -74,9 +74,8 @@
  * 实现体在 src/l2s/l2s-runtime.c。
  */
 __attribute__((weak))
-void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
-                             uint16_t *stx_mode,
-                             unsigned int statx_nlink_bit, const char *path);
+void l2s_rt_patch_statx_buf(void *sx, unsigned int statx_nlink_bit,
+                            const char *path);
 
 /*
  * STATX_NLINK：避免为一个常量引入 <linux/stat.h>（见上面的耦合说明）。
@@ -821,32 +820,24 @@ long syscall(long number, ...)
          *     bxroot(修前): mode=0120777 nlink=1 islnk=1
          */
         if (ret == 0 && number == SCG_NR_statx && a4 != 0 && a1 != 0 &&
-            l2s_rt_patch_statx_full != NULL) {
-            /* struct statx 的字段布局（u32 起始部分）：
-             *   stx_mask(0) stx_blksize(4) stx_attributes(8)
-             *   stx_nlink(16) stx_uid(20) stx_gid(24) stx_mode(28)
-             * 前三个字段之后正好是 nlink/uid/gid/mode —— 用 u32 指针
-             * 加偏移寻址，避免为一个结构体拖进 <linux/stat.h>。 */
-            unsigned int *base = (unsigned int *)(uintptr_t)a4;
-
+            l2s_rt_patch_statx_buf != NULL) {
             /*
-             * ★ stx_mode 是 __u16，不是 u32 ★
+             * ★ 用 `_buf` 版本（传整个结构体指针）★
              *
-             * 它在 struct statx 里 offset 28、宽 2 字节；而 `base[7]` 是
-             * u32 下标 7（= offset 28）的 **4 字节**视图。传 `&base[7]`
-             * 给一个写入方，会让它做 4 字节写，越界覆盖 offset 30-31。
+             * 早前这里调的是三指针版本（nlink/mask/mode），后来发现那
+             * 三个字段**不够**：stx_size / stx_ino / stx_blocks 同样必须
+             * 回填 —— 否则 `stat` 命令（走 statx）看到的是符号链接的
+             * size，`tar` 因而按符号链接归档、`cp -a` 报 ELOOP。
              *
-             * 所以这里用字节寻址 + 正确的 uint16_t* —— 与结构体定义一致。
-             * （字段偏移经 `offsetof` 实测：stx_mask=0, stx_nlink=16,
-             *   stx_mode=28。）
+             * 现在把 `a4`（客户传的 struct statx *）整个交给 l2s 层，
+             * 由它按 offsetof 实测的偏移访问各字段。
+             * 好处是**字段布局知识只存在于一处** —— 这里不再重复硬编码偏移，
+             * 也不会出现"调用方与实现方对同一布局有两套理解"的漂移
+             * （本项目在 statx 的 stx_mode 宽度上刚踩过一次）。
              */
-            uint16_t *mode16 = (uint16_t *)(void *)((unsigned char *)(uintptr_t)a4 + 28);
-
-            l2s_rt_patch_statx_full(&base[4] /* stx_nlink, offset 16 */,
-                                    &base[0] /* stx_mask,  offset 0  */,
-                                    mode16   /* stx_mode,  offset 28 */,
-                                    SCG_STATX_NLINK,
-                                    (const char *)(uintptr_t)a1);
+            l2s_rt_patch_statx_buf((void *)(uintptr_t)a4,
+                                   SCG_STATX_NLINK,
+                                   (const char *)(uintptr_t)a1);
         }
 
         return ret;

@@ -509,6 +509,29 @@ static void t_stat_size_is_real(void)
     sandbox_drop();
 }
 
+/*
+ * A4. readlink 对伪造链接返回「失败」哨兵（2026-09-16 语义反转）
+ *
+ * 【本用例为什么改了断言（原断言固化的是缺陷行为）】
+ *
+ * 原断言要求：
+ *     rc == 1                        （改写成功）
+ *     strstr(out, "orig.txt") != NULL（还原出客户本来的名字）
+ * 即把「readlink 成功返回一个客户名」当成期望行为。
+ *
+ * 实测证明那个返回值会造成**数据完整性缺陷**：
+ *   - 客户的 lstat 说 S_IFREG（本层抹掉了 S_IFLNK），而 readlink 却成功
+ *     —— 两个信号自相矛盾，工具据此判定"它是符号链接"
+ *   - `tar cf`   → 按符号链接归档，并把**宿主绝对路径**
+ *                  （/data/data/com.dsh.client/files/...）写进归档
+ *   - `cp -a`    → ELOOP（cp 拿 readlink 的结果自己去解析，形成自环）
+ * 官方 proroot 对同一路径返回 EINVAL（它不刻意如此，而是因为它在
+ * 系统调用入口就把伪造链接换成了数据文件，内核看到的已是普通文件）。
+ *
+ * 所以断言改为反映**新契约**：命中伪造链接 → L2S_RT_READLINK_FAKE。
+ * 后半段（用户自己的真符号链接不被改写）保持不变 —— 那是必须守住的
+ * 回归点，也是一刀切关掉 readlink 时最容易破坏的地方。
+ */
 static void t_readlink_rewrite(void)
 {
     l2s_config cfg = cfg_beside();
@@ -517,7 +540,7 @@ static void t_readlink_rewrite(void)
     ssize_t n;
     int rc;
 
-    CASE("A4 readlink 不把内部中间层名泄露给客户");
+    CASE("A4 readlink 对伪造链接报告失败哨兵，真符号链接不受影响");
     sandbox_make("readlink");
     l2s_rt_init(&REAL_OPS, &cfg);
     l2s_rt_reset_stats();
@@ -536,13 +559,31 @@ static void t_readlink_rewrite(void)
         /* 内核视角确实带 l2s 装饰 */
         CHECK(strstr(raw, ".l2s.") != NULL);
 
+        /*
+         * 客户视角：a 是普通文件，readlink 必须失败。
+         * 返回 L2S_RT_READLINK_FAKE，由钩子转成 errno=EINVAL。
+         */
         rc = l2s_rt_rewrite_readlink(a, raw, out, sizeof(out));
-        CHECK_EQ_I(rc, 1);                       /* 已改写 */
-        CHECK(strstr(out, ".l2s.") == NULL);     /* 装饰已剥掉 */
-        CHECK(strstr(out, "orig.txt") != NULL);  /* 还原出原始名字 */
+        CHECK_EQ_I(rc, L2S_RT_READLINK_FAKE);
     }
 
-    /* 用户自己的普通符号链接不应被改写 */
+    /* 同一个链的第二个名字也必须失败（两条都是伪造链接） */
+    {
+        char raw2[PATH_MAX];
+        n = readlink(b, raw2, sizeof(raw2) - 1);
+        CHECK(n > 0);
+        if (n > 0) {
+            raw2[n] = '\0';
+            rc = l2s_rt_rewrite_readlink(b, raw2, out, sizeof(out));
+            CHECK_EQ_I(rc, L2S_RT_READLINK_FAKE);
+        }
+    }
+
+    /*
+     * 用户自己的普通符号链接**必须仍然正常**（rc == 0 → 调用方透传
+     * 内核结果）。这是修复"伪造链接的 readlink 应失败"时最容易破坏的
+     * 一点：一刀切地让 readlink 全部失败，就会把正常功能一起关掉。
+     */
     {
         char plain_link[PATH_MAX], plain_tgt[PATH_MAX];
         sp(plain_link, sizeof(plain_link), "plain");

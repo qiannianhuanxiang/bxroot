@@ -113,22 +113,21 @@ KNOWN=0
 # 保留这行注释而不是直接删干净，是为了让后来者知道：这张表**是可以清空的** ——
 # 登记不是"把测试关掉"，而是"承认缺陷存在、让它可见但不污染回归信号"。
 #
-# ★ 2026-09-16（第二次登记）：l2s 的 `size` 与 `readlink` ★
+# ★ 2026-09-16（第二次登记）→ 已修复，第三次清空 ★
 #
-# 前一轮修好了 nlink / islink（并据此清空了这张表）。随后用**真实工具链**
-# 探针（tar / cp -a）发现了更细的一层：
+# 这一轮修的是 `size` 与 `ino`/`blocks` 的回填：
+#   - `l2s_rt_patch_stat` 现在会 lstat 最终数据文件并回填真实元数据
+#   - 新增 `l2s_rt_patch_statx_buf`（传整个结构体），覆盖 statx 路
+#     （`stat` 命令与 node 走这条）
 #
-#     bxroot: lstat size=73（符号链接目标长度）  readlink 返回宿主路径
-#     官方  : lstat size=5 （真实内容长度）      readlink 返回 EINVAL
+# 实测与官方逐项一致：
+#     bxroot: nlink=2 islink=false size=5 stsize=5 reallink=true content="hello"
+#     官方  : nlink=2 islink=false size=5 stsize=5 reallink=true content="hello"
 #
-# 后果是 tar 把伪造链接当符号链接归档，并把**宿主绝对路径**写进归档。
-#
-# 测试已加固（`RUN_L2S_E2E.sh` 现在测 size × 2 + 真符号链接），
-# 于是本项转红 —— 这是**预期的**，缺陷正在修。
-# 详见 docs/l2s-真实工具链缺陷-tar与lstat-size.md
-#
-# 修复后把这一行改回 KNOWN_FAIL="" 即可。
-KNOWN_FAIL="l2s 端到端契约 l2s 运行时"
+# ⚠️ 但 `readlink` 那一项**仍待修**（另一个子代理在做）——
+# 它不影响本回归项（本项测的是 stat 的字段），但会让 `tar` / `cp -a` 仍失败。
+# 见 docs/l2s-真实工具链缺陷-tar与lstat-size.md
+KNOWN_FAIL=""
 
 # 记录一条结果：$1=状态(PASS/FAIL/SKIP) $2=名称 $3=摘要
 note() {
