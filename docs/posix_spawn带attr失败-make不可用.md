@@ -124,3 +124,60 @@ spawnattr 这条**绕过钩子**的路径）。
   （**这一半已修好**）
 - DSHA 主链路（node）不直接走 `make`，但 `dsh` 若在容器内触发
   构建（如插件编译）会受影响
+
+---
+
+## 五、2026-09-17 追加：观察垫片证实 make 的 sigmask 绕过一切钩子
+
+### 实验：LD_PRELOAD 垫片拦截 `posix_spawnattr_setsigmask`
+
+用垫片观察 make 传给 spawnattr 的掩码（同时挂官方与 bxroot 两侧）：
+
+```
+### bxroot + 观察垫片 ###
+make: *** [Makefile:2: all] Bad system call     ← 垫片**一次都没被调**
+
+### 官方 + 观察垫片 ###
+RECIPE-X                                        ← 垫片**也一次都没被调**
+```
+
+**两侧的垫片都没有输出** —— 说明 make 的 sigmask **根本不走**
+`posix_spawnattr_setsigmask` 的 PLT（glibc 在内部直接构造）。
+这与本容器"LD_PRELOAD 被吞"的既有记录一致，**双重确认**：
+无法从符号层观察或拦截 make 的 attr。
+
+### 进一步收窄：死亡发生在子进程"起不来"这一步
+
+用 `ps` 在 make 运行期间抓进程：**看不到任何配方子进程**
+（连 `sleep 2` 都没出现），且配方里的文件操作（`echo MARK > out.marker`）
+在宿主视角也**不存在**。所以：
+
+- make 打印命令行（它自己干的）
+- 子进程 spawn 出来了（否则 make 会报别的错）
+- 子进程**在能留下任何痕迹之前就死了**
+- 死因是 SIGSYS（make 报 "Bad system call"）
+
+### 广泛冒烟：其余常用程序全部正常
+
+对 14 个常用程序做 `--version` 冒烟（同一 runtime、同一容器）：
+
+```
+ls        ls (GNU coreutils) 9.4        bash   GNU bash, version 5.2.21
+cat       cat (GNU coreutils) 9.4       python3 Python 3.12.3
+grep      grep (GNU grep) 3.11          node   v24.19.0
+sed       sed (GNU sed) 4.9             git    git version 2.43.0
+tar       tar (GNU tar) 1.35            make   GNU Make 4.3        ← 本体能跑
+```
+
+**除 make 的"跑配方"外全部正常**。即该缺陷**只**影响
+"`make` 的配方子进程"这一条路径，不影响任何其他常用程序。
+
+### 状态与建议
+
+- 死亡点在子进程能留痕之前 → 常规插桩（`ps`/文件痕迹/`SIGSYS` 日志）
+  都观察不到，需要 **ptrace 级**或**改 bridge** 才能看进去。
+- 若要继续，建议方向：给 bridge 加一条早期诊断输出
+  （`PROROOT_VERBOSE` 已存在，看它能否打到子进程），
+  或在 `sigsys.c` 的模拟层里把"首次 TRAP"**无条件**打印（当前
+  受 `BXROOT_SIGSYS_LOG` 门控且要去重）。
+- 本文件不再继续（需要改 bridge / ptrace，超出本轮范围）。
