@@ -4791,6 +4791,444 @@ struct passwd *getpwuid(uid_t uid) {
     return &fake;
 }
 
+/*
+ * ★ getpwnam —— 缺口 D 的最后一块拼图（2026-09-17）★
+ *
+ * 【实测差异（NSS 全家对照）】
+ *
+ *     调用              官方      bxroot（修前）
+ *     getpwuid(0)       root      root     ← 已有钩子
+ *     getpwnam("root")  root      NULL     ← ★ 缺口
+ *     getgrgid(0)       root      NULL     ← ★ 缺口
+ *     getgrnam("root")  root      NULL     ← ★ 缺口
+ *
+ * 【为什么必须补，而不只是"NSS 缺陷记录在案"】
+ *
+ * dpkg -i 的失败（"unknown system user 'root' in statoverride file"）
+ * 正是它：dpkg 读 statoverride 后要用 getpwnam('root') 解析用户名，
+ * 拿不到就中止。官方同一场景能装包 —— 这是**核心容器工作负载**
+ * 的实际断点，不再是"仅显示层"的差异。
+ *
+ * 【为什么之前没发现】
+ * fakeroot 域早先补过 getpwuid（按 uid 查询），但**按名字查**的
+ * getpwnam 漏了 —— 又一次"同一功能只覆盖一条路径"：
+ * pwuid 覆盖了，pwnam 没覆盖。getgr 系列（组）则是整族缺失。
+ *
+ * 【为什么合成是安全的】
+ * 只在 fakeroot 开启且真实查询**失败**时才合成 root 条目 ——
+ * 与 getpwuid 的判据完全一致。真实查询成功时（宿主 passwd 恰好
+ * 有该记录）优先用真实的，不覆盖。
+ *
+ * 【为什么 buf 静态】与 getpwuid 同款：getpwnam 的返回指向**库内部
+ * 静态存储**（glibc 对非 _r 版本的契约），调用方不释放。线程安全
+ * 由调用方保证（glibc 对非 _r 版本本就不保证）。
+ */
+/*
+ * ★ /etc/passwd 直解回退（缺口 D 的核心修法）★
+ *
+ * glibc 的 getpwnam 内部走 NSS 分派（__nss_database_lookup →
+ * _nss_files_getpwnam_r），实测该分派在 bxroot 下失败（即使
+ * /etc/passwd 可读、内容正确）。官方能查到是因为官方对 libc 的
+ * 内联 svc 做了 livepatch，NSS 内部那条路是通的。
+ *
+ * 我们不做 NSS 内部修补（那是官方闭源内部），而是**退而求其次**：
+ * NSS 失败时直接 open/parse /etc/passwd。这覆盖了容器最常见
+ * （也是唯一）的 passwd 源 —— files。数据来自 rootfs 内的同一份
+ * /etc/passwd，与官方查到的内容一致。
+ *
+ * 【为什么不 hook NSS 内部】_nss_files_* 是 libc 内部符号、
+ * glibc 2.39 起已内置 libc.so.6，无独立 .so 可换；而改 NSS 分派
+ * 属于"改 glibc 内部"，风险与本仓库 dlsym 垫片的 148 处回滚教训同类。
+ *
+ * 【线程安全】static 缓冲 + 一次解析后缓存：调用方契约（非 _r）
+ * 本就允许覆盖；_r 版本不缓存（写调用方缓冲）。
+ */
+struct passwd *getpwnam(const char *name) {
+    static struct passwd *(*fnsym)(const char *) = NULL;
+    static struct passwd fake;
+    struct passwd *real;
+    FILE *f;
+    char line[512];
+
+    if (fnsym == NULL)
+        fnsym = (struct passwd *(*)(const char *))bxroot_next_symbol("getpwnam");
+    if (fnsym == NULL) { errno = ENOSYS; return NULL; }
+
+    real = fnsym(name);
+    if (real != NULL)
+        return real;                     /* NSS 通了：用真实的 */
+
+    if (name == NULL)
+        return NULL;
+
+    /* NSS 失败 → 直解 /etc/passwd（容器内的同一条记录） */
+    f = fopen("/etc/passwd", "r");
+    if (f == NULL)
+        return NULL;
+
+    while (fgets(line, sizeof line, f) != NULL) {
+        char *fields[7];
+        int nf = 0, i;
+        char *w = line, *e;
+
+        /* 逐字段切（passwd 格式: name:passwd:uid:gid:gecos:dir:shell）*/
+        for (i = 0; i < 7; i++) {
+            fields[i] = w;
+            e = strchr(w, i < 6 ? ':' : '\n');
+            if (e == NULL) { break; }
+            *e = '\0';
+            w = e + 1;
+            nf++;
+        }
+        if (nf < 7)
+            continue;
+        if (strcmp(fields[0], name) != 0)
+            continue;
+
+        /* 命中：填静态 struct passwd（非 _r 版本用静态存储是契约允许的）*/
+        {
+            static char f_name[64], f_passwd[64], f_gecos[64];
+            static char f_dir[256], f_shell[64];
+            snprintf(f_name,   sizeof f_name,   "%s", fields[0]);
+            snprintf(f_passwd, sizeof f_passwd, "%s", fields[1]);
+            snprintf(f_gecos,  sizeof f_gecos,  "%s", fields[4]);
+            snprintf(f_dir,    sizeof f_dir,    "%s", fields[5]);
+            snprintf(f_shell,  sizeof f_shell,  "%s", fields[6]);
+            fake.pw_name   = f_name;
+            fake.pw_passwd = f_passwd;
+            fake.pw_uid    = (uid_t)atoi(fields[2]);
+            fake.pw_gid    = (gid_t)atoi(fields[3]);
+            fake.pw_gecos  = f_gecos;
+            fake.pw_dir    = f_dir;
+            fake.pw_shell  = f_shell;
+        }
+        fclose(f);
+        return &fake;
+    }
+    fclose(f);
+    return NULL;                          /* 表里没有，如实 NULL */
+}
+
+/*
+ * getpwnam_r —— 与 getpwnam 同一套直解回退（_r 契约：写调用方缓冲）。
+ * python 的 pwd 模块、dpkg（多线程路径）都走这个。
+ */
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result) {
+    static int (*fn)(const char *, struct passwd *, char *, size_t,
+                     struct passwd **) = NULL;
+    int rc;
+    FILE *f;
+    char line[512];
+
+    if (result != NULL) *result = NULL;
+    if (name == NULL || pwd == NULL || buf == NULL || result == NULL) {
+        return EINVAL;
+    }
+
+    if (fn == NULL)
+        fn = (int (*)(const char *, struct passwd *, char *, size_t,
+                      struct passwd **))bxroot_next_symbol("getpwnam_r");
+    if (fn != NULL) {
+        errno = 0;
+        rc = fn(name, pwd, buf, buflen, result);
+        if (rc == 0 && *result != NULL)
+            return 0;                    /* NSS 通了 */
+        if (rc != 0 && rc != ENOENT && rc != ESRCH)
+            return rc;                   /* 非"没找到"的真实错误，透传 */
+    }
+
+    /*
+     * NSS 失败 → 直解 /etc/passwd。
+     * 布局：name:passwd:uid:gid:gecos:dir:shell
+     * 解析结果全部写进调用方的 buf（_r 版本的契约），pwd 指进 buf。
+     */
+    f = fopen("/etc/passwd", "r");
+    if (f == NULL)
+        return ENOENT;
+
+    while (fgets(line, sizeof line, f) != NULL) {
+        char *fields[7];
+        int nf = 0, i;
+        char *w = line, *e;
+        size_t used = 0;
+
+        for (i = 0; i < 7; i++) {
+            fields[i] = w;
+            e = strchr(w, i < 6 ? ':' : '\n');
+            if (e == NULL) break;
+            *e = '\0';
+            w = e + 1;
+            nf++;
+        }
+        if (nf < 7 || strcmp(fields[0], name) != 0)
+            continue;
+
+        /* 依序把 7 个字段拷进 buf，pwd 指进去 */
+        {
+            const char *order[7] = { fields[0], fields[1], NULL, NULL,
+                                     fields[4], fields[5], fields[6] };
+            size_t len[2];
+            unsigned uid_v = (unsigned)atoi(fields[2]);
+            unsigned gid_v = (unsigned)atoi(fields[3]);
+
+            pwd->pw_uid = uid_v;
+            pwd->pw_gid = gid_v;
+
+            len[0] = strlen(fields[0]) + 1;
+            if (used + len[0] > buflen) { fclose(f); return ERANGE; }
+            pwd->pw_name = buf + used;
+            memcpy(buf + used, fields[0], len[0]); used += len[0];
+
+            len[1] = strlen(fields[1]) + 1;
+            if (used + len[1] > buflen) { fclose(f); return ERANGE; }
+            pwd->pw_passwd = buf + used;
+            memcpy(buf + used, fields[1], len[1]); used += len[1];
+
+            if (used + strlen(fields[4]) + 1 > buflen) { fclose(f); return ERANGE; }
+            pwd->pw_gecos = buf + used;
+            memcpy(buf + used, fields[4], strlen(fields[4]) + 1); used += strlen(fields[4]) + 1;
+
+            if (used + strlen(fields[5]) + 1 > buflen) { fclose(f); return ERANGE; }
+            pwd->pw_dir = buf + used;
+            memcpy(buf + used, fields[5], strlen(fields[5]) + 1); used += strlen(fields[5]) + 1;
+
+            if (used + strlen(fields[6]) + 1 > buflen) { fclose(f); return ERANGE; }
+            pwd->pw_shell = buf + used;
+            memcpy(buf + used, fields[6], strlen(fields[6]) + 1); used += strlen(fields[6]) + 1;
+
+            (void)order;
+        }
+
+        *result = pwd;
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return ENOENT;                        /* 表里没有 */
+}
+
+/*
+ * ★ getgrgid / getgrnam —— 组族查询（缺口 D 的组半边）★
+ *
+ * 同 getpwnam：只在 fakeroot 开启且真实查询失败时合成 root 组
+ * （gid=0 / 组名 root）。glibc 的 group 结构比 passwd 多一个
+ * gr_mem（成员列表指针），fakeroot 下没有可信的成员清单，
+ * 返回一个**只有单个成员 root** 的列表 —— 这正是 root 组的
+ * 实际形态，也够 dpkg/statoverride 的解析需求。
+ */
+static char gr_mem_buf[8] = "root\0";
+
+struct group *getgrgid(gid_t gid) {
+    static struct group *(*fnsym)(gid_t) = NULL;
+    static char name_buf[32];
+    static char *mem_list[2];
+    static struct group fake;
+    struct group *real;
+
+    if (fnsym == NULL)
+        fnsym = (struct group *(*)(gid_t))bxroot_next_symbol("getgrgid");
+    if (fnsym == NULL) { errno = ENOSYS; return NULL; }
+
+    real = fnsym(gid);
+    if (!g_fakeroot_on || real != NULL)
+        return real;
+    if (gid != g_fakeroot_state.egid)
+        return real;
+
+    memcpy(name_buf, "root", 5);
+    mem_list[0] = gr_mem_buf;
+    mem_list[1] = NULL;
+    fake.gr_name   = name_buf;
+    fake.gr_passwd = name_buf;
+    fake.gr_gid    = gid;
+    fake.gr_mem    = mem_list;
+    return &fake;
+}
+
+/*
+ * getgrnam —— 同 getpwnam 的直解回退（读 /etc/group）。
+ * group 格式：name:passwd:gid:mem（mem 是逗号分隔的成员列表）。
+ *
+ * ★ 注意 _r 契约：本函数返回静态存储（非 _r 版本允许），但 gr_mem
+ *   的成员指针必须指向**持久**存储 —— 所以成员名要拷进静态区，
+ *   不能指向 line（那是栈上的，函数返回就失效）。
+ */
+struct group *getgrnam(const char *name) {
+    static struct group *(*fnsym)(const char *) = NULL;
+    static struct group fake;
+    struct group *real;
+    FILE *f;
+    char line[1024];
+
+    if (fnsym == NULL)
+        fnsym = (struct group *(*)(const char *))bxroot_next_symbol("getgrnam");
+    if (fnsym == NULL) { errno = ENOSYS; return NULL; }
+
+    real = fnsym(name);
+    if (real != NULL)
+        return real;
+
+    if (name == NULL)
+        return NULL;
+
+    f = fopen("/etc/group", "r");
+    if (f == NULL)
+        return NULL;
+
+    while (fgets(line, sizeof line, f) != NULL) {
+        char *fields[4];
+        int nf = 0, i;
+        char *w = line, *e;
+
+        for (i = 0; i < 4; i++) {
+            fields[i] = w;
+            e = strchr(w, i < 3 ? ':' : '\n');
+            if (e == NULL) break;
+            *e = '\0';
+            w = e + 1;
+            nf++;
+        }
+        if (nf < 4 || strcmp(fields[0], name) != 0)
+            continue;
+
+        {
+            /* ★ 全部用 static：gr_mem 指向它，函数返回后必须仍有效 ★ */
+            static char g_name[64], g_passwd[64], g_mem[512];
+            static char *g_memlist[8];
+            int mi = 0, k;
+            char *tok;
+
+            snprintf(g_name,   sizeof g_name,   "%s", fields[0]);
+            snprintf(g_passwd, sizeof g_passwd, "%s", fields[1]);
+            snprintf(g_mem,    sizeof g_mem,    "%s", fields[3]);
+
+            tok = g_mem;
+            while (tok != NULL && mi < 7) {
+                char *c = strchr(tok, ',');
+                if (c != NULL) *c = '\0';
+                if (*tok != '\0') g_memlist[mi++] = tok;
+                tok = (c != NULL) ? c + 1 : NULL;
+            }
+            for (k = mi; k < 8; k++) g_memlist[k] = NULL;
+
+            fake.gr_name   = g_name;
+            fake.gr_passwd = g_passwd;
+            fake.gr_gid    = (gid_t)atoi(fields[2]);
+            fake.gr_mem    = g_memlist;
+        }
+        fclose(f);
+        return &fake;
+    }
+    fclose(f);
+    return NULL;
+}
+/*
+ * getgrnam_r —— _r 契约版本（python grp 模块走这条）。
+ * 与 getpwnam_r 同款直解回退；成员列表也写进调用方缓冲。
+ */
+int getgrnam_r(const char *name, struct group *grp, char *buf, size_t buflen,
+               struct group **result) {
+    static int (*fn)(const char *, struct group *, char *, size_t,
+                     struct group **) = NULL;
+    int rc;
+    FILE *f;
+    char line[1024];
+
+    if (result != NULL) *result = NULL;
+    if (name == NULL || grp == NULL || buf == NULL || result == NULL)
+        return EINVAL;
+
+    if (fn == NULL)
+        fn = (int (*)(const char *, struct group *, char *, size_t,
+                      struct group **))bxroot_next_symbol("getgrnam_r");
+    if (fn != NULL) {
+        errno = 0;
+        rc = fn(name, grp, buf, buflen, result);
+        if (rc == 0 && *result != NULL)
+            return 0;
+        if (rc != 0 && rc != ENOENT && rc != ESRCH)
+            return rc;
+    }
+
+    f = fopen("/etc/group", "r");
+    if (f == NULL)
+        return ENOENT;
+
+    while (fgets(line, sizeof line, f) != NULL) {
+        char *fields[4];
+        int nf = 0, i;
+        char *w = line, *e;
+        size_t used = 0;
+
+        for (i = 0; i < 4; i++) {
+            fields[i] = w;
+            e = strchr(w, i < 3 ? ':' : '\n');
+            if (e == NULL) break;
+            *e = '\0';
+            w = e + 1;
+            nf++;
+        }
+        if (nf < 4 || strcmp(fields[0], name) != 0)
+            continue;
+
+        {
+            size_t len;
+            unsigned gid_v = (unsigned)atoi(fields[2]);
+            int mi = 0;
+            char *tok;
+
+            grp->gr_gid = gid_v;
+
+            len = strlen(fields[0]) + 1;
+            if (used + len > buflen) { fclose(f); return ERANGE; }
+            grp->gr_name = buf + used;
+            memcpy(buf + used, fields[0], len); used += len;
+
+            len = strlen(fields[1]) + 1;
+            if (used + len > buflen) { fclose(f); return ERANGE; }
+            grp->gr_passwd = buf + used;
+            memcpy(buf + used, fields[1], len); used += len;
+
+            /* 成员列表：整体拷进 buf，指针数组也放 buf（对齐安全）*/
+            len = strlen(fields[3]) + 1;
+            if (used + len > buflen) { fclose(f); return ERANGE; }
+            memcpy(buf + used, fields[3], len); used += len;
+
+            /* 成员指针数组：最多 7 个成员 + NULL */
+            tok = buf + (used - len);
+            while (tok != NULL && mi < 7) {
+                char *c = strchr(tok, ',');
+                if (c != NULL) *c = '\0';
+                if (*tok != '\0') mi++;
+                tok = (c != NULL) ? c + 1 : NULL;
+            }
+            {
+                char **ml = (char **)(buf + ((used + sizeof(char*) - 1) &
+                                             ~(sizeof(char*) - 1)));
+                int k = 0;
+                tok = buf + (used - len);
+                while (tok != NULL && k < 7) {
+                    char *c = strchr(tok, ',');
+                    if (c != NULL) *c = '\0';
+                    if (*tok != '\0') ml[k++] = tok;
+                    tok = (c != NULL) ? c + 1 : NULL;
+                }
+                for (; k < 8; k++) ml[k] = NULL;
+                grp->gr_mem = ml;
+                used += 8 * sizeof(char*);
+                if (used > buflen) { fclose(f); return ERANGE; }
+            }
+
+            *result = grp;
+            fclose(f);
+            return 0;
+        }
+    }
+    fclose(f);
+    return ENOENT;
+}
+
 /* getpwuid_r 的可重入版本 —— 有些程序只用它 */
 int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
                struct passwd **result) {
