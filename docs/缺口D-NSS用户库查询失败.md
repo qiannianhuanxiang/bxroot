@@ -126,3 +126,76 @@ C) getpwnam -> root                               C) getpwnam -> (NULL)     ← 
 - 与缺口 C（降权族）**无关但会叠加**：`passwd -S root` 同时受两者影响，
   子代理已实测"补了 setter 也没用"（零 SIGSYS 命中）—— 因为它的阻塞点是 D
 
+---
+
+## 七、2026-09-17 追加：又排除五项，根因**仍未定位**
+
+继续排查，把可疑面收窄到"glibc 内部"这一层，但**没有找到根因**。
+以下全部为实测，供接手者避免重走。
+
+### 关键新证据：`_nss_files_getpwnam_r` 返回值不同
+
+glibc 2.39 起 `_nss_files_*` **已内置到 libc.so.6**（实测导出 74 个
+`_nss_files_*` 符号），独立的 `libnss_files.so.2` 只剩 8 个符号、
+**不导出任何 `_nss_files_*`**（这一点本身就推翻了我初稿"dlopen 搜索路径"
+的方向）。两侧 `dlsym` 都能拿到内置实现，**且是同一地址**。
+
+直接调该实现：
+
+```
+                        官方         bxroot
+_nss_files_getpwnam_r   rc=1        rc=0
+                        (NOTFOUND)  (SUCCESS 但 res=NULL)
+```
+
+**返回值不同**，但含义不明 —— `rc=0` 且 `res=NULL` 在 NSS 约定里是
+"找到了但结果空"，而实际 `/etc/passwd` 里有 `root`。这一条**尚未解释**，
+是最可能的突破口。
+
+### 又排除的五项（全部实测）
+
+| 假设 | 结果 |
+|---|---|
+| `libnss_files.so.2` 导出 NSS 入口 | ✗ 它**只导出 8 个符号**，`_nss_files_*` 全在 libc 里 |
+| 容器与宿主的模块文件不同 | ✗ **md5 完全相同**（`9c5a05…`），且是同一 inode |
+| `/etc/passwd` 不可读 | ✗ `stat`/`open`/`fopen` 五种模式**全部正常**，内容正确 |
+| 文件元数据异常 | ✗ `dev/ino/mode/size/nlink` **两侧逐位相同** |
+| `nsswitch.conf` 解析 | ✗ 两侧都能读到，内容一致（`passwd: files`）|
+
+并且：`getpwnam` 失败时**没有任何 `/etc/passwd` 的 open 被记录**
+（`BXROOT_SCG=1` 转发日志里没有），说明 glibc **在读文件之前就放弃了**。
+
+### 一个仍未被解释的观察（可能是线索）
+
+`dlopen("libnss_files.so.2")` 后取 `link_map.l_name`：
+
+```
+官方  : l_name=/data/data/.../ubuntu/usr/lib/aarch64-linux-gnu/libnss_files.so.2
+bxroot: l_name=libnss_files.so.2        ← 未解析成绝对路径
+```
+
+官方解析成了容器内绝对路径，bxroot 保留了裸名字。**但两者 dlsym 结果
+相同**，所以它**未必是根因** —— 也可能只是 link_map 记账的差异。
+**记录在此，不下结论。**
+
+### 建议的下一步（比之前更具体）
+
+1. **追那个 `rc=0 / res=NULL`**：反汇编 libc 里 `_nss_files_getpwnam_r`
+   的返回路径，看 `rc=0` 对应哪个分支（很可能是"文件读取中途遇到问题
+   但被当成 EOF"）。
+2. **`strace -f`** 看 glibc 到底 open 了什么（本容器无 strace，
+   需要外部手段或自写 ptrace 工具）。
+3. **`LD_DEBUG=libs` 无效**（实测无 NSS 相关输出）—— glibc 的 NSS
+   内部加载不走 `LD_DEBUG` 那条路，别在这上面浪费时间。
+
+### 为什么没继续深挖
+
+需要反汇编 glibc 内部实现或自写 ptrace 工具，**成本已明显超过本轮
+其他任务的量级**，而本项目在"动 ld.so/glibc 内部"这个方向上
+有明确的失败先例（`docs/dlsym垫片与插件加载修复.md`：148 处错误改动
+被全部回滚）。**宁可留着有精确记录的缺口，也不要冒险改坏它。**
+
+### 影响面重申
+
+走 NSS 的都会受影响：`getent`、`id`（组名）、python `pwd`/`grp`、
+`passwd -S`。DSHA 主链路（node）不直接依赖。
