@@ -248,6 +248,48 @@ int bxroot_fakeroot_groups(unsigned int *groups, int cap, int *count)
     return 1;
 }
 
+/*
+ * 缺口 C：身份变更桥。
+ *
+ * 桩要能证明**账本语义被搬运了**，而不只是"返回了 0"。所以它做两件事：
+ *   1. 记录收到的 op 与参数（第 1/2/3 个），供断言比对；
+ *   2. 按 op 返回一组**可区分**的结果：
+ *        setfsuid/setfsgid 回**旧值**（不是 0）—— 这是 man 明确要求的语义，
+ *        最容易在实现里被写成 0，所以专门给一个非 0 的旧值来钉住。
+ *
+ * `g_setter_calls` 用 volatile 计数（本文件头部的教训：跨"真实调用边界"
+ * 传观测值必须 volatile，否则 -O 下会被优化成两个不同对象）。
+ */
+static volatile int g_setter_calls;
+static volatile int g_setter_last_op;
+static volatile unsigned long g_setter_a0, g_setter_a1, g_setter_a2;
+
+#define FAKE_OLD_FSUID 4242u
+
+int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
+                           unsigned long a2, long *out_ret, int *out_errno);
+
+int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
+                           unsigned long a2, long *out_ret, int *out_errno)
+{
+    if (!g_fake_on)
+        return 0;
+
+    g_setter_calls++;
+    g_setter_last_op = op;
+    g_setter_a0 = a0;
+    g_setter_a1 = a1;
+    g_setter_a2 = a2;
+
+    if (out_errno != NULL)
+        *out_errno = 0;
+    if (out_ret != NULL) {
+        /* setfsuid(8) / setfsgid(9) 回**旧值**；其余回 0 */
+        *out_ret = (op == 8 || op == 9) ? (long)FAKE_OLD_FSUID : 0;
+    }
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* 测试框架                                                            */
 /* ------------------------------------------------------------------ */
@@ -502,6 +544,114 @@ int main(void)
         check("反复切换开关每次都正确",
               off1 == off2 && off1 != (long)FAKE_UID &&
               on1 == (long)FAKE_UID && on2 == (long)FAKE_UID, buf);
+    }
+
+    /* ============================================================== */
+    /*
+     * 二·补二、缺口 C：降权族
+     *
+     * 这一组与前面的**本质不同**：它们不是"读出来要假"，而是
+     * "写下去要假装成功，并且账本要真的被更新"。
+     *
+     * 实测背景（docs/身份查询与降权族-原始数据.md）：官方这些号
+     * 全部返回 0 且**账本被更新**（回读 getuid 变新值）；bxroot 修前
+     * 一律 ENOSYS，于是 `chage -l root` 报
+     * `failed to drop privileges`。
+     *
+     * 本测试只测**接线**（op 编号与参数搬运），账本本身由
+     * fakeroot 的纯逻辑测试覆盖 —— 两层分工，避免重复。
+     */
+    printf("\n-- 二·补二、缺口 C：降权族（setuid/setgid/...）--\n");
+    {
+        long rc;
+        size_t k;
+
+        /*
+         * 编号 → op 的映射是**一份约定**，写错就会把 setgid 的参数喂给
+         * setuid（在 fakeroot 语义下都是"改身份"，不报错但改错字段）。
+         * 所以逐个号验证 op 与参数位置。
+         */
+        static const struct {
+            long nr;
+            int  op;
+            const char *name;
+        } setters[] = {
+            { 143, 3, "setreuid"  },
+            { 144, 2, "setgid"    },
+            { 145, 4, "setregid"  },
+            { 146, 1, "setuid"    },
+            { 147, 5, "setresuid" },
+            { 149, 6, "setresgid" },
+            { 151, 8, "setfsuid"  },
+            { 152, 9, "setfsgid"  },
+            { 159, 7, "setgroups" },
+        };
+
+        /*
+         * ★ 159 setgroups 的 a1 是**指针**，不能传 22 ★
+         *
+         * 第一版对所有号一律传 (11, 22, 33)，结果 setgroups 把 22 当
+         * gid 数组去读 → SIGSEGV（pc 指向垃圾地址、x8=0x9f=159）。
+         * 这不是 bxroot 的缺陷：内核同样会对非法指针 EFAULT（实测
+         * 官方侧传 0x1 也是 SIGSEGV）。**是测试写得不真实。**
+         * 所以这里给 setgroups 传一个真实数组与合法长度。
+         */
+        static gid_t grp[2] = { 100, 200 };
+
+        for (k = 0; k < sizeof(setters) / sizeof(setters[0]); k++) {
+            unsigned long exp_a0 = 11UL, exp_a1 = 22UL, exp_a2 = 33UL;
+
+            g_setter_calls = 0;
+            g_setter_last_op = -1;
+            g_setter_a0 = g_setter_a1 = g_setter_a2 = 0;
+
+            if (setters[k].nr == 159) {
+                exp_a0 = 2UL;                          /* n = 2 */
+                exp_a1 = (unsigned long)(uintptr_t)grp; /* list */
+                exp_a2 = 33UL;
+            }
+
+            errno = 0;
+            rc = syscall(setters[k].nr, (long)exp_a0, (long)exp_a1,
+                         (long)exp_a2);
+            snprintf(buf, sizeof buf,
+                     "%s(%ld) rc=%ld op=%d a=(%lu,%lu,%lu)",
+                     setters[k].name, setters[k].nr, rc,
+                     g_setter_last_op, g_setter_a0, g_setter_a1, g_setter_a2);
+            check("降权号被搬到正确的 op，且参数前三位原样",
+                  g_setter_calls == 1 && g_setter_last_op == setters[k].op &&
+                  g_setter_a0 == exp_a0 && g_setter_a1 == exp_a1 &&
+                  g_setter_a2 == exp_a2, buf);
+        }
+
+        /*
+         * ★ setfsuid/setfsgid 必须回**旧值**，不是 0 ★
+         * man 明确："the previous value"，且失败时也返回当前值。
+         * 这是最容易被写成 `return 0` 的地方，所以单独钉住。
+         */
+        rc = syscall(151, 500L);
+        snprintf(buf, sizeof buf, "setfsuid -> %ld 期望旧值 %u", rc,
+                 FAKE_OLD_FSUID);
+        check("setfsuid 返回旧值（不是 0）", rc == (long)FAKE_OLD_FSUID, buf);
+
+        rc = syscall(152, 500L);
+        snprintf(buf, sizeof buf, "setfsgid -> %ld 期望旧值 %u", rc,
+                 FAKE_OLD_FSUID);
+        check("setfsgid 返回旧值（不是 0）", rc == (long)FAKE_OLD_FSUID, buf);
+
+        /* 其余 setter 回 0（成功） */
+        rc = syscall(146, 999L);
+        snprintf(buf, sizeof buf, "setuid(999) -> %ld 期望 0", rc);
+        check("setuid 返回成功 0", rc == 0, buf);
+
+        /* fakeroot 关：必须**透传**（不发这个调用，也不假装成功）*/
+        g_fake_on = 0;
+        g_setter_calls = 0;
+        (void)syscall(146, 999L);
+        snprintf(buf, sizeof buf, "关闭时桩被调 %d 次", g_setter_calls);
+        check("fakeroot 关：降权号原样透传（桩一次都不该被调）",
+              g_setter_calls == 0, buf);
+        g_fake_on = 1;
     }
 
     /* ============================================================== */

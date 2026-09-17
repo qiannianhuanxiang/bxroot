@@ -147,6 +147,17 @@ static fakeroot_state g_fakeroot_state;
 static int g_fakeroot_on = 0;
 
 /*
+ * 前向声明：身份变更桥（缺口 C）。
+ *
+ * 定义在本文件末尾，但符号层的 setuid/setgid/... 钩子（文件中部）要用它。
+ * 之所以集中在末尾定义而不是就近：那一组函数与 `bxroot_fakeroot_ids` 等
+ * 查询入口放在一起，让"身份账本的所有对外接口"一目了然 —— 本项目在
+ * "同一套规则写两处"上反复踩坑，把接口聚在一处是低成本的防漂移手段。
+ */
+int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
+                           unsigned long a2, long *out_ret, int *out_errno);
+
+/*
  * `-L`（proot 的 fix_symlink_size）是否启用。
  *
  * 语义（读 proot 的 fix_symlink_size.c 确认）：对**真符号链接**，
@@ -6078,48 +6089,212 @@ FILE *freopen64(const char *path, const char *mode, FILE *stream) {
  * 初始化也已一并删除 —— 否则会触发本仓库零告警门禁的未使用变量告警。
  */
 
-/* Hook: getuid (fakeroot) */
+/*
+ * Hook: getuid / getgid / geteuid / getegid (fakeroot)
+ *
+ * ★ 必须读**账本**，不能硬编码 0 ★
+ *
+ * 【缺陷（实测，2026-09-17）】这四个原先写的是：
+ *
+ *     if (g_config.fakeroot) { return 0; }
+ *
+ * 即"只要 fakeroot 开着就永远是 0"。这在**没有 setter 之前**看不出问题，
+ * 但官方是**有状态**的 —— setter 生效后回读会变：
+ *
+ *     ########## 官方 ##########            ########## bxroot（修前）##########
+ *     BEFORE: getuid=0 getgid=0              BEFORE: getuid=0 getgid=0
+ *     setgid(999) rc=0  setuid(999) rc=0     setgid(999) rc=0（已可模拟）
+ *     AFTER : getuid=999 getgid=999          AFTER : getuid=0   ❌ 账本没被读
+ *
+ * 也就是"setter 写了账本、getter 不读账本"——正是本项目反复出现的
+ * **两层给出不同答案**。账本就在 `g_fakeroot_state` 里，读它即可。
+ *
+ * 【判据用哪个】
+ * 用 `g_fakeroot_on`（不是 `g_config.fakeroot`）：`init_fakeroot()` 在
+ * 记账表创建失败时会**整体关掉** fakeroot（半残的 fakeroot 比没有更危险）。
+ * 这与 `bxroot_fakeroot_ids()` 的判据必须**同一个** —— 否则会出现
+ * "符号层读账本、裸 syscall 层硬编码 0"这种新的两层矛盾。
+ *
+ * 注：`real_getuid` 等指针仍保留（未启用时透传），见上面的
+ * ensure_real_functions()。
+ */
 uid_t getuid(void) {
     ensure_real_functions();
 
-    if (g_config.fakeroot) {
-        return 0;
+    if (g_fakeroot_on) {
+        return g_fakeroot_state.ruid;
     }
 
     return real_getuid();
 }
 
-/* Hook: getgid (fakeroot) */
 gid_t getgid(void) {
     ensure_real_functions();
 
-    if (g_config.fakeroot) {
-        return 0;
+    if (g_fakeroot_on) {
+        return g_fakeroot_state.rgid;
     }
 
     return real_getgid();
 }
 
-/* Hook: geteuid (fakeroot) */
 uid_t geteuid(void) {
     ensure_real_functions();
 
-    if (g_config.fakeroot) {
-        return 0;
+    if (g_fakeroot_on) {
+        return g_fakeroot_state.euid;
     }
 
     return real_geteuid();
 }
 
-/* Hook: getegid (fakeroot) */
 gid_t getegid(void) {
     ensure_real_functions();
 
-    if (g_config.fakeroot) {
-        return 0;
+    if (g_fakeroot_on) {
+        return g_fakeroot_state.egid;
     }
 
     return real_getegid();
+}
+
+/*
+ * ==================================================================
+ * 缺口 C（符号层）：setuid / setgid / setreuid / ... 的钩子
+ * ==================================================================
+ *
+ * 【为什么必须有这一层 —— 实测证据】
+ *
+ * 先前修了 `syscall(143/144/...)` 这一层，但 `chage` **仍然失败**：
+ *
+ *     $ BXROOT_SIGSYS_LOG=1 chage -l root
+ *     [bxroot] sigsys: 模拟 syscall 143 -> ENOSYS
+ *     chage: failed to drop privileges (Function not implemented)
+ *
+ * 而 `readelf --dyn-syms chage` 显示它引用的是 **`setreuid` 符号**
+ * （不是裸 svc；`objdump -d chage | grep -c svc` = **0**）。
+ * 也就是说 glibc 的 `setreuid` **包装函数**自己发 svc —— 它既不经过
+ * libc 的 `syscall()` 符号（我们上轮修的那层），也不经过我们的任何钩子，
+ * 直接撞上 proroot-ldso 的 seccomp 过滤器。
+ *
+ * ┌──────────────────────────────────────────────────────────┐
+ * │ 三种发起方式，各自需要不同的拦截点：                      │
+ * │   ① 程序调 setreuid(2) 符号   -> 需要**符号层**钩子（本组）│
+ * │   ② 程序调 syscall(143,...)   -> 需要 syscall() 钩子（上轮）│
+ * │   ③ 程序内联 svc #0           -> **两侧都拦不到**（官方也不拦）│
+ * └──────────────────────────────────────────────────────────┘
+ *
+ * 这正是本项目反复出现的「同一功能在不同路径上覆盖不全」模式 ——
+ * 修了 ② 就以为修完了，而真实程序（chage）走的是 ①。
+ *
+ * 【为什么调用 fakeroot_set* 而不是自己改字段】
+ * 与桥接层同一理由：账本逻辑只有一份，改字段会与纯逻辑层的闸门
+ * （caps_active / keep_caps / MAYBE_DROP_CAPS）脱钩。
+ *
+ * 【setgroups 为什么走桥接而不是 fakeroot_setgroups】
+ * 见 preload.c 末尾 `bxroot_fakeroot_setter` 的 case 7 长注释：
+ * 上游 PRoot 对 setgroups 是**无条件成功**（fake_id0.c:1016），
+ * 而纯逻辑层带一条 CAP_SETGID 闸门。为与官方可观测行为一致，
+ * 这一层与 syscall 层**共用**同一个桥接实现（单一来源）。
+ */
+int setuid(uid_t uid) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(1, (unsigned long)uid, 0, 0, &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int setgid(gid_t gid) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(2, (unsigned long)gid, 0, 0, &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int setreuid(uid_t r_, uid_t e_) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(3, (unsigned long)r_, (unsigned long)e_, 0,
+                               &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int setregid(gid_t r_, gid_t e_) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(4, (unsigned long)r_, (unsigned long)e_, 0,
+                               &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int setresuid(uid_t r_, uid_t e_, uid_t s_) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(5, (unsigned long)r_, (unsigned long)e_,
+                               (unsigned long)s_, &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int setresgid(gid_t r_, gid_t e_, gid_t s_) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(6, (unsigned long)r_, (unsigned long)e_,
+                               (unsigned long)s_, &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int setgroups(size_t n, const gid_t *list) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(7, (unsigned long)n,
+                               (unsigned long)(uintptr_t)list, 0,
+                               &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+/*
+ * setfsuid / setfsgid 的返回值是**旧值**（man 明确），所以桥接直接
+ * 把旧值放在 `r` 里给我们，不能当成"0 = 成功"处理。
+ */
+uid_t setfsuid(uid_t fsuid) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(8, (unsigned long)fsuid, 0, 0, &r, &e) == 1) {
+        errno = e;
+        return (uid_t)r;
+    }
+    errno = ENOSYS;
+    return (uid_t)-1;
+}
+
+gid_t setfsgid(gid_t fsgid) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(9, (unsigned long)fsgid, 0, 0, &r, &e) == 1) {
+        errno = e;
+        return (gid_t)r;
+    }
+    errno = ENOSYS;
+    return (gid_t)-1;
 }
 
 /* Hook: uname (伪装为 Linux) */
@@ -6876,6 +7051,151 @@ int bxroot_fakeroot_groups(unsigned int *groups, int cap, int *count)
     if (groups != NULL && cap > 0) {
         for (k = 0; k < n && k < cap; k++)
             groups[k] = (unsigned int)g_fakeroot_state.groups[k];
+    }
+    return 1;
+}
+
+/*
+ * ==================================================================
+ * 缺口 C：裸 syscall 层的身份变更桥（setuid/setgid/setgroups/...）
+ * ==================================================================
+ *
+ * 【为什么需要它】
+ *
+ * preload.c 的 getuid/getresuid/... 是**符号层**查询钩子；
+ * fakeroot.c 的 setuid/setgid/... 是**符号层**变更钩子 —— 但那一层被
+ * `-DFAKEROOT_PURE_LOGIC` **排除在运行时之外**（BUILD_RUNTIME.sh:92），
+ * 所以运行时里根本没有符号层的 setter。程序若绕过 libc 直接发
+ * `syscall(144 setgid, ...)`（静态链接的 Go/Rust、安全自检代码），
+ * 就完全碰不到任何拦截：
+ *
+ *     官方 : syscall(144) = 0，且**账本被更新**（回读 getuid 变成新值）
+ *     bxroot(修前): syscall(144) = -38 (ENOSYS，sigsys.c 统一回绝)
+ *
+ * 现场后果（实测）：`chage -l root` 官方 rc=0、bxroot rc=1
+ * （`failed to drop privileges (Function not implemented)`）。
+ *
+ * 【为什么不"让这几个号直接返回 0"】
+ *
+ * 实测官方**有用户态身份账本** —— setter 生效后回读 getter 会变：
+ *
+ *     ########## 官方 ##########            ########## bxroot ##########
+ *     BEFORE: getuid=0 getgid=0              BEFORE: getuid=0 getgid=0
+ *     setgid(999) rc=0  setuid(999) rc=0     setgid(999) rc=-1 errno=38
+ *     AFTER : getuid=999 getgid=999          AFTER : getuid=0 getgid=0
+ *
+ * 只返回 0 会让程序看到**自相矛盾**的世界（"降权成功"但回读仍是原身份），
+ * 比报错更难查。所以这里复用 fakeroot 的**纯逻辑** setter
+ * （fakeroot_setuid/setgid/setgroups…），它们已经在维护账本。
+ *
+ * 【op 为什么用数字】
+ * `syscall_guard.c` 是独立编译单元（会被 test_syscall_argpos.c 单独链接），
+ * 拖进 fakeroot.h 会引入一堆依赖。用数字让两侧只共享一个约定，
+ * 不必各自定义枚举（本项目在号码表上出过两次事故）。
+ *   1=setuid 2=setgid 3=setreuid 4=setregid 5=setresuid
+ *   6=setresgid 7=setgroups 8=setfsuid 9=setfsgid
+ *
+ * 【★ 真实性副作用，必须写清 ★】
+ * 这些调用"成功"后内核身份**没有**真的改变。对 `chage`/`passwd` 这类
+ * 工具，这意味着它们会跳过后续权限检查却仍以原身份执行 —— 这是
+ * **与官方一致**，不是"正确"。官方就是这么做的（实测 9 个 setter 全返回 0）。
+ */
+int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
+                           unsigned long a2, long *out_ret, int *out_errno)
+{
+    int rc;
+
+    if (out_ret != NULL)   *out_ret = 0;
+    if (out_errno != NULL) *out_errno = 0;
+
+    if (!g_fakeroot_on)
+        return 0;               /* 未启用：guard 必须原样透传 */
+
+    switch (op) {
+    case 1:  rc = fakeroot_setuid (&g_fakeroot_state, (uid_t)a0);             break;
+    case 2:  rc = fakeroot_setgid (&g_fakeroot_state, (gid_t)a0);             break;
+    case 3:  rc = fakeroot_setreuid(&g_fakeroot_state, (uid_t)a0, (uid_t)a1); break;
+    case 4:  rc = fakeroot_setregid(&g_fakeroot_state, (gid_t)a0, (gid_t)a1); break;
+    case 5:  rc = fakeroot_setresuid(&g_fakeroot_state, (uid_t)a0, (uid_t)a1,
+                                     (uid_t)a2);                             break;
+    case 6:  rc = fakeroot_setresgid(&g_fakeroot_state, (gid_t)a0, (gid_t)a1,
+                                     (gid_t)a2);                             break;
+    case 7:
+        /*
+         * setgroups(n, list)：n == 0 且 list == NULL 表示清空。
+         *
+         * ★ 上限校验是必须的 ★
+         * 客户传的 list 是我们要**读**的指针。n 超过 FR_NGROUPS_MAX 时
+         * 按内核语义回 EINVAL（实测内核也是 EINVAL，不是截断），
+         * 既避免读越界，也与内核行为一致。
+         *
+         * ★★ 为什么这里**绕过** fakeroot_setgroups 的 CAP_SETGID 闸门 ★★
+         *
+         * 【实测差异（2026-09-17）】
+         * fakeroot_setgroups() 带一条权限闸门：
+         *     if (!(fs->euid == 0 || fs->caps_active)) return FR_EPERM;
+         * 于是 `setuid(999)` 之后再 `setgroups` 会得到 EPERM。而**官方允许**：
+         *
+         *     官方 : setuid(999) -> 999/999/999，然后 setgroups rc=0
+         *     bxroot(修前): 同样状态，setgroups rc=-1 EPERM   ← 不一致
+         *
+         * 【上游 PRoot 的做法】
+         * `src/extension/fake_id0/fake_id0.c:1011-1017` 对 setgroups 是
+         * **无条件** `poke_reg(tracee, SYSARG_RESULT, 0)` —— 注释写着
+         * "TODO: need to really emulate"，即**根本没做权限检查**，
+         * 一律"假装成功"。
+         *
+         * 【为什么不改 fakeroot_setgroups() 本身】
+         * 那条闸门是**纯逻辑层**的既有行为，`test_fakeroot` 有断言钉着它
+         * （fake_id0.c:112 的 `allowed = ...` 模型）。改它会让纯逻辑测试
+         * 与 PRoot 的 setuid 族语义脱钩。所以**只在本桥接层**放宽：
+         * 桥接的职责就是"让 syscall 层与官方可观测行为一致"。
+         *
+         * 【为什么这是安全的】
+         * fakeroot 本来就是"假装" —— 内核身份并未改变。官方把这条做成
+         * 无条件成功，我们跟它，可观测行为才一致。
+         */
+        if (a0 > (unsigned long)FR_NGROUPS_MAX) {
+            rc = FR_EINVAL;
+        } else {
+            size_t n = (size_t)a0;
+            const gid_t *list = (n == 0) ? NULL
+                                         : (const gid_t *)(uintptr_t)a1;
+            size_t i;
+
+            if (n > 0 && list == NULL) {
+                rc = FR_EINVAL;
+            } else {
+                for (i = 0; i < n; i++)
+                    g_fakeroot_state.groups[i] = list[i];
+                g_fakeroot_state.ngroups = (int)n;
+                rc = FR_OK;
+            }
+        }
+        break;
+    case 8:
+        /* setfsuid 返回**旧值**（man 明确），不是 0 */
+        if (out_ret != NULL)
+            *out_ret = (long)fakeroot_setfsuid(&g_fakeroot_state, (uid_t)a0);
+        return 1;
+    case 9:
+        if (out_ret != NULL)
+            *out_ret = (long)fakeroot_setfsgid(&g_fakeroot_state, (gid_t)a0);
+        return 1;
+    default:
+        /*
+         * 未知 op：**不能**假装成功 —— 那等于对一张没定义的表给出"成功"。
+         * 返回 -1 让 guard 原样透传（由内核报出真实错误）。
+         */
+        return -1;
+    }
+
+    if (rc != FR_OK) {
+        if (out_errno != NULL)
+            *out_errno = (rc == FR_EINVAL) ? EINVAL : EPERM;
+        if (out_ret != NULL)
+            *out_ret = -1;
+        return 1;
     }
     return 1;
 }

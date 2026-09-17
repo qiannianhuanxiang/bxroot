@@ -1511,7 +1511,8 @@ void fakeroot_state_set_enabled(fakeroot_state *fs, bool enabled)
          * 但**官方选择只给一个 [0]**，我们与官方对齐而不是与真实内核对齐
          * （这是 fakeroot 的语义 —— 让程序看到"它以为的那个身份"）。
          *
-         * 注意组表可以被 `setgroups` 覆盖（见 fr_setgroups），这里只设初值。
+         * 注意组表可以被 `setgroups` 覆盖（见 fakeroot_setgroups），
+         * 这里只设初值。
          */
         fs->groups[0]  = (gid_t)0;
         fs->ngroups    = 1;

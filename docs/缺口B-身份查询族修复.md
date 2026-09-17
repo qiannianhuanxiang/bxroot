@@ -139,3 +139,119 @@ all-3               rc=0 0/0/0         10655×3            rc=0 0/0/0    ✅
 > **缺口 B 的修复让 `id` 的组名解析相关行为更接近官方**，但
 > `passwd -S root` 仍失败 —— 它的阻塞点是**缺口 D**（NSS），
 > 不是 setter 族（子代理实测：它零 SIGSYS 命中）。三个缺口互不替代。
+
+---
+
+# 附：缺口 C（降权族）后续修复
+
+> 本节在缺口 B 修完后追加。缺口 C 原本标为"未修"，本轮一并解决。
+
+## 缺陷
+
+```
+########## 官方 ##########                    ########## bxroot ##########
+$ chage -l root                               $ chage -l root
+Last password change : Aug 05, 2025           chage: failed to drop privileges
+...（正常输出，rc=0）                          (Function not implemented)  rc=1
+```
+
+## ★ 关键：这是**两条**路径都没覆盖，修一条不够 ★
+
+先前只修了 `syscall(143/144/...)` 层，但 `chage` **仍然失败**。追踪：
+
+```
+$ BXROOT_SIGSYS_LOG=1 chage -l root
+[bxroot] sigsys: 模拟 syscall 143 -> ENOSYS
+```
+
+而 `readelf --dyn-syms chage` 显示它引用的是 **`setreuid` 符号**
+（`objdump -d chage | grep -c svc` = **0**）—— glibc 的 `setreuid`
+**包装函数自己发 svc**，既不经过 libc 的 `syscall()` 符号，
+也不经过我们任何钩子，直接撞 proroot-ldso 的 seccomp 过滤器。
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ 三种发起方式，各自需要不同的拦截点：                        │
+│  ① 程序调 setreuid(2) 符号   -> 符号层钩子                  │
+│  ② 程序调 syscall(143,...)   -> syscall() 钩子              │
+│  ③ 程序内联 svc #0           -> 两侧都拦不到（官方也不拦）    │
+└──────────────────────────────────────────────────────────┘
+```
+
+**这正是本项目反复出现的「同一功能在不同路径上覆盖不全」模式** ——
+修了 ② 就以为修完了，而真实程序走的是 ①。
+
+## 修法：用户态身份账本（不是"返回 0"）
+
+官方**有状态**：setter 生效后回读 getter 会变。
+
+```
+########## 官方 ##########            ########## bxroot（修前）##########
+BEFORE: getuid=0 getgid=0              BEFORE: getuid=0 getgid=0
+setgid(999) rc=0  setuid(999) rc=0     setgid(999) rc=-1 errno=38
+AFTER : getuid=999 getgid=999          AFTER : getuid=0        ❌
+```
+
+只返回 0 会让程序看到**自相矛盾**的世界（"降权成功"却回读原身份），
+比报错更难查。所以：
+
+1. **`preload.c` 新增桥接 `bxroot_fakeroot_setter(op, a0..a2, ...)`**
+   —— 复用 fakeroot 纯逻辑层的 `fakeroot_setuid/setgid/setresuid/...`
+   （账本逻辑只有一份）。
+2. **符号层补 9 个 setter 钩子**（`setuid`/`setgid`/`setreuid`/`setregid`/
+   `setresuid`/`setresgid`/`setgroups`/`setfsuid`/`setfsgid`）—— 这一层
+   **原先完全不存在**，是 `chage` 走的路径。
+3. **修好 getter 的硬编码**：`getuid/getgid/geteuid/getegid` 原先写的是
+   `if (g_config.fakeroot) return 0;` —— **永远返回 0，不读账本**。
+   改为读 `g_fakeroot_state.ruid/rgid/euid/egid`（判据用 `g_fakeroot_on`，
+   与 `bxroot_fakeroot_ids()` 同一个）。
+
+## ★ 一处与上游的差异，我选择**跟官方而不是跟纯逻辑层** ★
+
+`fakeroot_setgroups()` 带一条 CAP_SETGID 闸门；而**上游 PRoot 对
+`setgroups` 是无条件成功**：
+
+```c
+/* termux-proot/src/extension/fake_id0/fake_id0.c:1011-1017 */
+case PR_setgroups:
+        /*TODO: need to really emulate*/
+        poke_reg(tracee, SYSARG_RESULT, 0);
+        return 0;
+```
+
+实测差异：
+```
+官方 : setuid(999) -> 999/999/999，然后 setgroups rc=0
+bxroot(先): 同样状态，setgroups rc=-1 EPERM   ← 不一致
+```
+
+处置：**不改** `fakeroot_setgroups()`（纯逻辑层的闸门有测试钉着、
+且它是 PRoot setuid 族语义的一部分），而是在**桥接层**（case 7）
+直接操作账本 —— 桥接的职责本就是"让 syscall/符号层与官方可观测行为一致"。
+
+## 修后对照（逐行一致）
+
+```
+syscall 探针                     官方          bxroot 修后
+before  r/e/s                  0/0/0          0/0/0
+setgid(144)                    rc=0 errno=0   rc=0 errno=0
+setuid(146)                    rc=0 errno=0   rc=0 errno=0
+after   r/e/s                  999/999/999    999/999/999      ← 账本自洽
+setgroups(0,NULL)              rc=0 errno=0   rc=0 errno=0
+
+真实程序 chage -l root         rc=0 正常输出   rc=0 正常输出     ← ★
+```
+
+## 验证
+
+- **判别力**：用 git 镜像的旧 guard 跑同一测试 → **11 条缺口 C 判据全红**
+- 单测 `RUN_ID_SYSCALL.sh` → **60 用例 / 0 失败**
+- 新增 `test/RUN_PRIVDROP.sh`（6 条判据，含真实程序 `chage` 与账本自洽性），
+  已纳入 `RUN_ALL.sh` 第 9f 项
+- 回归 **18/18**（既有 17 项一项没红）；门禁零告警
+
+## ★ 副作用（与官方一致，但不是"正确"）★
+
+这些调用"成功"后**内核身份没有真的改变**。对 `chage`/`passwd` 这类工具，
+意味着它们会跳过后续权限检查却仍以原身份执行。官方就是这么做的 ——
+这是**兼容性取舍**，不是安全建议。已在 `preload.c` 与测试注释中写明。

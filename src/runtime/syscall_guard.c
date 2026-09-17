@@ -130,6 +130,33 @@ __attribute__((weak))
 int bxroot_fakeroot_groups(unsigned int *groups, int cap, int *count);
 
 /*
+ * 缺口 C：降权族的**状态**接口（setuid/setgid/setgroups…）。
+ *
+ * 【为什么不是"让这几个号直接返回 0"】
+ *
+ * 实测官方**有用户态身份账本**：setter 生效后回读 getter 会变成新值：
+ *
+ *     ########## 官方 ##########            ########## bxroot ##########
+ *     BEFORE: getuid=0 getgid=0              BEFORE: getuid=0 getgid=0
+ *     setgid(999) rc=0  setuid(999) rc=0     setgid(999) rc=-1 errno=38
+ *     AFTER : getuid=999 getgid=999          AFTER : getuid=0 getgid=0
+ *
+ * 所以修法**不是**"让几个号返回 0"，而是"让 setter 真正更新账本"。
+ * 账本本身在 fakeroot 层**早已实现**（fakeroot_setuid/setgid/setgroups…），
+ * 符号层钩子也已接上 —— 缺的只是**裸 syscall 层**这条路。
+ *
+ * `op` 用数字（1..9），与 fakeroot.c 的定义严格对应。用数字而非枚举是
+ * 刻意的：guard 侧只需要数字，两处各定义一份枚举必然漂移。
+ *
+ * 返回：1 = 已模拟（out_ret/out_errno 是给客户的结果）；
+ *       0 = fakeroot 未启用，guard 应原样透传；
+ *      -1 = op 未知，应原样透传。
+ */
+__attribute__((weak))
+int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
+                           unsigned long a2, long *out_ret, int *out_errno);
+
+/*
  * STATX_NLINK：避免为一个常量引入 <linux/stat.h>（见上面的耦合说明）。
  *
  * ★ 值必须是 0x4，不要写成 0x200 ★
@@ -963,8 +990,16 @@ long syscall(long number, ...)
          * 所以 148/150 单独走一个分支，**不看 ret**：
          * 我们自己有完整的伪造值，根本不需要内核的答复；
          * 只要能证明"这次调用合法"，就自己填好并返回 0。
+         *
+         * ★ 这里**不判** bxroot_fakeroot_ids 是否为 NULL ★
+         *
+         * 原先的门控是 `if (bxroot_fakeroot_ids != NULL) { switch ... }`，
+         * 但那会让**降权族（缺口 C）永远进不来** —— 它是另一组 weak 符号
+         * （bxroot_fakeroot_setter），而某些编译方式下（单测只给部分强定义）
+         * bxroot_fakeroot_ids 为 NULL 而 bxroot_fakeroot_setter 非 NULL。
+         * 门控放到**每个 case 内部**各自判自己的符号，才不会互相连坐。
          */
-        if (bxroot_fakeroot_ids != NULL) {
+        {
             unsigned int fuid = 0, fgid = 0;
 
             switch (number) {
@@ -980,7 +1015,12 @@ long syscall(long number, ...)
                  * 与 148/150 不同：这里没有"客户缓冲区"要填，纯粹是改写
                  * 内核给的返回值。内核失败时（理论不会，但可以回 -EPERM）
                  * 必须保留失败语义，不能把错误伪装成成功。
+                 *
+                 * ★ 显式判 NULL ★ 每个 weak 符号各自判（见 148/150 的
+                 * 崩溃记录：漏判会跳到地址 0）。
                  */
+                if (bxroot_fakeroot_ids == NULL)
+                    break;
                 if (ret >= 0 && bxroot_fakeroot_ids(&fuid, NULL)) {
                     if (g_trace)
                         log_num("[bxroot] syscall_guard: 伪装 uid ", number, " ");
@@ -989,6 +1029,8 @@ long syscall(long number, ...)
                 break;
             case 176:   /* getgid  */
             case 177:   /* getegid */
+                if (bxroot_fakeroot_ids == NULL)
+                    break;
                 if (ret >= 0 && bxroot_fakeroot_ids(NULL, &fgid)) {
                     if (g_trace)
                         log_num("[bxroot] syscall_guard: 伪装 gid ", number, " ");
@@ -1178,6 +1220,91 @@ long syscall(long number, ...)
                                     gcount, " ");
                     }
                 }
+                break;
+            }
+
+            /*
+             * ========================================================
+             * 缺口 C：降权族（setuid/setgid/setgroups/...）
+             * ========================================================
+             *
+             * 【缺陷】这些号在 bxroot 下统一返回 ENOSYS：
+             *
+             *     官方 : syscall(144 setgid) = 0  且账本被更新
+             *     bxroot: syscall(144) = -38 (ENOSYS，sigsys.c 统一回绝)
+             *
+             * 现场后果：`chage -l root` 官方 rc=0、bxroot rc=1
+             * （`failed to drop privileges`）。
+             *
+             * 【机制（实测，见 docs/身份查询与降权族-原始数据.md）】
+             * 官方这些号**全部被 seccomp TRAP**，但它在 SIGSYS 处理器里
+             * 改写 x0 为成功 —— 也就是说它有一套**用户态身份账本**。
+             * bxroot 的 sigsys.c 策略是统一回 ENOSYS（那是让 libuv 回退
+             * epoll 的**关键契约**，不能动），所以这条路必须在本函数补。
+             *
+             * 【为什么是"更新账本"而不是"直接返回 0"】
+             * 只返回 0 会让程序看到自相矛盾的世界（"降权成功"但回读仍是
+             * 原身份）。官方实测是**自洽**的：setgid(999) 后 getgid()=999。
+             * 账本在 fakeroot 层早已实现，这里只是把它接到 syscall 层。
+             *
+             * 【为什么每个号单独列】
+             * 号码表是本文件出过两次致命事故的地方（36 把 dirfd 当路径、
+             * 260 把 wait4 当 linkat）。而且这里的号**不连续**
+             * （143..147、149、151、152、159），范围判断必然卷错。
+             *
+             * 【`147 setresuid` 为什么也在表里】
+             * 先前调查说它"未被 TRAP、不能一刀切"—— 那是说在**官方**的
+             * SIGSYS 路径里收不到它（内核在 seccomp 前就查了权限）。
+             * 但 bxroot 这里走的是 `syscall()` **符号层**，与 seccomp 无关，
+             * 所以它同样应该被模拟（否则 `setresuid` 与 `setuid` 行为不一致）。
+             */
+            case 143:   /* setreuid   (r, e)          */
+            case 144:   /* setgid     (gid)           */
+            case 145:   /* setregid   (r, e)          */
+            case 146:   /* setuid     (uid)           */
+            case 147:   /* setresuid  (r, e, s)       */
+            case 149:   /* setresgid  (r, e, s)       */
+            case 151:   /* setfsuid   (fsuid)         */
+            case 152:   /* setfsgid   (fsgid)         */
+            case 159:   /* setgroups  (n, list)       */
+            {
+                long sret = 0;
+                int serr = 0;
+                int sop;
+                int src;
+
+                /* 独立 weak 符号，单独判 NULL（见 148/150 的崩溃记录） */
+                if (bxroot_fakeroot_setter == NULL)
+                    break;
+
+                switch (number) {
+                case 143: sop = 3; break;   /* setreuid  */
+                case 144: sop = 2; break;   /* setgid    */
+                case 145: sop = 4; break;   /* setregid  */
+                case 146: sop = 1; break;   /* setuid    */
+                case 147: sop = 5; break;   /* setresuid */
+                case 149: sop = 6; break;   /* setresgid */
+                case 151: sop = 8; break;   /* setfsuid  */
+                case 152: sop = 9; break;   /* setfsgid  */
+                default:  sop = 7; break;   /* 159 setgroups */
+                }
+
+                src = bxroot_fakeroot_setter(sop, (unsigned long)a0,
+                                             (unsigned long)a1,
+                                             (unsigned long)a2, &sret, &serr);
+                if (src == 1) {
+                    /*
+                     * 已模拟。注意 `setfsuid`/`setfsgid` 的返回值是**旧值**
+                     * （man 明确），不是 0 —— fakeroot 层已经处理好，
+                     * 这里原样透传即可。
+                     */
+                    ret = sret;
+                    errno = serr;
+                    if (g_trace)
+                        log_num("[bxroot] syscall_guard: 模拟降权号 ", number,
+                                " -> ");
+                }
+                /* src == 0（未启用）或 -1（未知 op）：不动 ret，原样透传 */
                 break;
             }
 
