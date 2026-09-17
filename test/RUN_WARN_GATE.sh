@@ -131,6 +131,10 @@ echo "   proc.c : ${PROC_DIR:-<未找到，将跳过>}"
 TOTAL=0
 FAILED=""
 CHECKED=0
+# 因 ICE 耗尽而**未被检查**的单元（见下方重试循环的注释）。
+# 与 FAILED 分开统计：ICE 是环境噪声，不是代码缺陷，不该让门禁变红；
+# 但也必须显式报出来，否则就成了新的"静默跳过"。
+SKIPPED=""
 
 for f in $UNITS; do
     [ -f "$f" ] || continue
@@ -151,18 +155,50 @@ for f in $UNITS; do
     # 同时补上 -O1：gcc 的 -O2 才有的那批告警（如 bridge.c 的
     # -Wstringop-truncation）在 -O0 下不报，而构建脚本实际用 -O2/-O1。
     # 门禁的优化级别必须与真实构建**对齐**，否则策略漂移。
+    #
+    # ★ 重试次数必须与真实构建一致：都取 10 ★
+    #
+    # 实测缺陷（2026-09-17，由"回归偶发变红"暴露）：这里原先只重试 **3**
+    # 次，而 BUILD_RUNTIME.sh 重试 **10** 次。实测 sigsys.c 的 ICE 发生率：
+    #
+    #     $ for i in $(seq 1 30); do gcc ... -c -o /dev/null src/runtime/sigsys.c; done
+    #     ICE 次数 = 5 / 30        ← 约 17%
+    #
+    # 3 次重试全部撞上 ICE 的概率约 0.5%，单看很小；但全量回归里这一项
+    # 每轮都跑、且经常连跑多轮，累积起来就成了**偶发假红**：
+    #
+    #     通过 11 / 失败 1   ← 报的是 sigsys.c "编译失败（非告警，是真错误）"
+    #     通过 12 / 失败 0   ← 同一条命令重跑就绿
+    #
+    # 而报错信息会把 ICE 说成"真错误"，把排查方向指向 src/runtime/sigsys.c
+    # 的代码 —— 那里其实没有任何问题。**假红比不红更贵**。
     rc=1
     i=1
-    while [ "$i" -le 3 ]; do
+    ICE=0
+    while [ "$i" -le 10 ]; do
         # shellcheck disable=SC2086
         "$CC" $BASE -O1 -I"${PROC_DIR:-.}" $DEFS -c -o /dev/null "$f" \
             >/dev/null 2>"/tmp/bxroot-warn-$$.txt"
         rc=$?
         grep -q 'internal compiler error' "/tmp/bxroot-warn-$$.txt" || break
+        ICE=1
         i=$((i + 1))
     done
 
     if [ "$rc" -ne 0 ] && ! grep -q 'warning:' "/tmp/bxroot-warn-$$.txt" 2>/dev/null; then
+        # ★ 区分"ICE 耗尽"与"真错误" ★
+        #
+        # 两者的处置完全不同：真错误要改代码，ICE 耗尽只说明这次运气差
+        # （重跑即可），且**不能算作告警门禁失败** —— 那会把一个环境噪声
+        # 报成代码缺陷。但也不能静默放过：ICE 耗尽意味着这个编译单元
+        # 这一轮**没被检查到**，必须显式说出来，否则门禁又在"静默跳过"。
+        if [ "$ICE" = 1 ]; then
+            echo "⚠️  $f —— 10 次重试均遇 gcc ICE（环境问题，非代码缺陷）"
+            echo "     该单元本轮**未被检查**。重跑本脚本即可；"
+            echo "     若持续复现，说明 ICE 命中率异常高，需单独排查。"
+            SKIPPED="$SKIPPED $f"
+            continue
+        fi
         echo "❌ $f —— 编译失败（非告警，是真错误）"
         head -20 "/tmp/bxroot-warn-$$.txt" | sed 's/^/     /'
         FAILED="$FAILED $f"
@@ -193,6 +229,13 @@ echo "---------------------------------------------------------------------"
 if [ "$CHECKED" -eq 0 ]; then
     echo "❌ 一个源文件都没检查到 —— 脚本可能跑错了目录"
     exit 2
+fi
+
+# ICE 跳过的单元单独汇报：它不构成失败，但必须让人看见"这一轮漏检了什么"。
+# 静默跳过是本项目反复出现的缺陷模式（见 docs/测试基础设施红队报告.md）。
+if [ -n "$SKIPPED" ]; then
+    echo "⚠️  因 gcc ICE 耗尽而**未被检查**的单元:$SKIPPED"
+    echo "    （环境问题，非代码缺陷；重跑本脚本即可。上面已逐个列出原因）"
 fi
 
 if [ "$TOTAL" -eq 0 ]; then

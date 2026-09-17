@@ -174,8 +174,9 @@ static int (*real_access)(const char *, int) = NULL;
 static ssize_t (*real_readlink)(const char *, char *, size_t) = NULL;
 static char *(*real_realpath)(const char *, char *) = NULL;
 /* real_execve / real_execvpe 已随 4 个 exec 钩子一并删除（见文件后段
- * 「exec 家族已移交给 D4 进程管理层」）—— 留着会是未使用变量。 */
-static pid_t (*real_getpid)(void) = NULL;
+ * 「exec 家族已移交给 D4 进程管理层」）—— 留着会是未使用变量。
+ * real_getpid 同理：getpid 钩子已删除（官方从不改 getpid，见其钩子原址
+ * 的说明），此处不再需要解析真实 getpid。 */
 static uid_t (*real_getuid)(void) = NULL;
 static gid_t (*real_getgid)(void) = NULL;
 static uid_t (*real_geteuid)(void) = NULL;
@@ -1035,7 +1036,7 @@ static void ensure_real_functions(void) {
         real_access = (int (*)(const char *, int))bxroot_next_symbol("access");
         real_readlink = (ssize_t (*)(const char *, char *, size_t))bxroot_next_symbol("readlink");
         real_realpath = (char * (*)(const char *, char *))bxroot_next_symbol("realpath");
-        real_getpid = (pid_t (*)(void))bxroot_next_symbol("getpid");
+        /* 不解析 getpid：钩子已删除（官方从不改 getpid），解析了也没人用 */
         real_getuid = (uid_t (*)(void))bxroot_next_symbol("getuid");
         real_getgid = (gid_t (*)(void))bxroot_next_symbol("getgid");
         real_geteuid = (uid_t (*)(void))bxroot_next_symbol("geteuid");
@@ -5404,19 +5405,70 @@ FILE *freopen64(const char *path, const char *mode, FILE *stream) {
     return fn(path, mode, stream);
 }
 
-/* Hook: getpid (fakeroot) */
-pid_t getpid(void) {
-    ensure_real_functions();
-
-    pid_t pid = real_getpid();
-
-    if (g_config.fakeroot) {
-        /* 伪装为 root 进程 */
-        return 1;
-    }
-
-    return pid;
-}
+/*
+ * ★ 这里**曾经**有一个 getpid 钩子，已删除。不要加回来。★
+ *
+ * 原实现（错误）：
+ *     pid_t getpid(void) {
+ *         ensure_real_functions();
+ *         pid_t pid = real_getpid();
+ *         if (g_config.fakeroot) {
+ *             return 1;      /＊ 伪装为 root 进程 ＊/
+ *         }
+ *         return pid;
+ *     }
+ *
+ * 【官方行为是什么】
+ *   官方 proroot/proot **从不**导出 getpid，也从不改它的返回值。
+ *   proot 自己的注释写得很直白（src/extension/fake_id0/sendmsg.c:164-165）：
+ *       "Set uid and gid of SCM_CREDENTIALS to ones that proot really has.
+ *        Pid is not changed as we don't fiddle with getpid()"
+ *   实测核对两份动态符号表（nm -D --defined-only，去版本号）：
+ *       官方 libproroot-runtime.so : 无 getpid
+ *       bxroot （本次修复前）      : 有 getpid      ← 唯一的偏离
+ *   fakeroot 只伪装 **uid/gid**（getuid/getgid/geteuid/getegid），
+ *   与 pid 毫无关系 —— 那是两件不相干的事。
+ *
+ * 【原来错在哪】
+ *   在 BXROOT_FAKEROOT=1 下把 getpid() 硬编码成 1，于是**同一条**命令的
+ *   每个进程都自称 pid 1。shell 的 `$$` 就是 getpid()，而 `$$` 是脚本里
+ *   进程唯一性的常规手段：
+ *       D=/tmp/build-$$ ; mkdir -p "$D"
+ *   所有并发进程都落进同一个 /tmp/build-1，互相删对方的中间文件。
+ *   portage / dpkg / npm 这类会 fork 并发的工具因此会莫名失败。
+ *   实测（同一探针，见 docs/getpid伪造缺陷.md）：
+ *       官方  : PID=10664  CHILD_A pid=10665  CHILD_B pid=10666  DIRS=2
+ *       bxroot: PID=1      CHILD_A pid=1      CHILD_B pid=1      DIRS=1  ← 撞车
+ *
+ * 【为什么这样改：直接删掉，而不是「保留钩子但返回真 pid」】
+ *   两种写法语义等价（都返回真实 pid），但删掉更强：
+ *     1. 与官方**逐符号一致** —— 这是本项目 work/parity 的目标本身；
+ *     2. 不再有调用开销：原钩子每次调用都要过 ensure_real_functions()
+ *        再间接转发，而 getpid 是热路径（libuv/shell/进程管理都会走）；
+ *     3. 消灭整类缺陷：钩子没了，就没有任何分支可能再把它改回 1。
+ *        留一个只会原样转发的钩子，等于给下一个人留了个改错的地方。
+ *
+ * 【删除它会破坏什么：已逐点排查，结论是「什么都不破坏」】
+ *   - D4 进程管理层**不依赖**本钩子：proc.c 一律用
+ *     syscall(SYS_getpid) 取自身 pid（px_self_pid / PX_SYSOPS），
+ *     刻意绕开 libc 包装，所以删掉钩子对它毫无影响。
+ *   - crash.c 的 `kill(getpid(), sig)` 反而**需要**真实 pid：
+ *     修复前它拿到 1，被 D4 白名单当成「容器外进程」拒绝
+ *     （实测日志「proc: kill(1, 11) 被拒绝」），重抛失败；删掉钩子后
+ *     命中 px_check_kill 的 protect_self 分支正常放行。这是**同源**的
+ *     第二个缺陷，一并被这次修改修掉。
+ *   - bridge.c 的 socket 路径 "/tmp/.bxroot-bridge-<pid>.sock"
+ *     要的也是真实 pid。
+ *   - 全仓搜索确认：**没有任何代码判断 `getpid() == 1`**。
+ *     docs/P0-3-D4集成报告.md:51-52 那句「getpid 在 fakeroot 下被伪装成 1，
+ *     这个自伤场景是常态」只是对当时现象的**描述**，并据此加了
+ *     px_runtime_register_self() 这道补丁；它并不是一个依赖，
+ *     而是一个「绕开错误行为」的规避手段。真实 pid 下该补丁无害
+ *     （把自己记进账本仍然正确），故保留不动。
+ *
+ * 参考实现里的 real_getpid 静态指针与它在 ensure_real_functions() 里的
+ * 初始化也已一并删除 —— 否则会触发本仓库零告警门禁的未使用变量告警。
+ */
 
 /* Hook: getuid (fakeroot) */
 uid_t getuid(void) {
@@ -5653,15 +5705,35 @@ int uname(struct utsname *buf) {
  *    完全一致；反过来若我们真去发，就会引入官方没有的副作用。
  *
  * 【实现口径】
- *   audit_open 走 `syscall(SYS_openat, ...)` 而不是 libc 的 `openat()`：
- *     - 官方内核路径是 raw syscall（0x27f80 尾部是 svc #0，不设 errno）；
- *     - 走 libc 就会进到**本文件自己的 openat hook**，于是 "/dev/null"
- *       会被根路径翻译成 "<rootfs>/dev/null"。实测 rootfs 里**没有**
- *       /dev/null（它由 `-b /dev:/dev` 之类的 bind 才可见），
- *       翻译后必定 ENOENT → 官方返回有效 fd 而我们返回 -1，行为就不等价了。
- *     注意差别仅在 errno：官方 shim 是短路径不设 errno。本实现用
- *     `syscall()`（glibc 版本会设 errno），errno 是**额外**信息、
- *     返回值逐字节相同，且 errno 本就不在契约内。
+ *   audit_open / audit_close 走 `syscall(...)` 而不是 libc 的 `openat()` /
+ *   `close()`。理由按重要性排序：
+ *
+ *   1. **绕开本文件自己的钩子层。** 走 libc 的 `openat()` 会进本文件的
+ *      `openat` hook，那条路上叠着 translate_path / bind / l2s / fakeroot
+ *      多层逻辑；走 libc 的 `close()` 会进本文件的 `close` hook，
+ *      那层带**资源清理记账**（l2s / 座位 / netlink 的 on_close）——
+ *      都不是官方 audit 桩的行为。官方这里是裸 `svc #0`，
+ *      照抄 raw 是与官方对齐最短、最没有意外的路径。
+ *
+ *   2. **顺带与官方的错误路径一致。** 官方 shim 在 `cmn x20,#0xfff`
+ *      判出负 errno 后跳到 0x8908，那里
+ *      `bl __errno_location; neg w1,w20; str w1,[x0]; x20 = -1`
+ *      —— 即**官方同样设置 errno 并返回 -1**。
+ *      实测两侧一致：fd 耗尽时都是 `= -1 errno=24`。
+ *      （`-ENOSYS` 走 0x8924 的另一条分支，本桩不涉及。）
+ *
+ *   实测澄清（避免后人误判）：`syscall()` 垫片对 **56/57 两个号是透传** ——
+ *   56 虽然在 `path_arg_mask` 表里（`case 56: return 1u << 1`）会触发路径
+ *   翻译，但 `translate_path()` 对 `/dev` 前缀有**透传特例**
+ *   （源码里 `special[] = {"/proc","/sys","/dev"}` 那段），
+ *   所以 "/dev/null" 翻译前后都是 "/dev/null"。实测两条路都落到真 /dev/null：
+ *
+ *       syscall(openat,AT_FDCWD,"/dev/null",O_WRONLY) = 11 → /dev/null
+ *       openat() via libc                            = 12 → /dev/null
+ *
+ *   也就是说：**即使这里改用 libc，`/dev/null` 本身也不会被翻错**；
+ *   真正让 raw syscall 成为正确选择的是上面的理由 1（绕开记账层），
+ *   而不是"路径会被翻坏"。
  */
 int audit_open(const char *path, int flags, int mode)
 {
@@ -6002,10 +6074,20 @@ static void constructor(void) {
     /*
      * 把自己记进 pid 账本。
      *
-     * 否则 kill(getpid(), ...) 会被我们**自己的**白名单拒绝 ——
-     * 而 getpid 在 fakeroot 下被伪装成 1，所以这个自伤场景在容器里
-     * 是常态而不是边缘情况（shell 的自杀、node 的 process.kill(pid,0)
-     * 探活都会踩到）。
+     * 否则 kill(getpid(), ...) 会被我们**自己的**白名单拒绝
+     * （shell 的自杀、node 的 process.kill(pid,0) 探活都会踩到）。
+     *
+     * ★ 2026-09-17 更正 ★
+     * 这里原先接着说「而 getpid 在 fakeroot 下被伪装成 1，所以这个自伤
+     * 场景在容器里是常态而不是边缘情况」。那句话描述的**不是依赖，而
+     * 正是缺陷本身**：当时 getpid 钩子在 fakeroot 下返回 1，于是
+     * kill(getpid()) 打到 pid 1 → 被 D4 白名单当容器外进程拒绝，
+     * 才不得不靠这道登记来绕开。getpid 钩子已删除（见其原址处的长注释），
+     * getpid() 现在返回真实 pid，命中 px_check_kill 的 protect_self
+     * 分支即可放行。
+     *
+     * 这道登记**保留不动**：真实 pid 下它依然正确（把自己记进账本本就
+     * 是应有的行为），且删除它对本轮缺陷没有任何收益、只有回归风险。
      */
     px_runtime_register_self();
 
