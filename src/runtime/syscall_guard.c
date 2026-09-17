@@ -78,6 +78,23 @@ void l2s_rt_patch_statx_buf(void *sx, unsigned int statx_nlink_bit,
                             const char *path);
 
 /*
+ * fakeroot 身份查询桥（实现体在 preload.c）。与本文件上面那条 weak 声明
+ * **完全同一个理由**，这里不重复整段论述，只记差异：
+ *
+ *   - 上一条是"能不能伪装一个结构体"，这一条是"要不要伪装身份"；
+ *   - 返回值约定：非 0 表示 fakeroot 已启用，并通过两个出参给出伪造的
+ *     uid/gid；0 表示未启用（此时两个出参不被写）。
+ *
+ * ★ 为什么用出参而不是让本文件自己假设"假身份 = 0" ★
+ * "假身份是多少"是 fakeroot 层的判据（它支持 BXROOT_FAKE_UID/GID 之类的
+ * 扩展，且 setresuid 之后假身份会变）。在这里硬编码 0 等于把同一套规则
+ * 写两处 —— 本项目在 statx 的 stx_mode 宽度与 fakeroot 的初始化顺序上
+ * 都刚踩过这种漂移。本文件只搬运，不判断。
+ */
+__attribute__((weak))
+int bxroot_fakeroot_ids(unsigned int *uid, unsigned int *gid);
+
+/*
  * STATX_NLINK：避免为一个常量引入 <linux/stat.h>（见上面的耦合说明）。
  *
  * ★ 值必须是 0x4，不要写成 0x200 ★
@@ -838,6 +855,105 @@ long syscall(long number, ...)
             l2s_rt_patch_statx_buf((void *)(uintptr_t)a4,
                                    SCG_STATX_NLINK,
                                    (const char *)(uintptr_t)a1);
+        }
+
+        /*
+         * ============================================================
+         * 身份伪装在**裸 syscall 路径**上缺失的那一半
+         * ============================================================
+         *
+         * 【问题】fakeroot 只在 libc 符号层伪装身份：
+         *
+         *     preload.c  uid_t getuid(void) { if (g_config.fakeroot) return 0; ... }
+         *
+         * 而**绕过 libc 直接发 `syscall(174)` 的程序**（静态链接的
+         * Go/Rust、部分 libuv 代码，以及大量"我是不是 root"的自检逻辑）
+         * 看到的是**真实 uid**。实测三层探针：
+         *
+         *     官方 : libc getuid=0   syscall(174)=0        ← 已覆盖
+         *     bxroot(修前): libc getuid=0   syscall(174)=10655   ← 未覆盖
+         *
+         * 【后果不是"少个功能"，而是程序走错分支】
+         * 自检"非 root"→ 尝试降权（setgroups 等）→ 撞上 proroot-ldso 的
+         * seccomp 过滤器。现场表现（docs/裸syscall身份伪造修复.md 记录）：
+         *     官方  : chage -l root 正常输出（它自认为已是 root，跳过降权）
+         *     bxroot: chage: failed to drop privileges (Function not implemented)
+         *
+         * 【为什么放在 raw_syscall6 之后】
+         * 与上面 statx 那条同一个道理，但方向相反：身份是**返回值**而非
+         * 结构体字段。必须等内核把真值写进 x0、本函数拿到 ret 之后再改，
+         * 放在调用前等于白改（内核随后会覆盖回去）。
+         * 好消息是 raw_syscall6 的 x0 是 `"+r"` 读写操作数且函数 `return x0`，
+         * 所以"改写返回值"是本文件**现成可做**的事，不需要动内联汇编。
+         *
+         * 【与官方机制不同，但外部行为一致 —— 这一点必须写清】
+         * 官方反汇编显示它把 syscall(174) 转发到内部特权层（0x8740）。
+         * bxroot 没有那一层，用"调用后改写返回值"达到同样的可观测行为。
+         * **差异只在真·裸 svc 上**：本函数改不到 `svc #0` 内联汇编
+         * （那不经任何 C 代码）。实测官方**也**改不到 —— 用运行时 JIT
+         * 生成的 svc 探针测两侧，getuid 都返回 10655 真值。且内核在身份
+         * 上是"自己人"（本进程 uid 就是 10655），不存在第三方能伪造它。
+         * 所以"裸 svc 不伪造"是与官方**对齐**的，不是缺口。
+         *
+         * 【门控条件，一条都不能少】
+         *   1. bxroot_fakeroot_ids != NULL —— weak 声明，本文件被单独链接
+         *      （test_syscall_argpos.c / test_rename_link_argpos.c 不链
+         *      preload.c）时为 NULL，必须跳过而不是调用空指针；
+         *   2. 它返回非 0 —— 未启用 fakeroot 时**原样透传**，不碰 ret；
+         *   3. number 精确落在 174..177 —— 不用范围判断，避免把邻近号
+         *      （172 getpid / 178 gettid）卷进来。本项目在这张"号码表"上
+         *      有过两次事故（36 把 dirfd 当路径、260 把 wait4 当 linkat），
+         *      所以这里刻意逐个列出而不是写 `>= 174 && <= 177`；
+         *   4. ret >= 0 —— 失败时（理论上不会，但内核可以回 -EPERM 之类）
+         *      必须保留失败语义，不能把错误伪装成成功。
+         *
+         * 【errno 为什么不用管】
+         * raw_syscall6 只在 x0 落在 -4095..-1 时才写 errno。成功路径
+         * （我们改写的那条）根本不碰 errno，所以"改写身份"不会污染它。
+         *
+         * 【覆盖范围与已知缺口】
+         * 本轮覆盖 174..177。**未覆盖**：
+         *   - 148/150（getresuid/getresgid）—— 它们是"一次写三个字段"，
+         *     必须判空+逐个写回，风险与工作量都更高，单列一项；
+         *   - 158（getgroups）—— 要伪造整个数组，且长度必须自洽；
+         *   - 降权族（setuid/setgid/setgroups…，见"降权族"一节）。
+         * 这些缺口已逐条登记在 docs/裸syscall身份伪造修复.md，并有
+         * test/test_id_syscall_guard.c 的边界用例钉住"当前未覆盖"这一事实。
+         */
+        if (ret >= 0 && bxroot_fakeroot_ids != NULL) {
+            unsigned int fuid = 0, fgid = 0;
+
+            switch (number) {
+            /*
+             * 逐个列出而不是范围判断：号码表是本文件出过两次致命事故的
+             * 地方，"精确"比"简短"重要。174..177 在 asm-generic 与
+             * aarch64 上一致（本机 gcc 打印 SYS_getuid..SYS_getegid 核对过）。
+             */
+            case 174:   /* getuid  */
+            case 175:   /* geteuid */
+                if (bxroot_fakeroot_ids(&fuid, NULL)) {
+                    if (g_trace)
+                        log_num("[bxroot] syscall_guard: 伪装 uid ", number, " ");
+                    ret = (long)fuid;
+                }
+                break;
+            case 176:   /* getgid  */
+            case 177:   /* getegid */
+                if (bxroot_fakeroot_ids(NULL, &fgid)) {
+                    if (g_trace)
+                        log_num("[bxroot] syscall_guard: 伪装 gid ", number, " ");
+                    ret = (long)fgid;
+                }
+                break;
+            default:
+                /*
+                 * 走到这里说明 number 不是身份调用 —— **不动 ret**。
+                 * 保留这个 default 分支是刻意的：将来若有人往上面的
+                 * case 列表里加号，编译器不会因为"少一个 default"而
+                 * 报错，但这里的显式"什么都不做"让语义一目了然。
+                 */
+                break;
+            }
         }
 
         return ret;

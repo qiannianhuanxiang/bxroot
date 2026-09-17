@@ -3713,6 +3713,176 @@ void *dlopen(const char *filename, int flags) {
  */
 
 /*
+ * ====================================================================
+ * dl 家族错误状态：`dlerror` 与 `dlsym` 的**同源**实现
+ * ====================================================================
+ *
+ * 为什么必须与 dlsym 同源
+ * -----------------------
+ * 本库的 `dlsym` 走的是 **linker 服务**（`ldso_service_dlsym*`），
+ * **不是 glibc 的 `dlsym`**。于是 glibc 那套 `__libc_dlerror_result`
+ * **永远不会被写** —— 客户程序在 `dlsym` 失败后调 `dlerror()` 只能拿到 NULL，
+ * 真故障被静默吞掉。实测（本容器 A/B，探针 `dlprobe`）：
+ *
+ *     官方 runtime: dlsym(不存在)=(nil)  dlerror() = undefined symbol: xxx
+ *     bxroot 修前 : dlsym(不存在)=(nil)  dlerror() = NULL (!!)
+ *
+ * 而本库内部自己就依赖这条契约（`px_wait_dlsym` 与 `proc.c` 都写了
+ * `dlsym 失败: %s` 的诊断），所以"错误串恒为 NULL"等于
+ * **专门写的诊断代码永远打不出原因**。
+ *
+ * 官方做法（`libproroot-runtime.so` 反汇编 + `.rodata` 实读）
+ * ----------------------------------------------------------
+ * 官方把状态放在**自己的 TLS 变量**里（`adrp 0x60000` + `#0x4c8`；
+ * 重定位表实测该槽是 `R_AARCH64_TLSDESC`，**不是** `dlsym`）：
+ *
+ *     dlerror@0x22fa0:  ldr  w3, [tls, off]   ; 有错吗
+ *                       add  x2, tls, off
+ *                       cbz  w3, -> NULL
+ *                       add  x2, x2, #0x10   ; 错误串在 TLS 偏移 +0x10
+ *                       str  wzr, [tls, off] ; ★ 读一次即清 ★
+ *
+ * 布局 = { int 有错标志; 12 字节对齐空洞; char 错误串[128] }，因为官方是
+ * `snprintf(x0 = tls+off+0x10, x1 = 0x80, fmt, name)` —— **缓冲区 128 字节**。
+ * 标志与串之间的 12 字节空洞是 16 字节对齐的自然结果。
+ *
+ * ★ 只有 `dlsym` 与 `dlerror` 读写这个槽 ★
+ * 全库 `ldr x?,[x0,#1224]`（即该 TLS 描述符槽）的出现点实测为：
+ * `dlsym` 三处、`dlerror` 一处、`dlopen` 两处 —— 而 `dlopen` 那两处
+ * 只读 `[tls+off+0x90]` 的**另一个**变量（`ldsomutex`）且只 `strb`，
+ * **没有**写 dlerror 槽。所以 glibc 里"dlopen 失败也能 dlerror"的语义，
+ * 官方**并没有**接：官方侧 `dlopen(不存在)` 之后 `dlerror()` 实测也是 NULL
+ * （它把原因 `snprintf` 到栈上 256 字节缓冲再 `write(2,…)` 到 stderr）。
+ * 本实现与官方保持一致，**不**替官方臆造那条语义。
+ *
+ * 格式串原文（从官方 `.rodata` 实读，非转述）
+ * -----------------------------------------
+ *     0x36c68: "undefined symbol: %s"
+ *     0x36c38: "ldso_runtime dlsym: symbol '%s' not found"
+ *
+ * 两条分支的对应关系由反汇编逐条坐实：
+ *   0x22e90: cbz x0, 0x22f14          ; handle == NULL  → RTLD_DEFAULT 分支
+ *   0x22ea8: b.eq 0x22f8c             ; handle == RTLD_NEXT → next_from 分支
+ *   0x22eb0: b.eq 0x22f14             ; handle == RTLD_DEFAULT（-2）→ 同上
+ *   0x22f14: bl ldso_service_dlsym    ; ← **服务分支**，失败 → 0x22f4c
+ *   0x22f4c: … add x2,x2,#0xc68       ; ★ "undefined symbol: %s" ★
+ *   0x22ed4: … add x2,x2,#0xc38       ; ★ "ldso_runtime dlsym: symbol '%s' not found" ★
+ *
+ * 即 0x22f4c（服务版失败）用 `undefined symbol: %s`，
+ * 0x22ed4（"真 dlsym" 存在但返回 NULL 的失败）用 `ldso_runtime dlsym: …`。
+ * 因为本库**全部**查找都走服务，所以本库只会在**服务失败**那条路上出错，
+ * 对应官方的就是 0x22f4c → `undefined symbol: %s`。
+ * 实测印证（隔离垫片 `dlshim.so`，只实现 dlsym/dlerror/dl_iterate_phdr）：
+ *
+ *     dlsym(RTLD_DEFAULT, 不存在) → <undefined symbol: bxroot_…_42>
+ *     dlsym(libm句柄,    不存在) → <ldso_runtime dlsym: symbol 'no_such_in_libm_xyz' not found>
+ *
+ * 两条格式串本库都保留（带句柄那条走 `ldso_runtime dlsym: …`），
+ * 逐字对齐官方 `.rodata`。
+ *
+ * ★ 为什么不复刻 glibc 的 `__libc_dlerror_result` ★
+ * 客户程序只会通过 `dlerror()` 访问，不会去读布局；而 glibc 的布局是私有的、
+ * 随版本漂移。用本库自己的 TLS 变量既安全又足够 —— 这与官方同构
+ * （官方用的也只是"自己的一个 TLS 变量"，并非 glibc 那个）。
+ *
+ * ★ 自递归防护（不做会 100% SIGSEGV）★
+ * 见下面 `dlerror` 实现上方的长注释。要点：**本文件中没有任何 dlerror
+ * 转发路径**，因此不存在"判据失效导致递归"的可能。
+ */
+
+/* 与官方逐字段对齐：{标志; 对齐空洞; 128 字节串} */
+struct bxroot_dl_error_state {
+    int  flag;          /* +0x00：非 0 = 有未读错误（官方 `str w6,[x4,x0]`） */
+    int  _pad[3];       /* +0x04：对齐到 +0x10（官方 `add x2,x2,#0x10`）    */
+    char msg[128];      /* +0x10：错误串（官方 `mov x1,#0x80`）             */
+};
+
+/*
+ * 本库能否用 linker 服务。与 `bxroot_has_ldso_service` 同一个理由，
+ * **不能**在构造函数里缓存死（构造函数可能早于 linker 填完 PLT）。
+ */
+static int bxroot_dl_service_state = -1;
+
+static int bxroot_dl_has_service(void) {
+    if (bxroot_dl_service_state < 0)
+        bxroot_dl_service_state = bxroot_has_ldso_service() ? 1 : 0;
+    return bxroot_dl_service_state;
+}
+
+/*
+ * 线程局部错误状态。模型与官方一致（`mrs tpidr_el0` + TLSDESC）；
+ * 实测本容器 aarch64 glibc 下 `-fPIC` 共享库生成的就是 `R_AARCH64_TLSDESC`。
+ *
+ * ★ 下面两个写函数**不调用任何外部函数**（连 snprintf/strlen 都不调）★
+ * 只在同一个 .so 内部按偏移取地址、逐字节拷贝。理由见 `dlerror` 那段：
+ * 任何"调用出去"的动作都可能经 PLT 再绕回本库，而那正是历史上崩过的形状。
+ * 逐字节拷贝对本容器 aarch64 是内联的 ldrb/strb 小循环，不产生外部调用。
+ */
+static _Thread_local struct bxroot_dl_error_state bxroot_dl_err;
+
+static void bxroot_dl_error_set2(const char *prefix, const char *name,
+                                 const char *suffix) {
+    char *dst = bxroot_dl_err.msg;
+    size_t cap = sizeof(bxroot_dl_err.msg);
+    size_t n = 0;
+    const char *p;
+
+    for (p = prefix; p != NULL && *p != '\0' && n + 1 < cap; p++)
+        dst[n++] = *p;
+    for (p = name; p != NULL && *p != '\0' && n + 1 < cap; p++)
+        dst[n++] = *p;
+    for (p = suffix; p != NULL && *p != '\0' && n + 1 < cap; p++)
+        dst[n++] = *p;
+    dst[n] = '\0';
+
+    bxroot_dl_err.flag = 1;
+}
+
+static void bxroot_dl_error_clear(void) {
+    bxroot_dl_err.flag = 0;
+}
+
+/*
+ * 自研 dlerror —— 读本库自己的 TLS 状态，**读一次即清**（与官方逐条同构）。
+ *
+ * ★★★ 自递归防护：为什么这里一行"转发"都不能有 ★★★
+ *
+ * 本函数是本库导出的符号，因此：
+ *   1. `dlsym(RTLD_NEXT, "dlerror")` / `ldso_service_dlsym_next_from(retaddr,…)`
+ *      在本库里解析 `dlerror` 会**解析回本函数自己** —— 本库比 libc 靠前，
+ *      而 RTLD_NEXT 的"下一个"在调用方位于库内时会绕回本库。
+ *   2. 于是"取下一个 dlerror、为空就转发"这种写法 = **无条件无限自递归**。
+ *
+ * 这不是推测，是**实测**。本容器 A/B 对照（垫片 `dlbad.c`，实现本函数并
+ * 打印解析结果）：
+ *
+ *     [dlbad] 解析到 0x7bcbe3b4a0；本库 &dlerror=0x7bcbe3b4a0
+ *     [dlbad] 命中自己或为空 —— 若继续转发即无限自递归     （连刷数百行）
+ *
+ * 解析结果与本库 `&dlerror` **是同一个地址**。报告 §2.3 记录的
+ * `[selfdetect] 解析到 0x…；本库 &dlerror=0x…` 与此完全一致。
+ *
+ * 所以本实现的防护**不是**"判一下再转发"，而是**根本不转发**：
+ *   - 状态与 dlsym 同源（同一个 TLS 结构），dlerror 只读它；
+ *   - 不需要、也不可能从 libc 的 dlerror 取任何东西；
+ *   - 唯一的外部影响是读自己的 TLS，`_Thread_local` 访问器由 ld.so 在装载时
+ *     填好（TLSDESC），**不经过符号解析**。
+ *
+ * 这比"加一个自检判据"更强：判据可能因 `dl_iterate_phdr` 残缺而失效
+ * （报告 §2.3 实测自检垫片拿到 `base=0x0`，**没拦住**），而"没有转发路径"
+ * 不存在失效的可能。这也是本任务要求两个符号**一起修**的原因。
+ *
+ * 非 proroot 环境（无 linker 服务）：本库的 `dlsym` 返回 NULL 并在这里登记
+ * `undefined symbol: …` —— 语义明确，且**依然不递归**。
+ */
+char *dlerror(void) {
+    if (!bxroot_dl_err.flag)
+        return NULL;
+    bxroot_dl_err.flag = 0;          /* ★ 读一次即清（官方 `str wzr`）★ */
+    return bxroot_dl_err.msg;
+}
+
+/*
  * 自研 dlsym —— 只做**分派**，真正的符号解析仍由 linker 服务完成。
  *
  * 为什么必须导出：见上。客户程序（node 的 N-API 模块）要靠它
@@ -3730,21 +3900,44 @@ void *dlopen(const char *filename, int flags) {
  * 这比"猜一个实现"安全：那种情况下本来也没有服务在提供符号视图。
  */
 void *dlsym(void *handle, const char *symbol) {
+    void *res;
+
     if (symbol == NULL) {
-        /* glibc 对 symbol==NULL 的行为是未定义；这里明确失败，不猜 */
+        /* glibc 对 symbol==NULL 的行为是未定义；这里明确失败，不猜。
+         * 失败也要留痕（与官方一致：官方成功必清标志，失败必登记）。 */
+        bxroot_dl_error_set2("undefined symbol: ", "(nil)", NULL);
         return NULL;
     }
 
-    if (bxroot_has_ldso_service()) {
+    if (bxroot_dl_has_service()) {
         /* RTLD_NEXT：从**调用方**之后开始找 */
         if (handle == RTLD_NEXT) {
-            return ldso_service_dlsym_next_from(__builtin_return_address(0), symbol);
+            res = ldso_service_dlsym_next_from(__builtin_return_address(0), symbol);
+            /* ★ 与 dlerror 同源：成功清标志 / 失败登记错误串 ★
+             * 官方 dlsym@0x22f38 `str wzr` 清标志、@0x22f4c 走
+             * snprintf(tls+0x10, 0x80, "undefined symbol: %s", name)。
+             * 这里必须**每条退出路径**都过一遍，否则会出现
+             * "失败返回 NULL 但 dlerror() 说没错误"的假绿。 */
+            if (res != NULL) {
+                bxroot_dl_error_clear();
+            } else {
+                bxroot_dl_error_set2("undefined symbol: ", symbol, NULL);
+            }
+            return res;
         }
         /* RTLD_DEFAULT / NULL：全局查找。
          * 注意服务在 handle==NULL 时的语义就是 RTLD_DEFAULT
          * （实测 ldso_service_dlsym(NULL,"malloc") == global("malloc")）。 */
         if (handle == NULL || handle == RTLD_DEFAULT) {
-            return ldso_service_dlsym(NULL, symbol);
+            res = ldso_service_dlsym(NULL, symbol);
+            if (res != NULL) {
+                bxroot_dl_error_clear();
+            } else {
+                /* 官方 @0x22f14→0x22f4c：**服务分支**失败用
+                 * `undefined symbol: %s`（.rodata@0x36c68 实读原文）。 */
+                bxroot_dl_error_set2("undefined symbol: ", symbol, NULL);
+            }
+            return res;
         }
         /*
          * ★ 具体句柄：**直接交给 linker 服务**，不要再去找"真 dlsym" ★
@@ -3765,7 +3958,17 @@ void *dlsym(void *handle, const char *symbol) {
          * 而那个 handle 正是本库 dlopen（转发给 libc 的 dlopen）返回的句柄，
          * 类型一致，无需转换。
          */
-        return ldso_service_dlsym(handle, symbol);
+        res = ldso_service_dlsym(handle, symbol);
+        if (res != NULL) {
+            bxroot_dl_error_clear();
+        } else {
+            /* 带句柄失败 → 官方 .rodata@0x36c38 那条串（实读原文）：
+             * `ldso_runtime dlsym: symbol '%s' not found`
+             * 实测隔离垫片复现一致。 */
+            bxroot_dl_error_set2("ldso_runtime dlsym: symbol '", symbol,
+                                 "' not found");
+        }
+        return res;
     }
 
     /*
@@ -3910,6 +4113,124 @@ int dladdr(const void *addr, Dl_info *info) {
     info->dli_sname = NULL;
     info->dli_saddr = NULL;
     return 1;
+}
+
+/*
+ * ====================================================================
+ * 自研 dl_iterate_phdr —— 接上 linker 的**私有模块视图**
+ * ====================================================================
+ *
+ * 为什么必须补（实测）
+ * -------------------
+ * 不导出它时，客户程序解析到的是 **glibc 的 `dl_iterate_phdr`**，
+ * 而 glibc 那份遍历的是 glibc 自己的 loader 状态 —— proroot 用的是
+ * 自研 loader，那份状态只认识主程序。本容器 A/B 实测（探针 `dlprobe`）：
+ *
+ *     官方 runtime: 共 6 个模块（主程序×2 + runtime + libc + ld.so + libm）
+ *     bxroot 修前 : 共 1 个模块（只有主程序自己）      ← ★ 缺陷 ★
+ *
+ * 模块视图不全的直接后果：任何"遍历已加载模块找自己/找别的 so"的代码
+ * 都拿到错误结果。报告 §2.3 已经实证了它的**二次伤害** ——
+ * 报告作者写的"dlerror 自递归检测垫片"因为拿不到自身基址（`base=0x0`）
+ * 而**没能拦住**无限递归，最后 SIGSEGV。所以这两个符号必须一起修。
+ *
+ * 官方做法（`libproroot-runtime.so` @0x22fec 反汇编逐条）
+ * -----------------------------------------------------
+ * 官方**先 `dlsym(-1, "dl_iterate_phdr")` 填一个静态缓存并调用**，
+ * 返回非 0 就直接返回；返回 0 则**再兜一层** `ldso_service_dl_iterate_phdr`：
+ *
+ *     22ffc: add  x21, x21, #0xf68        ; x21 = &缓存槽
+ *     2300c: ldr  x2, [x21, #8]           ; 读缓存
+ *     23010: cbz  x2, 2304c               ; 空 → 去解析
+ *     2301c: blr  x2                      ; 调"真正的 dl_iterate_phdr"
+ *     23020: cbnz w0, 2303c               ; ★ 非 0 → 直接返回
+ *     23038: b    ldso_service_dl_iterate_phdr@plt   ; ★ 否则再兜一层 ★
+ *     2304c: … dlsym(-1, "dl_iterate_phdr")          ; .rodata@0x36c80 实读
+ *
+ * 也就是说：**即使官方也只是转发给 libc，真正干活的是 libc**，
+ * 官方额外做的唯一一件事就是那一层 linker 服务兜底 —— 而正是这一层
+ * 把模块视图从 1 个补成了 6 个。本实现保留同一形状。
+ *
+ * ★ 反递归：为什么这里转发给"真 dl_iterate_phdr"是安全的 ★
+ *
+ * 与 `dlerror` 的关键差别是**返回值的语义**：
+ *   - `dlerror` 返回的是"错误串指针"，控制流必须**进入**被解析的函数，
+ *     所以解析到自己 = 无限自递归 = 必崩；
+ *   - `dl_iterate_phdr` 的结果是"回调被跑了几轮"，官方在
+ *     `cbnz w0` **非 0 时就直接返回**，只有 0 才继续兜底。
+ *     即便解析结果是自己，也是**有限步**：`libc版 → 服务版`，
+ *     不会成环（服务版不再回调本函数）。
+ *
+ * 但本实现**不依赖**这个论证，而且把防护**限定在真正有环的那条路上**：
+ *
+ *   1. 有 linker 服务（DSHA / proroot 环境，实测始终有）：
+ *      **只**调 `ldso_service_dl_iterate_phdr`。这是 linker 自己的函数，
+ *      不会回调本函数 —— **结构上无环**，所以这里**不加任何哨兵**，
+ *      `dl_iterate_phdr` 的**嵌套调用照常可用**（回调里再遍历一次是合法用法，
+ *      glibc 也允许；实测本容器 glibc 侧嵌套返回 0 且视图完整）。
+ *      这一条很重要：把哨兵无差别地罩在服务路径上会**误伤正常嵌套**。
+ *   2. 无服务（非 proroot 环境）：这里要转发给 libc 的 `dl_iterate_phdr`，
+ *      是**唯一**可能成环的路径（若解析结果落回本库）。
+ *      于是**只在这条路上**加一次性哨兵 + 自身地址判据：
+ *        - 解析结果 == 本函数 → 直接失败，不调用（对应报告 §2.3 的"路 B"判据）；
+ *        - 重入 → 返回 -1。
+ *      两道防护都只在"服务不可用"的降级环境里生效。
+ *
+ * 实测（本容器 A/B）：官方 runtime 在**嵌套调用**下 SIGSEGV
+ * （见 docs/dl家族符号修复.md §5.6）—— 官方没有重入防护；本实现的
+ * 服务路径**允许**嵌套，行为比官方更接近 glibc。
+ */
+
+/* 降级路径（无 ldso 服务）专用：重入哨兵 + 缓存。
+ * 线程局部 —— 它描述的是"本线程正在这条降级路径里"，跨线程共享会误判。 */
+static _Thread_local int bxroot_dl_iterate_fallback_busy = 0;
+
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
+                    void *data) {
+    if (callback == NULL)
+        return -1;          /* glibc 同：回调为空是调用方的错 */
+
+    if (bxroot_dl_has_service()) {
+        /*
+         * ★ 与官方 @0x23038 那一层完全对应：linker 的**私有模块视图**。
+         * 官方是先 dlsym 拿 libc 版跑一遍、返回 0 才兜到这里；本库直接用服务，
+         * 因为服务本身就是完整视图（实测它就是官方那 6 个模块的来源），
+         * 而"先跑 libc 版"只会把主程序**重复回调两次** —— 那正是官方实测输出里
+         * `phdr[0]` 与 `phdr[1]` 同 name 同 base 的原因（报告 §5 把它列为
+         * "像是官方的一个小瑕疵"）。这里不复制那个重复：模块视图**完整**
+         * 已达成，重复回调反而会让"数模块数"的调用方多算一个。
+         *
+         * 无环：服务不回调本函数，故**不加哨兵**，嵌套调用照常可用。
+         */
+        return ldso_service_dl_iterate_phdr(callback, data);
+    }
+
+    /*
+     * 降级路径：非 proroot 环境（例如 Ubuntu 容器里直接 LD_PRELOAD 跑单测）。
+     * 只有这条路可能成环，两道防护都放这里。
+     */
+    {
+        static int (*fn)(int (*)(struct dl_phdr_info *, size_t, void *), void *);
+        int rc;
+
+        if (bxroot_dl_iterate_fallback_busy)
+            return -1;      /* ★ 重入截断：宁可报错，绝不爆栈 ★ */
+        bxroot_dl_iterate_fallback_busy = 1;
+
+        if (fn == NULL)
+            fn = (int (*)(int (*)(struct dl_phdr_info *, size_t, void *), void *))
+                 bxroot_next_symbol("dl_iterate_phdr");
+
+        /* ★ 自身地址判据（报告 §2.3 "路 B"）：解析回本库就绝不调用 ★ */
+        if (fn == NULL || (void *)fn == (void *)&dl_iterate_phdr) {
+            bxroot_dl_iterate_fallback_busy = 0;
+            return -1;
+        }
+
+        rc = fn(callback, data);
+        bxroot_dl_iterate_fallback_busy = 0;
+        return rc;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -6154,4 +6475,55 @@ static void constructor(void) {
             setenv(BXROOT_WORKDIR_DONE_ENV, "1", 1);
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* 给 syscall_guard.c 的身份查询入口                                   */
+/*                                                                    */
+/* ★ 本段是**纯追加**：不改动本文件上方任何既有逻辑 ★                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ★ 为什么需要这个函数 ★
+ *
+ * fakeroot 的伪装此前只在 **libc 符号层**生效（getuid/geteuid/getgid/
+ * getegid/getresuid/getresgid/getgroups 这几个钩子）。而 `syscall_guard.c`
+ * 的 `syscall()` 接管层只做了"路径翻译"和"statx 结果补丁"，没有身份那
+ * 一半 —— 于是绕过 libc 直接 `syscall(174)` 的程序看到的是**真实 uid**。
+ *
+ * 实测（三层探针，详见 docs/裸syscall身份伪造修复.md）：
+ *
+ *     官方 : libc getuid=0   syscall(174)=0        ← 伪造覆盖到 syscall() 符号层
+ *     bxroot(修前): libc getuid=0   syscall(174)=10655   ← 只到 libc 符号层
+ *
+ * syscall_guard.c 是**独立编译单元**（单独链进 test_syscall_argpos.c /
+ * test_rename_link_argpos.c，那两个测试不链本文件），所以它对本函数的
+ * 声明必须是 `__attribute__((weak))`，未链接本文件时解析为 NULL 并跳过。
+ *
+ * ★ 为什么不直接让 guard 读 getuid() ★
+ * guard 的职责是"拦在 libc 之前"，它自己去调 libc 的 getuid() 会把符号层
+ * 钩子重新卷进调用链 —— 而且那两个既有测试不链 preload.c，会立刻链接
+ * 失败。查询状态必须走这个显式的、可 weak 解析的入口。
+ *
+ * ★ 为什么返回"两个出参 + 返回值"而不是只返回 bool ★
+ * 伪造身份当前恒为 0/0（见 fakeroot_state_set_enabled），但**判据属于
+ * fakeroot 层**，不该在这里或 guard 里复制一份"假身份就是 0"的假设 ——
+ * 那正是本文件注释反复警告的"同一套规则写两处，两边迟早漂移"。
+ * 所以这里把 fakeroot 状态里的 uid/gid 原样交出去，guard 只负责搬运。
+ */
+int bxroot_fakeroot_ids(unsigned int *uid, unsigned int *gid)
+{
+    /*
+     * 与 preload.c 的 getuid/getgid 钩子用**同一个**判据（g_fakeroot_on），
+     * 不是 g_config.fakeroot：init_fakeroot() 在记账表创建失败时会整体
+     * 关掉 fakeroot（半残的 fakeroot 比没有更危险，见那里的注释）。
+     * 若这里改用 g_config.fakeroot，就会出现"符号层不伪装、裸 syscall 层
+     * 伪装"的新矛盾 —— 与本次要修的缺陷方向相反、更难查。
+     */
+    if (!g_fakeroot_on)
+        return 0;
+
+    if (uid != NULL) *uid = (unsigned int)g_fakeroot_state.ruid;
+    if (gid != NULL) *gid = (unsigned int)g_fakeroot_state.rgid;
+    return 1;
 }

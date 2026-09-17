@@ -18,6 +18,7 @@
 #   4. fakeroot 纯逻辑     test/RUN_TESTS.sh
 #   5. 系统调用参数位置    test/test_syscall_argpos.c
 #   5b. rename/link 双路径 test/test_rename_link_argpos.c（含 syscall_guard.c）
+#   5c. 身份 syscall 伪装  test/test_id_syscall_guard.c（含 syscall_guard.c）
 #   6. crash 崩溃处理器    src/runtime/RUN_CRASH_TESTS.sh
 #   7. D4 进程管理         src/proc/RUN_TESTS.sh
 #   8. wait 家族钩子       test/RUN_WAIT_TESTS.sh
@@ -296,6 +297,22 @@ if [ -f test/test_rename_link_argpos.c ]; then
 else
     run_step "rename/link 双路径"
 fi
+
+# =====================================================================
+# 5c. 裸 syscall 层身份伪装（fakeroot 的 uid/gid）
+#
+# 与 5/5b 是**同一个文件**（syscall_guard.c）的另一半契约：前两项钉住
+# "哪些参数寄存器是路径"，本项钉住"哪些**返回值**要被改写"。
+#
+# 为什么也必须与 syscall_guard.c 一起编译：被测的就是那个文件里的
+# syscall() 接管层。它有两次明确记录的事故都在"号码/位置"上
+# （case 36 把 dirfd 当路径、case 260 把 wait4 当 linkat），所以本项
+# 除正向判据外还带**负向判据**（172 getpid / 178 gettid / 148 / 150
+# 不得被波及），防止"为了加身份把别的调用卷进来"。
+#
+# 编译参数收在 test/RUN_ID_SYSCALL.sh 里（只有一份，避免与别处漂移）。
+# =====================================================================
+run_step "身份 syscall 伪装" sh test/RUN_ID_SYSCALL.sh
 
 # =====================================================================
 # 6. crash 崩溃处理器
