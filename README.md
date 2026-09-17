@@ -136,7 +136,7 @@ Node 全部 `ENOENT`。
 ## 测试
 
 ```sh
-sh test/RUN_ALL.sh --quick      # 主回归（18 项，一键全跑）
+sh test/RUN_ALL.sh --quick      # 主回归（20 项，一键全跑）
 ```
 
 分项：
@@ -151,11 +151,37 @@ sh test/RUN_PTHREAD_CREATE.sh   # pthread_create 栈
 sh test/RUN_PRIVDROP.sh         # 降权族（真实 chage 验收）
 sh test/RUN_SHEBANG.sh          # shebang 直接 exec
 sh test/RUN_WARN_GATE.sh        # 编译零告警门禁
+sh test/RUN_CLI_COMPAT.sh       # proot CLI 语义（38 项）
+sh test/RUN_UPSTREAM_CLI.sh     # 上游选项表全覆盖（35 项）
+sh test/RUN_PATH_FORMS.sh       # 路径形态（裸相对名/dirfd+相对/…）
 sh issue-regression-test.sh     # 上游 24 issue 的 25 用例回归
 ```
 
 判定口径：所有端到端测试都采用**双基线**——bxroot 与官方 proroot
 对照，逐行比对输出，"比官方差"才算 FAIL。
+
+## 开发工具
+
+```sh
+sh tools/push-verified.sh       # 推送并在推后核对 hash
+```
+
+★ **推送必须用这个脚本，不要直接 `git push --force`** ★
+
+`--force` 的语义是"用我这条谱系无条件替换远端"。本项目实际发生过一次
+事故：另一个停在旧状态的 clone 一推，就把远端整体换回了前一天的样子，
+而**推送输出照样写着 `forced update`、退出码照样是 0**（详见
+`docs/事件-远端被旧clone覆盖.md`）。
+
+本脚本把两个必需动作固化下来，堵住这个静默失败：
+
+1. **推之前**：远端 HEAD 必须是本地 HEAD 的祖先。不是 → 远端有本地
+   没见过的提交 → 停下并列出那些提交，让人判断。
+2. **推之后**：远端 HEAD 必须 == 本地 HEAD。不等 → 推上去的不是本地
+   的东西 → 报错退出并给出排查步骤。
+
+已用真实误推场景验证过它确实会拦（另起两个 clone 互相推，再让落后的
+那个去推 —— 脚本正确识别并拒绝）。
 
 ## 许可
 
