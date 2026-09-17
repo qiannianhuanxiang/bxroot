@@ -390,3 +390,44 @@ make 的配方子进程创建路径，在 glibc 2.39 上**不经任何导出符�
 
 在 **LD_PRELOAD 架构**下这是原理性不可观测的 —— 需要 ptrace。
 本缺陷已完整记录（20+ 实验、4 个被否定假设），**归档为架构级已知限制**。
+
+---
+
+## 十、2026-09-17 追加五：`posix_spawn` 钩子**已实证生效**（缩小怀疑面）
+
+用 combo 探针（fa+attr 组合，即 make 的参数形态）+ `BXROOT_VERBOSE=1`：
+
+```
+### combo 探针（fa+attr 组合）###
+[bxroot] proc: trampoline_spawn host=... argv0=... preload=... fa=1 attr=1
+COMBO-CHILD-OK
+posix_spawn(fa+attr) rc=0 ...
+```
+
+**`trampoline_spawn` 日志出现了 1 次** —— 我们的 `posix_spawn` 钩子
+**确实生效**、确实走了 trampoline、`--preload` 确实传了出去。
+（对照：make 跑配方时**一条都没有**。）
+
+### 由此收窄
+
+排除项更新：
+- ~~posix_spawn 钩子未生效~~ —— **否定**，它对同形态参数工作正常
+- ~~trampoline 未传 --preload~~ —— **否定**，日志里 preload 非空
+- ~~fa/attr 组合导致放弃 trampoline~~ —— **否定**，fa=1 attr=1 照走
+
+### 怀疑面只剩一个
+
+make 的子进程死亡**不经我们的任何钩子**（无 spawn/execve 日志）、
+**在留痕前死亡**。已知唯一符合的机制是 glibc 私有 clone 路径
+（CLONE_VM|CLONE_VFORK，`__spawni`），其子进程若未加载 runtime
+就没有 SIGSYS 处理器 → 首个 seccomp TRAP 即死。
+
+但矛盾在于：combo 探针同样由 `real_posix_spawn`（内部即 `__spawni`）
+创建，子进程却加载了 runtime。**唯一未验证的差异**是
+`make` 传入的 `envp` 内容 —— 若 make 的 envp 里 `LD_PRELOAD`
+是**空或宿主不可解析**的值，子进程 bridge 起来后 linker
+找不到 runtime，行为即与观察吻合。
+
+**验证方法（下一轮）**：hook `posix_spawn` 时打印**实际传给
+`real_posix_spawn` 的 envp 里的 LD_PRELOAD**（而非 `getenv` 的值），
+再跑 make 对照。这是一行日志的事。
