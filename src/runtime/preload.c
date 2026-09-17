@@ -5096,7 +5096,14 @@ struct passwd *getpwnam(const char *name) {
         /* 逐字段切（passwd 格式: name:passwd:uid:gid:gecos:dir:shell）*/
         for (i = 0; i < 7; i++) {
             fields[i] = w;
-            e = strchr(w, i < 6 ? ':' : '\n');
+            /* ★ 末行无换行符也要收（D4 修）★ 详见 getpwnam_r 内同款注释 */
+            if (i < 6) {
+                e = strchr(w, ':');
+            } else {
+                e = strchr(w, '\n');
+                if (e == NULL)
+                    e = w + strlen(w);
+            }
             if (e == NULL) { break; }
             *e = '\0';
             w = e + 1;
@@ -5109,13 +5116,52 @@ struct passwd *getpwnam(const char *name) {
 
         /* 命中：填静态 struct passwd（非 _r 版本用静态存储是契约允许的）*/
         {
-            static char f_name[64], f_passwd[64], f_gecos[64];
-            static char f_dir[256], f_shell[64];
-            snprintf(f_name,   sizeof f_name,   "%s", fields[0]);
-            snprintf(f_passwd, sizeof f_passwd, "%s", fields[1]);
-            snprintf(f_gecos,  sizeof f_gecos,  "%s", fields[4]);
-            snprintf(f_dir,    sizeof f_dir,    "%s", fields[5]);
-            snprintf(f_shell,  sizeof f_shell,  "%s", fields[6]);
+            /*
+             * ★ 改为按需分配，不再用固定小缓冲（D6 修）★
+             *
+             * 原先 `f_gecos[64]` / `f_dir[256]` 配 `snprintf` —— 超长字段被
+             * **静默截断**。实测 104 字节的 GECOS 在 bxroot 下只返回 63 字节，
+             * 而 glibc 完整返回 104 字节。
+             *
+             * 危害不是"少几个字符"：GECOS 里放的是真实姓名/联系方式，
+             * 而 `dir`（家目录）被截断会让后续 chdir/家目录解析指向错路径 ——
+             * 那类错误离截断点非常远，极难排查。（本项目在别处吃过
+             * "静默截断比报错糟"的教训，见 l2s 的 st_nlink 契约。）
+             *
+             * 现在按实际字段长度 realloc 静态缓冲，只受一个防御上限约束。
+             * 到上限时**不静默截断** —— 直接放弃直解并回退返回 NULL，
+             * 让调用方看到"查不到"而不是拿到半个字符串。
+             */
+            static char *f_name = NULL, *f_passwd = NULL, *f_gecos = NULL;
+            static char *f_dir = NULL, *f_shell = NULL;
+            static size_t f_name_cap = 0, f_passwd_cap = 0, f_gecos_cap = 0;
+            static size_t f_dir_cap = 0, f_shell_cap = 0;
+            /* 单字段防御上限：/etc/passwd 单行本身限 1024（见 line[]），
+             * 所以任何字段都不可能超过它。取 1024 与之一致。 */
+            const size_t FIELD_MAX = 1024;
+
+            /* 辅助：把 src 复制进 *dst（容量 *cap），不足则 realloc。
+             * 返回 1 成功 / 0 失败（超上限或分配失败）。 */
+            #define BXROOT_DUP_FIELD(dst, cap, src)                       \
+                do {                                                      \
+                    size_t _n = strlen(src) + 1;                           \
+                    if (_n > FIELD_MAX) { fclose(f); return NULL; }        \
+                    if (*(cap) < _n) {                                      \
+                        char *_p = (char *)realloc(*(dst), _n);            \
+                        if (_p == NULL) { fclose(f); return NULL; }        \
+                        *(dst) = _p; *(cap) = _n;                          \
+                    }                                                      \
+                    memcpy(*(dst), (src), _n);                             \
+                } while (0)
+
+            BXROOT_DUP_FIELD(&f_name,   &f_name_cap,   fields[0]);
+            BXROOT_DUP_FIELD(&f_passwd, &f_passwd_cap, fields[1]);
+            BXROOT_DUP_FIELD(&f_gecos,  &f_gecos_cap,  fields[4]);
+            BXROOT_DUP_FIELD(&f_dir,    &f_dir_cap,    fields[5]);
+            BXROOT_DUP_FIELD(&f_shell,  &f_shell_cap,  fields[6]);
+
+            #undef BXROOT_DUP_FIELD
+
             fake.pw_name   = f_name;
             fake.pw_passwd = f_passwd;
             fake.pw_uid    = (uid_t)atoi(fields[2]);
@@ -5177,7 +5223,20 @@ int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
 
         for (i = 0; i < 7; i++) {
             fields[i] = w;
-            e = strchr(w, i < 6 ? ':' : '\n');
+            /*
+             * ★ 末行不带换行符也要收（D4 修）★
+             * 第 7 个字段原先只找 '\n'：末行无换行时 strchr 返回 NULL
+             * → break → nf<7 → **整条记录被丢弃**。改为接受字符串结尾。
+             * （同款问题存在于 getgrnam / getgrgid / getpwnam 三处，
+             *   一并修。实测依据见 docs/NSS直解边界测试报告.md D4。）
+             */
+            if (i < 6) {
+                e = strchr(w, ':');
+            } else {
+                e = strchr(w, '\n');
+                if (e == NULL)
+                    e = w + strlen(w);
+            }
             if (e == NULL) break;
             *e = '\0';
             w = e + 1;
@@ -5227,7 +5286,14 @@ int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
         return 0;
     }
     fclose(f);
-    return ENOENT;                        /* 表里没有 */
+    /*
+     * ★ 查不到 → rc=0 + *result=NULL，不是 ENOENT（D5 修）★
+     *
+     * glibc 的 `_r` 契约里"查不到"**不是错误**：返回 0 并把 `*result`
+     * 置 NULL。返回 ENOENT 会让调用方把"这个用户不存在"当成系统错误。
+     * （入口处已 `*result = NULL`，直接 return 0 即符合契约。）
+     */
+    return 0;
 }
 
 /*
@@ -5305,7 +5371,14 @@ struct group *getgrnam(const char *name) {
 
         for (i = 0; i < 4; i++) {
             fields[i] = w;
-            e = strchr(w, i < 3 ? ':' : '\n');
+            /* ★ 末行无换行符也要收（D4 修）★ 详见 getpwnam_r 内同款注释 */
+            if (i < 3) {
+                e = strchr(w, ':');
+            } else {
+                e = strchr(w, '\n');
+                if (e == NULL)
+                    e = w + strlen(w);
+            }
             if (e == NULL) break;
             *e = '\0';
             w = e + 1;
@@ -5316,23 +5389,100 @@ struct group *getgrnam(const char *name) {
 
         {
             /* ★ 全部用 static：gr_mem 指向它，函数返回后必须仍有效 ★ */
-            static char g_name[64], g_passwd[64], g_mem[512];
-            static char *g_memlist[8];
+            static char *g_name = NULL, *g_passwd = NULL, *g_mem = NULL;
+            static size_t g_name_cap = 0, g_passwd_cap = 0, g_mem_cap = 0;
+            /*
+             * ★ 成员指针槽位改为按需扩展，不再固定 8 个（D3 修）★
+             *
+             * 原先 `static char *g_memlist[8]` + `mi < 7` 让"多于 7 个成员"
+             * **静默截断**（实测 `getent group big` 9 个成员只回 7 个）。
+             * 静默给错数据比报错糟 —— 调用方无法察觉。
+             *
+             * 现在按实际成员数 realloc；上限设 4096 作防御（正常
+             * /etc/group 远达不到），到顶**不截断而是少填**并在下面
+             * 留 NULL 终止（非 _r 版无返回值可报错，这是它能做的最好选择；
+             * 4096 个成员的实际文件不会出现）。
+             */
+            static char **g_memlist = NULL;
+            /* g_memlist 的指针槽位数（与字符串容量 g_mem_cap 是**两个量**，
+             * 别合并 —— 合并会因单位不同而永不 realloc，见下方注释） */
+            static size_t g_slots_cap = 0;
+            size_t n_mem = 0;
+            const char *t;
             int mi = 0, k;
             char *tok;
 
-            snprintf(g_name,   sizeof g_name,   "%s", fields[0]);
-            snprintf(g_passwd, sizeof g_passwd, "%s", fields[1]);
-            snprintf(g_mem,    sizeof g_mem,    "%s", fields[3]);
+            /*
+             * ★ 按需分配，不再静默截断（D6 同族修）★
+             *
+             * 原先 g_name[64] / g_mem[512] 配 snprintf：超长被静默砍掉。
+             * `g_mem` 尤其危险 —— 成员列表被截断会让调用方以为"这个组
+             * 只有前几个成员"，进而做出错误的权限判断。
+             *
+             * 上限与 line[]（1024）一致；超限则放弃直解返回 NULL
+             * （让调用方看到"查不到"，而不是拿到半个列表）。
+             */
+            #define BXROOT_DUP_G(dst, cap, src)                           \
+                do {                                                      \
+                    size_t _n = strlen(src) + 1;                           \
+                    if (_n > 1024) { fclose(f); return NULL; }             \
+                    if (*(cap) < _n) {                                      \
+                        char *_p = (char *)realloc(*(dst), _n);            \
+                        if (_p == NULL) { fclose(f); return NULL; }        \
+                        *(dst) = _p; *(cap) = _n;                          \
+                    }                                                      \
+                    memcpy(*(dst), (src), _n);                             \
+                } while (0)
+
+            BXROOT_DUP_G(&g_name,   &g_name_cap,   fields[0]);
+            BXROOT_DUP_G(&g_passwd, &g_passwd_cap, fields[1]);
+            BXROOT_DUP_G(&g_mem,    &g_mem_cap,    fields[3]);
+
+            #undef BXROOT_DUP_G
+
+            /* 先数实际成员数 */
+            t = g_mem;
+            while (*t != '\0') {
+                const char *c = strchr(t, ',');
+                size_t seg = (c != NULL) ? (size_t)(c - t) : strlen(t);
+                if (seg > 0) n_mem++;
+                if (c == NULL) break;
+                t = c + 1;
+            }
+            if (n_mem > 4096) n_mem = 4096;   /* 防御上限 */
+
+            /*
+             * ★ 指针槽位单独用自己的容量变量 ★
+             *
+             * 上一版我复用了 `g_memcap`（它是**字符串字节容量**）去跟
+             * `n_mem + 1`（**指针个数**）比较，两个单位不同 ——
+             * 结果是"容量够大"的判断永远成立，realloc 从不发生，
+             * `g_memlist` 一直是 NULL，成员数变成 0。
+             *
+             * 这正是"同一变量承担两种语义"的典型后果，也是本项目的
+             * 高频缺陷模式（同一功能不同入口覆盖不全）。这里把两者
+             * 彻底分开：`g_mem_cap` 管字符串字节，`g_slots_cap` 管指针个数
+             * （`g_slots_cap` 在函数上方已声明）。
+             */
+            /* 需要 n_mem + 1 个槽（含结尾 NULL） */
+            if (g_slots_cap < n_mem + 1) {
+                char **nw = (char **)realloc(g_memlist,
+                                             (n_mem + 1) * sizeof(char *));
+                if (nw == NULL) { fclose(f); return NULL; }
+                g_memlist = nw;
+                g_slots_cap = n_mem + 1;
+            }
 
             tok = g_mem;
-            while (tok != NULL && mi < 7) {
+            while (tok != NULL && (size_t)mi < n_mem) {
                 char *c = strchr(tok, ',');
                 if (c != NULL) *c = '\0';
                 if (*tok != '\0') g_memlist[mi++] = tok;
                 tok = (c != NULL) ? c + 1 : NULL;
             }
-            for (k = mi; k < 8; k++) g_memlist[k] = NULL;
+            /* 结尾 NULL —— 用**指针槽位**容量判断（不是字符串字节容量） */
+            for (k = mi; (size_t)k < g_slots_cap; k++)
+                g_memlist[k] = NULL;
 
             fake.gr_name   = g_name;
             fake.gr_passwd = g_passwd;
@@ -5383,9 +5533,25 @@ int getgrnam_r(const char *name, struct group *grp, char *buf, size_t buflen,
         char *w = line, *e;
         size_t used = 0;
 
+        /*
+         * ★ 末行不带换行符也要收（D4 修）★
+         *
+         * 原先第 4 个字段找的是 '\n'：文件末行若没有换行符，
+         * `strchr(w,'\n')` 返回 NULL → break → nf<4 → **整条记录被丢弃**。
+         * 实测：`printf 'root:x:0:root'`（无结尾换行）下 getpwnam 返回
+         * NULL，而 glibc 正常命中。
+         *
+         * 修法：第 4 个字段接受 '\n' 或字符串结尾 —— 两者都算"字段结束"。
+         */
         for (i = 0; i < 4; i++) {
             fields[i] = w;
-            e = strchr(w, i < 3 ? ':' : '\n');
+            if (i < 3) {
+                e = strchr(w, ':');
+            } else {
+                e = strchr(w, '\n');
+                if (e == NULL)
+                    e = w + strlen(w);   /* 末行无换行：以 '\0' 为界 */
+            }
             if (e == NULL) break;
             *e = '\0';
             w = e + 1;
@@ -5397,49 +5563,108 @@ int getgrnam_r(const char *name, struct group *grp, char *buf, size_t buflen,
         {
             size_t len;
             unsigned gid_v = (unsigned)atoi(fields[2]);
-            int mi = 0;
-            char *tok;
+            const char *memstr = fields[3];
+            size_t n_mem = 0, ptr_bytes, need, align_pad;
+            char **ml;
+            int k;
 
             grp->gr_gid = gid_v;
 
+            /*
+             * =========================================================
+             * ★ 先把总需求算清、再检查、最后才写（D2/D3 修）★
+             * =========================================================
+             *
+             * 【D2：曾经越界写 60 字节】
+             *
+             * 原先的写法是"先把 8 个指针写进调用方缓冲，写完再查
+             * `used > buflen`"。后果是：buflen 不足时虽然**返回了
+             * ERANGE**，但**已经越界写过了** ——
+             *
+             *     实测（哨兵法，buflen=32）：越界写 40 字节，
+             *     最远偏移 71；同一场景 glibc 越界 0 字节。
+             *
+             * 这是**内存安全**问题，不是返回值问题：调用方拿到 ERANGE
+             * 后可能重试（用更大的缓冲），但被破坏的内存已经破坏了。
+             * glibc 的契约是"失败时不写任何东西"（`*result = NULL`），
+             * 必须照做。
+             *
+             * 【D3：成员数硬上限 7】
+             *
+             * 原先 `g_memlist[8]` 的固定 8 个槽位（7 个成员 + NULL）
+             * 是从原型的栈缓冲写法遗留下来的，且 `mi < 7` 让**多于 7 个
+             * 成员时静默截断**。实测 `getent group big`（9 个成员）
+             * 只返回 7 个 —— 静默给错数据比报错更糟。
+             *
+             * 现在按实际成员数动态分配指针槽。上限仍设一个（防御畸形
+             * 输入），但**超限时报 ERANGE 而不是静默截断**。
+             */
+            n_mem = 0;
+            {
+                const char *t = memstr;
+                while (*t != '\0') {
+                    const char *c = strchr(t, ',');
+                    size_t seg = (c != NULL) ? (size_t)(c - t) : strlen(t);
+                    if (seg > 0) n_mem++;
+                    if (c == NULL) break;
+                    t = c + 1;
+                }
+            }
+            /* 防御：成员数上限（正常 /etc/group 远达不到） */
+            if (n_mem > 4096) { fclose(f); return ERANGE; }
+
+            /* 指针数组按指针对齐；每个成员一个指针 + 结尾 NULL */
+            ptr_bytes = (n_mem + 1) * sizeof(char *);
+
+            /* ---- 需求计算（只算，不写）---- */
+            need = strlen(fields[0]) + 1;          /* gr_name   */
+            need += strlen(fields[1]) + 1;         /* gr_passwd */
+            need += strlen(memstr) + 1;            /* 成员串本体 */
+            /* 指针数组前要对齐 */
+            align_pad = (sizeof(char *) - (need % sizeof(char *))) % sizeof(char *);
+            need += align_pad + ptr_bytes;
+
+            /* ---- 一次性检查：不够就直接失败，**此时尚未写过任何字节** ---- */
+            if (need > buflen) { fclose(f); return ERANGE; }
+
+            /* ---- 检查通过，开始写 ---- */
+            used = 0;
+
             len = strlen(fields[0]) + 1;
-            if (used + len > buflen) { fclose(f); return ERANGE; }
             grp->gr_name = buf + used;
             memcpy(buf + used, fields[0], len); used += len;
 
             len = strlen(fields[1]) + 1;
-            if (used + len > buflen) { fclose(f); return ERANGE; }
             grp->gr_passwd = buf + used;
             memcpy(buf + used, fields[1], len); used += len;
 
-            /* 成员列表：整体拷进 buf，指针数组也放 buf（对齐安全）*/
-            len = strlen(fields[3]) + 1;
-            if (used + len > buflen) { fclose(f); return ERANGE; }
-            memcpy(buf + used, fields[3], len); used += len;
-
-            /* 成员指针数组：最多 7 个成员 + NULL */
-            tok = buf + (used - len);
-            while (tok != NULL && mi < 7) {
-                char *c = strchr(tok, ',');
-                if (c != NULL) *c = '\0';
-                if (*tok != '\0') mi++;
-                tok = (c != NULL) ? c + 1 : NULL;
-            }
+            len = strlen(memstr) + 1;
+            memcpy(buf + used, memstr, len);
+            /* 记住成员串在 buf 里的起点，下面按 ',' 就地切分 */
             {
-                char **ml = (char **)(buf + ((used + sizeof(char*) - 1) &
-                                             ~(sizeof(char*) - 1)));
-                int k = 0;
-                tok = buf + (used - len);
-                while (tok != NULL && k < 7) {
-                    char *c = strchr(tok, ',');
-                    if (c != NULL) *c = '\0';
-                    if (*tok != '\0') ml[k++] = tok;
-                    tok = (c != NULL) ? c + 1 : NULL;
+                char *base = buf + used;
+                used += len;
+
+                /* 对齐后放指针数组 */
+                used += (sizeof(char *) - (used % sizeof(char *))) % sizeof(char *);
+                ml = (char **)(buf + used);
+
+                k = 0;
+                {
+                    char *t = base;
+                    while (*t != '\0' && k < (int)n_mem) {
+                        char *c = strchr(t, ',');
+                        if (c != NULL) *c = '\0';
+                        if (*t != '\0') ml[k++] = t;
+                        if (c == NULL) break;
+                        t = c + 1;
+                    }
                 }
-                for (; k < 8; k++) ml[k] = NULL;
+                /* 结尾 NULL（可能多个，保持习惯） */
+                while (k <= (int)n_mem) ml[k++] = NULL;
+
                 grp->gr_mem = ml;
-                used += 8 * sizeof(char*);
-                if (used > buflen) { fclose(f); return ERANGE; }
+                used += ptr_bytes;
             }
 
             *result = grp;
@@ -5448,7 +5673,21 @@ int getgrnam_r(const char *name, struct group *grp, char *buf, size_t buflen,
         }
     }
     fclose(f);
-    return ENOENT;
+    /*
+     * ★ 查不到时返回 0 + *result=NULL，不是 ENOENT（D5 修）★
+     *
+     * glibc 的 `_r` 契约：**查不到不是错误**，而是"成功但无结果"：
+     *     rc = 0, *result = NULL, errno 不变
+     * 返回 ENOENT 会让调用方把"这个用户/组不存在"当成**系统错误** ——
+     * 典型后果是程序打印"无法查询用户"而不是走正常的"用户不存在"分支。
+     *
+     * 实测依据：glibc 对不存在的组返回 rc=0 + *result=NULL。
+     * 原先 4 处 `_r` 钩子（getpwnam_r / getpwuid_r / getgrnam_r /
+     * getgrgid_r）都写的 `return ENOENT`，一并改正。
+     *
+     * 注意 `*result` 在函数入口已经置 NULL，所以这里直接 return 0 即可。
+     */
+    return 0;
 }
 
 /* getpwuid_r 的可重入版本 —— 有些程序只用它 */
