@@ -12,7 +12,7 @@
  * 内核投递 SIGSYS；**若该信号被屏蔽，内核直接杀掉进程**，表现为
  * 退出码 159 = 128+31，无法捕获、无法抢救。
  *
- * 这是官方 proroot 必须有 2624 字节 SIGSYS 模拟层（proroot_sigsys_emulate
+ * 这是参考实现 必须有 2624 字节 SIGSYS 模拟层（proroot_sigsys_emulate
  * / sigsys_log_append / proroot_sigsys_handler）的真正原因，也是 bxroot
  * 此前跑不了 dsh 的唯一原因：
  *     node --version         → rc=0    （不触发事件循环）
@@ -210,7 +210,7 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
  *   探针：sigprocmask(SIG_BLOCK,{SIGSYS}) 之后，直发一个被 seccomp
  *         TRAP 的内联 svc（nr=99 set_robust_list），看进程是否存活。
  *
- *   官方 proroot：SIGSYS 掩码位**保持为 0**（未被屏蔽）→ 存活 rc=0
+ *   参考实现：SIGSYS 掩码位**保持为 0**（未被屏蔽）→ 存活 rc=0
  *   bxroot      ：SIGSYS 掩码位**变成 1**（确实被屏蔽）→ 死 rc=159
  *
  *   回读证据（sigprocmask(SIG_BLOCK,NULL,&cur) 查询）：

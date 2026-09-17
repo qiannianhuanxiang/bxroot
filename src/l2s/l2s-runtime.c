@@ -4,7 +4,7 @@
  * 见 l2s-runtime.h 的设计说明。本文件的铁律：**不直接调用任何系统调用**，
  * 一切 FS 操作都走注入的 l2s_rt_ops。
  *
- * 参考实现：上游 PRoot 的 src/extension/link2symlink/link2symlink.c
+ * 参考实现：上游 参考实现 的 src/extension/link2symlink/link2symlink.c
  *   move_and_symlink_path()  -- 第 484-638 行
  *   decrement_link_count()   -- 第 646-755 行
  *   handle_sysexit_end()     -- 第 758-905 行的 stat 补丁分支
@@ -275,7 +275,7 @@ static int resolve_final(const char *mid, char *out_final, size_t outsz)
 
     /*
      * 中间层必须指向一个数据文件（带 ".NNNN" 尾巴），指向别处说明链
-     * 已经损坏 —— 按 PRoot 的做法静默跳过，反正调用方本来就要删它。
+     * 已经损坏 —— 按 参考实现 的做法静默跳过，反正调用方本来就要删它。
      */
     {
         l2s_info info;
@@ -304,7 +304,7 @@ static int resolve_final(const char *mid, char *out_final, size_t outsz)
  *       → /usr/bin/cp: cannot open '/tmp/x/a' for reading:
  *         Too many levels of symbolic links
  *
- * 官方 proroot 不会：它在系统调用入口就把路径换成了数据文件
+ * 参考实现不会：它在系统调用入口就把路径换成了数据文件
  * （link2symlink.c 的 translated_path()），内核根本见不到那条链接。
  *
  * 本层是 LD_PRELOAD 方案，只能在钩子里补：既然客户明确说了"别跟随
@@ -345,7 +345,7 @@ int l2s_rt_resolve_fake_link(const char *path, char *out, size_t outsz)
 /* ------------------------------------------------------------------ */
 
 /*
- * 首次链接时挑选一个空闲代号。PRoot 用 access(F_OK) 探测，它**跟随**符号
+ * 首次链接时挑选一个空闲代号。参考实现 用 access(F_OK) 探测，它**跟随**符号
  * 链接，因此悬空的中间层会被当成空闲槽位 —— 这个语义由注入方复现。
  *
  * l2s_exists_fn 的签名是 int (*)(const char *, void *)。
@@ -390,10 +390,10 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
             return rc == L2S_ERANGE ? -ENOSPC : -EINVAL;
 
         /*
-         * PRoot 首次链接写死的尾巴是字面量 ".0002"：它记的是**本次 link()
+         * 参考实现 首次链接写死的尾巴是字面量 ".0002"：它记的是**本次 link()
          * 完成后**的链接数（原有 1 条 + 新建 1 条）。实证产物是
          * "<uuid>0001.0001"，那是 link 计数被递减回来的结果，两者一致。
-         * 这里跟随 PRoot，写 2。
+         * 这里跟随 参考实现，写 2。
          */
         rc = l2s_make_paths_ex(&g_cfg, oldpath, gen, 2, &paths,
                                mid, final);
@@ -451,7 +451,7 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
          * 关键：**不动数据文件的名字，也不动中间层**。
          *
          * 原设计把链接数编进文件名（.0002 -> .0003），每次加链长都要
-         * rename 数据文件、重建中间层。那恰好命中官方 proroot 运行时的
+         * rename 数据文件、重建中间层。那恰好命中参考实现 运行时的
          * 一个缓存缺陷 —— 已被 open 过的路径，在目标改名后永久 ENOENT。
          * 详见 agents/_shared/官方运行时缺陷-符号链接改名后失效.md。
          *
@@ -467,7 +467,7 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
     if (g_ops->symlink(mid, newpath) != 0) {
         int e = errno;
         /*
-         * PRoot 在这里做 decrement_link_count() 回滚。本层不静默重放，
+         * 参考实现 在这里做 decrement_link_count() 回滚。本层不静默重放，
          * 把错误如实上抛，由调用方决定（EXECUTION_UNKNOWN 原则）。
          */
         return -e;
@@ -535,7 +535,7 @@ int l2s_rt_unlink(const char *path)
  * 改名**故意透传**。
  *
  * 直觉上会想「把中间层与数据文件一起搬走」，但那是错的，而且偏离参考实现。
- * PRoot 的 translated_path()（link2symlink.c 第 985-996 行）明确把
+ * 参考实现 的 translated_path()（link2symlink.c 第 985-996 行）明确把
  * rename/renameat/renameat2 排除在路径翻译之外：
  *
  *     if (sysnum == PR_rename || sysnum == PR_renameat || sysnum == PR_renameat2)
@@ -548,7 +548,7 @@ int l2s_rt_unlink(const char *path)
  * 我原先的实现会重建中间层，反而引入两个风险：中途失败留下悬空链接；
  * 以及 nlink 记账挂在中间层上，换名等于换账本。透传没有这些问题。
  *
- * 已知且接受的残留（PRoot 同样存在）：把一个普通文件改名**覆盖**到伪造
+ * 已知且接受的残留（参考实现 同样存在）：把一个普通文件改名**覆盖**到伪造
  * 链接上时，内核会用新文件替换掉那条符号链接，中间层与数据文件变成无人
  * 引用的孤儿，占用空间直到被清理。要修需要反向扫描整个元数据目录，代价
  * 远高于收益，且会让行为偏离参考实现，故不处理。
@@ -588,7 +588,7 @@ int l2s_rt_rename(const char *oldpath, const char *newpath)
  *     cp -a   → cannot open '...': Too many levels of symbolic links
  *   （后者是因为 cp 会拿 readlink 的结果自己去解析，形成自环）
  *
- * 【官方 proroot 的实测行为】
+ * 【参考实现的实测行为】
  * 它不刻意让 readlink 失败 —— 失败是**结构性**的：官方在系统调用入口
  * 就把伪造链接替换成最终数据文件（link2symlink.c 的 translated_path()），
  * 所以内核看到的已经是普通文件，readlink 自然回 EINVAL。这正是
@@ -732,7 +732,7 @@ int l2s_rt_rewrite_readlink(const char *path, const char *raw_target,
  *   - st_nlink 改成链长（磁盘上是符号链接，内核只会给 1）
  *   - 抹掉 S_IFLNK（客户不该知道这是符号链接）
  *
- * 注意 st_size/st_ino 的取舍：PRoot 只改 nlink，并把 stat 的其余部分
+ * 注意 st_size/st_ino 的取舍：参考实现 只改 nlink，并把 stat 的其余部分
  * 换成数据文件的（见 handle_sysexit_end 的 finalStat）。本层采取同样
  * 的最小改动，只动 nlink 与 mode 的 S_IFLNK 位，其余字段保持内核给的
  * 值 —— 因为本层拿不到 data 文件的 stat（那需要一次额外的 lstat，
@@ -771,9 +771,9 @@ void l2s_rt_patch_stat(struct stat *st, const char *path)
      *     tar tvf  → 把伪造链接按**符号链接**归档，并把**宿主绝对路径**
      *                写进归档（/data/data/com.dsh.client/files/...）
      *     cp -a    → ELOOP（Too many levels of symbolic links）
-     * 官方 proroot 在同场景下 tar 输出普通文件、cp -a 成功。
+     * 参考实现在同场景下 tar 输出普通文件、cp -a 成功。
      *
-     * 【PRoot 的权威做法】
+     * 【参考实现 的权威做法】
      * `src/extension/link2symlink/link2symlink.c:860-890` 是**整体替换**：
      *     status = lstat(final, &finalStat);
      *     finalStat.st_nlink = <链长>;
@@ -798,7 +798,7 @@ void l2s_rt_patch_stat(struct stat *st, const char *path)
      *   st_nlink —— 用读出的链长（下面的 l2s_patch_nlink_value）
      *   st_mode  —— ★ 权限位取数据文件的，类型位置 S_IFREG ★
      *   st_uid / st_gid —— ★ 保留不动（fakeroot 的成果）
-     *   时间戳 / st_dev / st_rdev —— 数据文件的（与 PRoot 一致）
+     *   时间戳 / st_dev / st_rdev —— 数据文件的（与参考实现一致）
      *
      * ★ st_mode 的权限位为什么必须取数据文件的（实测缺陷）★
      *
@@ -885,7 +885,7 @@ static void patch_statx_impl(unsigned int *stx_nlink, unsigned int *stx_mask,
      * 本模块要骗过的那一个。
      *
      * 【实测证据】裸 syscall(291) 探针（node/libuv 走的正是这条路）：
-     *     官方 proroot: mode=0100600 nlink=2 islnk=0
+     *     参考实现: mode=0100600 nlink=2 islnk=0
      *     bxroot      : mode=0120777 nlink=1 islnk=1   ← 修前
      *                   mode=0100777 nlink=2 islnk=0   ← 只抹类型位
      *                   mode=0100600 nlink=2 islnk=0   ← 权限位也取数据文件后

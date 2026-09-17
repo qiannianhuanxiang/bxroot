@@ -11,7 +11,7 @@
  *   - `chown` 看起来毫无效果（后面的 stat 仍显示旧属主），并且真实 chown
  *     对非 root 进程直接 EPERM。
  * 完整语义必须包含 **stat 结果补丁** + **chown 记账**，而不只是 get*id 的返回值。
- * 这一点已由 GAP-ANALYSIS.md §2.1 的活体实测证实（官方 proroot 里
+ * 这一点已由 GAP-ANALYSIS.md §2.1 的活体实测证实（参考实现 里
  * `stat -c %u` 对内核属主 10655 的文件返回 0，`chown 12345:12345` 返回 0）。
  *
  * 本文件的分层
@@ -33,11 +33,11 @@
  *
  * 上游参考（行号已逐一核对，见 REPORT.md §2）
  * -------------------------------------------
- *   proot/src/extension/fake_id0/fake_id0.c:102-137   SETXID
- *   proot/src/extension/fake_id0/fake_id0.c:152-211   SETREXID
- *   proot/src/extension/fake_id0/fake_id0.c:223-266   SETRESXID
- *   proot/src/extension/fake_id0/fake_id0.c:271-291   SETFSXID
- *   proot/src/extension/fake_id0/fake_id0.c:92-97     MAYBE_DROP_CAPS
+ *   参考实现 fake_id0 扩展的 SETXID 语义
+ *   参考实现 fake_id0 扩展的 SETREXID 语义
+ *   参考实现 fake_id0 扩展的 SETRESXID 语义
+ *   参考实现 fake_id0 扩展的 SETFSXID 语义
+ *   参考实现 fake_id0 扩展的 MAYBE_DROP_CAPS 语义
  *   proot/src/extension/fake_id0/fake_id0.c:535-559   handle_perm_err_exit_end
  *   proot/src/extension/fake_id0/fake_id0.c:1011-1015 getgroups/setgroups
  *   proot/src/extension/fake_id0/stat.c:32-48          stat 补丁（ptrace 分支）
@@ -143,7 +143,7 @@ typedef enum {
  *   FR_HEURISTIC_OWNER —— st_uid == real_uid ⇒ euid，st_gid == real_gid ⇒ egid。
  *                        默认值。与 proot fake_id0 的 ptrace 分支字面一致
  *                         （stat.c:43-48「Override only if the file is owned by
- *                          the current user」），也覆盖官方 proroot 的实测
+ *                          the current user」），也覆盖参考实现的实测
  *                          行为（GAP-ANALYSIS §2.1：内核属主 10655 的文件
  *                          在容器里 `stat -c %u` 读出 0）。
  *                         信息不丢失：真正属于 system/其他 uid 的文件保持原样。
@@ -421,7 +421,7 @@ int fakeroot_forget_inode(fakeroot_state *fs, dev_t dev, ino_t ino);
  *   2. 记账未命中且 fs->enabled ⇒ 按 fs->heuristic 做启发式（默认 OWNER）：
  *          st_uid == real_uid ⇒ st_uid = euid
  *          st_gid == real_gid ⇒ st_gid = egid
- *      这是官方 proroot 的活体行为：内核属主是 Android 应用 uid 的文件，
+ *      这是参考实现的活体行为：内核属主是 Android 应用 uid 的文件，
  *      在容器里一律读成 0。
  *
  *   3. 其余情况一律不动 —— 特别是 st_ino / st_dev / st_nlink / 时间戳。

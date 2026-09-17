@@ -12,7 +12,7 @@
  * 5. 内核调用本库作为解释器
  * 6. 本库加载 runtime .so，然后调用目标程序的 _start
  *
- * 参考：上游 proroot 的 stub-loader 实现
+ * 参考：stub-loader 的通用设计
  */
 
 #define _GNU_SOURCE

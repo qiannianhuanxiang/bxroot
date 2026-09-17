@@ -3,7 +3,7 @@
  *
  * 【为什么需要这个文件】
  *
- * 官方 proroot 有一个 3116 字节的 proroot_sigsegv_handler 和一个 340 字节的
+ * 参考实现 有一个 3116 字节的 proroot_sigsegv_handler 和一个 340 字节的
  * sigsegv_dump_word_window。它会在收到 SIGSEGV/SIGBUS 时打印：
  *   - 信号号、pc、lr、fault 地址、code
  *   - 全部通用寄存器（x0-x30、sp、pstate）

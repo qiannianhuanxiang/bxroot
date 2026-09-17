@@ -2,7 +2,7 @@
  * clone3_guard.h —— __clone3 禁用层
  *
  * 完整设计说明见 clone3_guard.c。要点：
- * proroot-ldso 的过滤器以 KILL_PROCESS 方式禁止 clone3(435)，
+ * 宿主 loader 的过滤器以 KILL_PROCESS 方式禁止 clone3(435)，
  * 无法用 SIGSYS 处理器挽救。官方 runtime 的做法是导出一个返回
  * -1/ENOSYS 的 __clone3，让 glibc 回退到 clone(2)。
  */

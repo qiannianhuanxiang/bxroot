@@ -1487,7 +1487,7 @@ void fakeroot_state_set_enabled(fakeroot_state *fs, bool enabled)
     }
     fs->enabled = enabled;
     if (enabled) {
-        /* 默认的假身份就是 root（uid=gid=0），与官方 proroot 一致。 */
+        /* 默认的假身份就是 root（uid=gid=0），与参考实现一致。 */
         fs->ruid = fs->euid = fs->suid = fs->fsuid = (uid_t)0;
         fs->rgid = fs->egid = fs->sgid = fs->fsgid = (gid_t)0;
         fs->caps_active = true;

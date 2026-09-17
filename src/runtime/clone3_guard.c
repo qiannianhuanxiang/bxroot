@@ -5,7 +5,7 @@
  *
  * 保留它的理由：记录一条走过并排除的路径，避免后人重复尝试。
  *
- * 【假设】glibc 的线程创建会先试 clone3(435)，被 proroot-ldso 的
+ * 【假设】glibc 的线程创建会先试 clone3(435)，被 宿主 loader 的
  *         seccomp 以 KILL_PROCESS 禁止 → 只要导出 __clone3 让它返回
  *         ENOSYS，glibc 就会回退到老的 clone(2)。
  *
@@ -55,7 +55,7 @@
  * **它无条件返回 -1/ENOSYS，一条 svc 都不发。**
  *
  * 原理：glibc 的线程创建路径会**先尝试 clone3**，失败后再回退到老的
- * clone(2)。clone3 的系统调用号是 435，被 proroot-ldso 的过滤器禁止
+ * clone(2)。clone3 的系统调用号是 435，被 宿主 loader 的过滤器禁止
  * 且以 KILL_PROCESS 处理 —— 所以只要让它"看起来不存在"，glibc 就会
  * 安静地走 clone 回退路径，新线程得以正常创建。
  *

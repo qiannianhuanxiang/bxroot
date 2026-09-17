@@ -7,7 +7,7 @@
  *
  * 两个独立的问题都由这一层解决：
  *
- * 【问题一】proroot-ldso 用 seccomp 以 KILL_PROCESS 方式禁止了一批系统
+ * 【问题一】宿主 loader 用 seccomp 以 KILL_PROCESS 方式禁止了一批系统
  * 调用（实测逐个列举，425/426/427 在内而 424 不在）。io_uring 家族一旦
  * 发出就杀进程且**不投递信号**，因此 SIGSYS 处理器救不了，只能从源头
  * 不让它发出去。返回 ENOSYS 是 libuv 期望的回退信号（它会改用 epoll）。
@@ -307,7 +307,7 @@ static int looks_like_guest_abs_path(const char *p)
  * 编号取自 asm-generic（aarch64 使用同一套编号）：
  *   425 io_uring_setup / 426 io_uring_enter / 427 io_uring_register
  *
- * 这三个是已实测确认被 proroot-ldso 的 seccomp 策略以 KILL_PROCESS
+ * 这三个是已实测确认被 宿主 loader 的 seccomp 策略以 KILL_PROCESS
  * 方式禁止的。libuv 在启动事件循环时会尝试 io_uring_setup；返回
  * ENOSYS 后它会**自动回退到 epoll**，这是它既有的代码路径。
  */
@@ -893,7 +893,7 @@ long syscall(long number, ...)
          *              解引用它就是 SIGSEGV
          *   a1 != 0    路径为空指针时 l2s 层无从 probe，直接跳过
          *
-         * ★ 官方 proroot 在同一位置做同一件事 ★
+         * ★ 参考实现在同一位置做同一件事 ★
          * 实测（同一个裸 statx 探针，同一颗 node 环境）：
          *     官方: mode=0100600 nlink=2 islnk=0   ← 已伪装
          *     bxroot(修前): mode=0120777 nlink=1 islnk=1
@@ -936,7 +936,7 @@ long syscall(long number, ...)
          *     bxroot(修前): libc getuid=0   syscall(174)=10655   ← 未覆盖
          *
          * 【后果不是"少个功能"，而是程序走错分支】
-         * 自检"非 root"→ 尝试降权（setgroups 等）→ 撞上 proroot-ldso 的
+         * 自检"非 root"→ 尝试降权（setgroups 等）→ 撞上 宿主 loader 的
          * seccomp 过滤器。现场表现（docs/裸syscall身份伪造修复.md 记录）：
          *     官方  : chage -l root 正常输出（它自认为已是 root，跳过降权）
          *     bxroot: chage: failed to drop privileges (Function not implemented)

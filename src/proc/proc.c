@@ -3760,7 +3760,7 @@ static int px_do_execve(const char *path, char *const argv[],
      *     ########## 官方 ##########            ########## bxroot ##########
      *     $ ./s1.sh                             $ ./s1.sh
      *     SHEBANG-OK                            loader: reject .../s1.sh: bad read
-     *     rc=0                                  proroot-ldso: failure rc=5
+     *     rc=0                                  宿主 loader: failure rc=5
      *                                           rc=2
      *
      * 注意 `sh s1.sh`（显式指定解释器）两侧**都正常** —— 所以不是脚本内容
@@ -4104,7 +4104,7 @@ int execveat(int dirfd, const char *path, char *const argv[],
 /*
  * posix_spawn 的实现策略与覆盖范围
  * --------------------------------
- * 参考实现（官方 proroot）为它写了 6064 字节并重建了完整的 spawn 语义。
+ * 参考实现（参考实现）为它写了 6064 字节并重建了完整的 spawn 语义。
  * **本实现不那样做**，理由是实证的（见 REPORT.md 的语义覆盖矩阵）：
  *
  *   - glibc 的 spawn 核心（0xd69c0..0xd7200）会**原样**调用
@@ -5227,7 +5227,7 @@ int tkill(int tid, int sig)
  * 方式下是死路。atexit 覆盖 return/exit() 两条路径，是可得的最优点。
  *
  * ★ 边界（如实记录，不假装覆盖）★
- * 走 _exit()/exit_group/信号致死的进程不会触发清理 —— 这与 proot 一致：
+ * 走 _exit()/exit_group/信号致死的进程不会触发清理 —— 这与参考实现一致：
  * 官方 proot 的 kill-on-exit 同样挂在正常退出路径上。要做到"任何死法
  * 都清理"需要父进程侧监控（如 pidfd 或 subreaper），属独立工作量，
  * 不在本次范围内。

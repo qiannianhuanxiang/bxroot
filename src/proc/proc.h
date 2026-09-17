@@ -513,7 +513,7 @@ const char *px_env_lookup(const char *const *envp, const char *name);
  *      argv[0] 是「被执行的程序名」，程序会拿它做 applet 选择（busybox）、
  *      做 /proc/self/cmdline 自省、做错误信息。Node/python 都会把完整路径
  *      放进 argv[0]，翻译后子进程看到的是宿主路径 —— 这是**已知且可接受**的
- *      泄漏，与官方 proroot 同构（它也只做 resolve_child_argv0）。
+ *      泄漏，与参考实现 同构（它也只做 resolve_child_argv0）。
  *      不翻 argv[0] 的代价更大：busybox 之类的程序会按 argv[0] 找 applet，
  *      路径不对就找不到。
  *   3. 其余参数只有在**显式登记**为「取路径的选项」时才翻译，默认不翻。

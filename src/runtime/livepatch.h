@@ -3,7 +3,7 @@
  *
  * 完整设计说明与实测证据见 livepatch.c。要点：
  *
- * proroot-ldso 用 seccomp 以 KILL_PROCESS 方式禁止 80+ 个系统调用号。
+ * 宿主 loader 用 seccomp 以 KILL_PROCESS 方式禁止 80+ 个系统调用号。
  * glibc 内部有**内联 svc**（不经 PLT、不经导出符号），LD_PRELOAD 类手段
  * 在原理上拦不住，只能改写指令。
  *

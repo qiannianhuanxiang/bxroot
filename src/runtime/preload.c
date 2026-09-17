@@ -112,7 +112,7 @@ static void ensure_real_functions(void);
 /*
  * 符号解析统一入口（实现见文件后段「dl* 家族」处）。
  * 语义 = `dlsym(RTLD_NEXT, name)`，但**不经过 libc 的 dlsym** ——
- * 本库导出了自己的 dlsym，libc 的 dlsym 在 proroot 自研 loader 下
+ * 本库导出了自己的 dlsym，libc 的 dlsym 在 参考实现的 loader 下
  * 会返回 NULL。声明放这里是因为 l2s / wait 家族等早期代码就要用。
  */
 static void *bxroot_next_symbol(const char *name);
@@ -158,10 +158,10 @@ int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
                            unsigned long a2, long *out_ret, int *out_errno);
 
 /*
- * `-L`（proot 的 fix_symlink_size）是否启用。
+ * `-L`（参考实现的 fix_symlink_size）是否启用。
  *
- * 语义（读 proot 的 fix_symlink_size.c 确认）：对**真符号链接**，
- * 把 st_size 钉成 readlink() 返回的长度。默认关闭 —— 与 proot 一致。
+ * 语义（读 参考实现的 fix_symlink_size.c 确认）：对**真符号链接**，
+ * 把 st_size 钉成 readlink() 返回的长度。默认关闭 —— 与参考实现一致。
  *
  * 与 l2s 的 size 补丁**互不相干**：伪造链接的 size 由 l2s 层无条件修正
  * （官方默认就对，已实测；传不传 -L 都该对）。本开关管的是 l2s 没接管
@@ -733,7 +733,7 @@ static void *px_wait_dlsym(const char *name)
     /*
      * 走 linker 服务版解析（`bxroot_next_symbol`，语义 = dlsym(RTLD_NEXT)）。
      * 这里**不能**直接写 dlsym(RTLD_NEXT, …)：本库现在导出了自己的
-     * `dlsym`，而 libc 的 dlsym 与 proroot 自研 loader 不自洽
+     * `dlsym`，而 libc 的 dlsym 与 参考实现的 loader 不自洽
      * （实测从本库内部调用会返回 NULL）。详见 bxroot_next_symbol 的注释。
      */
     void *p = bxroot_next_symbol(name);
@@ -1104,7 +1104,7 @@ static int call_real_openat(int dirfd, const char *path, int flags, mode_t mode)
  *     /usr/bin/cp: cannot open '/tmp/x/a' for reading:
  *     Too many levels of symbolic links
  *
- * 官方 proroot 不会：它在**系统调用入口**就把伪造链接替换成最终数据
+ * 参考实现不会：它在**系统调用入口**就把伪造链接替换成最终数据
  * 文件（link2symlink.c 的 translated_path()），内核根本见不到那条链接，
  * 所以 O_NOFOLLOW 看到的是一个货真价实的普通文件。
  *
@@ -1135,7 +1135,7 @@ static const char *l2s_open_path(const char *p, int flags,
  * ★ -L：修正 lstat 对符号链接返回的 size ★
  * ====================================================================
  *
- * proot 的 fix_symlink_size 扩展（src/extension/fix_symlink_size/）：
+ * 参考实现的 fix_symlink_size 语义（src/extension/fix_symlink_size/）：
  * 只 filter PR_lstat / PR_lstat64，成功返回后
  *
  *     if (!S_ISLNK(statl.st_mode)) return 0;   // 不是符号链接 → 不管
@@ -1147,7 +1147,7 @@ static const char *l2s_open_path(const char *p, int flags,
  * 恒等操作；真正有差别的是 /proc 下的魔法链接 —— 例如
  * /proc/self/cwd 的 st_size 是 0，而 readlink 返回实际路径长度。
  *
- * ★ 默认关闭 ★ 与 proot 一致（-L 是显式选项）。
+ * ★ 默认关闭 ★ 与参考实现一致（-L 是显式选项）。
  *
  * p 必须是**翻译后的宿主路径**（readlink 要用同一条路径去看目标）。
  */
@@ -1159,7 +1159,7 @@ static void l2s_fix_symlink_size(struct stat *st, const char *p)
     if (!g_fix_symlink_size || st == NULL || p == NULL)
         return;
 
-    /* 只对符号链接生效 —— 与 proot 的 S_ISLNK 门控一致。 */
+    /* 只对符号链接生效 —— 与参考实现的 S_ISLNK 门控一致。 */
     if (!S_ISLNK(st->st_mode))
         return;
 
@@ -1564,7 +1564,7 @@ int lstat(const char *path, struct stat *buf) {
      * 先跑，它会看到 S_ISLNK 并把 size 钉成目标串长度，把 l2s 刚回填的
      * 真实大小覆盖掉 —— 正好退回本次要修的缺陷。
      *
-     * 这个顺序与 proot 一致：它的 link2symlink 与 fix_symlink_size 都是
+     * 这个顺序与参考实现一致：它的 link2symlink 与 fix_symlink_size 都是
      * 扩展，而 -L 的注释明确写着「l2s 应当已经解链完毕」，即它排在后面。
      */
     if (rc == 0)
@@ -1585,7 +1585,7 @@ int lstat64(const char *path, struct stat64 *buf) {
         p = translated;
 
     rc = real_lstat64(p, buf);
-    /* 与 lstat 保持一致：proot 同样对 lstat64 做 owner 改写 */
+    /* 与 lstat 保持一致：参考实现同样对 lstat64 做 owner 改写 */
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat64(buf, &g_fakeroot_state);
     /* l2s：与 lstat 一致 */
@@ -2085,7 +2085,7 @@ int unlink(const char *path) {
  * 即：**容器里几乎每一个常用程序都在走这些路径**。不补它们，
  * 前面那 32 个 hook 有一大半是白写的。
  *
- * 官方 proroot 的 D7 域专门覆盖这些（GAP-ANALYSIS 把它列为 P1 关键）。
+ * 参考实现的 D7 域专门覆盖这些（GAP-ANALYSIS 把它列为 P1 关键）。
  *
  * 实现上它们只是**薄转发**：真实符号仍在 glibc 里导出着，
  * 用 dlsym(RTLD_NEXT) 拿得到，翻译逻辑与主 hook 完全一致。
@@ -2386,7 +2386,7 @@ int __lxstat(int ver, const char *path, struct stat *buf) {
      * 官方对任意 ver 都接受，所以这里归一化成 0 与它对齐。
      */
     rc = fn(0, p, buf);
-    /* 与 lstat 保持一致：proot 同样对 lstat 家族做 owner 改写 */
+    /* 与 lstat 保持一致：参考实现同样对 lstat 家族做 owner 改写 */
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat(buf, &g_fakeroot_state);
     /* l2s：__lxstat 是 lstat 的旧 ABI 入口，同样要抹掉 S_IFLNK */
@@ -3595,7 +3595,7 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
  * ====================================================================
  *
  * 为什么不能只写 `dlsym(RTLD_NEXT, name)`：见下面「dl* 家族」那段。
- * 在本容器（官方 proroot linker + 本运行时）实测：
+ * 在本容器（参考实现 linker + 本运行时）实测：
  *
  *     bxroot_next_symbol("open")  →  0x...22680  ✅（libc 的 open）
  *     换成本库导出 dlsym 之后       →  (nil)     ❌
@@ -3642,7 +3642,7 @@ extern void *ldso_service_dlsym_next_from(void *retaddr, const char *name);
  * 本库是否运行在**带 ldso 服务的 linker** 下。
  *
  * 官方 linker 一定有；纯 glibc / 其它 loader 下这三个符号解析不到，
- * 此时必须回落到 libc 的 dlsym —— 否则本库在非 proroot 环境（例如
+ * 此时必须回落到 libc 的 dlsym —— 否则本库在无 loader 服务环境（例如
  * 开发者直接在 Ubuntu 容器里 `LD_PRELOAD` 跑单测）会整片功能失效。
  *
  * 探测方式：`ldso_service_dlsym_global` 是 linker 的全局查找入口，
@@ -3686,7 +3686,7 @@ static void *bxroot_next_symbol(const char *name) {
          */
         return NULL;
     }
-    /* 无服务：退回 libc 原生 dlsym（非 proroot 环境） */
+    /* 无服务：退回 libc 原生 dlsym（无 loader 服务环境） */
     return dlsym(RTLD_NEXT, name);
 }
 
@@ -3988,7 +3988,7 @@ static void bxroot_dl_error_clear(void) {
  * （报告 §2.3 实测自检垫片拿到 `base=0x0`，**没拦住**），而"没有转发路径"
  * 不存在失效的可能。这也是本任务要求两个符号**一起修**的原因。
  *
- * 非 proroot 环境（无 linker 服务）：本库的 `dlsym` 返回 NULL 并在这里登记
+ * 无 loader 服务环境（无 linker 服务）：本库的 `dlsym` 返回 NULL 并在这里登记
  * `undefined symbol: …` —— 语义明确，且**依然不递归**。
  */
 char *dlerror(void) {
@@ -4088,14 +4088,14 @@ void *dlsym(void *handle, const char *symbol) {
     }
 
     /*
-     * 无 ldso 服务：本库在非 proroot 环境（例如 Ubuntu 容器里直接
+     * 无 ldso 服务：本库在无 loader 服务环境（例如 Ubuntu 容器里直接
      * LD_PRELOAD 跑单测）。此时 libc 的 dlsym 仍然有效，
      * 但**不能从本函数里调用它** —— 那正是递归。改用 dlvsym 也不行
      * （它内部同样会走到这里）。所以这里只处理能用服务表达的情形，
      * 其余返回 NULL，并让上层知道。
      *
      * 实测：本容器（官方 linker + 本运行时）**始终**有服务，
-     * 所以这条分支不影响 DSHA 路径；它只是让"非 proroot 环境"
+     * 所以这条分支不影响 DSHA 路径；它只是让"无 loader 服务环境"
      * 退化得明确而不是递归崩溃。
      */
     return NULL;
@@ -4285,7 +4285,7 @@ int dladdr(const void *addr, Dl_info *info) {
  *      `dl_iterate_phdr` 的**嵌套调用照常可用**（回调里再遍历一次是合法用法，
  *      glibc 也允许；实测本容器 glibc 侧嵌套返回 0 且视图完整）。
  *      这一条很重要：把哨兵无差别地罩在服务路径上会**误伤正常嵌套**。
- *   2. 无服务（非 proroot 环境）：这里要转发给 libc 的 `dl_iterate_phdr`，
+ *   2. 无服务（无 loader 服务环境）：这里要转发给 libc 的 `dl_iterate_phdr`，
  *      是**唯一**可能成环的路径（若解析结果落回本库）。
  *      于是**只在这条路上**加一次性哨兵 + 自身地址判据：
  *        - 解析结果 == 本函数 → 直接失败，不调用（对应报告 §2.3 的"路 B"判据）；
@@ -4322,7 +4322,7 @@ int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
     }
 
     /*
-     * 降级路径：非 proroot 环境（例如 Ubuntu 容器里直接 LD_PRELOAD 跑单测）。
+     * 降级路径：无 loader 服务环境（例如 Ubuntu 容器里直接 LD_PRELOAD 跑单测）。
      * 只有这条路可能成环，两道防护都放这里。
      */
     {
@@ -5637,7 +5637,7 @@ int getrlimit(__rlimit_resource_t resource, struct rlimit *rlim) {
  *
  * 【为什么需要】实测 A/B（同一个探针程序，只换 --preload 的运行时）：
  *
- *     官方 proroot：setrlimit(RLIMIT_NOFILE, {1M,1M}) → rc=0, errno=0
+ *     参考实现：setrlimit(RLIMIT_NOFILE, {1M,1M}) → rc=0, errno=0
  *     bxroot      ：setrlimit(RLIMIT_NOFILE, {1M,1M}) → rc=-1, errno=EPERM
  *
  * Android 对每个进程的 fd 上限卡得很死，而 guest 里的
@@ -5966,7 +5966,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
      *   1. 冗余。`bxroot_next_symbol` 在"无 linker 服务"的环境里
      *      已经退回了 libc 的 `dlsym(RTLD_NEXT, …)`；而 RTLD_NEXT 的语义
      *      正是"从**本库之后**开始找"，在 LD_PRELOAD 场景下会正确跳过我们
-     *      命中真 libc。那条路已经覆盖了非 proroot 环境。
+     *      命中真 libc。那条路已经覆盖了无 loader 服务环境。
      *   2. 危险。RTLD_DEFAULT 是"从搜索链**最前面**开始找"，
      *      而本库正是排在 LD_PRELOAD 最前面的那个 —— 于是它**必然**
      *      先命中我们自己。虽然下面有"等于自己就置 NULL"的防护，
@@ -6495,7 +6495,7 @@ FILE *fopen64(const char *path, const char *mode) {
  *
  *     fopen("/fr-in.txt","w") 成功 → freopen("/fr-out.txt","w",f)
  *
- *       官方 proroot：freopen 返回原 FILE* ，errno=0        ✅
+ *       参考实现：freopen 返回原 FILE* ，errno=0        ✅
  *       bxroot(改前)：freopen 返回 NULL，errno=30 EROFS     ❌
  *
  * 连续两轮复现一致；且与 setrlimit/SIGSYS 那两处无关（改动前同样如此）。
@@ -6574,7 +6574,7 @@ FILE *freopen64(const char *path, const char *mode, FILE *stream) {
  *     }
  *
  * 【官方行为是什么】
- *   官方 proroot/proot **从不**导出 getpid，也从不改它的返回值。
+ *   参考实现/proot **从不**导出 getpid，也从不改它的返回值。
  *   proot 自己的注释写得很直白（src/extension/fake_id0/sendmsg.c:164-165）：
  *       "Set uid and gid of SCM_CREDENTIALS to ones that proot really has.
  *        Pid is not changed as we don't fiddle with getpid()"
@@ -6711,7 +6711,7 @@ gid_t getegid(void) {
  * （不是裸 svc；`objdump -d chage | grep -c svc` = **0**）。
  * 也就是说 glibc 的 `setreuid` **包装函数**自己发 svc —— 它既不经过
  * libc 的 `syscall()` 符号（我们上轮修的那层），也不经过我们的任何钩子，
- * 直接撞上 proroot-ldso 的 seccomp 过滤器。
+ * 直接撞上 宿主 loader 的 seccomp 过滤器。
  *
  * ┌──────────────────────────────────────────────────────────┐
  * │ 三种发起方式，各自需要不同的拦截点：                      │
@@ -6729,7 +6729,7 @@ gid_t getegid(void) {
  *
  * 【setgroups 为什么走桥接而不是 fakeroot_setgroups】
  * 见 preload.c 末尾 `bxroot_fakeroot_setter` 的 case 7 长注释：
- * 上游 PRoot 对 setgroups 是**无条件成功**（fake_id0.c:1016），
+ * 上游 参考实现 对 setgroups 是**无条件成功**（fake_id0.c:1016），
  * 而纯逻辑层带一条 CAP_SETGID 闸门。为与官方可观测行为一致，
  * 这一层与 syscall 层**共用**同一个桥接实现（单一来源）。
  */
@@ -7301,7 +7301,7 @@ static void l2s_enable_core(void) {
      * proot 的「链接数编进文件名」方案。
      *
      * 这不是偏好，是必须：proot 方案每次加链长都要 rename 数据文件，
-     * 而官方 proroot 运行时的路径缓存在目标改名后会失效，导致已打开过
+     * 而参考实现 运行时的路径缓存在目标改名后会失效，导致已打开过
      * 的路径永久 ENOENT。详见
      * agents/_shared/官方运行时缺陷-符号链接改名后失效.md。
      */
@@ -7340,7 +7340,7 @@ static void init_l2s(void) {
 static int l2s_autostart_on_link_failure(void) {
     if (l2s_rt_enabled())
         return 1;                       /* 已经启用 */
-    LOG("link() 被内核拒绝 —— 自动启用 l2s（与官方 proroot 行为对齐）");
+    LOG("link() 被内核拒绝 —— 自动启用 l2s（与参考实现 行为对齐）");
     l2s_enable_core();
     return l2s_rt_enabled();
 }
@@ -7348,7 +7348,7 @@ static int l2s_autostart_on_link_failure(void) {
 /*
  * ★ link 自动回退启用（2026-09-17）★
  *
- * 【实测差异】本容器里 proroot-ldso 的 seccomp 过滤器**禁止 linkat(265)**：
+ * 【实测差异】本容器里 宿主 loader 的 seccomp 过滤器**禁止 linkat(265)**：
  *     官方  : 裸 svc linkat = -38 (ENOSYS)，但 link() 符号返回成功
  *             ——官方运行时在用户态模拟了 link（磁盘上留下的是真实文件，
  *             两个路径各一份，用复写实现，不是符号链接）
@@ -7378,7 +7378,7 @@ static void constructor(void) {
     /*
      * 崩溃现场捕获。
      *
-     * 官方 proroot 有一个 3116 字节的 SIGSEGV 处理器（还配 340 字节的
+     * 参考实现 有一个 3116 字节的 SIGSEGV 处理器（还配 340 字节的
      * 内存窗口转储）；bxroot 此前是**零** —— 崩溃时只留一句
      * "Segmentation fault"。
      *
@@ -7404,7 +7404,7 @@ static void constructor(void) {
     /*
      * 运行时指令补丁（seccomp 中和）—— 本轮实测定位的关键一层。
      *
-     * 为什么必须有：proroot-ldso 用 seccomp 以 KILL_PROCESS 方式禁止
+     * 为什么必须有：宿主 loader 用 seccomp 以 KILL_PROCESS 方式禁止
      * 了 80+ 个系统调用号（逐个列举，425/426/427 在内，424 不在）。
      * glibc 内部有**内联 svc**，它们不经 PLT、不经任何导出符号，
      * 因此 LD_PRELOAD 类手段在原理上拦不住 —— 只能改写指令。
@@ -7496,7 +7496,7 @@ static void constructor(void) {
      *     首个进程（launcher 起的）：没有标记 → 设 cwd → 打标记
      *     子进程（exec 出来的）：有标记 → **不动 cwd**（继承父进程的）
      *
-     * 这与 proot 一致：proot 只在启动 tracee 时应用 -w，不会在每次
+     * 这与参考实现一致：proot 只在启动 tracee 时应用 -w，不会在每次
      * execve 时重置子进程的工作目录。
      */
     if (g_config.workdir && getenv(BXROOT_WORKDIR_DONE_ENV) == NULL) {
@@ -7726,7 +7726,7 @@ int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
          *     官方 : setuid(999) -> 999/999/999，然后 setgroups rc=0
          *     bxroot(修前): 同样状态，setgroups rc=-1 EPERM   ← 不一致
          *
-         * 【上游 PRoot 的做法】
+         * 【上游 参考实现 的做法】
          * `src/extension/fake_id0/fake_id0.c:1011-1017` 对 setgroups 是
          * **无条件** `poke_reg(tracee, SYSARG_RESULT, 0)` —— 注释写着
          * "TODO: need to really emulate"，即**根本没做权限检查**，
@@ -7735,7 +7735,7 @@ int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
          * 【为什么不改 fakeroot_setgroups() 本身】
          * 那条闸门是**纯逻辑层**的既有行为，`test_fakeroot` 有断言钉着它
          * （fake_id0.c:112 的 `allowed = ...` 模型）。改它会让纯逻辑测试
-         * 与 PRoot 的 setuid 族语义脱钩。所以**只在本桥接层**放宽：
+         * 与 参考实现 的 setuid 族语义脱钩。所以**只在本桥接层**放宽：
          * 桥接的职责就是"让 syscall 层与官方可观测行为一致"。
          *
          * 【为什么这是安全的】
