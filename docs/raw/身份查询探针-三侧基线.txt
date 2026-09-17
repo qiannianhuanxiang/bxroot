@@ -1,0 +1,72 @@
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+  File "/usr/lib/python3.12/shutil.py", line 475, in copy2
+    copyfile(src, dst, follow_symlinks=follow_symlinks)
+  File "/usr/lib/python3.12/shutil.py", line 240, in copyfile
+    raise SameFileError("{!r} and {!r} are the same file".format(src, dst))
+shutil.SameFileError: '/root/gapfix/probe-17204/probe' and '/data/data/com.dsh.client/files/linux/ubuntu/root/gapfix/probe-17204/probe' are the same file
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+  File "/usr/lib/python3.12/shutil.py", line 475, in copy2
+    copyfile(src, dst, follow_symlinks=follow_symlinks)
+  File "/usr/lib/python3.12/shutil.py", line 240, in copyfile
+    raise SameFileError("{!r} and {!r} are the same file".format(src, dst))
+shutil.SameFileError: '/root/gapfix/probe-17204/libofficial-runtime.so' and '/data/data/com.dsh.client/files/linux/ubuntu/root/gapfix/probe-17204/libofficial-runtime.so' are the same file
+########## 无 runtime（纯 ldso 基线）##########
+=== probe_ids ===
+  status: Uid:	10655	10655	10655	10655
+  status: Gid:	10655	10655	10655	10655
+  libc : getresuid rc=0 r=10655 e=10655 s=10655 errno=0
+  libc : getresgid rc=0 r=10655 e=10655 s=10655 errno=0
+  libc : getgroups(0,NULL)=6 errno=0
+  libc : getgroups(6,list)=6 [1077,3003,9997,20655,50655,99909997]
+  sym  : getresuid(148) rc=0 r=10655 e=10655 s=10655 errno=0 哨兵=完好
+  sym  : getresgid(150) rc=0 r=10655 e=10655 s=10655 errno=0 哨兵=完好
+  sym  : getgroups(158,0,NULL)=6 errno=0
+  sym  : getgroups(158,6,list)=6 [1077,3003,9997,20655,50655,99909997] errno=0
+  sym  : getgroups(158,1,list) 在 n=6 时 =-1 errno=22
+  svc  : getresuid(148) rc=0 r=10655 e=10655 s=10655
+  svc  : getresgid(150) rc=0 r=10655 e=10655 s=10655
+  svc  : getgroups(158,0,NULL)=6
+  sym  : getresuid(148,NULL,NULL,NULL) rc=-1 errno=14
+  sym  : getresuid(148,&r,NULL,NULL) rc=-1 r=10655 errno=14
+rc=0
+
+########## 官方（PROROOT_*）##########
+=== probe_ids ===
+  status: Uid:	10655	10655	10655	10655
+  status: Gid:	10655	10655	10655	10655
+  libc : getresuid rc=0 r=0 e=0 s=0 errno=0
+  libc : getresgid rc=0 r=0 e=0 s=0 errno=0
+  libc : getgroups(0,NULL)=1 errno=0
+  libc : getgroups(1,list)=1 [0]
+  sym  : getresuid(148) rc=0 r=0 e=0 s=0 errno=0 哨兵=完好
+  sym  : getresgid(150) rc=0 r=0 e=0 s=0 errno=0 哨兵=完好
+  sym  : getgroups(158,0,NULL)=1 errno=0
+  sym  : getgroups(158,1,list)=1 [0] errno=0
+  sym  : getgroups(158,1,list) 在 n=1 时 =1 errno=0
+  svc  : getresuid(148) rc=0 r=10655 e=10655 s=10655
+  svc  : getresgid(150) rc=0 r=10655 e=10655 s=10655
+  svc  : getgroups(158,0,NULL)=6
+  sym  : getresuid(148,NULL,NULL,NULL) rc=0 errno=0
+  sym  : getresuid(148,&r,NULL,NULL) rc=0 r=0 errno=0
+rc=0
+
+########## bxroot（BXROOT_*，fakeroot=1）##########
+=== probe_ids ===
+  status: Uid:	10655	10655	10655	10655
+  status: Gid:	10655	10655	10655	10655
+  libc : getresuid rc=0 r=0 e=0 s=0 errno=0
+  libc : getresgid rc=0 r=0 e=0 s=0 errno=0
+  libc : getgroups(0,NULL)=0 errno=0
+  sym  : getresuid(148) rc=0 r=10655 e=10655 s=10655 errno=0 哨兵=完好
+  sym  : getresgid(150) rc=0 r=10655 e=10655 s=10655 errno=0 哨兵=完好
+  sym  : getgroups(158,0,NULL)=6 errno=0
+  sym  : getgroups(158,6,list)=6 [1077,3003,9997,20655,50655,99909997] errno=0
+  sym  : getgroups(158,1,list) 在 n=6 时 =-1 errno=22
+  svc  : getresuid(148) rc=0 r=10655 e=10655 s=10655
+  svc  : getresgid(150) rc=0 r=10655 e=10655 s=10655
+  svc  : getgroups(158,0,NULL)=6
+  sym  : getresuid(148,NULL,NULL,NULL) rc=-1 errno=14
+  sym  : getresuid(148,&r,NULL,NULL) rc=-1 r=10655 errno=14
+rc=0

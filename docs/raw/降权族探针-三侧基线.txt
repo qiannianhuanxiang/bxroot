@@ -1,0 +1,87 @@
+probe_setters.c: In function 'err':
+probe_setters.c:58:18: warning: format '%ld' expects argument of type 'long int', but argument 2 has type 'int' [-Wformat=]
+   58 |     printf("rc=%ld errno=%d (%s)", rc, errno, strerror(errno));
+      |                ~~^                 ~~
+      |                  |                 |
+      |                  long int          int
+      |                %d
+probe_setters.c: In function 'main':
+probe_setters.c:105:63: warning: implicit declaration of function 'setgroups'; did you mean 'getgroups'? [-Wimplicit-function-declaration]
+  105 |         errno = 0; printf("  libc setgroups(0,NULL)   "); err(setgroups(0, NULL)); printf("\n");
+      |                                                               ^~~~~~~~~
+      |                                                               getgroups
+probe_setters.c:106:70: warning: implicit declaration of function 'setfsuid'; did you mean 'setresuid'? [-Wimplicit-function-declaration]
+  106 |         errno = 0; printf("  libc setfsuid(999)       "); { long r = setfsuid(999); printf("rc=%ld errno=%d (%s)\n", r, errno, strerror(errno)); }
+      |                                                                      ^~~~~~~~
+      |                                                                      setresuid
+probe_setters.c:107:70: warning: implicit declaration of function 'setfsgid'; did you mean 'setresgid'? [-Wimplicit-function-declaration]
+  107 |         errno = 0; printf("  libc setfsgid(999)       "); { long r = setfsgid(999); printf("rc=%ld errno=%d (%s)\n", r, errno, strerror(errno)); }
+      |                                                                      ^~~~~~~~
+      |                                                                      setresgid
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+  File "/usr/lib/python3.12/shutil.py", line 475, in copy2
+    copyfile(src, dst, follow_symlinks=follow_symlinks)
+  File "/usr/lib/python3.12/shutil.py", line 240, in copyfile
+    raise SameFileError("{!r} and {!r} are the same file".format(src, dst))
+shutil.SameFileError: '/root/gapfix/probe-17458/probe' and '/data/data/com.dsh.client/files/linux/ubuntu/root/gapfix/probe-17458/probe' are the same file
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+  File "/usr/lib/python3.12/shutil.py", line 475, in copy2
+    copyfile(src, dst, follow_symlinks=follow_symlinks)
+  File "/usr/lib/python3.12/shutil.py", line 240, in copyfile
+    raise SameFileError("{!r} and {!r} are the same file".format(src, dst))
+shutil.SameFileError: '/root/gapfix/probe-17458/libofficial-runtime.so' and '/data/data/com.dsh.client/files/linux/ubuntu/root/gapfix/probe-17458/libofficial-runtime.so' are the same file
+########## 无 runtime（纯 ldso 基线）##########
+sigsys: trap on syscall nr not on allow-list, terminating
+rc=159
+
+########## 官方（PROROOT_*）##########
+  libc setreuid(-1,-1)  rc=0 errno=0 (Success)
+  libc setregid(-1,-1)  rc=0 errno=0 (Success)
+  libc setuid(999)      rc=0 errno=0 (Success)
+  libc setgid(999)      rc=0 errno=0 (Success)
+  libc setresuid(-1,-1,-1) rc=0 errno=0 (Success)
+  libc setresgid(-1,-1,-1) rc=0 errno=0 (Success)
+  libc setgroups(0,NULL)   rc=0 errno=0 (Success)
+  libc setfsuid(999)       rc=999 errno=0 (Success)
+  libc setfsgid(999)       rc=999 errno=0 (Success)
+  --- 裸 svc 层 ---
+  svc setreuid(143)     rc=0 errno=0 (Success)
+  svc setregid(145)     rc=0 errno=0 (Success)
+  svc setuid(146)       rc=0 errno=0 (Success)
+  svc setgid(144)       rc=0 errno=0 (Success)
+  svc setresuid(147)    rc=4294967295 errno=0 (Success)
+  svc setresgid(149)    rc=0 errno=0 (Success)
+  svc setgroups(159)    rc=0 errno=0 (Success)
+  svc setfsuid(151)     rc=999 errno=0 (Success)
+  svc setfsgid(152)     rc=3342938152 errno=0 (Success)
+  --- 回读身份（libc）---
+  getuid=999 geteuid=999 getgid=999 getegid=999
+  getresuid=999/999/999 getresgid=999/999/0 ngroups=0
+rc=0
+
+########## bxroot（BXROOT_*，fakeroot=1）##########
+  libc setreuid(-1,-1)  rc=4294967295 errno=38 (Function not implemented)
+  libc setregid(-1,-1)  rc=4294967295 errno=38 (Function not implemented)
+  libc setuid(999)      rc=4294967295 errno=38 (Function not implemented)
+  libc setgid(999)      rc=4294967295 errno=38 (Function not implemented)
+  libc setresuid(-1,-1,-1) rc=0 errno=0 (Success)
+  libc setresgid(-1,-1,-1) rc=4294967295 errno=38 (Function not implemented)
+  libc setgroups(0,NULL)   rc=4294967295 errno=38 (Function not implemented)
+  libc setfsuid(999)       rc=-1 errno=38 (Function not implemented)
+  libc setfsgid(999)       rc=-1 errno=38 (Function not implemented)
+  --- 裸 svc 层 ---
+  svc setreuid(143)     rc=4294967258 errno=0 (Success)
+  svc setregid(145)     rc=4294967258 errno=0 (Success)
+  svc setuid(146)       rc=4294967258 errno=0 (Success)
+  svc setgid(144)       rc=4294967258 errno=0 (Success)
+  svc setresuid(147)    rc=4294967295 errno=0 (Success)
+  svc setresgid(149)    rc=4294967258 errno=0 (Success)
+  svc setgroups(159)    rc=4294967258 errno=0 (Success)
+  svc setfsuid(151)     rc=4294967258 errno=0 (Success)
+  svc setfsgid(152)     rc=4294967258 errno=0 (Success)
+  --- 回读身份（libc）---
+  getuid=0 geteuid=0 getgid=0 getegid=0
+  getresuid=0/0/0 getresgid=0/0/0 ngroups=0
+rc=0
