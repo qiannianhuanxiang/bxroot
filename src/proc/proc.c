@@ -3460,6 +3460,23 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
      * 在它内部应用，语义天然保真。这也是本修法相对"自己 fork 再手工
      * 应用"的关键优势：没有第二份实现，也就没有漂移。
      */
+    /*
+     * ★ 这条日志是定位 spawn 链的关键（2026-09-17 补）★
+     *
+     * `px_trampoline_exec()` 那条路一直有 exec 日志，而 spawn 路径没有 ——
+     * 上一轮排查 make 时，正是靠 exec 日志数出官方 3 层 bridge、
+     * bxroot 只有 2 层，才确定"配方子进程没加载 runtime"。
+     * 当时 spawn 路径无法观测（不知道它有没有走 trampoline、
+     * `--preload` 有没有传出去）。补上这条后即可直接判断。
+     *
+     * 打印的内容刻意与 exec 路径对齐：路径 + argv0 + preload 是否为空。
+     */
+    PX_LOG("proc: trampoline_spawn host=%s argv0=%s preload=%s fa=%d attr=%d",
+           host != NULL ? host : "(null)",
+           argv0 != NULL ? argv0 : "(null)",
+           (preload != NULL && preload[0] != '\0') ? preload : "(none)",
+           fa != NULL, attr != NULL);
+
     rc = real_posix_spawn(pid, tramp_path, fa, attr, nv, (char *const *)envp);
     if (rc != 0) {
         /*

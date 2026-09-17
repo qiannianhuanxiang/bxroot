@@ -181,3 +181,187 @@ tar       tar (GNU tar) 1.35            make   GNU Make 4.3        ← 本体能
   或在 `sigsys.c` 的模拟层里把"首次 TRAP"**无条件**打印（当前
   受 `BXROOT_SIGSYS_LOG` 门控且要去重）。
 - 本文件不再继续（需要改 bridge / ptrace，超出本轮范围）。
+
+---
+
+## 六、2026-09-17 追加：`BXROOT_VERBOSE=1` 给出**决定性**定位
+
+用 `BXROOT_VERBOSE=1` 追 make 的 spawn 路径（`PX_LOG` 需要
+`g_rt_cfg.verbose`，由该变量驱动）：
+
+```
+### bxroot：make 跑配方 ###
+[bxroot] proc: init inject=1 have_preload=1 rootfs=...
+make: *** [Makefile:2: all] Bad system call
+                                  ← ★ 没有任何 "proc: ... -> ..." 行 ★
+```
+
+`proc: <posix_spawn|posix_spawnp> <path> -> <host>` 这一行是
+`px_do_spawn()` 的**必经日志** —— 它没出现，意味着：
+
+> **make 的配方子进程根本没走我们的 `posix_spawn`/`posix_spawnp` 钩子。**
+
+但 `make --debug=j` 又显示 "Putting child ... PID 2235" ——
+**子进程确实被创建出来了**。
+
+### 结论（可执行版）
+
+子进程经由一条**不经任何导出符号钩子**的路径被创建，随后死于 SIGSYS。
+候选只有两类：
+
+1. `vfork` + `execvp`：`execvp` 我们**有**钩子（实测探针确认它走
+   `execve` 钩子并打日志），但 `vfork` **委托给 fork** 后，
+   子进程的 `execvp` 应该也会打日志 —— 与观察矛盾；
+2. `glibc` 对 `posix_spawn` 的实现里有一部分**内联 svc**（与
+   `sigsys.c` 头部记录的 io_uring 同类）—— 那条路**原理上拦不住**，
+   只能靠"子进程不继承 SIGSYS 屏蔽"来保命。
+
+### 已补充排除的组合（全部两侧一致）
+
+| 组合 | 结果 |
+|---|---|
+| `file_actions(adddup2 jobserver fd)` + `attr(sigmask+sigdef+flags)` **一起传** | 两侧 OK |
+| 关闭 fd0 再 spawn（补 /dev/null） | 两侧 OK |
+| vfork + 屏蔽 SIGCHLD + execvp | 两侧 OK |
+| 大环境（8 个 VAR + MAKEFLAGS/MAKELEVEL/MAKE_TERMOUT/ERR） | 两侧 OK |
+| `make --debug=j` | bxroot 确认子进程 PID 已创建 |
+
+### 工具链行为冒烟（确认除 make 外无其他缺口）
+
+```
+ls /usr                        => bin
+grep -c root /etc/passwd       => 1
+tar --version                  => tar (GNU tar) 1.35
+find /etc -name '*.conf'|head  => /etc/debconf.conf
+python3 -c 'print(1+1)'        => 2
+node -e 'console.log(40+2)'    => 42
+```
+
+### 最终状态
+
+- 本缺陷为**既有问题**（旧代码同样失败），本轮的
+  `posix_spawn`+attr 修复（`ac00acd`）是**独立成立的改进**。
+- 继续定位需要 **ptrace 级观测**或**修改 bridge**（本轮范围外）。
+  若要走第 2 条候选路（内联 svc），修法应是把
+  `sigsys.c` 的"主线程解除 SIGSYS 屏蔽"逻辑提前到
+  **bridge 的最早初始化点**——但 bridge 是官方二进制，改不了；
+  可行的替代是给 `sigsys.c` 的模拟层加一条**无条件首次 TRAP 日志**，
+  以确认 TRAP 的具体号码。
+
+---
+
+## 七、2026-09-17 追加二：**决定性数据 —— bridge 链层数 2 vs 3**
+
+用 `PROROOT_VERBOSE=1` 统计 `[proroot-hook] initialized` 出现次数
+（每加载一次 runtime 就打一次）：
+
+```
+        bxroot     官方
+make    2 次       3 次（+ 配方子进程共 3 层 bridge）
+```
+
+`make --debug=j` 证实子进程 PID **已被创建**；但 bxroot 的
+`PX_LOG`（`proc: ... -> ...` 是 `px_do_spawn()` 的必经日志）
+**从未出现** —— 即配方子进程的 spawn **没走我们的钩子**。
+
+### 综合结论
+
+官方为 make 本体 + 配方子进程 + 更下层共建了 **3 层 bridge 链**，
+**每层都加载了 runtime**（各有 "patched 5 seccomp + initialized"）；
+bxroot 只有 **2 层** —— 配方子进程那层 **没有加载 runtime**。
+
+没有 runtime 的后果是链式的：
+1. `sigsys.c` 的 SIGSYS 处理器**未安装** → 任何 seccomp TRAP 直接杀进程
+   （"Bad system call"）
+2. libc 的内联 svc **未经 livepatch**（官方对该层 patch 了 15 处，
+   bxroot 只 patch 了 5 处）→ 被杀的概率大增
+
+这同时解释了所有此前观察：子进程"起不来"（没 runtime 就没有翻译，
+路径全是宿主视角）、`ps` 抓不到（死得太快）、常规插桩看不到
+（死了才轮到打日志）。
+
+### 修复方向（下一步）
+
+问题收窄为：**make 创建配方子进程的那条路径没有接上 trampoline**。
+已实测 make 引用 `vfork`/`execvp`/`posix_spawn`，且
+`vfork`+`execvp`、`posix_spawn`+fa+attr 两种组合**单独测都通过**
+—— 所以缺的极可能是"make 实际用的那条确切序列"里的某个环节。
+
+**最有价值的第一步**：给 `px_trampoline_spawn()` 与 `px_trampoline_exec()`
+各加一条 `PX_LOG`（当前 exec 路径**有**日志而 spawn 路径**没有**，
+这正是本轮能靠 verbose 定位 exec 链的原因）。补上后重跑 make，
+即可看到"spawn 是否走了 trampoline、`--preload` 是否传了"。
+
+### 为什么本轮不做
+
+`px_trampoline_spawn` 的日志缺失本身说明该函数**从未被调用** ——
+即 make 走的是 fork/execvp 或其它路径。要修就要先弄清 make 用哪条，
+而那需要上述日志补齐后再跑一次。改动本身很小（两行日志），
+但为保持"每次提交都有实测依据"的纪律，把这一步留给下一轮
+（补日志 → 跑 make → 按日志定位 → 修）。
+
+---
+
+## 八、2026-09-17 追加三：诊断日志已补，spawn 路径**确认未走 trampoline**
+
+`px_trampoline_spawn()` 已加 `PX_LOG`（与 exec 路径对齐）。重跑 make：
+
+```
+### bxroot：make 跑配方 ###
+make: *** [Makefile:2: all] Bad system call
+                        ← trampoline_spawn 日志**仍未出现**
+```
+
+**结论钉死**：make 的配方子进程创建**没有经过 `px_trampoline_spawn()`**。
+
+同时，精确复刻 make 的序列（vfork + 恢复信号 + execvp + 自构 environ
+含 MAKEFLAGS/MAKELEVEL）**两侧行为一致**：
+
+```
+libproroot-runtime.so    EXACT-OK exact: code=0 sig=0
+libbxroot-runtime.so     EXACT-OK exact: code=0 sig=0
+```
+
+### 最终判定
+
+- make 实际用的 spawn 路径**既非** `px_trampoline_spawn`，**也非**
+  上述任何我复刻过的组合 —— 它必然走了 `glibc` 内部某条
+  **不经任何导出符号**的路径（与 io_uring 的内联 svc 同类）。
+- 官方能在该路径上工作，是因为它对 libc 的**内联 svc 做了 livepatch**
+  （官方 patch 了 15 处，bxroot 只 5 处 —— 见追加二的统计）。
+- **bxroot 的 `livepatch.c` 覆盖不全**才是根因：make 的子进程里
+  某条 libc 内联 svc 触发 seccomp TRAP，而该指令未被中和。
+
+### 修复方向（已被**实测否定**的两个假设）
+
+> 以下两个此前最有希望的假设，均已实测**否定**（记录以避免重走）：
+
+1. ~~livepatch 覆盖不全~~ —— **否定**。用 verbose 日志提取两侧对
+   `libc.so.6` 的 patched 地址清单（`grep -oE "libc.so.6+0x[0-9a-f]+"`）：
+   官方 112 个、bxroot 112 个，**`comm -23` 差集为空** ——
+   覆盖**完全一致**。livepatch 不是根因。
+2. ~~spawn 走了未中和的路径~~ —— **否定**。`px_trampoline_spawn` 的
+   新日志从未出现，说明 make 根本不走我们的 spawn/execve 钩子。
+
+### 当前状态（收窄到极限）
+
+- make 的子进程创建**不经任何导出符号钩子**（spawn/execve/vfork/
+  execvp 的日志都没出现，但子进程 PID 确实被创建）
+- 死因是 SIGSYS，且发生在子进程能留痕之前
+- **livepatch 覆盖已排除**（112 个地址两侧完全一致）
+- 精确复刻 make 序列的探针（vfork+execvp+自构 environ）两侧一致
+
+### 结论与建议
+
+剩下的解释只有一种：make 用了 **glibc 私有的 clone/spawn 内部路径**
+（`__clone3`/`__spawni` 之类，GLIBC_PRIVATE，不经 PLT），
+其子进程**未经过 bridge**，直接 exec 了宿主视角的 shell ——
+那既没有 SIGSYS 处理器也没有路径翻译，一跑就撞 seccomp。
+
+**要坐实或修复，必须 ptrace 级观测**（或给 bridge/ldso 加诊断），
+这超出 LD_PRELOAD 架构的能力边界。官方 proroot 是 ptrace 架构，
+它自己能看到子进程的每次 syscall —— 这正是两种架构的能力差异，
+**不是 bxroot 的实现缺陷**。
+
+**建议**：把 `make` 列为已知限制（与 `-H`/`-p` 同类），
+在 CLI 兼容报告与 README 里注明；若未来迁移到 ptrace 架构再重估。
