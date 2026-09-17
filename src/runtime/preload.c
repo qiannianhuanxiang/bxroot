@@ -3633,10 +3633,33 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
  *   三种形态（NULL / RTLD_DEFAULT / RTLD_NEXT）调用**递归进入次数均为 0**。
  */
 
-/* linker 提供的私有服务。**只声明，不定义** —— 定义会覆盖 linker 的实现。 */
-extern void *ldso_service_dlsym(void *handle, const char *name);
-extern void *ldso_service_dlsym_global(const char *name);
-extern void *ldso_service_dlsym_next_from(void *retaddr, const char *name);
+/*
+ * linker 提供的私有服务。**只声明，不定义** —— 定义会覆盖 linker 的实现。
+ *
+ * ★ 必须是 weak（2026-09-18 修）★
+ *
+ * 这四条曾经是**普通 extern（强引用）**，后果很严重：
+ *
+ *   纯 glibc 环境（Ubuntu 容器、其它加载器）下，动态链接器在**符号解析
+ *   阶段**就失败，构造函数一个都跑不到：
+ *
+ *       $ LD_PRELOAD=build/libbxroot-runtime.so /bin/true
+ *       symbol lookup error: undefined symbol: ldso_service_dlsym_global
+ *
+ *   即"加载即崩"，一个命令都跑不了。
+ *
+ * 而下方注释早就写着"纯 glibc 下必须回落到 libc 的 dlsym" ——
+ * 承诺在注释里，实现里是强引用，**两者矛盾**。根因是这套代码只在
+ * "带 ldso 服务的 linker"（自研 linker / Android 真机）下验证过，
+ * 降级路径从未被真实执行过。
+ *
+ * 改成 weak 后：符号缺失时绑定为 NULL，加载不再失败；
+ * 配套地，`bxroot_has_ldso_service()` 的探针**必须先判空**再调用，
+ * 否则就是从"加载失败"变成"call NULL 崩溃"—— 两个坑二选一而已。
+ */
+extern void *ldso_service_dlsym(void *handle, const char *name) __attribute__((weak));
+extern void *ldso_service_dlsym_global(const char *name) __attribute__((weak));
+extern void *ldso_service_dlsym_next_from(void *retaddr, const char *name) __attribute__((weak));
 
 /*
  * 本库是否运行在**带 ldso 服务的 linker** 下。
@@ -3649,6 +3672,11 @@ extern void *ldso_service_dlsym_next_from(void *retaddr, const char *name);
  * 拿自己的一个自己一定有的符号（`bxroot_translate_path`）即可。
  * 取不到 → 判定为无服务，走 libc。
  *
+ * ★ 判空必须在调用之前 ★
+ * 弱符号缺失时值为 NULL。若直接 `ldso_service_dlsym_global(...)`，
+ * 就是 call NULL —— 实测表现为 `SEGV pc=0x0`，比"加载失败"更难排查
+ * （因为程序已经跑起来了，崩在某个看似无关的位置）。
+ *
  * 注意：这个探测**不能**在构造函数里缓存死。本库的构造函数可能早于
  * linker 填完 PLT（实测：bxroot linker 场景下构造函数压根没跑到就 SIGILL），
  * 所以每次解析时按需判定一次即可（成本 = 一次查表，热路径上早已判空短路）。
@@ -3656,8 +3684,40 @@ extern void *ldso_service_dlsym_next_from(void *retaddr, const char *name);
 static int bxroot_has_ldso_service(void) {
     static int cached = -1; /* -1 未知 / 0 无 / 1 有 */
     if (cached < 0) {
-        void *probe = ldso_service_dlsym_global("bxroot_translate_path");
-        cached = (probe != NULL) ? 1 : 0;
+        /*
+         * ★ 测试钩子：强制走降级路径 ★
+         *
+         * 存在的理由（这是"可测性"问题，不是功能需求）：
+         * 本库的降级路径（无 ldso 服务）在**开发环境里根本走不到** ——
+         * 无论是 Android 真机还是本容器，linker 服务始终存在。
+         * 后果就是用户报告里指出的那条：
+         *
+         *   「降级路径零测试覆盖。这就是三个 P0 都能活过仓库的原因：
+         *     它们全在降级路径上。」
+         *
+         * 这个判断是对的。2026-09-18 之前，这条分支里 `dlsym` 直接
+         * `return NULL`（客户程序 call NULL 崩），而**没有任何测试能发现**，
+         * 因为测试跑的全是有服务的路径。
+         *
+         * 有了这个开关之后，降级路径就能在当前环境里被真实执行，
+         * 从而可以被回归套件钉住（见 test/RUN_FALLBACK.sh）。
+         *
+         * 它只影响"走哪条分支"的判断本身，不改任何业务语义 ——
+         * 生产环境不设这个变量，行为与从前完全一致。
+         */
+        const char *force = getenv("BXROOT_FORCE_NO_LDSO_SERVICE");
+        if (force != NULL && force[0] == '1' && force[1] == '\0') {
+            cached = 0;
+            return cached;
+        }
+
+        /* 弱符号判空 —— 见上方"判空必须在调用之前" */
+        if (ldso_service_dlsym_global == NULL) {
+            cached = 0;
+        } else {
+            void *probe = ldso_service_dlsym_global("bxroot_translate_path");
+            cached = (probe != NULL) ? 1 : 0;
+        }
     }
     return cached;
 }
@@ -4089,16 +4149,89 @@ void *dlsym(void *handle, const char *symbol) {
 
     /*
      * 无 ldso 服务：本库在无 loader 服务环境（例如 Ubuntu 容器里直接
-     * LD_PRELOAD 跑单测）。此时 libc 的 dlsym 仍然有效，
-     * 但**不能从本函数里调用它** —— 那正是递归。改用 dlvsym 也不行
-     * （它内部同样会走到这里）。所以这里只处理能用服务表达的情形，
-     * 其余返回 NULL，并让上层知道。
+     * LD_PRELOAD 跑单测）。
      *
-     * 实测：本容器（官方 linker + 本运行时）**始终**有服务，
-     * 所以这条分支不影响 DSHA 路径；它只是让"无 loader 服务环境"
-     * 退化得明确而不是递归崩溃。
+     * ★ 这里必须真的转发给 libc，不能返回 NULL（2026-09-18 修）★
+     *
+     * 原先这里直接 `return NULL`，注释说"让无 loader 服务环境退化得明确
+     * 而不是递归崩溃"。**实测后果与注释相反**：客户程序拿到 NULL 后
+     * 直接调用空指针 —— `bash` 启动即 `SEGV pc=0x0`。
+     * 也就是说，"明确退化"实际比"递归崩溃"崩得更早更果断。
+     *
+     * ----- 原注释里那句"改用 dlvsym 也不行"是**错的** -----
+     *
+     * 原文写：
+     *     「改用 dlvsym 也不行（它内部同样会走到这里）」
+     *
+     * 这个论断把正确修法挡在门外，所以必须留档纠正：
+     *
+     *   `dlvsym` **没有被本库导出**（实测 `readelf --dyn-syms` 里
+     *   本库只导出 dlopen / dlsym / dlerror / dladdr / dl_iterate_phdr
+     *   五个 dl* 符号，**不含 dlvsym**）。
+     *
+     * 因此从本库调用 `dlvsym` 时，PLT 直接解析到 **libc 的实现**，
+     * 根本不会经过本库的 `dlsym`。递归的前提不存在。
+     *
+     * ----- 为什么用带版本号的 dlvsym 而不是普通 dlsym -----
+     *
+     * 直接 `dlsym(RTLD_NEXT, "dlsym")` 在这条分支里**不可靠**：
+     * 本库自己导出了 `dlsym`，RTLD_NEXT 的搜索起点依赖调用方位置，
+     * 在"本库导出同名符号"的语境下可能又拿到自己。
+     * `dlvsym` 带显式版本（GLIBC_2.34 是 glibc 里 dlsym 的版本节点），
+     * 语义精确，不会命中本库。
+     *
+     * 回退链：GLIBC_2.34 → GLIBC_2.17（老 glibc 的版本节点）。
+     * 两者都拿不到才返回 NULL，并且**登记 dlerror**（不能静默失败 ——
+     * 那会让调用方看到"失败但没有错误信息"的假绿）。
+     *
+     * 性能：结果静态缓存，只解析一次。这是降级路径，不在 Android
+     * 热路径上（Android 走上面的服务分支）。
      */
-    return NULL;
+    {
+        static void *(*real_dlsym_cached)(void *, const char *) = NULL;
+        static int tried = 0;
+
+        if (!tried) {
+            tried = 1;
+            /*
+             * ★ 这里**不**对 dlvsym 判空 —— 编译器是对的 ★
+             *
+             * 原先写了 `if (dlvsym != NULL)`，`-Waddress` 报：
+             *     the comparison will always evaluate as 'true' for the
+             *     address of 'dlvsym' will never be NULL
+             *
+             * 这个告警是**正确的**：`dlvsym` 是 glibc 的公开 API
+             * （`dlfcn.h` 声明，libc 始终提供），不是可选的弱符号。
+             * 给它判空等于假装它可能缺失，那是把"链接期就能确定的事"
+             * 拿到运行期猜 —— 既无效，又掩盖了真正的失败模式。
+             *
+             * 真正的失败模式是**版本节点不存在**（非 glibc 的 libc、
+             * 或极老的 glibc），那时 `dlvsym` 会**返回 NULL**，
+             * 而不是函数指针为空。所以判空要判在**返回值**上 ——
+             * 下面两条回退链正是这么做的。
+             */
+            real_dlsym_cached = (void *(*)(void *, const char *))
+                dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+            if (real_dlsym_cached == NULL)
+                real_dlsym_cached = (void *(*)(void *, const char *))
+                    dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
+        }
+
+        if (real_dlsym_cached == NULL) {
+            /* 连 libc 的 dlsym 都拿不到 —— 如实报错，不假装成功 */
+            bxroot_dl_error_set2("undefined symbol: ", symbol,
+                                 " (no ldso service, and libc dlsym unreachable)");
+            return NULL;
+        }
+
+        res = real_dlsym_cached(handle, symbol);
+        if (res != NULL) {
+            bxroot_dl_error_clear();
+        } else {
+            bxroot_dl_error_set2("undefined symbol: ", symbol, NULL);
+        }
+        return res;
+    }
 }
 
 
@@ -4147,9 +4280,26 @@ void *dlsym(void *handle, const char *symbol) {
  * 与官方 runtime 的对应函数是同一个形状。红线 CL-13/CL-14 未被触碰。
  */
 
-/* linker 服务：枚举已装载对象（回调签名同 dl_iterate_phdr） */
+/*
+ * linker 服务：枚举已装载对象（回调签名同 dl_iterate_phdr）。
+ *
+ * ★ 同样必须是 weak（2026-09-18 修）★
+ *
+ * 这一条当时被漏掉了 —— 上面三条 `ldso_service_dlsym*` 改成 weak 之后，
+ * `readelf --dyn-syms` 里它**仍然是 GLOBAL**，也就是说纯 glibc 环境下
+ * 依然会 "symbol lookup error" 加载失败。
+ *
+ * 教训：改符号绑定强度时，**必须把整族符号一次改完并逐个核对**
+ * （用 `readelf --dyn-syms | grep ldso_service` 看每一行的绑定列），
+ * 不能只改自己记得的那几个。这一族共 4 个，分两处声明，很容易漏。
+ *
+ * 两个使用点（dladdr 与 dl_iterate_phdr）本来就在
+ * `bxroot_has_ldso_service()` 判断之后，所以改 weak 不需要额外判空 ——
+ * 但调用点仍加判空，作为"多层防御"（见各调用点注释）。
+ */
 extern int ldso_service_dl_iterate_phdr(
-    int (*callback)(struct dl_phdr_info *, size_t, void *), void *data);
+    int (*callback)(struct dl_phdr_info *, size_t, void *), void *data)
+    __attribute__((weak));
 
 /* 与官方 @0x22d40 的 walk 结构逐字段对齐 */
 struct bxroot_dladdr_walk {
@@ -4219,7 +4369,16 @@ int dladdr(const void *addr, Dl_info *info) {
 
     memset(&w, 0, sizeof(w));
     w.addr = addr;
-    ldso_service_dl_iterate_phdr(bxroot_dladdr_walk_cb, &w);
+    /*
+     * 判空：弱符号缺失时为 NULL。
+     * 虽然上面的 `bxroot_has_ldso_service()` 已经保证了"有服务"，
+     * 但两个判断来自**两处独立的符号解析**（探针用 dlsym_global，
+     * 这里用 dl_iterate_phdr）—— 理论上有"前者有、后者无"的组合
+     * （例如 linker 只实现了部分服务）。call NULL 的代价是 SIGSEGV，
+     * 一次判空换掉这个风险，值得。
+     */
+    if (ldso_service_dl_iterate_phdr != NULL)
+        ldso_service_dl_iterate_phdr(bxroot_dladdr_walk_cb, &w);
 
     if (w.ptype == 0)
         return 0;   /* 未命中任何 PT_LOAD */
@@ -4306,7 +4465,7 @@ int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
     if (callback == NULL)
         return -1;          /* glibc 同：回调为空是调用方的错 */
 
-    if (bxroot_dl_has_service()) {
+    if (bxroot_dl_has_service() && ldso_service_dl_iterate_phdr != NULL) {
         /*
          * ★ 与官方 @0x23038 那一层完全对应：linker 的**私有模块视图**。
          * 官方是先 dlsym 拿 libc 版跑一遍、返回 0 才兜到这里；本库直接用服务，
@@ -4317,6 +4476,10 @@ int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
          * 已达成，重复回调反而会让"数模块数"的调用方多算一个。
          *
          * 无环：服务不回调本函数，故**不加哨兵**，嵌套调用照常可用。
+         *
+         * ★ 判空不是多余的 ★ 弱符号可能缺失，而这里若 call NULL 就是
+         * SIGSEGV。判空后**落到下面的降级路径**（而不是返回失败）——
+         * 降级路径能给出正确结果，比返回 0 更有用。
          */
         return ldso_service_dl_iterate_phdr(callback, data);
     }
