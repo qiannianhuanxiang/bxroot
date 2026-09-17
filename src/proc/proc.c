@@ -3394,6 +3394,211 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* shebang（`#!`）解析 —— 内核语义的用户态复刻                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 解析 `host` 指向的文件开头的 `#!` 行。
+ *
+ * 返回值：
+ *   1  = 是 shebang 脚本，已填好 out_interp / out_arg1 / out_has_arg
+ *   0  = 不是 shebang（保持原路径，调用方继续走原逻辑）
+ *  -1  = 读取失败或 shebang 行畸形（调用方应回 ENOEXEC）
+ *
+ * 【内核语义（这是复刻的规范，不要凭直觉改）】
+ *
+ * 1. 只认**文件最开头**的 `#!`（偏移 0、1 两个字节）。前面有任何字节
+ *    （包括换行、空格、BOM）都不是 shebang。
+ * 2. `#!` 之后**允许空格/Tab**（`#! /bin/sh` 合法）。
+ * 3. 解释器路径 = 到下一个空格/Tab/换行为止的整串。**可以为空** ——
+ *    内核在解释器为空时返回 ENOEXEC（`#!\n` 这种）。
+ * 4. 解释器的**单个可选参数** = 解释器之后、跳过空格/Tab、到行尾为止的
+ *    整串（**不按空格切分**！`#!/usr/bin/env python3 -u` 中
+ *    `python3 -u` 是**一个**参数，这是内核行为，很多人以为是两个）。
+ * 5. 行长上限 `BINPRM_BUF_SIZE` = **256** 字节（含 `#!`）。超过则
+ *    内核把它当畸形处理 → ENOEXEC。这里同取 256 保持一致。
+ * 6. `\r`：内核**不**特殊处理 CR —— 它只是行内容的一部分。但为了与
+ *    常见实现一致并且不制造意外，这里把行尾的 `\r` 当终止符（否则
+ *    `#!/bin/sh\r\n` 的解释器会变成 `/bin/sh\r`，那个文件不存在）。
+ *    **这一条是与内核的唯一有意偏离**，理由是 CRLF 脚本在本平台上
+ *    极常见，照搬内核会让它们全部失败且报错极难懂。
+ * 7. 改写后的 argv = `[解释器, 脚本, 原argv[1], 原argv[2], ...]`。
+ *    注意 `argv[0]` 在客户看来**变成了解释器路径**（脚本路径挪到 argv[1]）。
+ */
+static int px_parse_shebang(const char *host, char *out_interp,
+                            size_t interp_cap, char *out_arg1,
+                            size_t arg1_cap, int *out_has_arg)
+{
+    char buf[257];              /* BINPRM_BUF_SIZE(256) + NUL */
+    ssize_t n;
+    int fd;
+    size_t i, start, len;
+
+    if (out_has_arg != NULL) {
+        *out_has_arg = 0;
+    }
+    out_interp[0] = '\0';
+    if (out_arg1 != NULL && arg1_cap > 0) {
+        out_arg1[0] = '\0';
+    }
+
+    /*
+     * 用裸 syscall 打开/读取：本函数在 exec 路径上，必须避免任何可能
+     * 触发本文件其它钩子（或分配内存）的调用。O_NOFOLLOW 是**刻意**的：
+     * 内核 execve 一个指向脚本的符号链接时会跟随，但脚本本身若又是
+     * 符号链接，跟随会造成解析与执行目标不一致。这里拒绝 follow，
+     * 失败即回落到"不是 shebang"（返回 0），由原逻辑处理。
+     */
+    fd = (int)syscall(SYS_openat, AT_FDCWD, host, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) {
+        return 0;               /* 打不开：不是我们能判定的 shebang */
+    }
+    n = (ssize_t)syscall(SYS_read, fd, buf, 256);
+    (void)syscall(SYS_close, fd);
+    if (n < 2) {
+        return 0;               /* 太短，不可能是 shebang */
+    }
+    buf[n] = '\0';
+
+    if (buf[0] != '#' || buf[1] != '!') {
+        return 0;               /* 不是 shebang —— 保持原路径 */
+    }
+
+    /* 跳过 `#!` 后的空格 / Tab */
+    i = 2;
+    while (i < (size_t)n && (buf[i] == ' ' || buf[i] == '\t')) {
+        i++;
+    }
+
+    /* 解释器路径 */
+    start = i;
+    while (i < (size_t)n && buf[i] != ' ' && buf[i] != '\t' &&
+           buf[i] != '\n' && buf[i] != '\r') {
+        i++;
+    }
+    len = i - start;
+    if (len == 0) {
+        return -1;              /* `#!` 后没有解释器 → ENOEXEC */
+    }
+    if (len >= interp_cap) {
+        return -1;              /* 解释器路径过长 → ENAMETOOLONG 语义 */
+    }
+    memcpy(out_interp, buf + start, len);
+    out_interp[len] = '\0';
+
+    /* 单个可选参数：跳过空白后，到行尾为止的**整串**（不切分） */
+    if (i < (size_t)n && (buf[i] == ' ' || buf[i] == '\t')) {
+        while (i < (size_t)n && (buf[i] == ' ' || buf[i] == '\t')) {
+            i++;
+        }
+        start = i;
+        while (i < (size_t)n && buf[i] != '\n' && buf[i] != '\r') {
+            i++;
+        }
+        len = i - start;
+        if (len > 0 && out_arg1 != NULL && arg1_cap > 0) {
+            if (len >= arg1_cap) {
+                return -1;
+            }
+            memcpy(out_arg1, buf + start, len);
+            out_arg1[len] = '\0';
+            if (out_has_arg != NULL) {
+                *out_has_arg = 1;
+            }
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * 把 shebang 脚本的 exec 改写成"exec 解释器"。
+ *
+ * 入参 `host`/`guest` 是脚本的宿主/容器视角路径；`argv` 是调用方给的。
+ *
+ * **存储约定**：本函数不分配内存（exec 路径），所有输出都写进调用方给的
+ * 缓冲区。`out_argv` 的元素分别指向：
+ *     out_argv[0] = out_interp_guest        （解释器，客户视角）
+ *     out_argv[1] = out_arg1                （仅当 has_arg）
+ *     out_argv[?] = out_script              （脚本路径，**独立副本**）
+ *     out_argv[..] = argv[1..]              （调用方原有元素，生命周期足够）
+ * ★ `out_script` 必须是**独立**缓冲 —— 不能指向调用方的 `guest`：
+ *   调用方随后会把 `guest` 覆写成解释器路径，那样脚本路径就丢了。
+ *   （实测踩过：`./s2.py` 报 `File "/usr/bin/env", line 1 / ELF`。）
+ *
+ * 返回值：1 = 已改写；0 = 不是 shebang；-1 = 畸形 shebang（回 ENOEXEC）。
+ *
+ * 【递归与深度】解释器本身也可能是脚本（`#!/usr/bin/env` 链）。这里
+ * **只解析一层**，理由：
+ *   - 内核本身也只解析一层，然后 exec 解释器 —— 若解释器又是脚本，
+ *     那是**新的一次 execve**，由那次调用再解析。我们的 execve 钩子会
+ *     被再次调用，于是天然递归，且每层都有独立栈。
+ *   - 自己做多层解析会与内核行为**不一致**（内核每层都会重新做
+ *     权限检查与 AT_* 语义），且需要自己限制深度。
+ * 所以这里保持"一层"，把递归交还给 execve 钩子 —— 与内核同构。
+ */
+static int px_rewrite_shebang(const char *host, const char *guest,
+                              char *const argv[],
+                              char *out_interp_host, size_t ih_cap,
+                              char *out_interp_guest, size_t ig_cap,
+                              char *out_arg1, size_t a1_cap,
+                              char *out_script, size_t sc_cap,
+                              char **out_argv, size_t out_argv_cap)
+{
+    char interp[PX_PATH_MAX];
+    int has_arg = 0;
+    int rc;
+    size_t n = 0;
+    size_t i;
+
+    rc = px_parse_shebang(host, interp, sizeof(interp), out_arg1, a1_cap,
+                          &has_arg);
+    if (rc <= 0) {
+        return rc;
+    }
+
+    /* 脚本路径拷一份 —— 见函数头「存储约定」里的实测坑 */
+    if (strlen(guest) >= sc_cap) {
+        return -1;
+    }
+    px_cfg_str(out_script, sc_cap, guest);
+
+    /*
+     * 解释器路径要做**路径翻译**（它相对容器根，如 `/bin/sh`）。
+     * 翻译失败就原样使用 —— 与 exec 主路径的处置一致（宁可让下面的
+     * 环节报出真实错误，也不要在这里静默改变语义）。
+     */
+    if (px_runtime_translate(interp, out_interp_host, ih_cap) <= 0) {
+        px_cfg_str(out_interp_host, ih_cap, interp);
+    }
+    px_cfg_str(out_interp_guest, ig_cap, interp);
+
+    /*
+     * 构造 [解释器, (可选解释器参数,) 脚本, 原argv[1..]]
+     *
+     * ★ argv[0] 变成**解释器路径**，脚本路径挪到 argv[1] —— 这正是内核
+     *   改写 shebang 后客户看到的样子（`#!/usr/bin/env python3` 的脚本里
+     *   `sys.argv[0]` 是**脚本路径**，因为 python 会把 argv[1] 当作 script）。
+     */
+    out_argv[n++] = out_interp_guest;   /* argv[0] = 解释器（客户视角） */
+    if (has_arg) {
+        out_argv[n++] = out_arg1;       /* 解释器的单个可选参数 */
+    }
+    if (n + 1 >= out_argv_cap) {
+        return -1;
+    }
+    out_argv[n++] = out_script;         /* 脚本路径（独立副本） */
+    for (i = 1; argv != NULL && argv[i] != NULL; i++) {
+        if (n + 1 >= out_argv_cap) {
+            return -1;                  /* 参数过多 */
+        }
+        out_argv[n++] = argv[i];
+    }
+    out_argv[n] = NULL;
+    return 1;
+}
+
 static int px_do_execve(const char *path, char *const argv[],
                         char *const envp[], const char *path_env,
                         int use_search)
@@ -3409,24 +3614,114 @@ static int px_do_execve(const char *path, char *const argv[],
     char *const *final_argv;
     int rc;
 
+    /*
+     * ★ shebang 的改写结果必须放在**函数作用域**，不能放在下面的
+     *   if 块里 ★
+     *
+     * `argv` 会被重新指向 `sb_argv`，而 `sb_argv` 要一直用到函数末尾的
+     * trampoline exec —— 若它声明在块内，块一结束这些栈内存就失效，
+     * 后面的 `final_argv` 会指向已释放的栈帧（**野指针**，且因为栈很
+     * 可能还没被覆盖，症状是"大多数时候正常、偶发读到垃圾 argv"）。
+     * 这类缺陷极难定位，所以显式放到函数作用域并注释原因。
+     */
+    char *sb_argv[PX_ARGV_MAX + 1];
+    char sb_host[PX_PATH_MAX];
+    char sb_guest[PX_PATH_MAX];
+    char sb_arg1[PX_PATH_MAX];
+    /*
+     * ★ 脚本路径必须**单独一份**，不能复用 `guest` ★
+     *
+     * 实测踩到的坑：`px_rewrite_shebang()` 把 `sb_argv[1]` 指向 `guest`
+     * 那个缓冲区，而调用方随后把 `guest` **覆写成解释器路径** ——
+     * 于是 `sb_argv[1]` 指向的内容变成了解释器。症状极其误导：
+     *
+     *     $ ./s2.py
+     *       File "/usr/bin/env", line 1
+     *         ELF
+     *     SyntaxError: source code cannot contain null bytes
+     *
+     * 看起来像"python 把 ELF 当源码读"，实际是 argv[1] 指错了地方。
+     * 用一个独立缓冲把脚本路径**拷一份**，与解释器缓冲互不干扰。
+     */
+    char sb_script[PX_PATH_MAX];
+
     g_rt_stats.exec_calls++;
 
-    /* 1) 解析目标路径 */
-    if (use_search) {
-        if (px_resolve_exec_path(path, path_env, host, sizeof(host),
-                                 guest, sizeof(guest)) != 0) {
-            return -1;   /* errno 已置 ENOENT */
+    /*
+     * ★ shebang（`#!`）重定向 ★
+     *
+     * 【缺陷（实测，2026-09-17）】带 `#!` 的可执行脚本在 bxroot 下**无法直接
+     * exec**，而官方可以：
+     *
+     *     ########## 官方 ##########            ########## bxroot ##########
+     *     $ ./s1.sh                             $ ./s1.sh
+     *     SHEBANG-OK                            loader: reject .../s1.sh: bad read
+     *     rc=0                                  proroot-ldso: failure rc=5
+     *                                           rc=2
+     *
+     * 注意 `sh s1.sh`（显式指定解释器）两侧**都正常** —— 所以不是脚本内容
+     * 或权限问题，而是**内核那条 shebang 路径没被我们覆盖**。
+     *
+     * 【根因】execve 一个 shebang 脚本时，**内核**会自己解析 `#!` 行并把
+     * argv 改写成 `[interpreter, script, 原argv[1..]]`，然后 exec 解释器。
+     * 但 bxroot 的 exec 路径是「把 guest 路径翻译成宿主路径 → 交给官方
+     * linker 加载」—— linker 只认 ELF，看到脚本的文本内容就报
+     * `bad read`（ELF magic 校验失败）。**内核的 shebang 逻辑被我们绕过去了。**
+     *
+     * 【修法】在把目标交给 linker **之前**，自己解析 `#!` 行并按内核语义
+     * 改写 argv（`[解释器, 脚本, 原argv[1..]]`），然后把**解释器**当目标。
+     * 这样 linker 拿到的是真正的 ELF（`/bin/sh`），脚本作为参数传进去。
+     *
+     * 【为什么必须放在 `use_search` 解析之后】shebang 的解释器路径是相对
+     * **容器根**的（`/bin/sh`），要做路径翻译；而脚本路径本身也要翻译。
+     * 两者都在这一步已完成（`host`/`guest` 就绪）。
+     *
+     * 【为什么不用「返回 ENOEXEC 让调用方自己重试」】那是内核的行为，
+     * 但 bxroot 的调用方（shell）看到 ENOEXEC 后会用 `sh script` 重试 ——
+     * 那条路**本来就能走通**（实测）。所以"不修"的后果不是"脚本跑不了"，
+     * 而是"只有 shell 起的脚本能跑，其它调用方（python 的 subprocess、
+     * posix_spawn 等）全失败"。这仍然是兼容性缺口，而且表现**不一致**。
+     *
+     * ★ 这里调用的是 `px_rewrite_shebang()`，它失败时**返回 0 表示"不是
+     *   shebang 脚本"**（保持原路径不变），返回负数才是真错误。★
+     */
+    {
+        int sb_rc;
+
+        /* 1) 解析目标路径（必须在 shebang 判断之前 —— 要读文件内容） */
+        if (use_search) {
+            if (px_resolve_exec_path(path, path_env, host, sizeof(host),
+                                     guest, sizeof(guest)) != 0) {
+                return -1;   /* errno 已置 ENOENT */
+            }
+        } else {
+            rc = px_runtime_translate(path, host, sizeof(host));
+            if (rc < 0) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            if (rc == 0) {
+                px_cfg_str(host, sizeof(host), path);
+            }
+            px_cfg_str(guest, sizeof(guest), path);
         }
-    } else {
-        rc = px_runtime_translate(path, host, sizeof(host));
-        if (rc < 0) {
-            errno = ENAMETOOLONG;
+
+        sb_rc = px_rewrite_shebang(host, guest, argv,
+                                   sb_host, sizeof(sb_host),
+                                   sb_guest, sizeof(sb_guest),
+                                   sb_arg1, sizeof(sb_arg1),
+                                   sb_script, sizeof(sb_script),
+                                   sb_argv, PX_ARGV_MAX + 1);
+        if (sb_rc < 0) {
+            errno = ENOEXEC;   /* 与内核对畸形 shebang 的答复一致 */
             return -1;
         }
-        if (rc == 0) {
-            px_cfg_str(host, sizeof(host), path);
+        if (sb_rc > 0) {
+            /* 命中 shebang：目标改成解释器，argv 换成改写后的 */
+            px_cfg_str(host, sizeof(host), sb_host);
+            px_cfg_str(guest, sizeof(guest), sb_guest);
+            argv = sb_argv;
         }
-        px_cfg_str(guest, sizeof(guest), path);
     }
 
     /* 2) argv 翻译（默认只翻 argv[0]） */
