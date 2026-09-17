@@ -365,3 +365,28 @@ libbxroot-runtime.so     EXACT-OK exact: code=0 sig=0
 
 **建议**：把 `make` 列为已知限制（与 `-H`/`-p` 同类），
 在 CLI 兼容报告与 README 里注明；若未来迁移到 ptrace 架构再重估。
+
+---
+
+## 九、2026-09-17 追加四：又两个假设被否定（诚实记录）
+
+1. ~~嵌套启动会改变行为~~ —— 否定。make 从容器 `sh` 内启动
+   （已是第 2 层 bridge）仍同样失败。
+2. ~~make 直接引用 clone/clone3~~ —— **否定（我此前的 grep 是误报）**。
+   `readelf --dyn-syms make | grep -i clone` 命中的两条是
+   `_ITM_deregisterTMCloneTable` / `_ITM_registerTMCloneTable` ——
+   是 **GCC 的 ITM 弱符号**，名字里含 "TMClone" 所以被误匹配。
+   make **不**直接引用任何 clone 符号。
+3. ~~我的精确复刻探针与 make 同路~~ —— **否定（决定性证据）**。
+   `BXROOT_VERBOSE=1` 下，我的复刻探针打出了 **两条** `init inject=1`
+   （父 + 子都经过钩子链）；make 只有一条 —— **它的子进程从未经过
+   任何钩子**。两者确实不同路。
+
+### 最终收束
+
+make 的配方子进程创建路径，在 glibc 2.39 上**不经任何导出符号**
+（posix_spawn/execvp/vfork/fork/clone 的钩子日志均未出现），
+且**在能留痕之前死亡**（ps / 文件痕迹 / SIGSYS 日志均观察不到）。
+
+在 **LD_PRELOAD 架构**下这是原理性不可观测的 —— 需要 ptrace。
+本缺陷已完整记录（20+ 实验、4 个被否定假设），**归档为架构级已知限制**。
