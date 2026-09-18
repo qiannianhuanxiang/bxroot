@@ -242,13 +242,14 @@ Node 全部 `ENOENT`。
 ## 测试
 
 ```sh
-sh test/RUN_ALL.sh --quick      # 主回归（20 项，一键全跑）
+sh test/RUN_ALL.sh --quick      # 主回归（25 项，一键全跑）
 ```
 
 分项：
 
 ```sh
 sh test/RUN_TESTS.sh            # 纯逻辑（不需真机）
+sh test/RUN_CONCUR.sh           # fakeroot 账本多线程并发（8线程×400键）
 sh test/RUN_L2S_E2E.sh          # l2s 端到端（对照官方）
 sh test/RUN_ID_SYSCALL.sh       # 身份 syscall（47 用例）
 sh test/RUN_DL_TESTS.sh         # dl 家族契约
@@ -260,8 +261,22 @@ sh test/RUN_WARN_GATE.sh        # 编译零告警门禁
 sh test/RUN_CLI_COMPAT.sh       # proot CLI 语义（38 项）
 sh test/RUN_UPSTREAM_CLI.sh     # 上游选项表全覆盖（35 项）
 sh test/RUN_PATH_FORMS.sh       # 路径形态（裸相对名/dirfd+相对/…）
+sh test/RUN_SYSCALL_TABLE_AUDIT.sh  # 路径参数表实测审计（裸 svc 逐号对内核）
+sh test/RUN_RAW_SYSCALL.sh      # 非 Android 透传开关
+sh test/RUN_REALPATH_FIXUP.sh   # realpath 返回值反向翻译
+sh test/RUN_D3_FIXUP.sh         # /proc 泄漏反向翻译
 sh issue-regression-test.sh     # 上游 24 issue 的 25 用例回归
 ```
+
+其中两项是「会主动发现问题」的审计型测试，不只是防回归：
+
+- **`RUN_SYSCALL_TABLE_AUDIT.sh`**：用裸 `svc` 对内核逐号实测哪些系统
+  调用的哪个参数是路径，再与我们源码里的表比对。2026-09-18 用它发现
+  25 个路径型调用（xattr 族 / chdir / truncate / openat2 等）**未列入
+  表** —— 走裸 `syscall()` 的程序（如 node 的静态 libuv）对这些调用
+  拿不到翻译。补齐后遗漏归零。
+- **`RUN_CONCUR.sh`**：并发压测 fakeroot 账本。它曾直接暴露无锁下的
+  堆破坏（`double free`），促成加锁修复。
 
 判定口径：所有端到端测试都采用**双基线**——bxroot 与官方 proroot
 对照，逐行比对输出，"比官方差"才算 FAIL。
