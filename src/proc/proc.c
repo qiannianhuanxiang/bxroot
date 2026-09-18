@@ -3829,6 +3829,16 @@ static int px_do_execve(const char *path, char *const argv[],
      * /proc/self/comm 的上游语义（见赋值处注释）。
      */
     char raw_guest[PX_PATH_MAX];
+    /*
+     * 调用方原始 argv[0]（argv 翻译前）：trampoline 的 --argv0 用它，
+     * 保证 guest 看到的 argv[0] 是调用者给的 guest 字符串而不是
+     * 翻译后的宿主路径（见 trampoline 调用点注释）。
+     */
+    char raw_argv0[PX_PATH_MAX];
+    raw_argv0[0] = '\0';
+    if (argv != NULL && argv[0] != NULL) {
+        px_cfg_str(raw_argv0, sizeof(raw_argv0), argv[0]);
+    }
 
     g_rt_stats.exec_calls++;
 
@@ -4299,6 +4309,15 @@ static int px_do_spawn(pid_t *pid, const char *path,
                        int use_search)
 {
     char host[PX_PATH_MAX];
+    /*
+     * 调用方原始 argv[0]（argv 翻译前）—— trampoline --argv0 用，
+     * 与 px_do_execve 的 raw_argv0 同语义（见那里注释）。
+     */
+    char raw_argv0[PX_PATH_MAX];
+    raw_argv0[0] = '\0';
+    if (argv != NULL && argv[0] != NULL) {
+        px_cfg_str(raw_argv0, sizeof(raw_argv0), argv[0]);
+    }
     px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     px_argv_plan plan;
     char *vec[PX_ARGV_MAX + 1];
@@ -4369,8 +4388,20 @@ static int px_do_spawn(pid_t *pid, const char *path,
      * 未配置 PROROOT_TRAMPOLINE_PATH（普通 LD_PRELOAD / 单测）时
      * px_trampoline_spawn 直接返回 -1，行为与修复前完全一致。
      */
+    /*
+     * ★ --argv0 必须用 **guest 视角的 argv[0]**（调用者给的）★
+     *
+     * final_argv[0] 已被 argv 翻译成宿主路径；直接传它会让 bridge 的
+     * --argv0 机制把宿主路径透给 guest，guest 的 argv[0]/progname
+     * 因此带上译层前缀（实测：$0 显示 $ROOTFS/... 而非 /tmp/...，
+     * 上游 test-713b6910 断言失败）。
+     *
+     * 修法：用 raw user path 的 argv[0]（shebang 前保存的 raw_guest
+     * 仅对"目标本身"成立；argv[0] 的 raw 值就是调用方原始 argv[0]，
+     * 即参数 argv 尚未翻译时的首元素 —— 保存于 raw_argv0）。
+     */
     if (px_trampoline_spawn(pid, host, final_argv, final_env,
-                            (argv != NULL) ? argv[0] : path,
+                            raw_argv0,
                             getenv("BXROOT_LD_PRELOAD"), fa, attr) == 0) {
         if (pid != NULL && *pid > 0) {
             (void)px_ledger_add(g_rt_ledger, *pid, px_self_pid(), PX_TAG_SPAWN);

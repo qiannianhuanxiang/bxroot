@@ -229,6 +229,97 @@ static int expand_bind_list(launcher_config_t *cfg,
                             const char *rootfs,
                             const char *host_rootfs);
 
+/*
+ * 解析 guest 路径中的**符号链接链**（launcher 侧受限版，上游同语义）。
+ *
+ * 【为什么需要，上游用例 test-713b6910】
+ *     ln -s /tmp/A /tmp/B; proot /tmp/B
+ * guest 视角 /tmp/B 是合法可执行文件。launcher 把它加 rootfs 前缀成
+ * $ROOTFS/tmp/B 后，若 /tmp/B 是指向 guest 路径的 symlink，内核在
+ * **宿主视角**解引用 → /tmp/A 不存在 → execve ENOENT。guest 里极常见
+ * （/bin -> usr/bin 的 usr-merge、 alternatives、self-bundles）。
+ *
+ * 上游 proot 用 ptrace 在 execve 时做完整 canonicalize（含 symlink
+ * 展开），这里在 launcher 侧做**受限等价**：
+ *   - 只解析「宿主视角存在性」需要的部分（链接字面目标 + rootfs 前缀）；
+ *   - 循环上限 40（内核 MAXSYMLINKS 同量级），防死循环；
+ *   - 目标为 guest 绝对路径（以 / 开头且不带 rootfs 前缀）→ 加前缀；
+ *     相对目标 → 相对当前链接目录拼接。
+ *
+ * 解析成功返回 0 并把最终宿主路径写入 resolved；解析中途消失/循环
+ * 返回 -1（调用方保留原路径继续走，让内核给出真实 errno）。
+ */
+static int resolve_guest_symlinks(char *resolved, const char *rootfs)
+{
+    char cur[PATH_MAX];
+    char target[PATH_MAX];
+    char tmp[PATH_MAX];
+    int links = 0;
+
+    if (resolved == NULL || rootfs == NULL)
+        return -1;
+    snprintf(cur, sizeof(cur), "%s", resolved);
+
+    for (links = 0; links < 40; links++) {
+        struct stat sb;
+        ssize_t n;
+        const char *tp;
+        char *slash;
+
+        if (lstat(cur, &sb) != 0)
+            return -1;                       /* 中途消失：交内核报错 */
+        if (!S_ISLNK(sb.st_mode)) {
+            /* 解析完成：cur 即最终宿主路径，写回给调用方 */
+            snprintf(resolved, PATH_MAX, "%s", cur);
+            return 0;
+        }
+
+        n = readlink(cur, target, sizeof(target) - 1);
+        if (n <= 0)
+            return -1;
+        target[n] = '\0';
+        tp = target;
+
+        if (tp[0] == '/') {
+            /* guest 绝对目标：若已带 rootfs 前缀（宿主路径）直接用 */
+            size_t rl = strlen(rootfs);
+            if (rl > 0 && strncmp(tp, rootfs, rl) == 0 &&
+                (tp[rl] == '/' || tp[rl] == '\0')) {
+                snprintf(tmp, sizeof(tmp), "%s", tp);
+            } else {
+                snprintf(tmp, sizeof(tmp), "%s%s", rootfs, tp);
+            }
+        } else {
+            /* 相对目标：相对当前链接所在目录 */
+            slash = strrchr(cur, '/');
+            if (slash == NULL)
+                return -1;
+            {
+                /* 拼接改用手工拷贝（目录部分 + '/' + 目标），
+                 * 精确控制长度 —— gcc 的 -Wformat-truncation 对
+                 * "%.*s/%s" 三段动态宽度的推算过于保守，无法靠
+                 * 简单 clamp 压下去。语义与 snprintf 版一致。 */
+                size_t dlen = (size_t)(slash - cur);
+                size_t tlen = strlen(tp);
+                size_t pos = 0;
+
+                if (dlen > sizeof(tmp) - 2)
+                    dlen = sizeof(tmp) - 2;
+                memcpy(tmp, cur, dlen);
+                pos = dlen;
+                tmp[pos++] = '/';
+                if (tlen > sizeof(tmp) - pos - 1)
+                    tlen = sizeof(tmp) - pos - 1;
+                memcpy(tmp + pos, tp, tlen);
+                pos += tlen;
+                tmp[pos] = '\0';
+            }
+        }
+        snprintf(cur, sizeof(cur), "%s", tmp);
+    }
+    return -1;                               /* 超过内核同量级循环上限 */
+}
+
 static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
     cfg->rootfs = strdup(BXROOT_DEFAULT_ROOTFS);
 
@@ -1173,12 +1264,37 @@ int main(int argc, char **argv) {
 
     /* 解析命令路径：绝对路径加 rootfs 前缀，相对路径搜索 rootfs 内的 PATH */
     char resolved_path[PATH_MAX];
+    struct stat st_buf;   /* symlink 兜底检查用（见下） */
     const char *cmd = cfg.guest_exe;
+    /*
+     * guest_guest_path：**调用者视角**的 guest 完整路径（不含 symlink
+     * 链解析）。上游语义里 /proc/self/exe、argv[0]、comm 都用它 ——
+     * 即使内核实际 exec 的是 symlink 解析后的目标（见
+     * resolve_guest_symlinks 处的说明与 test-713b6910）。
+     */
+    char caller_guest_path[PATH_MAX];
 
     if (cmd[0] == '/') {
         /* 绝对路径：加上 rootfs 前缀 */
         snprintf(resolved_path, sizeof(resolved_path), "%s%s", cfg.rootfs, cmd);
-        if (access(resolved_path, F_OK) != 0) {
+        /*
+         * ★ 存在性检查：access 失败时再看 lstat（symlink 兜底）★
+         *
+         * access() 会**跟随符号链接**。guest 视角下的 symlink
+         * （如 /tmp/b -> /tmp/a，两个都是 guest 路径）在宿主视角里
+         * 目标可能不存在 —— access(\$RF/tmp/b) 跟随到 /tmp/a → ENOENT，
+         * 但链接本体明明在（上游用例 test-713b6910 第 20 行：
+         * ln -s \${TMP1} \${TMP2}; \${PROOT} \${TMP2} 应能执行）。
+         *
+         * 修法：lstat 只看链接本体。lstat 也失败才真的不存在。
+         * 放行后由内核 execve + runtime 路径翻译接管（symlink 目标
+         * 在内核解析时若失败，会由 runtime 对 guest 路径做翻译兜底）。
+         *
+         * 上游 test-713b6910 正是这条：ln -s 脚本A 脚本B 后 exec 脚本B，
+         * 输出 \$0 应为脚本B 的路径。
+         */
+        if (access(resolved_path, F_OK) != 0 &&
+            lstat(resolved_path, &st_buf) != 0) {
             /*
              * 注意：这里必须给足 4 个实参。
              * 曾经只传了 2 个（格式串里却要 4 个），于是 va_arg 从栈上
@@ -1192,6 +1308,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         cfg.guest_exe = strdup(resolved_path);
+        snprintf(caller_guest_path, sizeof(caller_guest_path), "%s", cmd);
     } else {
         /* 相对路径：搜索 rootfs 内的 PATH */
         const char *path_env = getenv("PATH");
@@ -1207,6 +1324,8 @@ int main(int argc, char **argv) {
             if (access(resolved_path, X_OK) == 0) {
                 found = 1;
                 cfg.guest_exe = strdup(resolved_path);
+                snprintf(caller_guest_path, sizeof(caller_guest_path),
+                         "%s/%s", dir, cmd);
             }
             dir = strtok_r(NULL, ":", &saveptr);
         }
@@ -1219,6 +1338,23 @@ int main(int argc, char **argv) {
         }
     }
     
+    /*
+     * ★ 解析 guest 路径里的符号链接链（上游 canonicalize 等价，受限版）★
+     *
+     * 放在两个解析分支之后统一处理：无论绝对路径还是 PATH 搜索，
+     * resolved_path 都可能是 guest 视角 symlink（usr-merge 的
+     * /bin -> usr/bin、alternatives、用户自建链接）。不解析的话
+     * 内核在宿主视角解引用会 ENOENT（上游 test-713b6910）。
+     */
+    if (resolve_guest_symlinks(resolved_path, cfg.rootfs) == 0) {
+        free(cfg.guest_exe);
+        cfg.guest_exe = strdup(resolved_path);
+    } else if (cfg.verbose) {
+        fprintf(stderr,
+                "[bxroot-launcher] symlink 解析失败，保留原路径继续: %s\n",
+                resolved_path);
+    }
+
     /*
      * ★ 重设 BXROOT_GUEST_EXE 为 **guest 视角的完整路径**（上游语义）★
      *
@@ -1252,14 +1388,34 @@ int main(int argc, char **argv) {
      * exec 核心路径且本容器无法端到端验证，留作待办。
      */
     {
-        const char *ge = cfg.guest_exe;
+        /*
+         * ★ 用 caller_guest_path（调用者视角），不用 symlink 解析后的 ★
+         *
+         * 上游语义（execve/enter.c:620 raw_path + test-713b6910）：
+         *   /proc/self/exe、argv[0]、/proc/pid/comm 一律是**调用者给的
+         *   guest 路径** —— 即便内核实际 exec 的是 symlink 解析后的目标
+         *   （test-713b6910 要求 ln -s A B 后 exec B，\$0=/tmp/B 且
+         *   输出不含 A）。symlink 解析只用于「找到可执行文件」。
+         *
+         * caller_guest_path 已是 guest 视角完整路径（裸名经 PATH 搜索
+         * 补全成 /usr/bin/xxx，满足 test-99999999 的完整路径断言）。
+         */
+        const char *ge = caller_guest_path;
         size_t rl = strlen(cfg.rootfs);
 
-        if (ge != NULL && strncmp(ge, cfg.rootfs, rl) == 0 && ge[rl] == '/') {
-            if (cfg.verbose)
-                fprintf(stderr, "[bxroot-launcher] guest_exe: %s -> %s\n",
-                        getenv("BXROOT_GUEST_EXE"), ge + rl);
-            setenv("BXROOT_GUEST_EXE", ge + rl, 1);
+        if (ge != NULL && ge[0] == '/' &&
+            strncmp(ge, cfg.rootfs, rl) == 0 && ge[rl] == '/') {
+            ge = ge + rl;
+        }
+        if (cfg.verbose)
+            fprintf(stderr, "[bxroot-launcher] guest_exe: %s -> %s\n",
+                    getenv("BXROOT_GUEST_EXE"), ge);
+        setenv("BXROOT_GUEST_EXE", ge, 1);
+        {
+            const char *b = strrchr(ge, '/');
+            b = (b != NULL) ? b + 1 : ge;
+            if (b[0] != '\0')
+                setenv("BXROOT_ORIG_COMM", b, 1);
         }
     }
 
