@@ -5398,6 +5398,96 @@ int statvfs64(const char *path, struct statvfs64 *buf) {
  * 我们用自己的静态缓冲，不覆盖 glibc 的 —— 因为调用方可能同时持有
  * 两个不同 uid 的返回结果（少见但合法）。
  */
+/*
+ * ★ /etc/passwd by-uid 直解回退（缺口 D 的 by-id 面，2026-09-18）★
+ *
+ * 背景：by-name（getpwnam）已有直解回退；实测 by-id（getpwuid）在
+ * bridge 环境同样 NSS 失败 —— getpwuid(0) 返回 NULL 而宿主返回 root。
+ * `id` 命令、`getent passwd <uid>`、python `pwd.getpwuid` 都走这里。
+ *
+ * 实现：解析 /etc/passwd，按 uid 匹配第 3 个字段。返回指向静态存储的
+ * 记录（与 getpwnam 直解共用其静态缓冲，因为两条查询在单次 lookup
+ * 里只发生一条 —— 与 glibc 非重入 _r 版本的既有契约一致）。
+ *
+ * 返回 NULL = 表里没有该 uid（如实）。
+ */
+static struct passwd *bxroot_passwd_by_uid_fallback(uid_t uid) {
+    static struct passwd fake;
+    FILE *f;
+    char line[512];
+
+    f = fopen("/etc/passwd", "r");
+    if (f == NULL)
+        return NULL;
+
+    while (fgets(line, sizeof line, f) != NULL) {
+        char *fields[7];
+        int nf = 0, i;
+        char *w = line, *e;
+
+        /* 逐字段切（passwd: name:passwd:uid:gid:gecos:dir:shell）*/
+        for (i = 0; i < 7; i++) {
+            fields[i] = w;
+            if (i < 6) {
+                e = strchr(w, ':');
+            } else {
+                e = strchr(w, '\n');
+                if (e == NULL)
+                    e = w + strlen(w);
+            }
+            if (e == NULL) { break; }
+            *e = '\0';
+            w = e + 1;
+            nf++;
+        }
+        if (nf < 7)
+            continue;
+        if ((uid_t)atoi(fields[2]) != uid)
+            continue;
+
+        /* 命中：复用 getpwnam 直解的静态缓冲策略 */
+        {
+            static char *f_name = NULL, *f_passwd = NULL, *f_gecos = NULL;
+            static char *f_dir = NULL, *f_shell = NULL;
+            static size_t f_name_cap = 0, f_passwd_cap = 0, f_gecos_cap = 0;
+            static size_t f_dir_cap = 0, f_shell_cap = 0;
+            const size_t FIELD_MAX = 1024;
+
+            #define BXROOT_DUP_FIELD_U(dst, cap, src)                      \
+                do {                                                        \
+                    size_t _n = strlen(src) + 1;                             \
+                    if (_n > FIELD_MAX) { fclose(f); return NULL; }          \
+                    if (*(cap) < _n) {                                       \
+                        char *_p = (char *)realloc(*(dst), _n);              \
+                        if (_p == NULL) { fclose(f); return NULL; }          \
+                        *(dst) = _p; *(cap) = _n;                            \
+                    }                                                        \
+                    memcpy(*(dst), (src), _n);                               \
+                } while (0)
+
+            BXROOT_DUP_FIELD_U(&f_name,   &f_name_cap,   fields[0]);
+            BXROOT_DUP_FIELD_U(&f_passwd, &f_passwd_cap, fields[1]);
+            BXROOT_DUP_FIELD_U(&f_gecos,  &f_gecos_cap,  fields[4]);
+            BXROOT_DUP_FIELD_U(&f_dir,    &f_dir_cap,    fields[5]);
+            BXROOT_DUP_FIELD_U(&f_shell,  &f_shell_cap,  fields[6]);
+
+            #undef BXROOT_DUP_FIELD_U
+
+            fake.pw_name   = f_name;
+            fake.pw_passwd = f_passwd;
+            fake.pw_uid    = (uid_t)atoi(fields[2]);
+            fake.pw_gid    = (gid_t)atoi(fields[3]);
+            fake.pw_gecos  = f_gecos;
+            fake.pw_dir    = f_dir;
+            fake.pw_shell  = f_shell;
+        }
+        fclose(f);
+        return &fake;
+    }
+    fclose(f);
+    return NULL;
+}
+
 struct passwd *getpwuid(uid_t uid) {
     static struct passwd *(*fnsym)(uid_t) = NULL;
     static char name_buf[32];
@@ -5413,13 +5503,28 @@ struct passwd *getpwuid(uid_t uid) {
     real = fnsym(uid);
 
     /*
-     * 只在「fakeroot 启用」且「请求的正是我们伪装的 uid」
-     * 且「真实查询失败或不匹配」时才合成。
-     *
-     * 若真实数据库里恰好有这条记录（例如宿主真有 uid 0 的记录），
-     * 直接用真实的 —— 那更完整，没必要造假。
+     * 真实查询命中：优先用真的（那更完整）。
+     * ★ 但 bridge 环境下 NSS 分派对 by-uid 查询同样会失败（实测
+     * getpwuid(0) 返回 NULL 而宿主返回 root），所以 real == NULL 时
+     * 需要直解回退 —— 与 getpwnam 的修法同源（缺口 D 的 by-id 面）。
      */
-    if (!g_fakeroot_on || real != NULL)
+    if (real != NULL)
+        return real;
+
+    /* ★ 通用 /etc/passwd 直解回退（按 uid 匹配，2026-09-18 补）★
+     * 与 getpwnam 直解同源；返回共享静态记录。
+     * 失败（表里没有）→ 继续走下面的 fakeroot 合成路径。 */
+    {
+        struct passwd *fb = bxroot_passwd_by_uid_fallback(uid);
+        if (fb != NULL)
+            return fb;
+    }
+
+    /*
+     * fakeroot 合成：只在「fakeroot 启用」且「请求的正是我们伪装的 uid」
+     * 时合成 root 记录（此前的行为，保持不变）。
+     */
+    if (!g_fakeroot_on)
         return real;
 
     if (uid != g_fakeroot_state.euid)
@@ -5730,6 +5835,96 @@ int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
  */
 static char gr_mem_buf[8] = "root\0";
 
+/*
+ * ★ /etc/group by-gid 直解回退（与 by-uid 同修法，2026-09-18）★
+ * group 格式：name:passwd:gid:mem。按 gid（第 3 字段）匹配。
+ * 返回静态存储记录（与 getgrnam 直解共用契约），NULL = 表里没有。
+ */
+static struct group *bxroot_group_by_gid_fallback(gid_t gid) {
+    static struct group fake;
+    FILE *f;
+    char line[512];
+
+    f = fopen("/etc/group", "r");
+    if (f == NULL)
+        return NULL;
+
+    while (fgets(line, sizeof line, f) != NULL) {
+        char *fields[4];
+        int nf = 0, i;
+        char *w = line, *e;
+
+        for (i = 0; i < 4; i++) {
+            fields[i] = w;
+            if (i < 3) {
+                e = strchr(w, ':');
+            } else {
+                e = strchr(w, '\n');
+                if (e == NULL)
+                    e = w + strlen(w);
+            }
+            if (e == NULL) { break; }
+            *e = '\0';
+            w = e + 1;
+            nf++;
+        }
+        if (nf < 4)
+            continue;
+        if ((gid_t)atoi(fields[2]) != gid)
+            continue;
+
+        {
+            static char *g_name = NULL, *g_passwd = NULL, *g_mem = NULL;
+            static size_t g_name_cap = 0, g_passwd_cap = 0, g_mem_cap = 0;
+            const size_t FIELD_MAX = 4096;   /* mem 列表可能很长 */
+            static char *mem_slots[64];
+            size_t nm = 0;
+            char *m;
+
+            #define BXROOT_DUP_FIELD_G(dst, cap, src)                      \
+                do {                                                        \
+                    size_t _n = strlen(src) + 1;                             \
+                    if (_n > FIELD_MAX) { fclose(f); return NULL; }          \
+                    if (*(cap) < _n) {                                       \
+                        char *_p = (char *)realloc(*(dst), _n);              \
+                        if (_p == NULL) { fclose(f); return NULL; }          \
+                        *(dst) = _p; *(cap) = _n;                            \
+                    }                                                        \
+                    memcpy(*(dst), (src), _n);                               \
+                } while (0)
+
+            BXROOT_DUP_FIELD_G(&g_name,   &g_name_cap,   fields[0]);
+            BXROOT_DUP_FIELD_G(&g_passwd, &g_passwd_cap, fields[1]);
+            BXROOT_DUP_FIELD_G(&g_mem,    &g_mem_cap,    fields[3]);
+
+            #undef BXROOT_DUP_FIELD_G
+
+            /* mem 列表切分成指针数组（逗号分隔），静态槽按需重置 */
+            nm = 0;
+            m = g_mem;
+            while (m != NULL && *m != '\0' && nm < 63) {
+                mem_slots[nm++] = m;
+                {
+                    char *c = strchr(m, ',');
+                    if (c == NULL) break;
+                    *c = '\0';
+                    m = c + 1;
+                }
+            }
+            if (nm > 0) mem_slots[nm] = NULL; else mem_slots[0] = NULL;
+            fake.gr_mem = (nm > 0) ? mem_slots : NULL;
+
+            fake.gr_name   = g_name;
+            fake.gr_passwd = g_passwd;
+            fake.gr_gid    = (gid_t)atoi(fields[2]);
+        }
+        fclose(f);
+        return &fake;
+    }
+    fclose(f);
+    return NULL;
+}
+
 struct group *getgrgid(gid_t gid) {
     static struct group *(*fnsym)(gid_t) = NULL;
     static char name_buf[32];
@@ -5742,7 +5937,17 @@ struct group *getgrgid(gid_t gid) {
     if (fnsym == NULL) { errno = ENOSYS; return NULL; }
 
     real = fnsym(gid);
-    if (!g_fakeroot_on || real != NULL)
+    if (real != NULL)
+        return real;
+
+    /* ★ /etc/group by-gid 直解回退（同 getpwuid 的 by-uid 修法）★ */
+    {
+        struct group *fb = bxroot_group_by_gid_fallback(gid);
+        if (fb != NULL)
+            return fb;
+    }
+
+    if (!g_fakeroot_on)
         return real;
     if (gid != g_fakeroot_state.egid)
         return real;
