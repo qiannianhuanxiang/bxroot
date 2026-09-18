@@ -2916,6 +2916,60 @@ static int readlink_fixup(const char *raw, char *out, size_t outsz)
             return 1;
         }
     }
+
+    /*
+     * 规则 4：fd 指向 rootfs 的**祖先目录** → guest 视角是 "/"（上游断言）。
+     *
+     * 【为什么需要，来自上游用例 test-51943658.c】
+     * 该用例（截取）：
+     *     dir_fd = open("/", O_RDONLY);
+     *     dir_fd1 = openat(dir_fd, ".", O_RDONLY);
+     *     dir_fd2 = openat(dir_fd, "..", O_RDONLY);
+     *     readlink("/proc/self/fd/<dir_fd1>") 必须等于 "/"
+     *     readlink("/proc/self/fd/<dir_fd2>") 必须等于 "/"   ← 这一条我们没过
+     *
+     * 【机制】guest 的 "/" 在宿主上是 $ROOTFS。fd2 = openat($ROOTFS-fd,
+     * "..") 在内核里解析为 **$ROOTFS 的父目录**（rootfs 之外！），于是
+     * 内核返回 `/data/data/.../linux/ubuntu/..` 实际解析后的宿主路径
+     * `/data/data/.../linux`。这个路径**不含 $ROOTFS 前缀**，规则 3 的
+     * 剥离不命中，于是原样泄漏给客户（实测：得到
+     * `/data/data/com.dsh.client/files/linux`，期望 "/"）。
+     *
+     * 【修法】客户能"从 / 往上一级"走到的地方，在我们眼里就是 rootfs
+     * 的祖先链 —— 从 guest 视角看只有一个答案："/"。判据是
+     * "raw 是 rootfs 的祖先目录（或 rootfs 本身之外的上级）"：
+     * rootfs 及其祖先链上的每一级，guest 视角都映射到 "/"。
+     *
+     * 只在 raw 确实位于 rootfs 的祖先链上时改写，不是"任何 rootfs 外的
+     * 路径都变 /" —— 后者会把宿主真实路径也吞掉。
+     */
+    {
+        const char *rootfs = g_config.rootfs ? g_config.rootfs : "";
+        size_t rl = strlen(rootfs);
+
+        if (rl > 0 && raw[0] == '/' && strncmp(raw, rootfs, rl) != 0) {
+            /*
+             * raw 不是 rootfs 自身/其下 —— 检查它是否在 rootfs 的祖先链上：
+             *   - raw == "/" ：祖先链顶端，恒真；
+             *   - 否则 rootfs 必须以 raw 开头，且 raw 之后紧跟 '/'（组件
+             *     边界），防止 /data/rootfX 这类同前缀误命中。
+             */
+            size_t ql = strlen(raw);
+            int is_ancestor = 0;
+
+            if (ql == 1) {                    /* raw == "/" */
+                is_ancestor = 1;
+            } else if (ql < rl && strncmp(rootfs, raw, ql) == 0 &&
+                       rootfs[ql] == '/') {
+                is_ancestor = 1;
+            }
+
+            if (is_ancestor) {
+                snprintf(out, outsz, "/");
+                return 1;
+            }
+        }
+    }
     return 0;
 }
 

@@ -63,6 +63,19 @@ int main(void) {
     check("rootfs 外路径",   "/etc/passwd",                 NULL,         0, RF);
     check("rootfs 内 cwd",   "/data/rootfs-test/root/w",    "/root/w",    1, RF);
 
+    printf("=== 规则 4：rootfs 祖先目录 → guest 视角 /（上游 test-51943658）===\n");
+    /*
+     * 场景来源：openat(open("/"), "..") 的 fd 在内核里解析为 $ROOTFS 的
+     * 父目录，readlink 返回不含 rootfs 前缀的宿主路径。上游断言必须是 "/"。
+     * rootfs = /data/rootfs-test 的祖先链只有 "/" 与 "/data"。
+     */
+    check("rootfs 的直接父",  "/data",            "/", 1, RF);
+    check("祖先链更上级",     "/",                "/", 1, RF);
+    /* 边界：不在祖先链上的路径不得被改成 / */
+    check("非祖先（同前缀）", "/data/rootfs-testX", NULL, 0, RF);
+    check("非祖先（兄弟）",   "/data/other",       NULL, 0, RF);
+    check("非祖先（无关）",   "/etc/passwd",       NULL, 0, RF);
+
     printf("=== 组件边界（不得误剥）===\n");
     /* /data/rootfs-test 不是 /data/rootfs-test 的路径 —— 前缀相似已覆盖 */
 
