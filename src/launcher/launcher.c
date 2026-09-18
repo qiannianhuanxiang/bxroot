@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>   /* signal(SIGPIPE, SIG_DFL)：见 execve 前的说明 */
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -223,7 +224,31 @@ static int expand_bind_list(launcher_config_t *cfg,
 
 static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
     cfg->rootfs = strdup(BXROOT_DEFAULT_ROOTFS);
-    cfg->workdir = strdup("/");
+
+    /*
+     * ★ workdir 默认值：继承宿主 cwd（上游语义，评估报告 D2）★
+     *
+     * 上游 proot 未给 -w/--cwd 时的默认是 "."（cli/proot.c:384-388），
+     * 再由 initialize_cwd() 用宿主 getcwd 解析成绝对路径并规范化
+     * （cli/cli.c:219-262）；若该目录在 guest rootfs 中不可用，才回落到
+     * "/"。其自带用例 test-eddeba0e.sh 断言：
+     *     ${PROOT} pwd -P | grep "^$PWD$"
+     *
+     * bxroot 原先硬编码 "/"，于是 `cd /some/dir && bxroot -r R pwd -P`
+     * 得到 "/" —— 与上游不一致，且真实脚本里"在哪个目录启动就在哪个
+     * 目录工作"的直觉被破坏（Makefile/构建脚本大量依赖）。
+     *
+     * 这里用宿主 getcwd 取绝对路径（等价上游 getcwd2 + canonicalize 的
+     * 起点）。若取不到（cwd 已被删除），退回 "/" 与上游的容错一致。
+     * 显式 -w 仍然覆盖此默认值。
+     */
+    {
+        char hcwd[4096];
+        if (getcwd(hcwd, sizeof(hcwd)) != NULL)
+            cfg->workdir = strdup(hcwd);
+        else
+            cfg->workdir = strdup("/");
+    }
     cfg->bind_count = 0;
     cfg->fakeroot = 0;
     cfg->verbose = 0;
@@ -1102,6 +1127,25 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[bxroot-launcher] stat(%s) OK, mode=%o, size=%ld\n", cfg.guest_exe, st.st_mode & 07777, (long)st.st_size);
         }
     }
+    /*
+     * ★ 复位 SIGPIPE（上游同等处理，评估报告 D5）★
+     *
+     * 【为什么必须做】SIG_IGN 会**跨 fork/exec 存活**。Android 的 zygote
+     * 把 SIGPIPE 设成 SIG_IGN 并一直传下来，于是 guest 里所有进程都继承
+     * 了"忽略"：`yes | head -1` 不会静默被杀，而是打印
+     * "yes: standard output: Broken pipe" 并继续跑 —— 脚本里判断管道
+     * 退出的逻辑全错（PIPESTATUS 期望 141，实得 1）。
+     *
+     * 上游 proot 专门修过这一条（src/tracee/event.c:111），理由与容器
+     * 运行时一致：**给 guest 一个正常系统上该有的处置**，而不是宿主
+     * 进程组的遗留状态。
+     *
+     * 【放在 execve 前】与上游同位置：复位后立即 exec，中间不再有
+     * 机会被重新置位。runtime 的构造函数也会再兜一次（防止经 bridge
+     * 链直接加载、绕过 launcher 的路径）。
+     */
+    signal(SIGPIPE, SIG_DFL);
+
     /* execve guest 程序 */
     if (cfg.verbose)
         fprintf(stderr, "[bxroot-launcher] execve: %s\n", cfg.guest_exe);

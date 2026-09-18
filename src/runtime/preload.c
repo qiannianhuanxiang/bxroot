@@ -337,6 +337,40 @@ static void warn_stale_proroot_env(void) {
     if (g_prefix_warned)
         return;
 
+    /*
+     * ★ 先排除「嵌套容器」这一正常形态，否则警告必然误报 ★
+     *
+     * bxroot 的**主要部署形态之一**就是跑在另一个 proroot 容器里
+     * （DSHA 真机链路即如此）。这时外层 proroot 会向 environ 注入
+     * 一整套 PROROOT_* 变量 —— 它们是**外层的实现状态**，而不是
+     * "手配 bxroot 时拼错前缀"。不排除的话，警告在每次嵌套启动时
+     * 都会刷出来，把正常形态误报成配置错误。
+     * （实测：上游套件自检的 stdout 探针因此被判失败，属真实回归。）
+     *
+     * 判别信号：外层 proroot 会设若干**用户不可能手配的实现细节变量**
+     * （配置 fd、跳板路径、stub-loader 路径等）。命中一个即认定
+     * "这是嵌套容器"，不报警。
+     *
+     * 反面：用户真的手配 bxroot 却写成 PROROOT_ROOTFS 时，环境里
+     * 不会同时出现 PROROOT_CFG_FD 这类内部变量，警告正常触发。
+     */
+    {
+        static const char *const nested_markers[] = {
+            "PROROOT_CFG_FD",               /* 配置传递 fd（内部机制） */
+            "PROROOT_ESCAPE_FD",            /* 逃逸 fd */
+            "PROROOT_TRAMPOLINE_PATH",      /* 跳板 so 路径 */
+            "PROROOT_STUB_LOADER",          /* 静态加载器路径 */
+            "PROROOT_LINKER_PATH",          /* 自研 linker 路径 */
+            "PROROOT_SIGSYS_LOG_HOST_PATH", /* SIGSYS 日志路径 */
+        };
+        size_t mi;
+        for (mi = 0; mi < sizeof(nested_markers) / sizeof(nested_markers[0]); mi++) {
+            const char *mv = getenv(nested_markers[mi]);
+            if (mv != NULL && mv[0] != '\0')
+                return;   /* 嵌套容器：静默 */
+        }
+    }
+
     for (k = 0; k < sizeof(stale_map) / sizeof(stale_map[0]); k++) {
         const char *oldv = getenv(stale_map[k].old_name);
 
@@ -8118,6 +8152,19 @@ static void constructor(void) {
     init_config();
     init_l2s();
     init_fakeroot();
+
+    /*
+     * ★ SIGPIPE 复位兜底（上游同等处理，评估报告 D5）★
+     *
+     * SIG_IGN 跨 fork/exec 存活：Android zygote 留下的 SIGPIPE=SIG_IGN
+     * 会让 guest 里 `yes | head -1` 打印 "Broken pipe" 而不是被静默杀死，
+     * 破坏脚本对管道退出的判断（PIPESTATUS 期望 141）。
+     *
+     * launcher 的 execve 前已复位一次；这里再兜一次，覆盖
+     * "经 bridge 链直接加载 runtime、绕过 launcher" 的路径。
+     * 上游在 src/tracee/event.c:111 做同样的事。
+     */
+    signal(SIGPIPE, SIG_DFL);
 
     /*
      * 崩溃现场捕获。

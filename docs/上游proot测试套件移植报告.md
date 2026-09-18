@@ -911,3 +911,27 @@ done
 # 上游的 rc 约定
 sed -n '89,101p' /tmp/proot-src/tests/GNUmakefile
 ```
+
+---
+
+## 附录：2026-09-18 修复进展（D1/D2/D5 已修）
+
+上文 §三 记录的是移植当时的取证（0 符合上游 / 5 不一致）。此后已修
+三项，最新取证为 **4 符合 / 1 不一致**：
+
+| 缺陷 | 状态 | 修复要点 |
+|---|---|---|
+| **D1** `-b` 单路径被拒 | ✅ 已修 | 按上游语义 `handle_option_b` 视为 `path:path` |
+| **D2** cwd 未继承 | ✅ 已修 | 上游 `cli/proot.c:384` 无 `-w` 时默认 `"."`，再由 `initialize_cwd` 用宿主 `getcwd` 解析。bxroot 原先硬编码 `/`，现改为继承宿主 cwd |
+| **D3** `/proc/self/fd/N` 泄漏宿主路径 | ✅ 已修 | `readlink`/`readlinkat` 返回值加反向翻译（`readlink_fixup`） |
+| **D4** symlink→dir 的 `L1/` | ⚠️ 保留 | 判定为「绝对目标符号链接」架构边界的可观测形态（内核解引用发生在宿主侧，LD_PRELOAD 观察不到）。见 `docs/缺陷-绝对目标符号链接打不开.md` 第七节 |
+| **D5** SIGPIPE 未复位 | ✅ 已修 | 上游 `src/tracee/event.c:111` 复位 SIG_DFL（理由：Android zygote 留下的 SIG_IGN 跨 fork/exec 存活）。bxroot 在 launcher 的 execve 前与 runtime 构造函数各兜一次 |
+
+**实测对照（D5）**：
+```
+baseline（无 bxroot，SIGPIPE=SIG_IGN）: PIPESTATUS[0]=1    ← 复现问题
+bxroot（新 launcher）                : PIPESTATUS[0]=141  ← 复位生效
+```
+
+剩余 19 个上游用例失败，主要是需要真机环境（B 段 `-r` 隔离语义）或
+依赖 `-b`/`-r` 的特定组合；逐项归因见下方 §四。
