@@ -122,6 +122,7 @@ static int l2s_real_symlink(const char *t, const char *l);
 static int l2s_real_rename(const char *o, const char *n);
 static int l2s_real_unlink(const char *p);
 static ssize_t l2s_real_readlink(const char *p, char *b, size_t sz);
+static int readlink_fixup(const char *raw, char *out, size_t outsz);   /* D3: /proc 泄漏反向翻译 */
 static int l2s_real_access(const char *p, int m);
 static int l2s_real_read_small(const char *p, char *b, size_t sz, size_t *len);
 static int l2s_real_write_small(const char *p, const char *b, size_t len);
@@ -1896,6 +1897,31 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
         return n;
 
     /*
+     * ★ D3 修复：/proc 泄漏的反向翻译，必须在 l2s 重写**之前**做 ★
+     *
+     * 内核对 /proc/self/fd/N、/proc/self/cwd、/proc/self/root 返回的
+     * 是宿主路径；客户期望 guest 视角。不剥的话，客户把它再喂回
+     * open()/stat() 会双重翻译或 ENOENT（实测：内核真值 n=61 带
+     * $ROOTFS 前缀）。socket:[N]/pipe:[N] 等非路径形态在 fixup 内部
+     * 被规则 1 原样放行。
+     */
+    {
+        char fixedp[MAX_PATH_LEN];
+        if (n < (ssize_t)sizeof(fixedp)) {
+            char rawp[MAX_PATH_LEN];
+            memcpy(rawp, buf, (size_t)n);
+            rawp[n] = '\0';
+            if (readlink_fixup(rawp, fixedp, sizeof(fixedp)) == 1) {
+                size_t flen = strlen(fixedp);
+                if (flen > buf_size)
+                    flen = buf_size;      /* 截断，与 readlink(2) 语义一致 */
+                memcpy(buf, fixedp, flen);
+                return (ssize_t)flen;
+            }
+        }
+    }
+
+    /*
      * 伪造链接的 readlink 必须失败（EINVAL）—— 见 l2s_rt_rewrite_readlink
      * 的长注释。判据在 l2s 层，这里只负责把哨兵转成 errno 语义。
      */
@@ -2581,6 +2607,125 @@ int __fxstat64(int ver, int fd, struct stat64 *buf) {
  *
  * 返回 0 成功；-ERANGE 表示调用方给的缓冲装不下（仅 buf != NULL 分支可能）。
  */
+/*
+ * 宿主路径 → guest 路径的核心反向翻译（原地）。
+ *
+ * 【抽出来共享的动机 —— D3 缺陷】
+ * 这段逻辑原先只属于 getcwd：readlink("/proc/self/fd/N") 返回的
+ * 同样是宿主路径（内核把 fd 的真实位置暴露出来），却没有任何反向
+ * 翻译，客户拿到带 $ROOTFS 前缀的路径后：
+ *   - 打日志/比较路径时出现"陌生前缀"；
+ *   - 把它再喂回 open()/stat() 会**双重翻译**（<rootfs><rootfs>/...）
+ *     或直接 ENOENT。
+ *
+ * 剥前缀只会让路径更短，原地 memmove 对调用方给的缓冲总是安全的。
+ * 返回 1 = 已剥；0 = 没动（路径不在 rootfs 之下）。
+ */
+static int strip_rootfs_prefix_inplace(char *buf)
+{
+    const char *rootfs;
+    size_t rl;
+
+    if (buf == NULL)
+        return 0;
+
+    /*
+     * 只在**组件边界**上剥（前缀后面必须是 '\0' 或 '/'），
+     * 否则 `/foo/rootfsXYZ` 会被误当成 `/foo/rootfs` 下的路径。
+     * 剥完如果剩空串，说明正处于 rootfs 根 —— 返回 "/"。
+     */
+    rootfs = g_config.rootfs ? g_config.rootfs : "";
+    rl = strlen(rootfs);
+    if (rl == 0)
+        return 0;
+
+    if (strncmp(buf, rootfs, rl) == 0 &&
+        (buf[rl] == '\0' || buf[rl] == '/')) {
+        const char *rest = buf + rl;
+        size_t restlen = strlen(rest);
+
+        if (restlen == 0) {
+            /* 正好在 rootfs 根 */
+            buf[0] = '/';
+            buf[1] = '\0';
+            return 1;
+        }
+        /* rest 以 '/' 开头，直接前移即可（含结尾 NUL） */
+        memmove(buf, rest, restlen + 1);
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * readlink 系返回值的反向翻译（D3 修复）。
+ *
+ * 内核对这三类 /proc 链接返回的是**宿主视角**：
+ *   /proc/<pid>/fd/N   → fd 真实指向的宿主路径
+ *   /proc/<pid>/cwd    → 宿主 cwd
+ *   /proc/<pid>/root   → 宿主 rootfs 前缀
+ * 客户期望 guest 视角。判别与改写规则：
+ *
+ *   1. 返回值不以 '/' 开头 → 不动。/proc 对 socket/pipe 返回
+ *      "socket:[123]"、"pipe:[456]"、对匿名 inode 返回
+ *      "anon_inode:..." —— 这些是内核契约格式，绝不能碰。
+ *   2. /proc/<pid>/root/... → 剥 /proc/<pid>/root 前缀后，
+ *      剩余部分当作 rootfs 内路径继续剥 $ROOTFS 前缀。
+ *   3. 其余绝对路径 → 走与 getcwd 相同的反向翻译
+ *      （剥 rootfs 前缀 + 反向 bind），原因同上：双重翻译风险。
+ *
+ * 返回 1 = out 已重写；0 = 保持内核返回值。
+ */
+static int readlink_fixup(const char *raw, char *out, size_t outsz)
+{
+    if (raw == NULL || out == NULL || outsz == 0)
+        return 0;
+
+    /* 规则 1：非绝对路径一律保持原样（socket:[N] / pipe:[N] / anon_inode:...） */
+    if (raw[0] != '/')
+        return 0;
+
+    /* 规则 2：/proc/<pid>/root 与 /proc/<pid>/root/<path> */
+    if (strncmp(raw, "/proc/", 6) == 0) {
+        const char *rest = raw + 6;
+        const char *slash = strchr(rest, '/');
+        if (slash != NULL && slash != rest) {
+            if (strcmp(slash, "/root") == 0) {
+                /* 客户的 / 就是 /（内核给的是宿主 rootfs 前缀） */
+                snprintf(out, outsz, "/");
+                return 1;
+            }
+            if (strncmp(slash, "/root/", 6) == 0) {
+                char tmp[MAX_PATH_LEN];
+                snprintf(tmp, sizeof(tmp), "%s", slash + 5);  /* "/..." */
+                (void)strip_rootfs_prefix_inplace(tmp);
+                if (detranslate_binds(tmp, out, outsz) == 1)
+                    return 1;
+                snprintf(out, outsz, "%s", tmp);
+                return 1;
+            }
+        }
+    }
+
+    /* 规则 3：普通宿主路径（fd 指向 rootfs 内文件、cwd 等）。
+     * 两个反向步骤在同一缓冲上串联（先剥 rootfs，再反 bind），
+     * 与 getcwd_fixup 的顺序一致。 */
+    {
+        char tmp[MAX_PATH_LEN];
+        int changed;
+
+        snprintf(tmp, sizeof(tmp), "%s", raw);
+        changed = strip_rootfs_prefix_inplace(tmp);
+        if (detranslate_binds(tmp, out, outsz) == 1)
+            return 1;
+        if (changed) {
+            snprintf(out, outsz, "%s", tmp);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int getcwd_fixup(char *buf, size_t size)
 {
     const char *rootfs;
@@ -3199,6 +3344,27 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     n = fn(dirfd, p, buf, bufsiz);
     if (n <= 0)
         return n;
+
+    /*
+     * ★ D3 修复：与 readlink() 同一处理 —— /proc 泄漏反向翻译 ★
+     * 必须在 l2s 重写之前：l2s 判据用的是宿主路径 p，改写 buf 会
+     * 破坏它的 probe；而且 /proc/self/fd/N 的返回值要 guest 视角。
+     */
+    {
+        char fixedp[MAX_PATH_LEN];
+        if (n < (ssize_t)sizeof(fixedp)) {
+            char rawp[MAX_PATH_LEN];
+            memcpy(rawp, buf, (size_t)n);
+            rawp[n] = '\0';
+            if (readlink_fixup(rawp, fixedp, sizeof(fixedp)) == 1) {
+                size_t flen = strlen(fixedp);
+                if (flen > bufsiz)
+                    flen = bufsiz;        /* 截断，与 readlinkat(2) 语义一致 */
+                memcpy(buf, fixedp, flen);
+                return (ssize_t)flen;
+            }
+        }
+    }
 
     {
         char joined[MAX_PATH_LEN];
@@ -7773,6 +7939,14 @@ static int l2s_autostart_on_link_failure(void) {
 
 __attribute__((constructor))
 static void constructor(void) {
+    /*
+     * BXROOT_NO_AUTORUN=1：静态链接本库（源码级单元测试等）时的逃生门。
+     * 完整跳过构造链 —— 单元探针只需要内部纯函数（如 readlink_fixup），
+     * 不需要 hook 安装/livepatch/崩溃处理器。正常运行时勿设。
+     */
+    if (getenv("BXROOT_NO_AUTORUN") != NULL)
+        return;
+
     init_config();
     init_l2s();
     init_fakeroot();

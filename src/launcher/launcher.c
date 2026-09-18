@@ -280,56 +280,39 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
             }
             free(cfg->workdir);
             cfg->workdir = strdup(argv[++i]);
-        } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0) {
+        } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0 ||
+                   strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mount") == 0) {
+            int is_bind_opt = strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0;
+            const char *optname = is_bind_opt ? "-b/--bind" : "-m/--mount";
             if (i + 1 >= argc) {
-                fprintf(stderr, "错误: -b 需要参数\n");
+                fprintf(stderr, "错误: %s 需要参数\n", optname);
                 return -1;
             }
-            if (cfg->bind_count >= MAX_BINDS) {
-                fprintf(stderr, "错误: 最多 %d 个 bind mount\n", MAX_BINDS);
+            char *spec = strdup(argv[++i]);
+            if (spec == NULL) {
                 return -1;
             }
-            cfg->binds[cfg->bind_count * 2] = strdup(argv[++i]);
-            /* 解析 src:dst */
-            char *colon = strchr(cfg->binds[cfg->bind_count * 2], ':');
-            if (!colon) {
-                fprintf(stderr, "错误: -b 需要 <host>:<guest> 格式\n");
-                return -1;
-            }
-            *colon = '\0';
-            cfg->binds[cfg->bind_count * 2 + 1] = strdup(colon + 1);
-            cfg->bind_count++;
-        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mount") == 0) {
-            /*
-             * `-m` / `--mount` 与 `-b` **完全同义**（proot 的选项表里
-             * 两者 handler 相同），所以复用同一段逻辑。
-             *
-             * 注意：不能简单 `goto` 到 -b 分支 —— 大小写敏感的
-             * 字符串比较已经消费了 argv[i]，直接在此重复解析更清晰。
-             */
-            if (i + 1 >= argc) {
-                fprintf(stderr, "错误: -m/--mount 需要 <host>:<guest> 参数\n");
-                return -1;
-            }
-            {
-                char *spec = strdup(argv[++i]);
-                if (spec == NULL) {
-                    return -1;
-                }
-                char *colon = strchr(spec, ':');
-                if (colon == NULL) {
-                    fprintf(stderr, "错误: -m/--mount 需要 <host>:<guest> 格式\n");
+            char *colon = strchr(spec, ':');
+            if (colon == NULL) {
+                /*
+                 * 上游 proot 对「不带冒号的单路径」的语义是
+                 * `-b <path>` == `-b <path>:<path>`（同一来源路径按
+                 * 原样映射到 rootfs 内相同位置）。保持一致，不再报错。
+                 */
+                if (add_bind(cfg, spec, spec) != 0) {
+                    fprintf(stderr, "错误: bind 数量已达上限 %d\n", MAX_BINDS);
                     free(spec);
                     return -1;
                 }
+            } else {
                 *colon = '\0';
                 if (add_bind(cfg, spec, colon + 1) != 0) {
                     fprintf(stderr, "错误: bind 数量已达上限 %d\n", MAX_BINDS);
                     free(spec);
                     return -1;
                 }
-                free(spec);
             }
+            free(spec);
         } else if (strcmp(argv[i], "-0") == 0 ||
                    strcmp(argv[i], "--root-id") == 0) {
             cfg->fakeroot = 1;
