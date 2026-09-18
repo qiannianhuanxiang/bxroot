@@ -58,22 +58,43 @@ ptrace 方案（proot）要让每个系统调用停两次。
 
 ## 非 Android 环境的修复历史
 
-v0.1.0 的一位用户在纯 Linux（Ubuntu 24.04 / aarch64 / 外层 proot 沙箱）
-做了源码走读 + 实测，报出两个真实缺陷。都已修复：
+v0.1.0 之后，有用户在纯 Linux（Ubuntu 24.04 / aarch64 / 外层 proot 沙箱）
+做了源码走读 + 实测，先后报出两批问题。**全部已修复并加了回归**：
+
+### 第一批：加载即崩（P0，降级路径）
 
 | 缺陷 | 现象 | 根因 | 状态 |
 |---|---|---|---|
-| `ldso_service_*` 强引用 | `LD_PRELOAD` 后 `symbol lookup error`，**一个命令都跑不了** | 4 个符号是普通 `extern`（强引用），纯 glibc 下链接器在符号解析阶段就失败，构造函数跑不到 | ✅ 改 `__attribute__((weak))`（4 个全改） |
-| `dlsym` 无服务分支 `return NULL` | `bash` 启动即 `SEGV pc=0x0` | 客户程序拿到 NULL 直接调用 | ✅ 改用 `dlvsym(RTLD_NEXT,"dlsym","GLIBC_2.34"/"2.17")` 取真身并转发 |
+| `ldso_service_*` 强引用 | `LD_PRELOAD` 后 `symbol lookup error`，**一个命令都跑不了** | 4 个符号是普通 `extern`（强引用），纯 glibc 下链接器在符号解析阶段就失败，构造函数跑不到 | ✅ 改 `__attribute__((weak))` |
+| `dlsym` 无服务分支 `return NULL` | `bash` 启动即 `SEGV pc=0x0` | 客户程序拿到 NULL 直接调用 | ✅ 改用 `dlvsym` 取真身并转发 |
+| livepatch 无门控 | 非 Android 环境改 libc 代码页 → SIGSEGV | 站点表按 Android seccomp 白名单设计，却无条件 `mprotect` | ✅ `PR_GET_SECCOMP` 门控 + `BXROOT_NO_LIVEPATCH=1` |
 
-★ 这两条为什么能活过 v0.1.0 ★
+★ 为什么能活过 v0.1.0 ★ 它们**都在降级路径上**（只有"无 ldso 服务"的
+环境才会走到），而此前测试全跑有服务的路径 —— 降级路径**零覆盖**。
+现补 `test/RUN_FALLBACK.sh`（`BXROOT_FORCE_NO_LDSO_SERVICE=1` 强制走）。
 
-它们**都在降级路径上**（只有"无 ldso 服务"的环境才会走到），而此前
-全部测试跑的都是有服务的路径 —— 降级路径**零覆盖**。
+### 第二批：可用性/正确性缺陷
 
-现已补 `test/RUN_FALLBACK.sh`：用 `BXROOT_FORCE_NO_LDSO_SERVICE=1`
-强制走那条分支，使它在开发环境里可被真实执行。该开关只影响"走哪条分支"
-的判断，不改业务语义；生产不设，行为与从前一致。
+| 缺陷 | 类别 | 状态 |
+|---|---|---|
+| `__libc_sigaction` 强引用（GLIBC_PRIVATE） | 非 glibc 环境加载失败（与第一批同类） | ✅ 改弱引用 + 探测降级 |
+| `realpath` 返回值不剥宿主前缀 | 客户拿到 `/data/.../rootfs/...`，路径相等性判断错 | ✅ 三钩子接入反向翻译 |
+| `-b <单路径>` 被拒 | 上游语义是 `path:path` | ✅ 按上游语义接受 |
+| `/proc/self/fd/N` readlink 泄漏宿主路径 | 客户把它喂回 open 会双重翻译/ENOENT | ✅ 反向翻译（socket/pipe 原样放行） |
+| 25 个路径型 syscall 未列入参数表 | 裸 `syscall()` 客户（如静态 libuv）绕过翻译 | ✅ 补齐 + 审计器入回归 |
+| fakeroot 账本无锁 | **多线程下堆破坏**（`double free`，可复现） | ✅ 自旋锁 + 并发回归 |
+| Android 策略中和无开关 | 非 Android 误伤合法调用（io_uring 族恒定 ENOSYS） | ✅ `BXROOT_RAW_SYSCALL=1` |
+| crash 处理器抢占客户 handler | node/V8 的自愈逻辑被短路 | ✅ `BXROOT_NO_CRASH=1` / `BXROOT_CRASH_CHAIN=1` |
+
+### 工程可信度（第二批同时补齐）
+
+- **CI**：`.github/workflows/ci.yml`（build / 全量回归 / 告警门禁三 job，
+  双架构矩阵，逐步骤超时）
+- **审计型测试**：`RUN_SYSCALL_TABLE_AUDIT.sh`（裸 svc 逐号对内核实测，
+  主动发现遗漏）与 `RUN_CONCUR.sh`（并发压测）—— 它们不是防回归，
+  而是**主动发现问题**，上表两项缺陷正是它们查出来的
+- **`.gitignore` 修正**：原先 `src/runtime/t_*` 裸通配会静默吞掉新增的
+  `t_*.c` 源码（只该忽略无扩展名的编译产物）
 
 ## 它解决什么问题
 
@@ -220,6 +241,8 @@ Node 全部 `ENOENT`。
 | `BXROOT_NO_AUTORUN` | 置 1 跳过 runtime 构造链（源码级单元测试专用，正常使用勿设） |
 | `BXROOT_NO_CRASH` | 置 1 不安装崩溃处理器，由客户程序自管 SIGSEGV/SIGBUS |
 | `BXROOT_CRASH_CHAIN` | 置 1 打印现场后链式调用更早注册的 handler（默认关，开启会有双方各一段输出） |
+| `BXROOT_NO_LIVEPATCH` | 置 1 跳过 libc 站点活体补丁（非 Android 环境兜底；正常有 `PR_GET_SECCOMP` 自动门控） |
+| `BXROOT_FORCE_NO_LDSO_SERVICE` | 置 1 强制走"无 ldso 服务"降级分支（**测试专用**：让该分支可在开发环境真实执行） |
 
 > 提示：检测到 `PROROOT_*`（旧名/官方名）环境变量但未设对应 `BXROOT_*` 时，启动会向 stderr 打一行拼写/迁移防呆警告（每进程最多一次）。
 
