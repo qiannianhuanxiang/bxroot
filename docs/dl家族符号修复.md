@@ -3,20 +3,29 @@
 - 修复日期：2026-09-17
 - 修改文件：`src/runtime/preload.c`（定点 edit，**不整文件重写**）
 - 新增文件：`test/dltest.c`、`test/RUN_DL_TESTS.sh`、`test/RUN_ALL.sh` 新增一项（**只增不改判据**）
-- 产物：`build/libbxroot-runtime.so` md5 `9401ddb2b650930803bd31cc2ee08a41`
+- 产物：`build/libbxroot-runtime.so`（md5 是**移动靶**，见下方说明）
 - 官方对照：`work/parity/off/libproroot-runtime.so` md5 `f14a074b41afb0424145f2c39401a1cc`
 - 探针目录：`/root/dlfix/`（= `<ROOTFS>/root/dlfix/`，§0.1 的同一 inode 关系）
 
 > **★ 关于产物 md5（并发编辑说明）★**
-> 本任务进行期间**有其它 agent 在同时改 `src/runtime/preload.c`**（已被告知）。
-> 上表是**最终冻结状态**的 md5。修复完成后的基线验证用
-> `e51ad038b5b4bec62ecc40a20797e292`；此后另一个 agent 回退了它的
-> `pthread_create` 钩子，md5 变为 `9401ddb2b650930803bd31cc2ee08a41`。
-> **§3/§4 的全部结论已在该新产物上复测通过**（dlerror 契约、模块视图 4 个对象、
-> `RUN_ALL --quick` 14/14、`RUN_WARN_GATE` 零告警）。
-> 我的改动**未被并发编辑破坏** —— 逐项核对：`bxroot_dl_err` 18 处、
+> 本任务进行期间**有其它 agent 在同时改 `src/runtime/preload.c`**（任务书已预告）。
+> 我观测到的 md5 序列：
+> `c04823e8…`（修前）→ `e51ad038…`（我的修复）→ `9401ddb2…`（另一 agent 回退它的
+> `pthread_create` 钩子）→ `e1fa03ec…` / `1c00819d…`（后续并发编辑与 ICE 重试重建）。
+> **md5 会继续变，因此不该拿它当验收判据** —— 判据是**行为**：
+>
+> | 判据 | 结果 |
+> |---|---|
+> | `dlerror` 失败后返回 `undefined symbol: <名>` | ✅ 在 `e51ad038…`/`9401ddb2…`/`e1fa03ec…` 上均通过 |
+> | `dl_iterate_phdr` 去重后 **4 个对象**（与官方集合一致） | ✅ 同上 |
+> | `RUN_ALL --quick` **14/14、失败 0** | ✅ 同上（多次） |
+> | `RUN_WARN_GATE` 零告警 | ✅ 同上 |
+> | 我的改动未被并发编辑破坏 | ✅ 逐项核对（见下） |
+>
+> 逐项核对（任一产物版本上都成立）：`bxroot_dl_err` 相关 18 处、
 > `bxroot_dl_error_set2` 定义 1 处 + 调用 4 处、`dlerror` 定义 1 处、
-> `dl_iterate_phdr` 定义 1 处、`audit_` 19 行、`getpid` 定义 0 处。
+> `dl_iterate_phdr` 定义 1 处、`audit_` 19 行、`getpid` 定义 0 处、
+> `nm -D` 里 `dlerror`/`dlsym`/`dl_iterate_phdr` 三个 `T` 符号俱在。
 
 ---
 

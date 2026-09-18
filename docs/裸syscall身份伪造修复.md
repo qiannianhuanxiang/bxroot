@@ -1,15 +1,20 @@
 # 裸 syscall 身份伪造：修复 + 机制更正
 
 > 状态：**第 1 部分（读身份 174..177）已修并有回归覆盖**；
-> 第 2 部分（降权族）**已调查、未动手**，结论与建议见 §5。
+> 第 2 部分（降权族）**已调查、未动手** —— 缺口**已实测确认真实存在**
+> （`chage` 两侧不一致），取舍分析与实现评估见 §5。
 >
 > ⚠️ **本报告更正了原任务描述里的两处机制判断，两处都以实测为准**
 > （见 §2、§3）。结论是：任务的前提「官方在裸 syscall 层也伪造」**不成立**，
 > 而真正的缺口比原描述**小一半**（只有 `syscall()` 符号层，不含 `svc` 层）。
+>
+> ⚠️ **报告自身也经过一次更正**：初版 §5.4 的理由 3（"收益不明确"）
+> 被上级 agent 的实测**推翻**，我复现并进一步定位到"`chage` 只需 2 个号"。
+> 原始措辞与被推翻的证据都保留在 §5.4，以免后人重犯同一推断。
 
 ---
 
-## 一、三层实测对照表
+## 一、四层实测对照表
 
 探针同时读四层：
 
@@ -54,7 +59,7 @@
 | `syscall(150)` `getresgid` | 0 / 0 / 0 | **10655 / 10655 / 10655** | 同上 |
 | `syscall(158)` `getgroups` | 1（零组） | **6（真实组表）** | 未覆盖（缺口 B） |
 | **JITsvc `getuid`** | **10655** | **10655** | **两侧一致，不是缺口** |
-| `setuid/setgid/setgroups/...` | 假装成功（0） | -1 / errno=38 ENOSYS | 缺口 C（§5） |
+| `setuid/setgid/setgroups/...` | 假装成功（0） | -1 / errno=38 ENOSYS | 缺口 C（§5）—— 已实测确认 `chage` 两侧不一致 |
 
 ---
 
@@ -248,7 +253,7 @@ NULL 边界）改前改后都是绿** —— 说明测试精确指向被测缺�
 
 ---
 
-## 五、降权族：调查结论（**未动手**，等决策）
+## 五、降权族：调查结论（**未动手**；缺口已实测确认真实存在）
 
 ### 5.1 官方到底让哪些"假装成功"——实测表
 
@@ -281,57 +286,234 @@ NULL 边界）改前改后都是绿** —— 说明测试精确指向被测缺�
 - 所以"降权族要不要假装成功"**与本项目现有的 `--change-id` 无关** ——
   它只支持 0:0。它影响的只是**客户程序自己主动调降权**的场景。
 
-### 5.4 我的建议：**不要做**（三条理由，按强度排序）
+### 5.4 ★ 更正：理由 3 被实测推翻 —— 缺口是**真实存在**的
 
-1. **副作用是真实的，且方向危险。** 让 `setgid`/`setgroups` 返回 0
-   而不真正改身份，程序会进入"我已降权"的分支 —— 典型是
-   `chage`/`passwd`/`su` 这类工具：它们会**跳过**后续的权限检查，
-   却仍然以 root 身份执行。官方就是这么做的（`chage -l root` 能输出），
-   所以这是**"与官方一致"而非"正确"**。跟进它等于把这个安全语义
-   也一起继承，需要有意识的决定。
-2. **实现位置会碰红线。** 唯一的做法是在 `sigsys.c` 的 SIGSYS 处理器里
-   按号改写 `x0`。但 `sigsys.c` 的现有策略是**统一回 ENOSYS**
-   （`sigsys.c:156-163`），那是让 libuv 回退 epoll 的**关键契约**
-   —— 一旦引入"按号改成成功"的分支，就等于把"哪些号回 ENOSYS、
-   哪些号回成功"变成一张新表。本项目在"号码表"上已经出过两次致命
-   事故，而这张表会更难测（要覆盖全部被 TRAP 的 80+ 个号）。
-   任务也明确要求**不要动 `syscall_guard.c` 的拦截策略**；
-   而 `sigsys.c` 同样是全局导出符号面。
-3. **收益不明确。** 修前 `chage` 的失败链是"raw 层看到非 root →
-   尝试降权 → 撞 seccomp"。**第 1 部分修完后，raw 层已经看到 root
-   （`syscall(174)=0`）**，程序的自检结果已与官方一致，
-   "因为自检非 root 而去降权"这条链已经断了。
-   §5.5 给了一个可判定的验收方法。
+> **本节经过一次更正。** 初版写的理由 3「收益不明确，第 1 部分修完后
+> `chage` 的链已断」是**错的**，且我当时把它标注为"我未能验证"。
+> 上级 agent 按 §5.5 的方法实测后给出反例，我**独立复现并进一步定位**，
+> 结论如下。**原始措辞与推翻它的证据都保留**，以免后人重犯同一推断。
 
-### 5.5 如果仍要做，建议的验收方法（先测后改）
+#### 5.4.1 实测：两侧确实不一致（我独立复现）
+
+```sh
+. /root/idfix/chage/run.sh          # 两侧同样 argv，退出码单独取（不经管道）
+OUT=$(run_off libofficial-runtime.so 2>&1); RC=$?     # 官方
+OUT=$(run_bx  libbxroot-runtime.so  2>&1); RC=$?      # bxroot（已含本轮 174..177 修复）
+```
+
+```
+##### 官方 #####
+Last password change					: Aug 05, 2025
+Password expires					: never
+...
+chage 真实退出码 = 0
+
+##### bxroot（修后，本轮已修 174..177）#####
+chage: failed to drop privileges (Function not implemented)
+chage 真实退出码 = 1
+```
+
+#### 5.4.2 为什么理由 3 是错的（机制层面）
+
+我原来的推断是「raw 层看到 root → 自检通过 → 跳过降权」。**这个推断
+预设了"先自检再决定"**，而 glibc/PAM 的 drop-privileges 路径是
+**无条件调用** `setreuid`/`setregid`/`setgroups` —— 与 `getuid()` 取什么
+值**无关**。所以修好 174..177 **不影响**这条链。
+
+这不是新知识：本项目 `docs/` 里另一个 agent 早已记下「glibc 的
+drop privileges 会无条件调 `setgroups`，与 `getuid()` 取值无关」，
+上级当时也转发过这句话。**我读过它，却没有把它落实到"理由 3 是否成立"
+的判断上** —— 这是本报告最该记住的教训：**引用了结论不等于检验了结论**。
+
+#### 5.4.3 ★ 进一步定位：`chage` 只需要 **两个**号（这条是新的，不在上级的实测里）
+
+用 `BXROOT_SIGSYS_LOG=1` 追踪 `chage` 实际撞到的号，得到**逐步扩大的
+受控实验**（在 `/root/idfix/setter-exp` 的一份**临时副本**上做，
+本工作副本的 `sigsys.c` **未被改动**）：
+
+| `BXROOT_EXP_SET`（假装成功的号） | `chage -l root` 退出码 |
+|---|---|
+| `（空，即现状：全 ENOSYS）` | **1** ❌ |
+| `143` | **1** ❌ |
+| **`143,145`** | **0** ✅ |
+| `143,145,159` | 0 ✅ |
+| `143,145,159,144` | 0 ✅ |
+| `143,145,159,144,146,149,151,152` | 0 ✅ |
+
+```
+--- BXROOT_EXP_SET='' ---
+chage: failed to drop privileges (Function not implemented)
+退出码=1
+--- BXROOT_EXP_SET='143' ---
+chage: failed to drop privileges (Function not implemented)
+退出码=1
+--- BXROOT_EXP_SET='143,145' ---
+Last password change					: Aug 05, 2025
+Password expires					: never
+退出码=0
+```
+
+`chage` 的输出与官方**逐字一致**：
+
+```sh
+diff /root/idfix/chage/out_off.txt /root/idfix/chage/out_exp.txt
+```
+
+```
+✅ 逐字一致
+```
+
+**代价比 §5.6 草案预估的**小得多**：不是"9 个 setter 的号码表"，
+而是 **`{143, 145}` 两个号**就能让 `chage` 完全对齐。
+
+**但这不等于"只做两个号就够"** —— 见 5.4.4 的反面证据。
+
+#### 5.4.4 ★ 反面证据：最小集合是**按工具**变化的，不是恒定的
+
+| 工具 | 官方 | bxroot 现状 | bxroot + 仅 `{143,145}` | 阻塞原因 |
+|---|---|---|---|---|
+| `chage -l root` | rc=0 ✅ | rc=1 ❌ | **rc=0 ✅ 逐字一致** | setter 族 |
+| `chage -l nosuchuser` | 报 "does not exist in /etc/passwd" | "failed to drop privileges" | — | **先降权再查库**，故连报错都不同 |
+| `passwd -S root` | rc=0 `root L 2025-08-05 …` | rc=1 ❌ | **rc=1 ❌ 未修好** | **不是 setter 族**（零 SIGSYS 命中） |
+| `su -S` | 参数错 rc=1 | 相同 | 相同 | 与本议题无关 |
+
+**`passwd` 的失败是另一个缺陷**，与降权族无关 —— 它**一次 SIGSYS 都没撞**：
+
+```
+##### passwd 现状 + SIGSYS 日志 #####
+[bxroot] sigsys 模拟层已安装
+passwd: user 'root' does not exist          ← 没有任何 "模拟 syscall" 行
+
+##### passwd 实验组(143,145) + SIGSYS 日志 #####
+[bxroot] sigsys 模拟层已安装
+passwd: user 'root' does not exist          ← 补了 setter 也没用
+```
+
+定位到用户库查询这一层：
+
+```sh
+getent passwd root
+```
+
+```
+--- off : root:x:0:0:root:/root:/bin/bash     ✅
+--- bx : （空）                                ❌
+```
+
+`id` 也是同类（两侧都输出 `uid=0(root) gid=0 groups=0`，但 bxroot 少了
+`(root)` 的组名反查）。**这是一个独立缺口，不应混进降权族里。**
+
+#### 5.4.5 更正后的结论
+
+- **理由 1 和 2 仍然成立**（副作用真实且方向危险；实现位置会碰
+  `sigsys.c` 的 ENOSYS 契约）。它们才是真正的顾虑。
+- **理由 3 撤销**：缺口**真实存在**，`chage` 两侧不一致是硬证据。
+- **结论从"建议不做"改为**：
+  **技术上确实有缺口，且代价比预估小（`chage` 只需 2 个号）；
+  是否做取决于对理由 1/2 的取舍，而不是"收益不明确"。**
+- 不要把这个建议建立在一个已被推翻的论据上 —— 这正是本节更正的用意。
+
+### 5.5 验收方法（已实测有效，可复现）
 
 用真实受害者命令做**两侧对照**，而不是看单个 syscall 的返回值：
 
 ```sh
 # 官方侧
 PROROOT_ROOTFS=... PROROOT_TMP_DIR=... bridge --preload <官方runtime> \
-    <rootfs>/usr/bin/chage -l root
+    --argv0 chage <rootfs>/usr/bin/chage -l root
 # bxroot 侧（同样的 argv）
 BXROOT_ROOTFS=... BXROOT_TMP_DIR=... BXROOT_FAKEROOT=1 bridge --preload <bxroot runtime> \
-    <rootfs>/usr/bin/chage -l root
+    --argv0 chage <rootfs>/usr/bin/chage -l root
 ```
 
-判据：**两侧输出逐字一致**才算需要跟；若 bxroot 在我们**没做**
-降权族改动的情况下已经与官方一致，那就不该做（理由 3）。
+判据：**两侧退出码与输出逐字一致**。
 
-### 5.6 若要做，最小实现草案（仅供评估，未实现）
+> ★ **两个操作细节**（都会让结论失真）：
+> 1. **退出码必须单独取，不要经管道** —— `cmd | head` 拿到的是 `head`
+>    的退出码，会把 `rc=1` 显示成 `rc=0`。
+> 2. **要判"是否真的被阻塞"，看 `BXROOT_SIGSYS_LOG=1` 的命中行**，
+>    不要只看报错文本 —— `chage -l nosuchuser` 两侧都"报错"，
+>    但错误内容与成因完全不同（一个是查库失败，一个是降权失败）。
 
-在 `sigsys.c` 的处理器里，**在既有的 ENOSYS 回退之前**插入一个小表：
+### 5.6 若要实现：最小改动面、最坏情况、必须先有的测试（**未实现**）
+
+#### 5.6.1 最小改动面
+
+**一个函数、一处插入**，不改任何现有策略分支：
+
+```c
+/* src/runtime/sigsys.c —— 改这个函数，其余一行不动 */
+static int emulate_errno(long sc)
+{
+    (void)sc;
+    return ENOSYS;          /* 现状 */
+}
+```
+
+改成"查一张小表，表内返回 0，表外维持 ENOSYS"。表内**候选**：
+
+| 号 | 名称 | 表内取值 | 依据 |
+|---|---|---|---|
+| 143 | `setregid` | 0 | 实测 `chage` 需要 |
+| 145 | `setreuid` | 0 | 实测 `chage` 需要 |
+| 144 | `setgid` | 0 | 官方返回 0；尚未实测到受害者 |
+| 146 | `setuid` | 0 | 官方返回 0；尚未实测到受害者 |
+| 149 | `setresgid` | 0 | 官方返回 0；尚未实测到受害者 |
+| 159 | `setgroups` | 0 | **风险最高**，见 5.6.2 |
+| 151/152 | `setfsuid`/`setfsgid` | **旧值，不是 0** | 官方 libc 侧返 0、`syscall()` 侧返 999 |
+| 147 | `setresuid` | **不进表** | 实测**未被 TRAP**（内核直接 EPERM），本函数根本收不到它 |
+
+**最小可行集是 `{143,145}`**（`chage` 的实测充分必要集）；
+其余号要不要加，取决于能否为每个号找到受害者并两侧对照。
+
+#### 5.6.2 最坏情况（按严重度）
+
+1. **安全语义被静默放宽（最重要）**。返回 0 而不真改身份 → 程序进入
+   "已降权"分支。若某个 setuid 工具因此**跳过**了后续的权限检查，
+   却仍以原（root）身份执行，那是**行为上的提权**。
+   官方已经在这么做，所以跟进 = 继承同一个语义 —— 必须是有意识的选择，
+   而不是"为了对齐而对齐"。
+2. **`setgroups` 的返回值与 `getgroups` 必须自洽**。若 `setgroups` 假装
+   成功而 `getgroups`（`syscall(158)`，**当前未覆盖**，返回真实 6 个组）
+   仍报旧组表，客户会看到自相矛盾的状态。这正是缺口 B 与缺口 C 的
+   **耦合点** —— 单独做 C 而不做 B，会制造一个新的不一致。
+3. **`setfsuid/setfsgid` 返回旧值**。`x0=0` 会让调用方（典型是
+   `setfsuid(uid)` 之后读返回值判断"我成功了吗"）拿到错误结论；
+   正确值是"**改动前**的 fs uid/gid"，而这个值在 SEQUENCE 模式下
+   需要跟踪状态。
+4. **与 `sigsys.c` 的 ENOSYS 契约耦合**。`ENOSYS` 是 libuv 回退 epoll 的
+   信号。改动必须保证**只有表内号**走成功分支，表外**逐字不变**；
+   否则 `io_uring_setup(425)` 等回退路径会被破坏（实测那会让 node
+   直接 abort）。
+5. **号码表本身的漂移风险**。本项目在 `syscall_guard.c` 的号码表上已出过
+   两次致命事故（36 把 dirfd 当路径、260 把 wait4 当 linkat）。
+   本表虽小，但同样必须**逐个 `case` 列出**、不得写范围判断。
+
+#### 5.6.3 必须先有的测试（按顺序，缺一不可）
+
+1. **`sigsys.c` 的 ENOSYS 契约回归**：表内号返回 0，**表外每个号仍返回
+   ENOSYS**。已有 `test/RUN_WAIT_TESTS.sh` / crash 测试覆盖部分；需要补一条
+   直接断言 `emulate_errno()` 行为的用例（可参照
+   `test/test_id_syscall_guard.c` 的"负向判据"写法：用一个**真值取不到**
+   的期望值，避免恒真）。
+2. **`chage -l root` 两侧逐字对照**（§5.5），且必须**同时**断言
+   `rc` 与**完整输出**（只比 rc 会漏掉"输出不同但都返回 0"的情况）。
+3. **`setfsuid/setfsgid` 返回旧值**的专项用例（这是唯一返回非 0 的号）。
+4. **`setgroups` 与 `getgroups` 的自洽性**用例 —— **依赖缺口 B 先做**。
+5. **`io_uring_setup(425)` 仍回 ENOSYS**（防"表写宽了"）—— 这一条
+   必须有，否则 node 会以退出码 159 静默死掉。
+
+#### 5.6.4 建议的执行顺序
 
 ```
-被 TRAP 且 number ∈ {143,144,145,146,149,151,152,159,147?}
-  → x0 = 0（成功），且 setfsuid/setfsgid 例外：x0 = 当前 fs 的旧值
-  → 其余号：维持现有 ENOSYS 策略（**契约不变**）
+① 缺口 B（148/150/158）先做 —— 它是 ③ 的前置，且风险最低（与已完成的 174..177 同级）
+② 补 sigsys 契约测试（5.6.3 的 1、5）
+③ 只加 {143,145}，用 chage 验收
+④ 再谈其余号（每个号都要先找到受害者并两侧对照）
 ```
 
-风险点：`setfsuid/setfsgid` 的返回值语义是"**旧的** fs uid/gid"而非 0，
-照抄 `x0=0` 会让调用方拿到错误的旧值；`setgroups` 还要考虑
-`getgroups` 的一致性（缺口 B）。**这三条必须先有测试再动手。**
+**不要跳过 ① 直接做 ③** —— 那会让 `setgroups`(假装成功) 与
+`getgroups`(真实组表) 互相矛盾，制造一个比现在更难查的缺陷。
 
 ---
 
@@ -571,6 +753,96 @@ node[1]: pthread_create: Invalid argument
 > `pthread_create: Invalid argument` 是**既有现象**，与本次改动无关 ——
 > 修前产物上跑同一条命令输出**逐字相同**（已在 `before-tree` 上复核）。
 
+### 6.8 降权族：`chage` 两侧对照（§5.4 的原始输出）
+
+```sh
+. /root/idfix/chage/run.sh
+OUT=$(run_off libofficial-runtime.so 2>&1); RC=$?    # 官方
+OUT=$(run_bx  libbxroot-runtime.so  2>&1); RC=$?     # bxroot（已含 174..177 修复）
+```
+
+```
+##### 官方 #####
+Last password change					: Aug 05, 2025
+Password expires					: never
+Password inactive					: never
+Account expires						: never
+Minimum number of days between password change		: 0
+Maximum number of days between password change		: 99999
+Number of days of warning before password expires	: 7
+chage 真实退出码 = 0
+
+##### bxroot（修后，本轮已修 174..177）#####
+chage: failed to drop privileges (Function not implemented)
+chage 真实退出码 = 1
+```
+
+### 6.9 受控实验：找出 `chage` 的**充分必要**阻塞集
+
+在一个**临时副本**（`/root/idfix/setter-exp`）上把 `emulate_errno()`
+改成可配置（表内返回 0、表外维持 ENOSYS），工作副本的 `sigsys.c` 未动。
+
+```sh
+for SET in "" "143" "143,145" "143,145,159" ...; do
+  BXROOT_EXP_SET="$SET" ... --preload libbxroot-exp.so ... chage -l root
+done
+```
+
+```
+--- BXROOT_EXP_SET='' ---
+chage: failed to drop privileges (Function not implemented)
+退出码=1
+--- BXROOT_EXP_SET='143' ---
+chage: failed to drop privileges (Function not implemented)
+退出码=1
+--- BXROOT_EXP_SET='143,145' ---
+Last password change					: Aug 05, 2025
+Password expires					: never
+退出码=0
+--- BXROOT_EXP_SET='143,145,159' ---
+Last password change					: Aug 05, 2025
+Password expires					: never
+退出码=0
+```
+
+**充分必要集 = `{143 setregid, 145 setreuid}`**（144/146/149/151/152/159 加了
+不会更好，不加也不影响 `chage`）。
+
+输出与官方逐字一致：
+
+```sh
+diff /root/idfix/chage/out_off.txt /root/idfix/chage/out_exp.txt
+```
+
+```
+✅ 逐字一致
+```
+
+### 6.10 缺口 D 的原始证据（`passwd` / `getent`）
+
+```
+##### passwd 现状 + SIGSYS 日志 #####
+[bxroot] sigsys 模拟层已安装
+passwd: user 'root' does not exist          ← 无任何 "模拟 syscall" 行
+
+##### passwd 实验组(143,145) + SIGSYS 日志 #####
+[bxroot] sigsys 模拟层已安装
+passwd: user 'root' does not exist          ← 补了 setter 也没用
+```
+
+```
+--- off : root:x:0:0:root:/root:/bin/bash
+--- bx : （空）
+```
+
+```
+--- id (off) : uid=0(root) gid=0(root) groups=0(root)
+--- id (bx)  : uid=0(root) gid=0 groups=0
+```
+
+`passwd -S root`：官方 `root L 2025-08-05 0 99999 7 -1` rc=0；
+bxroot `passwd: user 'root' does not exist` rc=1。**两侧差异与 setter 无关。**
+
 ---
 
 ## 七、与预期不符之处（汇总）
@@ -585,6 +857,9 @@ node[1]: pthread_create: Invalid argument
 | 6 | `setfsuid/setfsgid` 返回旧值 | 官方 **libc** 侧返回 0，**`syscall()` 侧返回 999** | 两条路返回值语义不同；照抄 `x0=0` 会错 |
 | 7 | ——（描述未提） | gcc 把"桩内自增 / main 读取"当两个对象，桩被调用而计数器读 0 → 断言恒真 | 观测值一律 `volatile`（已改） |
 | 8 | `getresuid` 是否要处理"由你判断" | 官方**已覆盖**（sym 列 0/0/0），bxroot **未覆盖**（10655） | 这是一个**真实且确认**的缺口，见缺口 B |
+| 9 | **降权族"收益不明确，链已断"**（我自己初版的理由 3） | **被推翻**：修完 174..177 后 `chage` **仍然** rc=1，官方 rc=0。glibc 的降权是**无条件调用**，与 `getuid()` 无关 | 缺口 C **真实存在**。§5.4 已更正，教训是"引用了结论 ≠ 检验了结论" |
+| 10 | ——（描述未提） | `chage` 的阻塞集**恰好是 `{143 setregid, 145 setreuid}` 两个号**（逐步扩大的受控实验） | 缺口 C 的代价比预想**小得多**：不是 9 个号的表 |
+| 11 | `passwd`/`su` 与 `chage` 同类 | `passwd -S root` 的失败**零 SIGSYS 命中**，是**用户库查询**缺陷（`getent passwd root` 返回空） | 新缺口 **D**，与 B/C 修复路径完全不同，不可混做 |
 
 ---
 
@@ -593,13 +868,116 @@ node[1]: pthread_create: Invalid argument
 | 缺口 | 内容 | 官方 | bxroot | 建议 |
 |---|---|---|---|---|
 | **A** | `svc #0` 真·裸层 | 不伪造 | 不伪造 | **不是缺口，是两侧一致**。不要试图修 |
-| **B** | `148/150`（getresuid/getresgid）、`158`（getgroups） | 已覆盖 | 未覆盖 | **建议下一个任务做**：风险与 174..177 同级（`syscall_guard.c` 里加 3 个 case + 一次指针写回），收益确定（官方已覆盖，且 dpkg/postinst 大量用 `getresuid`） |
-| **C** | 降权族 9 个 setter | 假装成功 | ENOSYS | **建议先不做**，理由见 §5.4；若要做，先按 §5.5 做受害者命令的两侧对照 |
+| **B** | `148/150`（getresuid/getresgid）、`158`（getgroups） | 已覆盖 | 未覆盖 | **下一个任务做**（本轮明确不做：并发 agent 太多）。实现要点见 §8.1 |
+| **C** | 降权族 setter | 假装成功 | ENOSYS | 缺口**真实存在**（`chage` 两侧不一致，§5.4.1）；是否做取决于 §5.4.5 的取舍。实现评估见 §5.6 |
+| **D** | **用户/组库查询**（`getent passwd`、`passwd -S`、`id` 的组名反查） | 正常 | 空/失败 | **本轮新发现**，与 B/C 都无关，见 §8.2 |
 
-**缺口 B 的实现要点（供下个任务参考）**：`148/150` 的 `a0/a1/a2` 是
-三个 `uid_t*`，需要**判空后逐个写回**（客户允许传 NULL，内核语义是
-"不关心这一项"）—— 这正是本项目在 `statx` 的 `a4=NULL` 上踩过的
-同一类坑，已在 `test/test_id_syscall_guard.c` 里留了 NULL 边界的写法
-可直接照抄。`158 getgroups` 更麻烦：长度与内容必须自洽
-（`size==0` 返回个数、`size<n` 返回 EINVAL），且要与
-`preload.c` 的 `getgroups` 钩子返回**同一个**组表，否则又是一处漂移。
+### 8.1 缺口 B 的完整实现要点（留给下一轮）
+
+**改动面**：`src/runtime/syscall_guard.c` 一处（`return ret` 之前的同一个
+`switch`），`src/runtime/preload.c` 的 `bxroot_fakeroot_ids()` **需要扩展**
+（当前只给 uid/gid 两个值，不够用）。
+
+#### 8.1.1 接口扩展（必须先做，否则 B 做不了）
+
+`148/150` 一次要写**三个**值（real/effective/saved），而当前入口只有
+两个出参。且 `getresuid` 的三个值**不是**同一个数 —— 它们来自
+`fakeroot_state` 的 `ruid/euid/suid`（`getresgid` 取
+`rgid/egid/sgid`），**在 `setresuid(-1,1000,-1)` 之后会各不相同**。
+
+所以 **不要**把 `bxroot_fakeroot_ids` 改成给三个 uid 就完事（那会让
+`getgid` 也跟着拿 uid 的值）—— 正确做法是**再加一个独立入口**：
+
+```c
+/* preload.c 追加（与现有入口并列，不改动它） */
+int bxroot_fakeroot_res_ids(unsigned int *ruid, unsigned int *euid,
+                           unsigned int *suid, unsigned int *rgid,
+                           unsigned int *egid, unsigned int *sgid);
+```
+
+返回 0=未启用 / 1=已启用并已写满六个出参。**判据仍用 `g_fakeroot_on`**
+（与 `getuid` 钩子同源，理由见 §4.1 的注释）。
+
+#### 8.1.2 `syscall_guard.c` 的三个新 case
+
+```c
+case 148:   /* getresuid(uid_t *r, uid_t *e, uid_t *s) */
+case 150:   /* getresgid(gid_t *r, gid_t *e, gid_t *s) */
+```
+
+**四条硬性注意**（每条都有前车之鉴）：
+
+1. **每个指针都要单独判空**。客户可以传 NULL 表示"这一项不关心"
+   （内核语义），`getresuid(&r, NULL, &s)` 是合法的。**三个参数分别判**，
+   不能"有一个 NULL 就整体跳过" —— 内核的语义是逐项写。
+   这正是本项目在 `statx` 的 `a4=NULL` 上踩过的同一类坑
+   （见 §4.4 的负向判据写法，可直接照抄）。
+2. **写回的是 `uid_t`（4 字节），不是 `long`**。`raw_syscall6` 的
+   `a0/a1/a2` 是 `long`（8 字节），**必须 `(int *)` 而非 `(long *)` 解引用**
+   —— 写成 `long *` 会写坏相邻 4 字节。这是"参数宽度"类缺陷，
+   本项目在 statx 的 `stx_mode` 宽度上出过同款。
+3. **`ret == 0` 才写回**。失败时内核没写缓冲，改它就是碰运气
+   （与 statx 补丁的门控一致）。
+4. **`number` 逐个 `case`**，不写范围。
+
+#### 8.1.3 `158 getgroups` —— 明显更难，建议单独一轮
+
+| 难点 | 说明 |
+|---|---|
+| 返回值双重语义 | `size==0` 时返回**组数**且不写缓冲；`size<n` 时返回 -1/EINVAL；否则写 `size` 个元素并返回 `n` |
+| 长度必须自洽 | 组表长度来自 `fakeroot_state.ngroups`，必须与 `preload.c` 的 `getgroups` 钩子返回**同一个**表 |
+| 元素宽度 | `gid_t`（4 字节），同上第 2 条 |
+| 缓冲大小由客户给 | 必须在**写入前**校验 `size >= n`，否则越界写 |
+
+**★ 必须与 `preload.c` 的 `getgroups` 钩子同源**（`fakeroot_state.groups`
++ `ngroups`），**不要**在 guard 里另建一份组表 —— 那就是 §4.1 反复警告的
+"同一套规则写两处"。当前实测：`libc getgroups(0,NULL)` 在 fakeroot 下返回
+**0**（`g_fakeroot_on` 分支，`ngroups` 为 0），而 `syscall(158)` 返回
+**6**（真实组表）—— 这个矛盾本身就是缺口 B 的一部分。
+
+#### 8.1.4 缺口 B 必须先有的测试
+
+1. `syscall(148)`/`syscall(150)` 在 fakeroot 开/关下分别返回伪造值/真值；
+2. **三个指针的 NULL 组合**（`(NULL,NULL,NULL)`、`(&r,NULL,NULL)` 等）
+   都不能崩溃、且只写非 NULL 的那几个；
+3. **宽度**：在缓冲区**前后各放哨兵**，断言只被改写了 4 字节；
+4. `syscall(158)` 的 `size==0` / `size<n` / `size>=n` 三种分支；
+5. `syscall(158)` 与 `libc getgroups` 返回**同一个**表（自洽性）；
+6. **负向**：`172/178/174..177` 仍不受影响（防"加 148/150 时把邻近号卷进来"）。
+
+### 8.2 ★ 缺口 D：用户/组库查询（本轮新发现）
+
+**这不是降权族，也不是身份读取**，是一个独立缺陷。最初是在分析
+`passwd -S root` 为何失败时发现的 —— 它**一次 SIGSYS 都没撞**，
+排除了 setter 族，继续追才定位到这里。
+
+```sh
+getent passwd root
+```
+
+```
+--- 官方 : root:x:0:0:root:/root:/bin/bash
+--- bxroot: （空）
+```
+
+```sh
+id
+```
+
+```
+--- 官方 : uid=0(root) gid=0(root) groups=0(root)
+--- bxroot: uid=0(root) gid=0 groups=0        ← 注册名/组名反查缺失
+```
+
+**受害命令**：`passwd -S root`（官方 rc=0 输出 `root L 2025-08-05 …`，
+bxroot rc=1 报 `passwd: user 'root' does not exist`）。
+
+**方向（未定位到根因，仅记录观测）**：`getent`/`passwd` 走的是
+NSS 路径（`/etc/nsswitch.conf` → `files` → 读 `/etc/passwd`），
+或 `getpwuid`/`getpwnam` 的符号路径。`id` 能拿到 uid/gid 却拿不到
+名字，说明 **`getpwuid`/`getgrgid` 这一族在 bxroot 下返回了空**。
+
+**为什么单列**：它与缺口 B/C 的修复路径**完全不同**（B/C 在
+`syscall_guard.c` + `sigsys.c`，D 大概率在 `preload.c` 的 NSS 符号
+或 `/etc/passwd` 的路径翻译上），混在一起做会互相干扰判断。
+**下一轮应该先单独定位 D 的根因**，再决定它与 B 的先后。

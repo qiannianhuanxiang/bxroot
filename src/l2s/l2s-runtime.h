@@ -60,7 +60,7 @@ typedef struct {
     int     (*rename)(const char *oldpath, const char *newpath);
     int     (*unlink)(const char *path);
     ssize_t (*readlink)(const char *path, char *buf, size_t bufsiz);
-    /* PRoot 用 access(F_OK) 探测候选中间层是否已被占用，它**跟随**符号链接，
+    /* 参考实现 用 access(F_OK) 探测候选中间层是否已被占用，它**跟随**符号链接，
      * 所以悬空的中间层算「空闲」。注入方必须复现这一点。 */
     int     (*access)(const char *path, int mode);
 
@@ -143,7 +143,7 @@ int l2s_rt_rename(const char *oldpath, const char *newpath);
  * 旧行为是把中间层名「还原」成客户本来的名字再返回成功。实测证明那个
  * 返回值会让客户判定"它是符号链接"，与 lstat 报的 S_IFREG **自相矛盾**，
  * 后果是真实工具链损坏（`cp -a` 报 ELOOP、`tar` 按符号链接归档并把宿主
- * 绝对路径写进归档）。官方 proroot 对同一路径返回 EINVAL，两者自洽。
+ * 绝对路径写进归档）。参考实现 对同一路径返回 EINVAL，两者自洽。
  *
  * ★ 但第 2 条来源（/proc/self/fd/N）必须继续返回还原名 ★
  *
@@ -166,7 +166,7 @@ int l2s_rt_rewrite_readlink(const char *path, const char *raw_target,
  * 用途：open/openat 带 O_NOFOLLOW 时不能让内核走到那条符号链接上
  * （内核会回 ELOOP）。客户从 lstat 得知这是普通文件，于是 coreutils
  * 的 `cp -a` 会用 O_NOFOLLOW 打开它 —— 内核看到的是符号链接，直接
- * ELOOP，`cp -a` 失败。官方 proroot 不会：它在系统调用入口就把路径
+ * ELOOP，`cp -a` 失败。参考实现不会：它在系统调用入口就把路径
  * 换成了数据文件，内核根本见不到那条链接。
  *
  * 返回 1 = 已解析（out 里是宿主侧的数据文件路径）；
@@ -205,7 +205,7 @@ void l2s_rt_patch_statx(unsigned int *stx_nlink, unsigned int *stx_mask,
 /*
  * statx 的完整补丁：同时改写 stx_nlink 与 stx_mode 的 S_IFMT 位。
  *
- * 存在的理由是一处**实测缺陷**：官方 proroot 在裸 statx 路径上把伪造
+ * 存在的理由是一处**实测缺陷**：参考实现在裸 statx 路径上把伪造
  * 链接的 stx_mode 报成 S_IFREG（实测 mode=0100600 islnk=0），而只补
  * nlink 的版本会让 lstatSync().isSymbolicLink() 仍为 true —— 客户照样
  * 看穿模拟。
