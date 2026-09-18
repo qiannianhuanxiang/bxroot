@@ -460,6 +460,26 @@ if [ -f test/RUN_D3_FIXUP.sh ]; then
 fi
 
 # =====================================================================
+# D3 同族：realpath 返回值反向翻译（源码级单元，见 probe_realpath_fixup.c 头注）
+# =====================================================================
+#
+# 与上一项的分工：上一项钉「readlink 系返回值」（/proc/fd、/proc/cwd），
+# 本项钉「realpath 系返回值」（realpath / __realpath_chk /
+# canonicalize_file_name 三个入口）。修前返回的是宿主绝对路径，
+# tar/git 的绝对路径与路径相等性判断全错（评估报告 8.2）。
+# 两者共用 strip_rootfs_prefix_inplace + detranslate_binds 反向核心。
+if [ -f test/RUN_REALPATH_FIXUP.sh ]; then
+    run_step "realpath 返回值反向翻译" sh test/RUN_REALPATH_FIXUP.sh
+fi
+
+# =====================================================================
+# RAW_SYSCALL 透传开关（源码级单元，见 probe_raw_syscall.c 头注）
+# =====================================================================
+if [ -f test/RUN_RAW_SYSCALL.sh ]; then
+    run_step "RAW_SYSCALL 透传开关" sh test/RUN_RAW_SYSCALL.sh
+fi
+
+# =====================================================================
 # 8c. l2s 端到端契约（依赖真机 rootfs；不在真机上会自行跳过）
 # =====================================================================
 #

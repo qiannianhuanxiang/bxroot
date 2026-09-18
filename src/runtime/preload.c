@@ -123,6 +123,8 @@ static int l2s_real_rename(const char *o, const char *n);
 static int l2s_real_unlink(const char *p);
 static ssize_t l2s_real_readlink(const char *p, char *b, size_t sz);
 static int readlink_fixup(const char *raw, char *out, size_t outsz);   /* D3: /proc 泄漏反向翻译 */
+static int strip_rootfs_prefix_inplace(char *buf);                     /* 剥 rootfs 前缀核心（定义在 getcwd_fixup 前） */
+static int realpath_fixup_inplace(char *buf, size_t cap);              /* realpath 返回值反向翻译 */
 static int l2s_real_access(const char *p, int m);
 static int l2s_real_read_small(const char *p, char *b, size_t sz, size_t *len);
 static int l2s_real_write_small(const char *p, const char *b, size_t len);
@@ -285,9 +287,79 @@ static void parse_binds(void) {
     LOG("bind mounts: %d", g_config.bind_count);
 }
 
+/*
+ * ==================================================================
+ * 任务 3.5：PROROOT_* 旧前缀防呆警告
+ * ==================================================================
+ *
+ * 本项目曾整体改名 PROROOT_* → BXROOT_*（RENAME-REPORT.md §2.3）。
+ * 旧名与官方名都是 PROROOT_*：手滑写回旧前缀（或沿用旧 Java 侧 /
+ * 旧文档示例）时，getenv 全部落空，runtime **静默**按另一套默认配置
+ * 跑（rootfs 回到编译期默认、/tmp 回退等）—— 排查方向会先指向容器
+ * 内部而不是"变量拼错了"。这里在配置初始化时探测一次，把症状拉回
+ * 真正的原因。
+ *
+ * 【只对真实存在的变量做】逐对列出"旧名 + runtime 侧真实读取点"：
+ *     ROOTFS    preload.c  BXROOT_ROOTFS（init_config）
+ *     TMP_DIR   preload.c  BXROOT_TMP_DIR（init_config）
+ *     GUEST_EXE preload.c  BXROOT_GUEST_EXE（init_config）
+ *     WORKDIR   preload.c  BXROOT_WORKDIR（init_config）
+ *     FAKEROOT  preload.c  BXROOT_FAKEROOT（init_config）
+ *     BINDS     preload.c  BXROOT_BINDS（parse_binds）
+ *     VERBOSE   preload.c  BXROOT_VERBOSE（init_config）
+ *     L2S_DIR   preload.c  BXROOT_L2S_DIR（init_l2s）
+ *     FORCE_NO_LDSO_SERVICE  preload.c（ldso 服务开关）
+ * 刻意**不**枚举 PROROOT_LINKER_PATH/STUB_LOADER/LIB_PATH/LINKER/
+ * RUNTIME 等：它们只被 launcher/Java 侧消费，runtime 从不读取，
+ * 列进来是给不存在的行为发警告。
+ *
+ * 【每进程最多一次】g_prefix_warned 打点；配置只初始化一次，但本
+ * 函数与 init_config 解耦，防将来出现二次初始化路径时刷屏。
+ */
+static void warn_stale_proroot_env(void) {
+    static const struct {
+        const char *old_name;   /* 旧/官方前缀变量名 */
+        const char *new_name;   /* runtime 侧真实读取的 BXROOT_ 名 */
+    } stale_map[] = {
+        { "PROROOT_ROOTFS",   "BXROOT_ROOTFS" },
+        { "PROROOT_TMP_DIR",  "BXROOT_TMP_DIR" },
+        { "PROROOT_GUEST_EXE","BXROOT_GUEST_EXE" },
+        { "PROROOT_WORKDIR",  "BXROOT_WORKDIR" },
+        { "PROROOT_FAKEROOT", "BXROOT_FAKEROOT" },
+        { "PROROOT_BINDS",    "BXROOT_BINDS" },
+        { "PROROOT_VERBOSE",  "BXROOT_VERBOSE" },
+        { "PROROOT_L2S_DIR",  "BXROOT_L2S_DIR" },
+        { "PROROOT_FORCE_NO_LDSO_SERVICE", "BXROOT_FORCE_NO_LDSO_SERVICE" },
+    };
+    static int g_prefix_warned = 0;
+    size_t k;
+
+    if (g_prefix_warned)
+        return;
+
+    for (k = 0; k < sizeof(stale_map) / sizeof(stale_map[0]); k++) {
+        const char *oldv = getenv(stale_map[k].old_name);
+
+        if (oldv != NULL && oldv[0] != '\0' &&
+            getenv(stale_map[k].new_name) == NULL) {
+            fprintf(stderr,
+                    "[bxroot] 警告: 检测到 %s 环境变量但未设 %s"
+                    "（是否拼写/迁移遗漏？）: %s\n",
+                    stale_map[k].old_name, stale_map[k].new_name,
+                    stale_map[k].old_name);
+            g_prefix_warned = 1;
+            /* 只报第一条：一句话点破根因即可，逐条刷屏没有增量信息 */
+            return;
+        }
+    }
+}
+
 /* 初始化配置 */
 static void init_config(void) {
     const char *env;
+
+    /* 任务 3.5：先探测旧前缀变量，再按新名读配置 —— 见函数头注释。 */
+    warn_stale_proroot_env();
 
     /*
      * rootfs。
@@ -1950,15 +2022,92 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
     return n;
 }
 
+/*
+ * realpath 返回值的反向翻译（8.2 修复）。
+ *
+ * realpath()/canonicalize_file_name() 解析符号链接后返回的是**宿主绝对
+ * 路径**（正向翻译过的 path 交给 real_realpath，内核在宿主上解析），
+ * 客户期望的是 **guest 视角**。不修的实测后果：tar/git 的绝对路径、
+ * 路径相等性判断全错 —— 同一个文件经两条 API 得到两个"不同"的名字。
+ *
+ * 改写规则与 getcwd_fixup 完全一致（先剥 rootfs 前缀，再反 bind）：
+ *   1. 剥 $ROOTFS 前缀（仅组件边界；剥后空串说明正在 rootfs 根 → "/"）；
+ *   2. detranslate_binds：结果仍落在某个 bind 的 source（宿主路径）下时，
+ *      换回 target（guest 名）。bind source 命中时以 detranslate_binds
+ *      的结果为准 —— 与 getcwd_fixup 的串联顺序一致：先脱 rootfs，再脱 bind。
+ *
+ * 返回 1 = buf 已重写；0 = 保持 real_realpath 的返回值。
+ *
+ * ★ 原地 memmove 的安全性论证 ★
+ * 两个步骤都只让字符串变短或等长（剥前缀是 memmove 前移；bind 反查的
+ * target 语义上是 guest 短名，且 snprintf 截断保护兜底），因此可以在
+ * 调用方的缓冲上原地修整 —— resolved_path 给的栈缓冲和 glibc malloc
+ * 返回的堆缓冲（realpath(path, NULL)）都适用。
+ *
+ * cap = 缓冲可用字节数：
+ *   - 栈缓冲传 sizeof(buf)；
+ *   - glibc malloc 返回的堆缓冲没有可查的容量，传 SIZE_MAX 表示
+ *     "不会越界"（与 getcwd(NULL, 0) 分支的既有先例一致 —— 剥前缀只缩
+ *     不涨，bind 反查的目标名也短于宿主前缀，实际不会写入超过原串长度）。
+ */
+static int realpath_fixup_inplace(char *buf, size_t cap)
+{
+    int changed;
+
+    if (buf == NULL)
+        return 0;
+
+    /* 第 1 步：剥 rootfs 前缀（组件边界；空余 → "/"） */
+    changed = strip_rootfs_prefix_inplace(buf);
+
+    /* 第 2 步：反向 bind 映射（source 命中时优先用它的结果）。
+     * 与 getcwd_fixup 顺序一致：先剥 rootfs，再反 bind —— 两者串联，
+     * 且 rootfs 之外的 bind 只有这一步能处理。 */
+    {
+        char reb[MAX_PATH_LEN];
+
+        if (detranslate_binds(buf, reb, sizeof(reb)) == 1) {
+            size_t need = strlen(reb) + 1;
+
+            if (need > cap)
+                return changed;         /* 放不下：保留已剥前缀的结果 */
+            memcpy(buf, reb, need);
+            return 1;
+        }
+    }
+    return changed;
+}
+
 /* Hook: realpath */
 char *realpath(const char *path, char *resolved) {
     ensure_real_functions();
 
     char translated[MAX_PATH_LEN];
-    if (translate_path(path, translated, sizeof(translated)) > 0) {
-        return real_realpath(translated, resolved);
-    }
-    return real_realpath(path, resolved);
+    char *r;
+
+    if (translate_path(path, translated, sizeof(translated)) > 0)
+        r = real_realpath(translated, resolved);
+    else
+        r = real_realpath(path, resolved);
+
+    if (r == NULL)
+        return NULL;   /* 失败路径：不动（8.2 任务约束 3） */
+
+    /*
+     * ★ resolved == NULL 分支也要修整 ★
+     *
+     * glibc 此时在堆上按需分配返回缓冲（realpath(path, NULL)，
+     * bash/dash 的 abs 目录解析走这条）。那里没有可查的容量，传
+     * SIZE_MAX —— 剥前缀只会变短，原地 memmove 安全
+     * （getcwd(NULL, 0) 分支已有同款处理先例）。
+     *
+     * 栈缓冲分支传 PATH_MAX：glibc 的契约是向 resolved 至多写
+     * PATH_MAX 字节（调用方因此按 PATH_MAX 备缓冲），cap 取同一值
+     * 可保证 bind 反查的 memcpy 绝不越过调用方缓冲的真实边界
+     * （sizeof(translated)=8192 会虚高，不能用）。
+     */
+    realpath_fixup_inplace(r, resolved == NULL ? SIZE_MAX : (size_t)PATH_MAX);
+    return r;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2307,15 +2456,16 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
 /*
  * __realpath_chk(path, resolved, resolvedlen)
  *
- * 注意实时翻译方向问题：realpath 返回的是**宿主绝对路径**，
- * 客户期望看到 guest 路径。这一步的反向翻译我们暂未实现
- * （需要知道 rootfs 前缀并做前缀剥离），因此这里只做正向翻译，
- * 保持与现有 realpath hook 的行为一致 —— 不引入新的不一致。
+ * 翻译方向与 realpath hook 一致：正向翻译入参，返回值反向翻译。
+ * （历史上这里只做正向 —— 当时注释明确以"与现有 realpath hook 的
+ * 行为保持一致，不引入新的不一致"为约束；8.2 修复 realpath 后，
+ * 本函数同步跟进，否则反而制造出新的不一致。）
  */
 char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
     static char *(*fn)(const char *, char *, size_t) = NULL;
     char translated[MAX_PATH_LEN];
     const char *p = path;
+    char *r;
 
     if (fn == NULL)
         fn = (char *(*)(const char *, char *, size_t))
@@ -2324,7 +2474,16 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
-    return fn(p, resolved, resolvedlen);
+
+    r = fn(p, resolved, resolvedlen);
+    if (r == NULL)
+        return NULL;   /* 失败路径：不动 */
+
+    /* resolved == NULL 时 glibc malloc 返回堆缓冲 → SIZE_MAX（同 realpath）；
+     * 否则调用方给了 resolvedlen（_FORTIFY_SOURCE 保证 >= PATH_MAX），
+     * 直接用真实容量。 */
+    realpath_fixup_inplace(r, resolved == NULL ? SIZE_MAX : resolvedlen);
+    return r;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2841,12 +3000,13 @@ char *getcwd(char *buf, size_t size) {
  * Hook: canonicalize_file_name(path)
  *
  * 等价于 realpath(path, NULL)（glibc 扩展），cp/mv/stat 都在用。
- * 翻译方向与 realpath 一致。
+ * 翻译方向与 realpath 一致：正向翻译入参，返回值反向翻译（8.2 修复）。
  */
 char *canonicalize_file_name(const char *path) {
     static char *(*fn)(const char *) = NULL;
     char translated[MAX_PATH_LEN];
     const char *p = path;
+    char *r;
 
     if (fn == NULL)
         fn = (char *(*)(const char *))bxroot_next_symbol("canonicalize_file_name");
@@ -2854,7 +3014,15 @@ char *canonicalize_file_name(const char *path) {
 
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
-    return fn(p);
+
+    r = fn(p);
+    if (r == NULL)
+        return NULL;   /* 失败路径：不动 */
+
+    /* 无缓冲实参，glibc 必走 malloc 返回 → SIZE_MAX（同 realpath 的
+     * resolved == NULL 分支）。 */
+    realpath_fixup_inplace(r, SIZE_MAX);
+    return r;
 }
 
 /*

@@ -216,7 +216,10 @@ Node 全部 `ENOENT`。
 | `BXROOT_TMP_DIR` | 临时目录 |
 | `BXROOT_VERBOSE` | 排障日志（**部分日志为 debug 构建编译期开关**：release 包中仅 proc 等运行期日志生效，`preload.c` 的 LOG 需 `make debug`/`-DBXROOT_VERBOSE=1` 重编才完整） |
 | `BXROOT_SCG` | `syscall` 层追踪 |
+| `BXROOT_RAW_SYSCALL` | 置 1 时对「因 Android 策略而中和」的调用（io_uring 家族 425/426/427）**真透传**，不再恒定回 `ENOSYS`，由真实内核/宿主 seccomp 给出答案 —— 适用于非 Android 环境（如通用 seccomp profile 的普通容器）。身份/降权伪装与路径翻译不受影响；`0` 或未设时行为不变 |
 | `BXROOT_NO_AUTORUN` | 置 1 跳过 runtime 构造链（源码级单元测试专用，正常使用勿设） |
+
+> 提示：检测到 `PROROOT_*`（旧名/官方名）环境变量但未设对应 `BXROOT_*` 时，启动会向 stderr 打一行拼写/迁移防呆警告（每进程最多一次）。
 
 ### 已知行为边界（如实告知）
 

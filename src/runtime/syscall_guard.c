@@ -301,8 +301,87 @@ static int looks_like_guest_abs_path(const char *p)
 /* 危险系统调用判定                                                    */
 /* ------------------------------------------------------------------ */
 
+static void init_trace(void);
+
 /*
- * 是否应当在本层拦截（不发 svc，直接返回 ENOSYS）。
+ * ====================================================================
+ * BXROOT_RAW_SYSCALL —— "Android 策略中和"的透传开关（任务 3.6/8.3）
+ * ====================================================================
+ *
+ * 【为什么需要它】
+ * should_block() 里那几个号（io_uring 家族 425/426/427）是针对**本
+ * 宿主 loader 的 seccomp 策略**实测得来的：在 Android 沙箱里这些调用
+ * 一旦发出就 KILL_PROCESS 且不投递信号，必须从源头不发出。但在
+ * **非 Android** 平台（例如通用 seccomp profile 的普通容器）并没有
+ * 那条策略，恒定 ENOSYS 反而误伤合法调用（评估报告 3.6/8.3 记录的
+ * apt 的 setgroups 报 ENOSYS 就是这一类症状）。
+ *
+ * 【语义】
+ *   - BXROOT_RAW_SYSCALL=1 → 因 Android 策略而中和的调用**真透传**：
+ *     照常发出 svc，由真实内核回答（支持就是支持，不支持就 ENOSYS，
+ *     seccomp 要拦也按宿主自己的策略来）。我们不再替内核做决定。
+ *   - BXROOT_RAW_SYSCALL=0 或未设 → 行为与历史版本**逐位一致**。
+ *
+ * 【为什么只放开 425/426/427，别的一概不放开 —— 判据写死在这里】
+ * 本文件里"伪装"共有三类，性质完全不同：
+ *
+ *   ① Android 策略中和（should_block 的 425/426/427）：唯一一类
+ *      "Android 没有就会误伤"的中和 —— 放开是安全的，内核自己会给出
+ *      正确答案。★ 本开关只作用这一类。★
+ *   ② 身份账本/降权族模拟（174..177、148/150、158、143..152/159）：
+ *      与**能力无关的视图伪装**，不是 Android 策略 —— 客户"自认为
+ *      root"依赖这套自洽视图（setgid 后 getgid 要变成新值），透传反而
+ *      制造自相矛盾。保持原行为。
+ *   ③ 路径翻译 + statx 结果补丁：容器的核心功能，放开了 l2s 硬链接
+ *      模拟立刻失效。与开关无关，永远照做。
+ *
+ * 【读取方式为什么不用 getenv】
+ * 与 init_trace() 同一理由（构造函数极早期可能被调用，且本文件
+ * 不用 stdio），直接扫 environ 找精确的 "BXROOT_RAW_SYSCALL=1"。
+ * 扫描结果缓存：环境变量在进程生命周期内不会变，每条 syscall 都扫
+ * environ 是可测的纯开销。
+ */
+/*
+ * 开关缓存。放文件作用域而不是函数内 static：源码级单元测试
+ * （test/probe_raw_syscall.c）需要重置 g_raw_init 来驱动
+ * "重扫 environ"，函数内 static 在外部不可见。
+ */
+static int g_raw_init;
+static int g_raw_enabled;
+
+static int raw_passthrough_enabled(void)
+{
+    if (!g_raw_init) {
+        extern char **environ;
+        char **e;
+
+        g_raw_init = 1;
+        /* 重扫 = 重算：先清旧结论，否则上一轮的 1 会跨轮泄漏
+         * （源码级单测 test/probe_raw_syscall.c 组 4 钉的就是这条）。 */
+        g_raw_enabled = 0;
+        for (e = environ; e != NULL && *e != NULL; e++) {
+            if (e[0][0] == 'B' && e[0][1] == 'X' &&
+                e[0][2] == 'R' && e[0][3] == 'O' &&
+                e[0][4] == 'O' && e[0][5] == 'T' &&
+                e[0][6] == '_' && e[0][7] == 'R' &&
+                e[0][8] == 'A' && e[0][9] == 'W' &&
+                e[0][10] == '_' && e[0][11] == 'S' &&
+                e[0][12] == 'Y' && e[0][13] == 'S' &&
+                e[0][14] == 'C' && e[0][15] == 'A' &&
+                e[0][16] == 'L' && e[0][17] == 'L' &&
+                e[0][18] == '=' && e[0][19] == '1') {
+                g_raw_enabled = 1;
+                break;
+            }
+        }
+    }
+    return g_raw_enabled;
+}
+
+/*
+ * ====================================================================
+ * 宿主 loader 的 seccomp 策略以 KILL_PROCESS 禁止的调用
+ * ====================================================================
  *
  * 编号取自 asm-generic（aarch64 使用同一套编号）：
  *   425 io_uring_setup / 426 io_uring_enter / 427 io_uring_register
@@ -310,9 +389,26 @@ static int looks_like_guest_abs_path(const char *p)
  * 这三个是已实测确认被 宿主 loader 的 seccomp 策略以 KILL_PROCESS
  * 方式禁止的。libuv 在启动事件循环时会尝试 io_uring_setup；返回
  * ENOSYS 后它会**自动回退到 epoll**，这是它既有的代码路径。
+ *
+ * 【判据 —— 哪些放行、哪些必须伪装（任务 3.6/8.3 要求写明）】
+ * 本名单只收"**因 Android 策略而中和**"的调用：它们被禁的原因是
+ * 宿主 seccomp 过滤器会杀进程，而不是内核缺能力。因此：
+ *   - BXROOT_RAW_SYSCALL=1 时原样放行（见 raw_passthrough_enabled）：
+ *     真透传、不做 ENOSYS 伪装，在非 Android 平台上由真实内核回答；
+ *   - 未置位时维持恒定 ENOSYS（Android 上不伪装 = 进程被杀）。
+ *
+ * 与架构/能力相关、**必须保持伪装**的调用不在本名单内（判据见
+ * raw_passthrough_enabled 注释里的三类划分）：
+ *   - 身份/降权族（174..177、148/150、158、143..152、159）——
+ *     视图伪装 + 用户态账本，透传会让"自认为 root"的世界自相矛盾；
+ *   - 路径翻译（path_arg_mask 表内各号）与 statx(291) 结果补丁 ——
+ *     容器核心功能，不是 Android 策略中和。
  */
 static int should_block(long nr)
 {
+    if (raw_passthrough_enabled())
+        return 0;
+
     switch (nr) {
     case 425:
     case 426:
@@ -593,6 +689,12 @@ long syscall(long number, ...)
     args[0] = &a0; args[1] = &a1; args[2] = &a2;
     args[3] = &a3; args[4] = &a4; args[5] = &a5;
 
+    /*
+     * Android 策略中和（io_uring 家族）：未置 BXROOT_RAW_SYSCALL=1 时
+     * 在此回 ENOSYS；置位后 should_block() 对它们返回 0，继续向下走
+     * path_arg_mask() == 0 的路径，最后由 raw_syscall6 发出真实 svc ——
+     * 由真实内核/宿主 seccomp 策略给出答案（真透传，无伪装）。
+     */
     if (should_block(number)) {
         g_blocked++;
         if (g_trace)

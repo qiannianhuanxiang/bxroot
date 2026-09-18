@@ -1,7 +1,8 @@
 # D3 缺陷确认与修复设计：/proc/self/fd/N readlink 泄漏宿主路径
 
 日期：2026-09-17 晚
-状态：**缺陷成立（代码层确凿），运行时复现受本容器验证边界限制**
+状态：**缺陷成立（代码层确凿）；已修复并单元验证（10/10）；运行时端到端
+验证受本容器 LD_PRELOAD 惰性限制，需真机复验**
 
 ---
 
@@ -88,7 +89,31 @@ static int readlink_fixup(const char *raw, char *out, size_t outsz);
 - 剥前缀只会让路径更短，原缓冲足够。
 - `/proc/self/exe` 伪装分支在其之前，不受影响。
 
-## 4. 验证方案（在 LD_PRELOAD 语义成立的环境）
+## 4. 已实施的修复与验证
+
+### 4.1 已实施（2026-09-18）
+
+- 新增 `strip_rootfs_prefix_inplace()`（从 getcwd_fixup 抽出的剥前缀核心）；
+- 新增 `readlink_fixup()`（判别 `/proc/<pid>/root`、`/proc/<pid>/root/<path>`、
+  普通宿主路径；socket/pipe/anon_inode 契约格式原样放行）；
+- `readlink` 与 `readlinkat` 两个钩子均接入（l2s 重写**之前**，避免破坏
+  l2s 的宿主路径 probe）；
+- 顺带新增 `BXROOT_NO_AUTORUN=1` 构造逃生门（源码级单元测试用）。
+
+### 4.2 单元验证（源码级，10/10 通过）
+
+`test/RUN_D3_FIXUP.sh` + `test/probe_d3_fixup.c`，已挂入 `test/RUN_ALL.sh`。
+覆盖：三类内核契约格式放行、`/proc/<pid>/root` 两种形态、rootfs 前缀剥
+离（含组件边界与"前缀相似不误剥"）。结果 10 通过 / 0 失败。
+
+回归：`test/RUN_ALL.sh` 21/21 全绿；项目警告门控零警告。
+
+### 4.3 待真机复验
+
+hook 的**运行时**生效需要 LD_PRELOAD 语义（本容器惰性）。真机上按下面
+矩阵复验一次即可闭环。
+
+## 5. 验证方案（在 LD_PRELOAD 语义成立的环境）
 
 判别输入：rootfs 内独有文件（如 `$ROOTFS/tmp/d3deep/f.txt`，宿主与容器
 内容/路径可区分），探针：
@@ -110,7 +135,7 @@ readlink(lp, buf, sizeof buf);
 | pipe/socket fd | `pipe:[123]` 不变 | 不变 ✅ |
 | bind source 下的 fd | 宿主 bind 源路径 ❌ | 反向 bind 后 guest 路径 ✅ |
 
-## 5. 方法论教训（本次实验的自省）
+## 6. 方法论教训（本次实验的自省）
 
 1. **直链 ≠ interpose**：`-l:lib...so` 只解析显式引用；LD_PRELOAD 的
    hook 生效依赖符号 interpose。用直链探针测 hook 行为是方法错误 ——

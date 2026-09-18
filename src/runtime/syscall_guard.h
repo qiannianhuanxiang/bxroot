@@ -9,6 +9,11 @@
  * 覆盖 libc 的，从源头不让该系统调用发出。
  *
  * 本层做同样的事：拦截 io_uring 家族，返回 ENOSYS，让 libuv 回退 epoll。
+ *
+ * 平台差异（评估报告 3.6/8.3）：这份"恒定 ENOSYS"名单针对 Android 宿主
+ * loader 的 seccomp 策略；非 Android 平台可用 BXROOT_RAW_SYSCALL=1 让
+ * 这一类调用真透传（由真实内核回答）。身份/降权伪装与路径翻译不受该
+ * 开关影响（判据见 syscall_guard.c 的 should_block 注释）。
  */
 
 #ifndef BXROOT_SYSCALL_GUARD_H
