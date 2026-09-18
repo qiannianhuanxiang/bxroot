@@ -263,10 +263,42 @@ static const char *cw_signame(int sig)
     }
 }
 
+/*
+ * 读取形如 NAME=1 的环境变量（异步信号安全：只扫 environ，不用 getenv）。
+ *
+ * 为什么不用 getenv：crash.c 的处理器路径刻意只用异步信号安全的原语，
+ * getenv 不在其列（它可能碰 malloc 内部状态）。这里直接线性扫描
+ * environ 数组，比较前缀与 "=1" 后缀。
+ *
+ * 返回 1 表示找到精确的 NAME=1，0 表示没有。
+ */
+static int cw_env_flag(const char *name)
+{
+    extern char **environ;
+    char **e;
+    size_t n = 0;
+
+    if (name == NULL || name[0] == '\0')
+        return 0;
+    while (name[n] != '\0')
+        n++;
+
+    for (e = environ; e != NULL && *e != NULL; e++) {
+        const char *v = *e;
+        size_t i;
+        for (i = 0; i < n; i++) {
+            if (v[i] != name[i])
+                break;
+        }
+        if (i == n && v[n] == '=' && v[n + 1] == '1' && v[n + 2] == '\0')
+            return 1;
+    }
+    return 0;
+}
+
 static void cw_handler(int sig, siginfo_t *info, void *uctx)
 {
-    ucontext_t *uc = (ucontext_t *)uctx;
-    uint64_t pc = 0, lr = 0, sp = 0, fp = 0, pstate = 0;
+    ucontext_t *uc = (ucontext_t *)uctx;    uint64_t pc = 0, lr = 0, sp = 0, fp = 0, pstate = 0;
     uint64_t fault = 0;
     int code = 0;
 
@@ -350,6 +382,50 @@ static void cw_handler(int sig, siginfo_t *info, void *uctx)
     cw_puts("\n");
 
     /*
+     * ★ 链式调用前置 handler（评估报告 8.4，opt-in）★
+     *
+     * 若在本处理器**之前**已有真实的 SIGSEGV/SIGBUS handler（如另一个
+     * 更早的 LD_PRELOAD 库 —— 典型是嵌套容器的外层运行时），置
+     * BXROOT_CRASH_CHAIN=1 时会先打印我们的现场、再把控制权交给它，
+     * 而不是让它永久失效。
+     *
+     * 【为什么默认关闭（opt-in）】
+     * 链式调用会**双重输出**：对方 handler 通常也打印现场。实测在本
+     * 容器里，外层 proroot 的 handler 被链式调用后，一次崩溃产生
+     * 「[bxroot] SIGSEGV ...」+「[proroot] SIGSEGV ...」两段 —— 破坏了
+     * 既有回归 T5 钉住的"恰好一次输出"保证（该保证与重入守卫绑定）。
+     * 因此默认行为与从前逐位一致；需要链式的环境显式开启。
+     *
+     * 只在前置处理体是真实函数时调用：SIG_DFL / SIG_IGN 没有可调用
+     * 的代码，误调会跳进地址 0/1。
+     */
+    if (cw_env_flag("BXROOT_CRASH_CHAIN")) {
+        const struct sigaction *prev =
+            (sig == SIGSEGV) ? &g_prev_segv :
+            (sig == SIGBUS)  ? &g_prev_bus  : NULL;
+
+        if (prev != NULL) {
+            /*
+             * struct sigaction 的 sa_handler / sa_sigaction 是同一个
+             * 存储位置（POSIX 定义为 union）。比对 SIG_DFL/SIG_IGN 时
+             * 转成 sa_handler 的统一类型，避免在 sa_sigaction 类型上
+             * 做不兼容的函数指针转换（-Wcast-function-type）。
+             */
+            void (*h1)(int) = prev->sa_handler;
+
+            if (prev->sa_flags & SA_SIGINFO) {
+                if (h1 != SIG_DFL && h1 != SIG_IGN) {
+                    void (*fn)(int, siginfo_t *, void *) = prev->sa_sigaction;
+                    fn(sig, info, uctx);
+                }
+            } else {
+                if (h1 != SIG_DFL && h1 != SIG_IGN)
+                    h1(sig);
+            }
+        }
+    }
+
+    /*
      * 不尝试恢复执行 —— 恢复几乎必然再次崩溃，只会刷屏。
      *
      * 恢复默认处理器后重新抛出，让内核按正常流程处理
@@ -387,6 +463,25 @@ int bxroot_crash_install(const char *tag)
 
     if (g_installed)
         return 0;
+
+    /*
+     * ★ BXROOT_NO_CRASH=1：让客户程序保留自己的 SIGSEGV/SIGBUS 处理器 ★
+     *
+     * 【为什么需要】
+     * 本处理器是**抢占式**安装的：LD_PRELOAD 运行时的构造函数早于
+     * 客户 main()，于是客户自己注册的崩溃处理器（node/V8 的
+     * OOM/assert handler、JVM、自带 core-dump 工具）在"后装者胜"
+     * 的规则下可能被我们覆盖或覆盖我们，结果不确定。
+     * 想完全自管崩溃处理的程序可置本开关，跳过我们的安装。
+     * （评估报告 8.4 的诉求；默认行为不变，保持开箱即用的现场捕获。）
+     *
+     * 【为什么不用 getenv】
+     * 本函数在构造早期被调用，crash.c 全篇刻意只用异步信号安全的
+     * 原语。这里复用 cw_env_flag() 扫 environ（与 syscall_guard.c 同思路）。
+     */
+    if (cw_env_flag("BXROOT_NO_CRASH"))
+        return 0;   /* 不安装；客户自管崩溃处理 */
+
     if (tag != NULL && tag[0] != '\0')
         g_tag = tag;
 

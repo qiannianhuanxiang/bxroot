@@ -12,6 +12,8 @@
 # 另加两项行为验证：
 #   T4 退出码必须是 139（128+SIGSEGV），父进程/脚本才能正确识别
 #   T5 重入守卫：崩溃后必须**恰好一次**输出，不能刷屏或死循环
+#   T6 BXROOT_NO_CRASH=1：客户自管崩溃处理时不抢占
+#   T7 后装者胜：客户在 bxroot 之后注册 handler 时由其接管
 set -e
 cd "$(dirname "$0")"
 
@@ -45,6 +47,8 @@ note "构建测试程序..."
 build t_null  t_null.c
 build t_write t_write.c
 build t_stack t_stack.c
+build t_nocrash t_nocrash.c
+build t_chain t_chain.c
 
 note ""
 note "T1 空指针解引用（SEGV_MAPERR）"
@@ -125,6 +129,36 @@ if [ "$n" = "1" ]; then
     ok "恰好输出一次（重入守卫生效）"
 else
     bad "输出了 $n 次，期望 1 次（重入守卫失效）"
+fi
+
+note ""
+note "T6 BXROOT_NO_CRASH=1（客户自管崩溃处理）"
+out=$(BXROOT_NO_CRASH=1 timeout 20 ./t_nocrash 2>&1 || true)
+if printf '%s' "$out" | grep -q 'NO_CRASH 生效'; then
+    ok "bxroot_crash_installed()=0（开关生效，未安装）"
+else
+    bad "开关未生效（bxroot 仍安装）"
+fi
+if printf '%s' "$out" | grep -q '客户 handler] 被调用'; then
+    ok "客户自己的 handler 被调用（未被 bxroot 抢占）"
+else
+    bad "客户 handler 未被调用"
+fi
+# 对照：不置开关时 bxroot 应安装
+out=$(timeout 20 ./t_nocrash 2>&1 || true)
+if printf '%s' "$out" | grep -q 'NO_CRASH 未生效'; then
+    ok "对照：未置开关时 bxroot 正常安装"
+else
+    bad "对照失败：未置开关时 bxroot 未安装"
+fi
+
+note ""
+note "T7 后装者胜（客户在 bxroot 之后注册 handler）"
+out=$(timeout 20 ./t_chain 2>&1 || true)
+if printf '%s' "$out" | grep -q '客户 handler] 被调用'; then
+    ok "客户后装的 handler 生效（覆盖 bxroot）"
+else
+    bad "客户 handler 未生效"
 fi
 
 note ""

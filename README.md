@@ -218,15 +218,19 @@ Node 全部 `ENOENT`。
 | `BXROOT_SCG` | `syscall` 层追踪 |
 | `BXROOT_RAW_SYSCALL` | 置 1 时对「因 Android 策略而中和」的调用（io_uring 家族 425/426/427）**真透传**，不再恒定回 `ENOSYS`，由真实内核/宿主 seccomp 给出答案 —— 适用于非 Android 环境（如通用 seccomp profile 的普通容器）。身份/降权伪装与路径翻译不受影响；`0` 或未设时行为不变 |
 | `BXROOT_NO_AUTORUN` | 置 1 跳过 runtime 构造链（源码级单元测试专用，正常使用勿设） |
+| `BXROOT_NO_CRASH` | 置 1 不安装崩溃处理器，由客户程序自管 SIGSEGV/SIGBUS |
+| `BXROOT_CRASH_CHAIN` | 置 1 打印现场后链式调用更早注册的 handler（默认关，开启会有双方各一段输出） |
 
 > 提示：检测到 `PROROOT_*`（旧名/官方名）环境变量但未设对应 `BXROOT_*` 时，启动会向 stderr 打一行拼写/迁移防呆警告（每进程最多一次）。
 
 ### 已知行为边界（如实告知）
 
 - **crash 处理器**：runtime 默认安装 SIGSEGV/SIGBUS 现场打印处理器
-  （崩溃时留现场而不是无声退出）。它会先于客户程序自身的 handler
-  收到信号；若你的程序自带崩溃自愈逻辑且被它干扰，属于已知取舍
-  （可改造为链式，未实现，见评估报告 8.4）。
+  （崩溃时留现场而不是无声退出）。客户在 `main()` 之后注册的 handler
+  会覆盖它（后装者胜）。若需完全自管崩溃处理，置 `BXROOT_NO_CRASH=1`；
+  若需在打印现场后把控制权交给**更早注册**的 handler（如嵌套容器的
+  外层运行时），置 `BXROOT_CRASH_CHAIN=1`（默认关闭 —— 链式会导致
+  双方各输出一段现场）。
 - **fakeroot 不等于真 root**：uid/gid/chmod 是用户态视图伪装，
   内核真实属主不变。依赖真实 uid 的检测（`make install` 的属主
   断言、部分 npm 安全校验）可能与真 root 有出入 —— 与官方 proot
