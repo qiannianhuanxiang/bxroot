@@ -199,7 +199,76 @@ struct fakeroot_map {
      */
     size_t   rehashes;   /* fr_map_compact 成功执行的次数 */
     size_t   compact_fail; /* fr_map_compact 因 ENOMEM/EFULL 失败的次数 */
+
+    /*
+     * ★ 多线程互斥（评估报告 8.7）★
+     *
+     * 【为什么必须有】账本原先假设单线程，但客户是多线程的（node 的
+     * worker 线程、pnpm 的并发 IO 都会经 chown/chmod 记账进来）。
+     * 并发压测（test/t_concur.c，8 线程 × 400 键）在无锁下**稳定复现**
+     * 堆破坏：`double free or corruption`、`malloc(): unaligned tcache
+     * chunk` —— 因为两个线程同时走 fr_map_compact（整表重建，
+     * realloc + 键所有权转移）与 fr_map_probe（按 cap 取模遍历探测链）
+     * 时，一个线程正在重哈希、另一个按旧 cap 访问。
+     *
+     * 【为什么用自旋锁而不是 pthread_mutex】本库刻意保持零 libc 依赖
+     * （-nostartfiles 构建，见 Makefile 说明），引入 pthread_mutex 会把
+     * libpthread 变成硬依赖，并影响纯逻辑测试的编译方式。临界区极短
+     * （哈希探测/单次插入，除了表自身的 malloc 无阻塞调用），自旋代价
+     * 远低于互斥量的上下文切换。
+     *
+     * 【为什么用 __atomic 而不是 volatile 手写】与 syscall_guard.c 的
+     * sg_pool_seq 同一风格：aarch64 上编译成 ldxr/stxr 独占访问序列。
+     *
+     * 【递归保护】账本内部有嵌套调用（fr_record_both → fr_map_update →
+     * fakeroot_map_put）。锁用 _Thread_local 持有标记实现可重入：
+     * 同一线程重入直接放行，不做第二次加锁（否则自死锁）。
+     * 跨线程仍然互斥。
+     */
+    volatile int lock;
 };
+
+/* 每个线程的持锁标记：>=1 表示本线程已持有锁（可重入）。 */
+static _Thread_local int fr_lock_depth_of_thread;
+
+/* 自旋加锁（可重入）。m 为 NULL 时直接返回，便于各入口统一调用。
+ * 参数为 const 以适配只读入口（get/count）；锁字段本身是可变的
+ * 同步原语，这里显式去掉 const。 */
+static void fr_lock(const fakeroot_map *m)
+{
+    fakeroot_map *mm = (fakeroot_map *)m;
+
+    if (mm == NULL)
+        return;
+    if (fr_lock_depth_of_thread > 0) {   /* 本线程已持有：重入 */
+        fr_lock_depth_of_thread++;
+        return;
+    }
+    for (;;) {
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&mm->lock, &expected, 1,
+                                        false, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED))
+            break;
+        /* 让出 CPU 的提示：aarch64 上等价于一段自旋等待 */
+        __asm__ __volatile__("yield" ::: "memory");
+    }
+    fr_lock_depth_of_thread = 1;
+}
+
+static void fr_unlock(const fakeroot_map *m)
+{
+    fakeroot_map *mm = (fakeroot_map *)m;
+
+    if (mm == NULL)
+        return;
+    if (fr_lock_depth_of_thread > 1) {
+        fr_lock_depth_of_thread--;
+        return;
+    }
+    fr_lock_depth_of_thread = 0;
+    __atomic_store_n(&mm->lock, 0, __ATOMIC_RELEASE);
+}
 
 /* 向上取整到 2 的幂；0 与 1 都返回 1。溢出返回 0。 */
 static size_t fr_round_pow2(size_t v)
@@ -263,7 +332,7 @@ static void fr_slot_release(fr_slot *s)
     memset(&s->rec, 0, sizeof(s->rec));
 }
 
-void fakeroot_map_destroy(fakeroot_map *m)
+static void fakeroot_map_destroy_unlocked(fakeroot_map *m)
 {
     size_t i;
 
@@ -281,7 +350,7 @@ void fakeroot_map_destroy(fakeroot_map *m)
     free(m);
 }
 
-void fakeroot_map_clear(fakeroot_map *m)
+static void fakeroot_map_clear_unlocked(fakeroot_map *m)
 {
     size_t i;
 
@@ -558,7 +627,7 @@ static int fr_map_compact(fakeroot_map *m)
  * 实现：反复线性扫描找 last_used 最小的那个，删掉，重复 n 次。
  * O(n * cap)，但 n <= FR_MAP_EVICT_BATCH 且只在装载率超阈值时调用。
  */
-size_t fakeroot_map_evict_lru(fakeroot_map *m, size_t n)
+static size_t fakeroot_map_evict_lru_unlocked(fakeroot_map *m, size_t n)
 {
     size_t evicted = 0;
 
@@ -607,7 +676,7 @@ static bool fr_map_overloaded(const fakeroot_map *m)
     return (used * 100u) >= (m->cap * (size_t)FR_MAP_LOAD_PERCENT);
 }
 
-int fakeroot_map_put(fakeroot_map *m, fr_key k, const fr_record *rec)
+static int fakeroot_map_put_unlocked(fakeroot_map *m, fr_key k, const fr_record *rec)
 {
     bool   found = false;
     size_t idx;
@@ -674,7 +743,7 @@ int fakeroot_map_put(fakeroot_map *m, fr_key k, const fr_record *rec)
     return FR_OK;
 }
 
-int fakeroot_map_get(fakeroot_map *m, const fr_key *k, fr_record *out)
+static int fakeroot_map_get_unlocked(fakeroot_map *m, const fr_key *k, fr_record *out)
 {
     bool   found = false;
     size_t idx;
@@ -704,7 +773,7 @@ bool fakeroot_map_has(fakeroot_map *m, const fr_key *k)
     return fakeroot_map_get(m, k, NULL) == FR_OK;
 }
 
-int fakeroot_map_remove(fakeroot_map *m, const fr_key *k)
+static int fakeroot_map_remove_unlocked(fakeroot_map *m, const fr_key *k)
 {
     bool   found = false;
     size_t idx;
@@ -725,6 +794,75 @@ int fakeroot_map_remove(fakeroot_map *m, const fr_key *k)
     m->count--;
     m->tombs++;
     return FR_OK;
+}
+
+/* ================================================================== */
+/* §2b 公开入口：加锁薄包装（评估报告 8.7 多线程互斥）                  */
+/* ================================================================== */
+/*
+ * 真正的实现在上面各 *_unlocked 里（不加锁），这里只负责「加锁 → 调用
+ * → 解锁」。这样写而不是在每个实现里散落 lock/unlock 的原因：
+ *   - fakeroot_map_put 有 5 个返回点，逐个补 unlock 极易漏一处，
+ *     漏掉就是永久死锁（比竞态更难查）；
+ *   - 内部嵌套调用（fr_map_update → put、fakeroot_map_has → get）
+ *     走的是 _unlocked 版本，不重复加锁 —— 锁本身也可重入，
+ *     双保险。
+ *
+ * 【可重入性】fr_lock/fr_unlock 用 _Thread_local 持锁深度实现：
+ * 同一线程重入只增计数，跨线程仍然互斥。
+ */
+
+void fakeroot_map_destroy(fakeroot_map *m)
+{
+    /*
+     * destroy 不加锁：它只应在「无其他线程在使用」时调用（析构语义），
+     * 加锁也保护不了「别人随后还来访问已释放的表」。保持原语义，
+     * 但把内部实现委托给 _unlocked 版本。
+     */
+    fakeroot_map_destroy_unlocked(m);
+}
+
+void fakeroot_map_clear(fakeroot_map *m)
+{
+    fr_lock(m);
+    fakeroot_map_clear_unlocked(m);
+    fr_unlock(m);
+}
+
+int fakeroot_map_put(fakeroot_map *m, fr_key k, const fr_record *rec)
+{
+    int rc;
+    fr_lock(m);
+    rc = fakeroot_map_put_unlocked(m, k, rec);
+    fr_unlock(m);
+    return rc;
+}
+
+int fakeroot_map_get(fakeroot_map *m, const fr_key *k, fr_record *out)
+{
+    int rc;
+    fr_lock(m);
+    rc = fakeroot_map_get_unlocked(m, k, out);
+    fr_unlock(m);
+    return rc;
+}
+
+int fakeroot_map_remove(fakeroot_map *m, const fr_key *k)
+{
+    int rc;
+    fr_lock(m);
+    rc = fakeroot_map_remove_unlocked(m, k);
+    fr_unlock(m);
+    return rc;
+}
+
+size_t fakeroot_map_evict_lru(fakeroot_map *m, size_t n)
+{
+    size_t rc;
+    fr_lock(m);
+    rc = fakeroot_map_evict_lru_unlocked(m, n);
+    fr_unlock(m);
+    return rc;
 }
 
 /* ================================================================== */
