@@ -3663,7 +3663,16 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
 
 int chdir(const char *path);   /* 已在前文定义 */
 
-/* Hook: ioctl —— 9 个程序使用，主要影响 /dev/shm、memfd、终端 */
+/* Hook: ioctl —— 9 个程序使用，主要影响 /dev/shm、memfd、终端
+ *
+ * ★ bionic（Android）编译适配（用户实测报告 4.1）★
+ * bionic 的 <bits/ioctl.h> 把 ioctl 声明为 __attribute__((overloadable))
+ * 且 request 是 int；clang 下普通可变参重载同名函数直接报
+ * "at most one overload for a given name may lack the 'overloadable'
+ * attribute"。bionic 下跳过本钩子（bxroot 在 Android 上由 ldso 服务
+ * 提供 ioctl 语义，preload 层介入与否不影响路径翻译），glibc 下维持
+ * 原样（Linux 桌面/容器场景仍需要它出现在符号表里，见原注释）。 */
+#ifndef __ANDROID__
 int ioctl(int fd, unsigned long request, ...) {
     static int (*fn)(int, unsigned long, ...) = NULL;
     va_list ap;
@@ -3690,6 +3699,8 @@ int ioctl(int fd, unsigned long request, ...) {
 
     return fn(fd, request, arg);
 }
+#endif /* !__ANDROID__ */
+
 
 /* ------------------------------------------------------------------ */
 /* exec 家族（execv / execvp / execve / execvpe）已移交给 D4 进程管理层  */
@@ -4617,7 +4628,15 @@ void *dlsym(void *handle, const char *symbol) {
         if (!tried) {
             tried = 1;
             /*
-             * ★ 这里**不**对 dlvsym 判空 —— 编译器是对的 ★
+             * ★ bionic（Android）没有 dlvsym（glibc 扩展）★
+             * 用户实测报告（Android/bionic 编译，v0.1.1）：这条降级分支
+             * 在 bionic 下编译失败。bionic 的 ldso 服务恒可用（bxroot 的
+             * 部署形态决定），此分支本不该走到；但为了【开源仓库在
+             * bionic 下可独立编译】，这里按平台分流：
+             *   - __ANDROID__：bionic 无版本节点，直接 dlsym 等价取真身；
+             *   - 其它（glibc）：dlvsym 带版本节点解析（原逻辑）。
+             *
+             * ★ 这里对 glibc 分支**不**对 dlvsym 判空 —— 编译器是对的 ★
              *
              * 原先写了 `if (dlvsym != NULL)`，`-Waddress` 报：
              *     the comparison will always evaluate as 'true' for the
@@ -4633,11 +4652,19 @@ void *dlsym(void *handle, const char *symbol) {
              * 而不是函数指针为空。所以判空要判在**返回值**上 ——
              * 下面两条回退链正是这么做的。
              */
+#ifdef __ANDROID__
+            /* bionic：无 dlvsym/版本节点。降级分支在 bionic 是"绝不期望
+             * 走到"的路径，真走到说明部署形态已错；此时用 dlsym 取真身
+             * 是唯一合理动作（bionic 的 dlsym 与 glibc 语义等价）。 */
+            real_dlsym_cached = (void *(*)(void *, const char *))
+                dlsym(RTLD_NEXT, "dlsym");
+#else
             real_dlsym_cached = (void *(*)(void *, const char *))
                 dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
             if (real_dlsym_cached == NULL)
                 real_dlsym_cached = (void *(*)(void *, const char *))
                     dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
+#endif
         }
 
         if (real_dlsym_cached == NULL) {

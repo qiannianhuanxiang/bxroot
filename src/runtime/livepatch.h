@@ -26,7 +26,9 @@
 #ifndef BXROOT_LIVEPATCH_H
 #define BXROOT_LIVEPATCH_H
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdint.h>
 
 /*
