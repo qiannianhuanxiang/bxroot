@@ -1,0 +1,138 @@
+# =====================================================================
+# bxroot CI（GitHub Actions）
+# =====================================================================
+#
+# 三个 job，互相独立、可并行：
+#   1. build      —— 编译运行时（含 ICE 重试逻辑），上传产物 artifact
+#   2. test       —— 21 项全量回归 test/RUN_ALL.sh（退出码非 0 即红）
+#   3. warn-gate  —— 编译告警门禁 test/RUN_WARN_GATE.sh（零告警单独展示）
+#
+# 已知限制（首次落地必读）
+# ------------------------
+# * 本工作流只做过**静态校验**（YAML 语法 + 结构核对），未在真实
+#   GitHub runner 上跑过 —— 推送后的第一次运行必须人工确认。
+# * x86_64 runner 上，回归里架构特定断言会按设计 SKIP（如
+#   RUN_PATH_FORMS / RUN_FALLBACK），这是预期行为，不算失败；
+#   判红只看 RUN_ALL.sh 的退出码。
+# * e2e（--e2e）默认不跑，无需额外参数；它需要真机 rootfs。
+# * 环境差异提示：测试由被测进程自行 LD_PRELOAD bxroot，不依赖
+#   "宿主 shell 外层预加载"这类机制，在标准 GitHub runner 上行为
+#   与本仓库开发容器（LD_PRELOAD 被外层劫持）不同，以 runner 为准。
+# * ubuntu-24.04-arm 为 GitHub 公共仓库免费 arm runner；上线初期
+#   置为 continue-on-error 观察，稳定后可把 allow_fail 改为 false。
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支新提交到来时取消旧运行，省 runner 额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------
+  # job1：构建
+  # -------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.allow_fail }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            allow_fail: false
+          - runner: ubuntu-24.04-arm
+            allow_fail: true
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc6-dev libtalloc-dev gawk
+        timeout-minutes: 10
+
+      # BUILD_RUNTIME.sh 自带 gcc ICE 逐级重试（-O2 → -O1 → -O0），
+      # CI 上偶发 ICE 由脚本自身消化，这里不需要额外重试壳。
+      - name: 构建运行时
+        run: sh BUILD_RUNTIME.sh
+        timeout-minutes: 30
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbxroot-runtime-${{ matrix.runner }}
+          path: build/libbxroot-runtime.so
+          if-no-files-found: error
+        timeout-minutes: 10
+
+  # -------------------------------------------------------------------
+  # job2：全量回归
+  # 与 build 并行、独立构建后自跑（RUN_ALL.sh 第 9 项本身含构建步骤，
+  # 且各用例自行编译探针二进制，不依赖 job1 的 artifact）。
+  # -------------------------------------------------------------------
+  test:
+    name: regression (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.allow_fail }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            allow_fail: false
+          - runner: ubuntu-24.04-arm
+            allow_fail: true
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc6-dev libtalloc-dev gawk
+        timeout-minutes: 10
+
+      # 不带参数：e2e 默认不跑；x86_64 上的架构相关 SKIP 是预期，
+      # 只认退出码 —— 非 0 即红。
+      - name: 全量回归（21 项）
+        run: sh test/RUN_ALL.sh
+        timeout-minutes: 30
+
+  # -------------------------------------------------------------------
+  # job3：编译告警门禁（零告警要求单独一眼可见，不淹没在回归里）
+  # -------------------------------------------------------------------
+  warn-gate:
+    name: warn-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        timeout-minutes: 5
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc6-dev libtalloc-dev gawk
+        timeout-minutes: 10
+
+      # 逐编译单元真实编译（-c -O1）统计 warning，任何一条即失败
+      - name: 编译告警门禁
+        run: sh test/RUN_WARN_GATE.sh
+        timeout-minutes: 30
