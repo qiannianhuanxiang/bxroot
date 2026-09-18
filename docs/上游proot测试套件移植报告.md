@@ -991,3 +991,80 @@ bxroot（新 launcher）                : PIPESTATUS[0]=141  ← 复位生效
 **诚实标注**：本轮只核实了前 3 项的架构归因与 test-99999999 的逐条断言；
 其余 13 项未逐个深查，不排除其中有真实缺陷。详见套件自身的
 `VERBOSE=1` 输出。
+
+---
+
+## 附录三：2026-09-18 第三轮 —— 剩余失败用例逐项归因
+
+本轮把剩余 18 个失败**逐个实测定性**（此前只查了 3 个）。结论如下。
+
+### 3.1 已确认的**真实缺陷**（本轮修复）
+
+| 缺陷 | 证据 | 修复 |
+|---|---|---|
+| `-v` 被当布尔开关 | `-v -1` 报「未知选项 '-1'」；上游选项表 `.value = "value"` | 按上游解析整数；负值静默 |
+| 诊断输出无条件打印 | `[bxroot-launcher] stat(...) OK` 每次运行必打 | 受 quiet/verbose 门控 |
+
+### 3.2 套件**自身**的问题（非 bxroot 缺陷）
+
+**helper 经宿主 bind 注入**（影响 test-a4d7ed70 等）：
+
+套件把 `cat`/`ls` 等 helper 从宿主 bind 进容器（`PATH=$WORK/hostbin`）。
+这些 helper 是**宿主 ELF**，运行时 `/proc/self/fd/N` 魔法链接指向
+**宿主进程的 fd**，容器内的路径翻译无法解析它。
+
+```
++ /tmp/.../hostbin/cat /tmp/xxx/stdin
+$ROOTFS/tmp/.../hostbin/cat: /tmp/xxx/stdin: No such file or directory
+```
+
+**对照证据**：换成容器内的 `cat` 立即通过：
+```
+$PROOT cat ${TMP}2 | grep ^OK$   →  OK ✅
+```
+故这是 helper 放置位置的问题（应放进 guest 而非 bind），不是 bxroot 缺陷。
+
+### 3.3 桥接层边界（非 bxroot 源码可控）
+
+**argv[0]/progname 变成宿主路径**（影响 test-dddddddd）：
+
+```
+宿主/上游: rmdir: failed to remove '...': Not a directory
+bxroot   : $ROOTFS/usr/bin/rmdir: failed to remove '...': ...   ← 多出译层前缀
+```
+
+**根因定位过程（含一次自我纠错）**：
+1. 先怀疑 `PX_ARGPOLICY_DEFAULT.translate_argv0`（默认 1 = 翻译 argv[0]），
+   改成 0 —— **实测 argv[0] 仍是宿主路径**，且破坏了 F2/F3 用例；
+2. 决定性实验：
+   ```
+   $PROOT -v -1 argv0probe                    → argv[0]=$ROOTFS/usr/bin/argv0probe
+   $PROOT -v -1 sh -c 'exec /usr/bin/argv0probe' → argv[0]=/usr/bin/argv0probe
+   ```
+   后者正确、前者不对 ⇒ 差异在 **launcher 直接 execve 的首进程**；
+3. 结论：**桥接层（proroot-bridge，外层闭源组件）用 execve 的 path
+   覆盖了 argv[0]**。launcher 传的 `guest_argv[0]` 是正确的原始输入
+   （已核实 launcher.c 未修改它），但在 bridge 链路上被覆盖。
+4. `translate_argv0` 已**回退为 1**，复核结论写进源码注释。
+
+这条属架构边界：bxroot 的源码（launcher/proc.c）无法控制 bridge 内的
+argv 改写。**待真机复核**：真机链路（静态 launcher）是否同样被覆盖。
+
+### 3.4 架构边界（LD_PRELOAD 方案做不到）
+
+- `test-33333333`：要求「父进程不 wait 子进程仍被追踪」—— ptrace 语义；
+- `test-0cf405b0` / `test-25069c12` / `test-25069c13`：
+  `execve("/proc/self/exe")` 重执行，自研 loader 报 `no PT_DYNAMIC`。
+
+### 3.5 环境限制
+
+- `test-8a83376a`（`ldd /bin/true` 在嵌套容器内不可靠）；
+- 其余依赖 `-r` 隔离语义者已在 B 段按设计跳过。
+
+### 3.6 诚实标注
+
+- 仍未**逐个**验证到"每一行断言"的：test-3ac8ef15、test-cb1143ab、
+  test-691786c8、test-b6df3cbe、test-311b7a95、test-3624be91、
+  test-713b6910、test-5bed7143。它们**可能含真实缺陷**，下一轮继续。
+- test-dddddddd 的 progname 归因已到"桥接层覆盖"这一层，但**未在真机
+  验证**（本容器无法构造静态 launcher 链路）。
