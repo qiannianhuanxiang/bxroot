@@ -2697,7 +2697,23 @@ static int px_xlate_trampoline(void *ud, const char *path, char *out, size_t out
  * （继承），要么就不该被我们凭空发明（发明一个默认值会静默地打开
  * 一个用户没要的功能）。我们只强制写「身份与去重必需」的四项。
  */
-static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap)
+/*
+ * 当次 exec 的 guest 视角路径（供 px_runtime_build_env 读取）。
+ *
+ * 为什么用「最近一次 exec 的临时槽」而不是结构体字段：build_env 的
+ * 调用链（px_do_execve → px_runtime_build_env → px_build_forced）之间
+ * 隔着 proc.h 的公开结构，加字段要动头文件与所有初始化点。这里用一个
+ * 文件内静态槽 + 显式设置/清除，改动面最小，且语义清楚：
+ * 「进程即将 exec 成谁」本来就只有一个当前值。
+ *
+ * 生命周期：px_do_execve 在调用 build_env 前 set，调用后 clear。
+ * 不在 exec 路径上的 exec（如纯逻辑测试直接调 build_env）保持 NULL，
+ * 此时不写 BXROOT_GUEST_EXE（沿用继承值，行为与从前一致）。
+ */
+static const char *g_exec_guest_exe;
+
+static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
+                           const char *guest_exe)
 {
     size_t n = 0;
 
@@ -2742,12 +2758,38 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap)
         kv[n].mode = PX_ENV_SET;
         n++;
     }
+
+    /*
+     * ★ BXROOT_GUEST_EXE：**每次 exec 都更新**为当次的目标（上游语义）★
+     *
+     * 【为什么必须在 exec 时写，而不是靠继承】
+     * runtime 用它回答客户的 `readlink("/proc/self/exe")`。若只在
+     * launcher 启动首进程时设一次，则子进程 exec 出去后仍继承父进程的
+     * 值 —— 表现为「readlink 自称是父进程」。
+     *
+     * 上游 proot 的语义是「/proc/self/exe 指向**正在运行**的那个程序」。
+     * 上游用例 test-99999999 第 8/9 行即断言：
+     *     \${PROOT} sh -c 'readlink /proc/self/exe'  →  /usr/bin/readlink
+     * （sh fork+exec 出 readlink，readlink 必须自称 readlink，不是 sh）
+     *
+     * 【mode = SET】调用方 envp 里的旧值（父进程的 guest_exe）必须被
+     * 覆盖，否则子进程读到过期身份 —— 这正是修复前的行为。
+     *
+     * guest_exe 为 NULL/空时跳过（不发明值：宁可不写，也不写一个
+     * 会误导客户的假路径）。
+     */
+    if (guest_exe != NULL && guest_exe[0] != '\0' && n < cap) {
+        kv[n].name = "BXROOT_GUEST_EXE";
+        kv[n].value = guest_exe;
+        kv[n].mode = PX_ENV_SET;
+        n++;
+    }
     return (int)n;
 }
 
 int px_runtime_build_env(char *const envp[], px_envout *out)
 {
-    px_env_kv forced[4];
+    px_env_kv forced[5];   /* 4 项原有 + BXROOT_GUEST_EXE（每次 exec 更新） */
     px_envpolicy pol;
     int nf;
 
@@ -2763,7 +2805,7 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
         return -1;
     }
 
-    nf = px_build_forced(&g_rt_cfg, forced, 4);
+    nf = px_build_forced(&g_rt_cfg, forced, 5, g_exec_guest_exe);
     if (nf <= 0) {
         return -1;
     }
@@ -3844,6 +3886,42 @@ static int px_do_execve(const char *path, char *const argv[],
     }
 
     /* 3) envp 重建 */
+    /*
+     * 先把「本次 exec 的目标」放进槽位：build_env 会据此强制写
+     * BXROOT_GUEST_EXE（上游语义 —— /proc/self/exe 指向正在运行的程序）。
+     * 用完立即清掉，避免影响非 exec 路径上的 build_env 调用。
+     * 见 g_exec_guest_exe 的说明。
+     */
+    /*
+     * ★ 必须写入 **guest 视角**路径，而不是 host ★
+     *
+     * px_do_execve 里 `guest` 通常就是调用方给的 guest 路径；但有一条
+     * 真实链路会让它是**宿主路径**：launcher 自己也在 `--preload` 下
+     * 运行时（Android 真机与上游测试套件都如此），它 execve 的是
+     * `$ROOTFS/usr/bin/readlink` —— 我们的钩子拿到的是宿主路径。
+     * 直接把宿主路径写进 BXROOT_GUEST_EXE，客户 readlink("/proc/self/exe")
+     * 就会看到 `/data/data/.../rootfs/usr/bin/readlink`（泄漏译层）。
+     *
+     * 实测（上游用例 test-99999999 首条断言）：
+     *     期望 /usr/bin/readlink，实得 $ROOTFS/usr/bin/readlink ❌
+     *
+     * 修法：剥掉 $ROOTFS 前缀得到 guest 视角。用 preload.c 暴露的
+     * bxroot_translate_path 的逆操作不可得（它是正向的），这里做最小
+     * 前缀剥离 —— 与 runtime 的 strip_rootfs_prefix_inplace 同判据
+     * （组件边界：前缀后必须是 '/' 或 '\\0'）。
+     */
+    {
+        const char *ge = guest;
+        const char *rf = g_rt_cfg.rootfs;
+        size_t rl = (rf != NULL) ? strlen(rf) : 0;
+
+        if (rl > 0 && ge != NULL && strncmp(ge, rf, rl) == 0 &&
+            (ge[rl] == '/' || ge[rl] == '\0')) {
+            g_exec_guest_exe = (ge[rl] == '\0') ? "/" : (ge + rl);
+        } else {
+            g_exec_guest_exe = guest;
+        }
+    }
     if (px_runtime_build_env(envp, &env) == 0) {
         final_env = env.v;
         final_env_use = env.v[0];
@@ -3851,6 +3929,7 @@ static int px_do_execve(const char *path, char *const argv[],
     } else {
         final_env = envp;      /* 注入被禁用/失败 → 沿用调用方的 */
     }
+    g_exec_guest_exe = NULL;
     (void)final_env_use;
 
     /* 4) 转发

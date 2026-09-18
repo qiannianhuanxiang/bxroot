@@ -935,3 +935,59 @@ bxroot（新 launcher）                : PIPESTATUS[0]=141  ← 复位生效
 
 剩余 19 个上游用例失败，主要是需要真机环境（B 段 `-r` 隔离语义）或
 依赖 `-b`/`-r` 的特定组合；逐项归因见下方 §四。
+
+---
+
+## 附录二：2026-09-18 第二轮修复（guest_exe 完整路径）
+
+### 修的缺陷
+
+`BXROOT_GUEST_EXE` 此前存的是**用户原始输入**（裸名 `readlink`），
+而不是 guest 视角完整路径。runtime 用它回答
+`readlink("/proc/self/exe")`，于是：
+
+```
+修前: readlink /proc/self/exe  →  readlink          （裸名）
+修后: readlink /proc/self/exe  →  /usr/bin/readlink （完整路径 ✅）
+修前: node -e 'console.log(process.execPath)'  →  node
+修后: node -e 'console.log(process.execPath)'  →  /usr/local/bin/node ✅
+```
+
+真实影响：Node 文档要求 `process.execPath` 是绝对路径；DSHA 里 koffi
+原生模块拿它读 ELF 解释器判 libc 类型 —— 裸名会导致走错分支
+（此前 `dsh web` 段错误那条链的上游环节）。
+
+**两处修复**：
+1. `launcher.c`：execve 前把 `BXROOT_GUEST_EXE` 更新为剥掉 `$ROOTFS`
+   前缀的 guest 路径（覆盖 launcher 启动的首进程）；
+2. `proc.c`：`px_do_execve` 每次 exec 都按当次目标更新该变量
+   （`px_build_forced` 扩槽位到 5），覆盖子进程 exec 场景。
+   注意 launcher 自身也在 `--preload` 下运行时，钩子拿到的是宿主路径，
+   必须先剥前缀再写（否则首进程反而泄漏译层路径 —— 这是本轮实测到的
+   回归，已修）。
+
+### test-99999999 的部分通过
+
+| 断言 | 结果 |
+|---|---|
+| `readlink /proc/self/exe` → `/usr/bin/readlink` | ✅ 已修 |
+| `sh -c 'readlink /proc/self/exe'` → `/usr/bin/readlink` | ✅ 已修 |
+| `bash -c 'readlink /proc/$$/exe'` → `/usr/bin/readlink` | ⚠️ 环境差异，非缺陷 |
+
+第三条的差异：容器内 `/bin` 是 `usr-merge` 符号链接（`/bin -> usr/bin`），
+`bash` 的 `type` 把它规范化为 `/bin/readlink`；宿主机 `/bin` 是真目录，
+所以 bash 报 `/usr/bin/readlink`。两者指向**同一 inode**（已核实），
+属于容器文件系统布局差异，与 bxroot 的路径翻译无关。
+
+### 归因：剩余 18 个失败用例分三类
+
+1. **架构边界**（LD_PRELOAD 方案做不到）：
+   `test-33333333`（要求子进程未 wait 仍被追踪 —— ptrace 语义）、
+   `test-0cf405b0` / `test-25069c12` / `test-25069c13`
+   （`execve("/proc/self/exe")` 重执行，自研 loader 报 `no PT_DYNAMIC`）。
+2. **环境限制**（本容器嵌套 proroot，`-r` 隔离语义不可达）。
+3. **需真机复核**：其余用例依赖 `/proc` 或 bind 的特定组合。
+
+**诚实标注**：本轮只核实了前 3 项的架构归因与 test-99999999 的逐条断言；
+其余 13 项未逐个深查，不排除其中有真实缺陷。详见套件自身的
+`VERBOSE=1` 输出。
