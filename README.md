@@ -122,7 +122,11 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 
 ## 当前状态
 
-**可用**（已在 Android 真机容器内对照官方 proroot 实测）：
+**v0.1.1 可用**（已在 Android 真机容器内对照官方 proroot 实测）：
+
+> v0.1.0 → v0.1.1 的完整变更见下文「修复历史」两批清单；一句话概括：
+> 第一环境（Android 真机）之外的第二环境（纯 Linux）从"加载即崩"
+> 修到"全量回归 25/25 + 上游选项表 35/35 + 路径参数表审计遗漏 0"。
 
 | 能力 | 状态 |
 |---|---|
@@ -133,14 +137,14 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 | `system()`/`popen()`（子进程带钩子 + 路径翻译） | ✅ |
 | seccomp 中和（Android 沙箱禁止的系统调用 + livepatch） | ✅ |
 | shebang 脚本直接 exec | ✅ |
-| NSS 用户/组查询（getpwnam/getpwnam_r/getgrnam/getgrnam_r 直解回退） | ✅ |
+| NSS 用户/组查询（by-name 与 by-id 全套直解回退 + fakeroot 合成） | ✅ |
 | libaudit 符号（passwd/login/chage 等 20 个程序依赖） | ✅ |
 | `dpkg -l` / `dpkg -S` / `dpkg-deb --build` / `dpkg -i`（unpack+configure） | ✅ |
 | `dlerror`/`dl_iterate_phdr`/`pthread_create`（栈下限与官方一致） | ✅ |
 | `syscall(174..177/148/150/158)` 身份查询（裸 syscall 层） | ✅ |
 | 运行 `node` + `dsh` | ✅ `dsh --version` → `0.1.5-rc.2` |
 
-**导出符号 372 个**（对照闭源 proroot 的 259 个）。
+**导出符号 375 个**（对照闭源 proroot 的 259 个）。
 
 ## 上游 24 个 issue 回归
 

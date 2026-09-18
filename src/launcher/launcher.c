@@ -37,7 +37,7 @@
  * 既有设计，兼容层必须照做，不能"统一"成同一个小写选项。
  */
 #ifndef BXROOT_VERSION
-#define BXROOT_VERSION "0.1.0"
+#define BXROOT_VERSION "0.1.1"
 #endif
 
 /*
