@@ -896,6 +896,26 @@ int main(int argc, char **argv) {
     setenv("BXROOT_WORKDIR", cfg.workdir, 1);
 
     /*
+     * ★ BXROOT_ORIG_COMM：容器**首命令**的名字（上游 /proc/pid/comm 语义）★
+     *
+     * 上游 proot 用 execve 的 raw user path 修正 /proc/pid/comm
+     * （src/execve/enter.c:620 注释）。经 bridge 链启动时 comm 会是
+     * bridge.so 的名字，需要把「首命令 basename」带进来修正。
+     *
+     * 【为什么独立于 BXROOT_GUEST_EXE】guest_exe 会被 proc.c 在**每次
+     * exec 时更新**（子进程要正确回答 /proc/self/exe），而 comm 语义
+     * 不同：上游只对**容器首命令**做修正，子进程各自 exe 的 basename
+     * 本来就正确。原始名只需在此设一次，runtime 侧用一次性标记防
+     * 子进程误用。
+     */
+    {
+        const char *b = strrchr(cfg.guest_exe, '/');
+        b = (b != NULL) ? b + 1 : cfg.guest_exe;
+        if (b[0] != '\0')
+            setenv("BXROOT_ORIG_COMM", b, 1);
+    }
+
+    /*
      * ===============================================================
      * proot 环境变量兼容层
      * ===============================================================

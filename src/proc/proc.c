@@ -2798,12 +2798,32 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
         kv[n].mode = PX_ENV_SET;
         n++;
     }
+
+    /*
+     * ★ BXROOT_ORIG_COMM 同步更新为当次 exec 的调用者路径 ★
+     *
+     * 上游语义（execve/enter.c:620）：/proc/pid/comm 用 execve 的
+     * **raw user path**（调用者给的，可能是符号链接名）—— 而不是
+     * 内核解析后的解释器/真实文件名。因此每次 exec 都要把
+     * 「当次调用者路径的 basename」传给子进程，runtime 构造函数用
+     * prctl(PR_SET_NAME) 设它。
+     *
+     * 实测（上游 test-commmmmm 末条断言）：
+     *     ln -s /tmp/A /tmp/B; exec /tmp/B
+     *     期望 comm = 'B'（调用者给的链接名），而非 'A' 或 'sh'。
+     */
+    if (guest_exe != NULL && guest_exe[0] != '\0' && n < cap) {
+        kv[n].name = "BXROOT_ORIG_COMM";
+        kv[n].value = guest_exe;
+        kv[n].mode = PX_ENV_SET;
+        n++;
+    }
     return (int)n;
 }
 
 int px_runtime_build_env(char *const envp[], px_envout *out)
 {
-    px_env_kv forced[5];   /* 4 项原有 + BXROOT_GUEST_EXE（每次 exec 更新） */
+    px_env_kv forced[7];   /* 4 原有 + GUEST_EXE + ORIG_COMM + 余量 */
     px_envpolicy pol;
     int nf;
 
@@ -2819,7 +2839,7 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
         return -1;
     }
 
-    nf = px_build_forced(&g_rt_cfg, forced, 5, g_exec_guest_exe);
+    nf = px_build_forced(&g_rt_cfg, forced, 7, g_exec_guest_exe);
     if (nf <= 0) {
         return -1;
     }
@@ -3804,6 +3824,11 @@ static int px_do_execve(const char *path, char *const argv[],
      * 用一个独立缓冲把脚本路径**拷一份**，与解释器缓冲互不干扰。
      */
     char sb_script[PX_PATH_MAX];
+    /*
+     * raw user path（shebang 重写前）：用于 BXROOT_ORIG_COMM /
+     * /proc/self/comm 的上游语义（见赋值处注释）。
+     */
+    char raw_guest[PX_PATH_MAX];
 
     g_rt_stats.exec_calls++;
 
@@ -3901,6 +3926,17 @@ static int px_do_execve(const char *path, char *const argv[],
             }
         }
 
+        /*
+         * ★ shebang 重写**前**保存 raw user path（上游同款）★
+         *
+         * 上游 enter.c:620 注释明确 raw_path 的用途之一是
+         * "fix the value of AT_EXECFN and /proc/{pid}/comm" ——
+         * 它是**调用者给的路径**（shebang 场景下是脚本路径，
+         * 而非重写后的解释器路径）。px_rewrite_shebang 会把 guest
+         * 覆写成解释器，所以必须先拷一份。
+         */
+        px_cfg_str(raw_guest, sizeof(raw_guest), guest);
+
         sb_rc = px_rewrite_shebang(host, guest, argv,
                                    sb_host, sizeof(sb_host),
                                    sb_guest, sizeof(sb_guest),
@@ -3960,7 +3996,13 @@ static int px_do_execve(const char *path, char *const argv[],
      * （组件边界：前缀后必须是 '/' 或 '\\0'）。
      */
     {
-        const char *ge = guest;
+        /*
+         * comm 用 raw_guest（调用者路径，shebang 场景=脚本路径）；
+         * /proc/self/exe 用 guest（最终 exec 的目标——shebang 场景=
+         * 解释器，这正是内核对 /proc/self/exe 的原生语义）。
+         * 两者上游语义不同，见各自注释。
+         */
+        const char *ge = raw_guest[0] != '\0' ? raw_guest : guest;
         const char *rf = g_rt_cfg.rootfs;
         size_t rl = (rf != NULL) ? strlen(rf) : 0;
 
@@ -3968,7 +4010,7 @@ static int px_do_execve(const char *path, char *const argv[],
             (ge[rl] == '/' || ge[rl] == '\0')) {
             g_exec_guest_exe = (ge[rl] == '\0') ? "/" : (ge + rl);
         } else {
-            g_exec_guest_exe = guest;
+            g_exec_guest_exe = ge;
         }
     }
     if (px_runtime_build_env(envp, &env) == 0) {

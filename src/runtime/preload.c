@@ -34,6 +34,7 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <sys/prctl.h>   /* PR_SET_NAME：/proc/self/comm 修正（见 constructor） */
 #include <dirent.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -8206,6 +8207,73 @@ static void constructor(void) {
     init_config();
     init_l2s();
     init_fakeroot();
+
+    /*
+     * ★ /proc/self/comm 修正（上游同等语义，execve/enter.c:620）★
+     *
+     * 【缺陷，上游用例 test-commmmmm】
+     * 内核把 comm（任务名，ps/pstree/`cat /proc/self/comm` 可见）设成
+     * **最后 exec 的二进制 basename**。经 bridge 链启动时，最后 exec 的
+     * 是 libproroot-bridge.so —— 于是 guest 里 `cat /proc/self/comm`
+     * 得到 `libproroot-brid`，而正确答案是**guest 程序名**：
+     *
+     *     期望: 5cebf97f85bb26c        （脚本名前 15 字节）
+     *     实得: libproroot-brid        ❌
+     *
+     * 上游 proot 明确用 execve 的 raw user path 修正 AT_EXECFN 与 comm
+     * （enter.c:620 注释 "useful to fix the value of AT_EXECFN and
+     * /proc/{pid}/comm"）。LD_PRELOAD 无法在 exec 后插入代码，唯一
+     * 时机是**新进程的构造函数** —— 它知道 guest_exe（BXROOT_GUEST_EXE）。
+     *
+     * 【为何无条件覆盖】guest 视角下"exe"就是 guest_exe，comm = 其
+     * basename 正是内核原生语义（只是被 bridge 链破坏）。普通
+     * LD_PRELOAD 路径下（无 bridge）内核已设好同样的值，覆盖是幂等的。
+     *
+     * 【PR_SET_NAME 只影响调用线程】构造函数跑在主线程 → 正确；
+     * 其它线程的 comm 本就各自独立（内核语义如此）。
+     *
+     * 【何时不设】BXROOT_GUEST_EXE 缺失（如源码级单元测试）时跳过；
+     * NX: 用 prctl 而非 settaskid —— 标准 POSIX/glibc 接口。
+     */
+    {
+        /*
+         * comm 语义（上游 execve/enter.c:620）：comm = **本次 execve 的
+         * raw user path** 的 basename（调用者给的，可能是符号链接名），
+         * 而非内核解析后的解释器/真实文件名。
+         *
+         * 【ORIG_COMM 的生命周期】launcher 设首命令；proc.c 在**每次
+         * exec** 时随 envp 更新为当次调用者路径（px_build_forced）。
+         * 所以这里的值总是「本次 exec 的调用者路径」—— 直接用，
+         * 不需要一次性标记。
+         *
+         * 【回退】ORIG_COMM 缺失（源码级单测等）时用 guest_exe basename
+         * 兜底（bridge 链的幂等修正）。
+         */
+        const char *orig = getenv("BXROOT_ORIG_COMM");
+        const char *name = NULL;
+
+        if (orig != NULL && orig[0] != '\0') {
+            /* ORIG_COMM 可能是完整路径（proc.c 传的是 guest 路径），
+             * comm 只要 basename。 */
+            name = strrchr(orig, '/');
+            name = (name != NULL) ? name + 1 : orig;
+        } else if (g_config.guest_exe != NULL &&
+                   g_config.guest_exe[0] != '\0') {
+            name = strrchr(g_config.guest_exe, '/');
+            name = (name != NULL) ? name + 1 : g_config.guest_exe;
+        }
+
+        if (name != NULL && name[0] != '\0') {
+            char comm[17];               /* 内核限制：16 字节 + NUL */
+            size_t nl = strlen(name);
+
+            if (nl > 16)
+                nl = 16;
+            memcpy(comm, name, nl);
+            comm[nl] = '\0';
+            (void)prctl(PR_SET_NAME, comm, 0, 0, 0);
+        }
+    }
 
     /*
      * ★ SIGPIPE 复位兜底（上游同等处理，评估报告 D5）★
