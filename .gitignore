@@ -46,10 +46,19 @@ src/runtime/test_crash
 src/runtime/test_crash.ub
 
 # 探针/临时可执行（`t_*` 是子代理常用的命名）
+#
+# ★ 只排除**无扩展名的编译产物**，绝不能用 `t_*` 这种裸通配 ★
+# 实测缺陷：`src/runtime/t_*` 会把新增的源码 `t_nocrash.c`、`t_chain.c`
+# 一并静默排除 —— 它们的二进制确实该忽略，但源码必须入库。既有
+# `t_null.c` 等之所以在库里，只是因为它们在规则加入前已被 `git add`
+# 跟踪过（.gitignore 对已跟踪文件无效），掩盖了这个规则的危险性。
+# 下面的写法用 `!*.c` 把源码显式放行。
 src/runtime/t_*
+!src/runtime/t_*.c
 src/proc/t_*
+!src/proc/t_*.c
 test/t_*
-t_*
+!test/t_*.c
 
 # === 编辑器与工具 ===
 *.swp
