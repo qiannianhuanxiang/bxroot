@@ -172,7 +172,7 @@ make test                   # 跑测试
 | `libbxroot-runtime.so` | 运行时：全部 `LD_PRELOAD` 钩子 |
 | `libbxroot-linker.so` | 自研 ELF 加载器 |
 | `libbxroot-bridge.so` | 宿主/客户桥接 |
-| `libbxroot-stub-loader.so` | 静态程序加载器 |
+| `libbxroot-stub-loader.so` | 静态二进制的 `PT_INTERP` 修补器（**非独立 ELF 加载器**：为静态二进制补上 PT_INTERP 后 `execve`，交给内核加载；不做 mmap/段加载/跳 `_start`。定位见 `src/stub-loader/stub-loader.c` 注释） |
 
 ## 架构
 

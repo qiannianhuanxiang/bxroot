@@ -254,12 +254,33 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
  * 直接传会 EINVAL，处理器静默装不上。
  * __libc_sigaction 是 GLIBC_PRIVATE 符号，内部做布局转换 —— 这是唯一
  * 被实测证明可用的路径（安装处与本文件其它地方都依赖它）。
+ *
+ * ★ 弱引用 + 运行期探测（评估报告 4.2）★
+ *
+ * 原先这是**强 extern 引用**，后果与已修的 ldso P0 同类：库在非 glibc
+ * 环境（musl/Alpine 等没有 GLIBC_PRIVATE 符号的 libc）**加载即失败**
+ * —— 不是功能降级，而是整个 LD_PRELOAD 一个符号都解析不了。
+ *
+ * 现在改为 __attribute__((weak))：非 glibc 下符号解析为 NULL，库能正常
+ * 加载；调用点先探测，缺失时明确报「无 GLIBC_PRIVATE 符号，SIGSYS
+ * 防护不可用」并退化为不安装 —— 而不是崩溃或静默失效。
  */
+extern int __libc_sigaction(int, const struct sigaction *,
+                            struct sigaction *)
+    __attribute__((weak));
+
+static int glibc_sigaction_available(void)
+{
+    return __libc_sigaction != NULL;
+}
+
 static int __libc_sigaction_ref(int sig, const struct sigaction *act,
                                 struct sigaction *old)
 {
-    extern int __libc_sigaction(int, const struct sigaction *,
-                                struct sigaction *);
+    if (__libc_sigaction == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
     return __libc_sigaction(sig, act, old);
 }
 
@@ -400,6 +421,18 @@ int bxroot_sigsys_install(void)
 
     if (g_installed)
         return 0;
+
+    /*
+     * ★ 能力探测（评估报告 4.2）★ 无 GLIBC_PRIVATE 符号的环境
+     * （musl/Alpine）下明确报告并退化为不安装，而不是让库加载失败
+     * 或装上收不到信号。注意这里**不**设置 g_installed，于是
+     * sigaction 钩子会原样透传（交由客户自己的 libc 处理）。
+     */
+    if (!glibc_sigaction_available()) {
+        em_say("[bxroot] 警告: 本 libc 无 __libc_sigaction (GLIBC_PRIVATE)，"
+               "SIGSYS 防护层不可用（退化为不安装）\n");
+        return -1;
+    }
 
     e = getenv("BXROOT_SIGSYS_LOG");
     g_verbose = (e != NULL && e[0] == '1') ? 1 : 0;
