@@ -620,6 +620,62 @@ static unsigned path_arg_mask(long nr)
      */
     case 36:   return 1u << 2;         /* symlinkat: 只翻 linkpath（a2），target(a0) 是链接内容，不翻 */
 
+    /*
+     * ---- 2026-09-18 补齐：审计器实测出的 25 项路径型调用 ----
+     *
+     * 【缺口如何被发现】`test/test_syscall_table_audit.c`（用裸 svc 对内核
+     * 逐号实测的工具）报出 25 个"内核确有、参数位置已实测/手册确认、
+     * 但本表未列"的路径型调用。不列入的后果是**静默绕过翻译**：
+     * 静态链接或直发 `syscall()` 的程序（本层存在的全部理由）对它们会
+     * 拿到宿主路径，表现为"文件明明在容器里却 ENOENT"。
+     *
+     * 【为什么不是"多此一举"】符号路径（hook 层 preload.c）已覆盖其中
+     * 多数（chdir/truncate/xattr 族等），但裸 syscall 路径**只**经过本表。
+     * 两类客户在真机上都存在（node 静态 libuv 就是裸 syscall 客户）。
+     *
+     * 【位置判据】
+     *   [实测] 审计器在本机确认：伪指针位置产生 EFAULT，或基线调用返回
+     *          可解释的 errno（成功/ENOENT/EEXIST）；
+     *   [手册] 本机被 seccomp 仿真层遮挡（mount 族/name_to_handle_at 等），
+     *          位置取自 aarch64 编号表与手册，审计器标"存疑"并允许；
+     *          这些调用在生产 seccomp 放开后必须复核。
+     */
+
+    /* xattr 族：路径在 a0（无 dirfd 版本） */
+    case 5:    return 1u << 0;   /* setxattr(path, name, value, size, flags)   [实测] */
+    case 6:    return 1u << 0;   /* lsetxattr                                   [实测] */
+    case 8:    return 1u << 0;   /* getxattr                                    [实测] */
+    case 9:    return 1u << 0;   /* lgetxattr                                   [实测] */
+    case 11:   return 1u << 0;   /* listxattr                                   [实测] */
+    case 12:   return 1u << 0;   /* llistxattr                                  [实测] */
+    case 14:   return 1u << 0;   /* removexattr                                 [实测] */
+    case 15:   return 1u << 0;   /* lremovexattr                                [实测] */
+
+    /* 其余单路径 a0 */
+    case 43:   return 1u << 0;   /* statfs(path, buf)                           [实测] */
+    case 45:   return 1u << 0;   /* truncate(path, length)                      [实测] */
+    case 49:   return 1u << 0;   /* chdir(path)                                 [实测] */
+
+    /* 带 dirfd：路径在 a1 */
+    case 27:   return 1u << 1;   /* inotify_add_watch(fd, path, mask)           [实测] */
+    case 33:   return 1u << 1;   /* mknodat(dirfd, path, mode, dev)             [实测] */
+    case 53:   return 1u << 1;   /* fchmodat(dirfd, path, mode, flags)          [实测] */
+    case 54:   return 1u << 1;   /* fchownat(dirfd, path, owner, group, flags)  [实测] */
+    case 88:   return 1u << 1;   /* utimensat(dirfd, path, times, flags)        [实测] */
+    case 452:  return 1u << 1;   /* fchmodat2(dirfd, path, mode, flags)         [实测] */
+    case 437:  return 1u << 1;   /* openat2(dirfd, path, how, size)             [实测] */
+
+    /* seccomp 遮挡组：[手册] 位置确定但本环境无法实测 */
+    case 51:   return 1u << 0;   /* chroot(path)                                [手册] */
+    case 264:  return 1u << 1;   /* name_to_handle_at(dfd, path, h, m, f)       [手册] */
+    case 428:  return 1u << 1;   /* open_tree(dfd, path, flags)                 [手册] */
+
+    /* 双路径 / mount 族（[手册]，真机复核） */
+    case 39:   return 1u << 0;               /* umount2(target, flags)          [手册] */
+    case 40:   return (1u << 0) | (1u << 1); /* mount(source, target, ...)      [手册] */
+    case 41:   return (1u << 0) | (1u << 1); /* pivot_root(new_root, put_old)   [手册] */
+    case 429:  return (1u << 1) | (1u << 3); /* move_mount(from_dfd, from_path, to_dfd, to_path, flags) [手册] */
+
     default:   return 0;
     }
 }
