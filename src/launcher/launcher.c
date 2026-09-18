@@ -1118,6 +1118,50 @@ int main(int argc, char **argv) {
         }
     }
     
+    /*
+     * ★ 重设 BXROOT_GUEST_EXE 为 **guest 视角的完整路径**（上游语义）★
+     *
+     * 【缺陷，上游 test-99999999 暴露】
+     * 上面把 cfg.guest_exe 解析成了**宿主路径**（$ROOTFS/usr/bin/readlink）
+     * 供 execve 使用 —— 这是对的。但 `BXROOT_GUEST_EXE` 早在此前（约
+     * 826 行）就已 setenv，用的还是**用户输入的原始串**（可能是裸名
+     * `readlink`、或相对名 `./x`）。
+     *
+     * runtime 用 guest_exe 回答客户的 `readlink("/proc/self/exe")`：
+     *   - 上游：`/usr/bin/readlink`（完整 guest 路径）—— 其用例
+     *     test-99999999 断言 `grep ^${WHICH_READLINK}$`；
+     *   - bxroot 实测：返回 `readlink`（裸名），断言失败。
+     *
+     * 【真实影响】裸名会让客户对"我是谁"的判断出错。DSHA 里 koffi
+     * 模块就是拿 process.execPath 去推导 libc 类型与同级路径 ——
+     * Node 的 execPath 必须是绝对路径（其文档明确要求），拿到裸名
+     * 会走错分支。这正是此前 dsh web 段错误那条链的上游环节。
+     *
+     * 修法（本轮，覆盖首进程）：在 execve 前把 BXROOT_GUEST_EXE 更新为
+     * **去掉 $ROOTFS 前缀**的绝对 guest 路径（= 容器内视角的完整路径）。
+     *
+     * ★ 已知残留：子进程 exec 场景尚未覆盖 ★
+     * 本修复只处理 launcher 启动的**首进程**。`sh -c 'readlink
+     * /proc/self/exe'` 这类场景里，sh 会 fork+exec 出 readlink，而
+     * runtime 的 exec 钩子（proc.c）目前**不更新** BXROOT_GUEST_EXE，
+     * 子进程于是继承父进程的值（`/usr/bin/sh`），readlink 会自称 sh。
+     * 上游 test-99999999 的第 8/9 行即断言此场景，当前仍失败。
+     * 正确修法是在 px_do_execve 的环境构建里按当次 exec 目标更新该变量
+     * （proc.c 的 px_build_forced 需扩槽位并把 guest 路径传入）；因涉及
+     * exec 核心路径且本容器无法端到端验证，留作待办。
+     */
+    {
+        const char *ge = cfg.guest_exe;
+        size_t rl = strlen(cfg.rootfs);
+
+        if (ge != NULL && strncmp(ge, cfg.rootfs, rl) == 0 && ge[rl] == '/') {
+            if (cfg.verbose)
+                fprintf(stderr, "[bxroot-launcher] guest_exe: %s -> %s\n",
+                        getenv("BXROOT_GUEST_EXE"), ge + rl);
+            setenv("BXROOT_GUEST_EXE", ge + rl, 1);
+        }
+    }
+
     /* 检查路径是否存在 */
     {
         struct stat st;
