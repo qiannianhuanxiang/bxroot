@@ -3864,6 +3864,41 @@ static int px_do_execve(const char *path, char *const argv[],
                 px_cfg_str(host, sizeof(host), path);
             }
             px_cfg_str(guest, sizeof(guest), path);
+
+            /*
+             * ★ path 可能本来就是**宿主路径** —— 必须剥回 guest 视角 ★
+             *
+             * 【实测链路，2026-09-18】launcher 自身也在 --preload 下运行，
+             * 它 execve 的目标是解析后的宿主路径
+             * （$ROOTFS/usr/bin/readlink、$ROOTFS/tmp/sg14456 …）。
+             * 我们的 execve 钩子收到它后，`guest` 直接拷贝了 path ——
+             * 于是 shebang 场景里 out_script（argv[1]）带着译层前缀：
+             *
+             *     宿主  : /bin/echo 打出 "HELLO /tmp/sg14456"
+             *     bxroot: /bin/echo 打出 "HELLO /data/.../rootfs/tmp/sg14456"
+             *
+             * python 的 sys.argv[0]、bash 的 $0 同理 —— 所有
+             * "脚本自称在哪"的逻辑都会看到宿主前缀。
+             *
+             * 【修法】path 以 rootfs 开头（组件边界）时，剥前缀得到
+             * guest 视角；否则维持原判（已是 guest 视角或纯相对名）。
+             * 判据与 strip_rootfs_prefix_inplace 一致。
+             */
+            {
+                const char *rf = g_rt_cfg.rootfs;
+                size_t rl = (rf != NULL) ? strlen(rf) : 0;
+
+                if (rl > 0 && guest[0] == '/' &&
+                    strncmp(guest, rf, rl) == 0) {
+                    if (guest[rl] == '\0') {
+                        px_cfg_str(guest, sizeof(guest), "/");
+                    } else if (guest[rl] == '/') {
+                        char tmp[PX_PATH_MAX];
+                        px_cfg_str(tmp, sizeof(tmp), guest + rl);
+                        px_cfg_str(guest, sizeof(guest), tmp);
+                    }
+                }
+            }
         }
 
         sb_rc = px_rewrite_shebang(host, guest, argv,

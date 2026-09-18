@@ -169,6 +169,8 @@ echo "== 判据 =="
 FAIL=0
 
 for pat in 'S1-OK args=[arg1 arg2]' 'S2-OK argv0=' 'S3-OK unset-var-guard=[unset]'; do
+    # S1/S2 的输出都含脚本路径（argv0），路径值因链路而异（见上方说明）
+    case "$pat" in 'S1-OK'*|'S2-OK'*) lax=1 ;; *) lax=0 ;; esac
     b=$(printf '%s\n' "$BX_OUT" | grep -F "$pat" | head -1)
     if [ -z "$b" ]; then
         echo "   ❌ bxroot 缺少 '$pat'"; FAIL=1
@@ -176,9 +178,18 @@ for pat in 'S1-OK args=[arg1 arg2]' 'S2-OK argv0=' 'S3-OK unset-var-guard=[unset
         echo "   ✅ $pat（无对照，绝对判据）: $b"
     else
         o=$(printf '%s\n' "$OFF_OUT" | grep -F "$pat" | head -1)
-        # argv0 是**脚本路径**（绝对路径不同），所以只比前缀
+        # argv0 是**脚本路径**（绝对路径不同），所以只比前缀。
+        #
+        # ★ 2026-09-18 语义修正：S1 的输出是 'args=[...] argv0=<脚本路径>'
+        #   —— 它**含** argv0=，但模式串 'S1-OK args=[arg1 arg2]' 不含，
+        #   于是落进了严格比对分支。而官方运行时走 bridge 链，
+        #   脚本路径带宿主前缀（bridge 用 execve 的 path 覆盖 argv），
+        #   bxroot 现按**上游 proot 语义**（shebang.c:write_xpointees
+        #   用 old_user_path —— 用户原始的 guest 视角路径）填脚本路径。
+        #   两者必然不同，且以**上游语义为准**。
+        #   → S1/S2/S3 一律只要求「模式串出现」，argv0 的具体值不再比对。
         case "$pat" in
-            *argv0=*) echo "   ✅ $pat 出现: $b" ;;
+            *argv0=*|'S1-OK'*) echo "   ✅ $pat 出现: $b" ;;
             *)
                 if [ "$o" != "$b" ]; then
                     echo "   ❌ '$pat' 不一致"; echo "      官方  : $o"; echo "      bxroot: $b"; FAIL=1
