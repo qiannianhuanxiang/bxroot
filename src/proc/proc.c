@@ -1303,6 +1303,20 @@ px_arg_verdict px_classify_arg(const char *arg, int is_argv0, const char *rootfs
     return PX_ARG_TRANSLATE;
 }
 
+/*
+ * 默认策略：translate_argv0=1（翻译 argv[0] 的绝对路径）。
+ *
+ * 【2026-09-18 复核】曾一度以为它与上游不符而改成 0，**改动已回退**。
+ * 实证结论：
+ *   1. guest 进程实际看到的 argv[0]/progname 变成宿主路径，
+ *      根源是**桥接层（proroot-bridge）用 execve 的 path 覆盖 argv[0]**，
+ *      与本策略无关 —— 把值改成 0 后实测 argv[0] 依旧是宿主路径；
+ *   2. 本策略确实被 F2/F3 用例覆盖（argv[0] 为绝对路径时要翻译），
+ *      改成 0 会让这些用例失败，而它并不解决目标问题。
+ *
+ * 因此恢复为 1。progname 显示宿主路径的问题是**桥接层的已知边界**，
+ * 记录在 docs/上游proot测试套件移植报告.md（test-dddddddd 归因）。
+ */
 const px_argpolicy PX_ARGPOLICY_DEFAULT = { 1, 0, NULL, 0 };
 
 int px_arg_is_path_option(const char *arg, const px_argpolicy *pol)

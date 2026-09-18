@@ -538,7 +538,7 @@ typedef enum {
  * open/stat 钩子翻到），不可多翻（语义被改坏且无迹可循）。
  */
 typedef struct {
-    int translate_argv0;            /* 默认 1 */
+    int translate_argv0;            /* 默认 1（F2/F3 用例覆盖；见 PX_ARGPOLICY_DEFAULT 注释） */
     int translate_other_args;       /* 默认 0 —— 保守 */
     /*
      * 「取路径的选项」白名单：argv 里出现这些**精确**字面量时，

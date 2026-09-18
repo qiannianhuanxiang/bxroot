@@ -276,7 +276,7 @@ mkdir -p "$WORK/sb"
 echo "SELFTEST-OK" > "$WORK/sb/m"
 sb_got=$(timeout 60 "$PROOT_BX" -r "$HOST_ROOTFS" -b "$WORK_K/sb:/ced" \
          /bin/cat /ced/m 2>&1 | grep -v '^\[bxroot-launcher\]' | head -1)
-banner=$(timeout 60 "$PROOT_BX" -r "$HOST_ROOTFS" -v /bin/true 2>&1 \
+banner=$(timeout 60 "$PROOT_BX" -r "$HOST_ROOTFS" -v 1 /bin/true 2>&1 \
          | grep -c 'bxroot-launcher')
 if [ "$sb_got" = "SELFTEST-OK" ]; then
     echo "  ✅ -b 探针：bind 生效（官方 runtime 不吃 -b）"

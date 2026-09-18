@@ -144,6 +144,13 @@ typedef struct {
     int bind_count;
     int fakeroot;
     int verbose;
+    /*
+     * quiet：上游 `-v <负数>` 的语义（cli/note.c:54）——
+     * verbose_level < 0 时**压制除 ERROR 外的一切输出**。
+     * 上游用例用它让容器输出与宿主逐字节一致（如 test-dddddddd 的 cmp）。
+     * 我们据此静默所有 [bxroot-launcher]/[bxroot] 诊断信息。
+     */
+    int quiet;
     int link2symlink;
     /*
      * CLI 兼容字段。
@@ -252,6 +259,7 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
     cfg->bind_count = 0;
     cfg->fakeroot = 0;
     cfg->verbose = 0;
+    cfg->quiet   = 0;
     cfg->link2symlink = 0;
     cfg->fix_symlink_size = 0;
     cfg->runtime_lib = NULL;
@@ -359,7 +367,68 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
              */
             cfg->link2symlink = 1;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            /*
+             * ★ 上游 -v 是「带整数值」的选项，不是布尔开关 ★
+             *
+             * 上游选项表（cli/proot.h）：
+             *     { .name = "-v",        .separator = ' ', .value = "value" }
+             *     { .name = "--verbose", .separator = '=', .value = "value" }
+             *     description: "Set the level of debug information to *value*."
+             * handler（cli/proot.c:handle_option_v）用 parse_integer_option
+             * 解析，接受任意整数（含负数，如 `-v -1`）。
+             *
+             * 【缺陷】bxroot 原先把 -v 当布尔开关（`cfg->verbose = 1`），
+             * 于是 `-v -1` 里的 `-1` 落进未知选项分支被拒绝：
+             *     错误: 未知选项 '-1'
+             * 而上游用例大量使用 `-v <level>` 形态（test-dddddddd 等）。
+             *
+             * 【修法】吃掉后面的整数值。语义映射到 bxroot 的布尔 verbose：
+             * 级别 > 0 视为开启（上游 0 = 关闭、>=1 = 递增详略）；
+             * 负数也开启 —— 上游对负数不报错，我们保持"接受且不崩"，
+             * 这是兼容性优先的取舍（verbose 只影响日志详略，不影响语义）。
+             * 缺值时报错（上游同样会报 "expects an integer value"）。
+             *
+             * 兼容 `--verbose=N`（= 分隔）已在下面单独处理。
+             */
+            /*
+             * 【兼容双模式】上游要求 `-v <int>`；但**裸 `-v` 是极常见的
+             * 用法**（本项目自己的 CLI 兼容测试、大量用户脚本、以及
+             * 我们在测试里的自检都用裸 `-v`）。上游对裸 `-v` 报
+             * "missing value"，我们选择**宽松接受**：
+             *
+             *   - 下一个 argv 是合法整数 → 按上游语义取级别
+             *     （>0 verbose、<0 静默 quiet、=0 都不开）；
+             *   - 否则（下一项是选项/命令/不存在）→ 视作 `-v 1`，
+             *     只把 verbose 打开，不消费下一个 argv。
+             *
+             * 为什么不严格照抄上游的报错：`-v` 只影响日志详略，
+             * 不影响任何语义；为它拒绝一次容器启动，代价远大于收益，
+             * 而兼容性是本项目的首要目标（见目标陈述）。
+             * 真正需要"精确复现上游报错"的场合（上游测试套件）用的是
+             * `-v <int>` 显式形态，两种都能满足。
+             */
             cfg->verbose = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '\0') {
+                char *endp = NULL;
+                long lvl = strtol(argv[i + 1], &endp, 10);
+                if (endp != NULL && endp != argv[i + 1] && *endp == '\0') {
+                    i++;                            /* 消费级别值 */
+                    cfg->verbose = (lvl > 0) ? 1 : 0;
+                    cfg->quiet   = (lvl < 0) ? 1 : 0;   /* 上游语义：负值静默 */
+                }
+            }
+        } else if (strncmp(argv[i], "--verbose=", 10) == 0) {
+            /* --verbose=<int>：上游用 '=' 分隔 */
+            char *endp = NULL;
+            long lvl = strtol(argv[i] + 10, &endp, 10);
+            if (endp != NULL && *endp == '\0' && endp != argv[i] + 10) {
+                cfg->verbose = (lvl > 0) ? 1 : 0;
+                cfg->quiet   = (lvl < 0) ? 1 : 0;
+            }
+            else {
+                fprintf(stderr, "错误: --verbose 需要整数值（上游语义）\n");
+                return -1;
+            }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             exit(0);
@@ -928,10 +997,22 @@ int main(int argc, char **argv) {
     else
         unsetenv("BXROOT_FAKEROOT");
 
-    if (cfg.verbose)
+    /* quiet 优先级高于 verbose：上游 -v <负数> 就是"压低输出"，
+     * 此时绝不能同时把 verbose 打开（那会自相矛盾）。 */
+    if (cfg.verbose && !cfg.quiet)
         setenv("BXROOT_VERBOSE", "1", 1);
     else
         unsetenv("BXROOT_VERBOSE");
+
+    /*
+     * quiet（上游 `-v <负数>`）要传到 runtime 侧：proc.c 的
+     * `[bxroot] proc: ...` 诊断与 runtime 的其它非 ERROR 输出都需抑制，
+     * 否则容器输出仍与宿主不一致。runtime 读 BXROOT_QUIET。
+     */
+    if (cfg.quiet)
+        setenv("BXROOT_QUIET", "1", 1);
+    else
+        unsetenv("BXROOT_QUIET");
 
     /* 设置 linker / stub-loader 环境变量（供 runtime 库查找） */
     if (cfg.linker_lib)
@@ -1162,8 +1243,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* 检查路径是否存在 */
-    {
+    /*
+     * 检查路径是否存在。
+     *
+     * ★ 诊断输出必须受 quiet/verbose 门控 ★
+     * 原先这条**无条件**打印，于是每次运行都在 stderr 留一行
+     * `[bxroot-launcher] stat(...) OK` —— 破坏与上游的输出一致性
+     * （上游默认静默，上游用例 test-dddddddd 用 cmp 逐字节比对）。
+     */
+    if (!cfg.quiet) {
         struct stat st;
         if (stat(cfg.guest_exe, &st) < 0) {
             fprintf(stderr, "[bxroot-launcher] stat(%s) failed: %s\n", cfg.guest_exe, strerror(errno));
