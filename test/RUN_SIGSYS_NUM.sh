@@ -58,6 +58,46 @@ if [ ! -f "$OUT" ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------
+# ★ 源码-探针一致性前置检查（防止"两处各写一份号"漂移）★
+#
+# 探针头注声称"从被测源码里取号，避免本探针与源码各写一份而再次漂移"，
+# 但它实际把 135 硬编码在自己文件里 —— 而 src/runtime/sigsys.c 也各有
+# 一份 `#define SYS_RT_SIGPROCMASK`。两边是**独立常量**，所以真正的
+# 漂移场景恰好测不出来：
+#
+#     若有人把 sigsys.c 改回 175（本次修复的那个缺陷），
+#     sigsys.c 那行裸调用会再次变成"查 euid"，SIGSYS 屏蔽位不被解除；
+#     而本探针**仍然只测自己那份 135** → 照旧 PASS。
+#
+# 那是典型的"防了回归却防不住真缺陷"：钉子的判别力没有覆盖被测对象。
+# 这里直接把两边拉齐：从源码里抽出实际的号，与探针里待测的号比对。
+# ---------------------------------------------------------------------
+SRC_SIGSYS="$ROOT/src/runtime/sigsys.c"
+SRC_NR=$(sed -n 's/^#define[[:space:]]\+SYS_RT_SIGPROCMASK[[:space:]]\+\([0-9]\+\).*/\1/p' \
+         "$SRC_SIGSYS" | head -1)
+PROBE_NR=$(sed -n 's/^#define[[:space:]]\+SYS_RT_SIGPROCMASK_UNDER_TEST[[:space:]]\+\([0-9]\+\).*/\1/p' \
+           "$ROOT/test/probe_sigprocmask_num.c" | head -1)
+
+if [ -z "$SRC_NR" ] || [ -z "$PROBE_NR" ]; then
+    echo "   ❌ 前置检查失败：抽不到系统调用号"
+    echo "      源码($SRC_SIGSYS)   SYS_RT_SIGPROCMASK='${SRC_NR:-<空>}'"
+    echo "      探针(probe_sigprocmask_num.c) SYS_RT_SIGPROCMASK_UNDER_TEST='${PROBE_NR:-<空>}'"
+    echo "      → 宏定义形式被改过？本检查是为了防止源码改回 175 而探针仍测 135。"
+    rm -f "$OUT" "$OUT.err"
+    exit 1
+fi
+
+if [ "$SRC_NR" != "$PROBE_NR" ]; then
+    echo "   ❌ 前置检查失败：源码与探针的 rt_sigprocmask 号不一致"
+    echo "      src/runtime/sigsys.c = $SRC_NR"
+    echo "      探针待测号           = $PROBE_NR"
+    echo "      → 二者必须一致，否则探针测的不是被测对象（本轮声称修的正是号写错）。"
+    rm -f "$OUT" "$OUT.err"
+    exit 1
+fi
+echo "   ✔ 前置检查：源码与探针的号一致（$SRC_NR）"
+
 "$OUT"
 rc=$?
 rm -f "$OUT" "$OUT.err"

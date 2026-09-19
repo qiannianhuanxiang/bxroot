@@ -289,6 +289,8 @@ fi
 # =====================================================================
 if [ -f test/RUN_CONCUR.sh ]; then
     run_step "fakeroot 账本并发" sh test/RUN_CONCUR.sh
+else
+    run_step "fakeroot 账本并发"
 fi
 
 # =====================================================================
@@ -325,6 +327,8 @@ fi
 # =====================================================================
 if [ -f test/RUN_SYSCALL_TABLE_AUDIT.sh ]; then
     run_step "路径参数表实测审计" sh test/RUN_SYSCALL_TABLE_AUDIT.sh
+else
+    run_step "路径参数表实测审计"
 fi
 
 # =====================================================================
@@ -480,6 +484,8 @@ fi
 # =====================================================================
 if [ -f test/RUN_D3_FIXUP.sh ]; then
     run_step "D3 /proc 泄漏反向翻译" sh test/RUN_D3_FIXUP.sh
+else
+    run_step "D3 /proc 泄漏反向翻译"
 fi
 
 # =====================================================================
@@ -493,6 +499,8 @@ fi
 # 两者共用 strip_rootfs_prefix_inplace + detranslate_binds 反向核心。
 if [ -f test/RUN_REALPATH_FIXUP.sh ]; then
     run_step "realpath 返回值反向翻译" sh test/RUN_REALPATH_FIXUP.sh
+else
+    run_step "realpath 返回值反向翻译"
 fi
 
 # =====================================================================
@@ -500,6 +508,8 @@ fi
 # =====================================================================
 if [ -f test/RUN_RAW_SYSCALL.sh ]; then
     run_step "RAW_SYSCALL 透传开关" sh test/RUN_RAW_SYSCALL.sh
+else
+    run_step "RAW_SYSCALL 透传开关"
 fi
 
 # =====================================================================
@@ -516,6 +526,8 @@ fi
 # 编译、返回值、静态检查全都看不出问题，只有实测**副作用**才暴露。
 if [ -f test/RUN_SIGSYS_NUM.sh ]; then
     run_step "sigsys 裸系统调用号/sigsetsize" sh test/RUN_SIGSYS_NUM.sh
+else
+    run_step "sigsys 裸系统调用号/sigsetsize"
 fi
 
 # =====================================================================
@@ -634,12 +646,27 @@ fi
 # =====================================================================
 # 10. 可选端到端
 # =====================================================================
+#
+# ★ 真机判据必须用**宿主视角**的 rootfs 路径 ★
+#
+# 踩过的坑（2026-09-19 发现）：这里原先判 `[ -d /data/data/com.dsh.client ]`
+# —— 那是**容器视角**路径。在干净的真机容器里它可能是假的，于是 `--e2e`
+# 即使加了参数也永远打印「跳过（需真机 rootfs）」，E2E 从来没跑过。
+#
+# 更糟的是它会**假真**：任何在 rootfs 内产生 `data/data/com.dsh.client`
+# 空目录的操作（例如某个探针里 `mkdir -p` 的路径被翻译了两次）都会让
+# 这个守卫变 TRUE。实测：把该空壳目录移走，守卫立刻从 TRUE 变 FALSE，
+# 而真正的 rootfs 与 node 一直都在（宿主视角判据为真）。
+# 也就是说这个守卫测的不是"有没有真机 rootfs"，而是"有没有人误建过目录"。
+#
+# 改用宿主视角判 rootfs 本体（与本文件其它项一致：ROOTFS 是宿主观的）。
+E2E_ROOTFS="${BXROOT_ROOTFS:-/data/data/com.dsh.client/files/linux/ubuntu}"
 if [ "$DO_E2E" = 1 ]; then
-    if [ -f test/RUN_E2E.sh ] && [ -d /data/data/com.dsh.client ]; then
+    if [ -f test/RUN_E2E.sh ] && [ -d "$E2E_ROOTFS" ]; then
         run_step "端到端 dsh" sh test/RUN_E2E.sh --version
     else
-        note SKIP "端到端 dsh" "非真机环境"
-        printf '⏭️  %-26s 跳过（需真机 rootfs）\n' "端到端 dsh"
+        note SKIP "端到端 dsh" "非真机环境（宿主视角 rootfs 不存在：$E2E_ROOTFS）"
+        printf '⏭️  %-26s 跳过（需真机 rootfs：%s）\n' "端到端 dsh" "$E2E_ROOTFS"
     fi
 fi
 

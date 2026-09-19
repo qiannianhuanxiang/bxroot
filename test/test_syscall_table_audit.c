@@ -427,7 +427,7 @@ static void sb_purge(void)
         "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8",
         "l1", "n1", "nl1", "nl2", "nl3", "nl4", "nl5", "nl6", "nl7",
         "h1", "h2", "rel_nl5", "rel_nl7", "rel_out", "rel_tmp",
-        "d1/g1", "d1/g2", "d1/g3",
+        "d1/g1", "d1/g2", "d1/g3", "d1/rel_g3",
         NULL
     };
     static const char *dirs[] = { "d1", NULL };
@@ -435,10 +435,26 @@ static void sb_purge(void)
 
     for (i = 0; files[i] != NULL; i++)
         sb_rm(files[i]);
-    /* 相对名夹具（raw cwd = 沙箱时由子进程创建，见 sb_setup） */
+    /* 相对名夹具（raw cwd = 沙箱时由子进程创建，见 sb_setup）
+     *
+     * ★ 清单必须与"测试过程中真实建过的相对名"逐一对齐 ★
+     *
+     * 踩过的坑：这里原先只有 rel_f1/rel_l1/rel_g3，漏了
+     * rel_rnsrc（第 820/1063/1066 行的 rename 用例）与
+     * rel_f2（第 1671-1697 行），于是每次跑完审计，仓库根目录都留下
+     * 一个非空的 `.bxroot-scg-audit-<pid>/` —— 而它**不在 .gitignore
+     * 里**，`git status` 会一路显示为未跟踪目录，`git add -A` 就会把它
+     * 提交进去（.gitignore 头注担心的正是这类产物）。
+     *
+     * 注意这里**不能**改成通配式批量删（例如让子进程自己 rmdir 整个
+     * g_sb）：沙箱是建在 raw cwd（宿主真实路径）下的，而本函数也可能
+     * 被 atexit 在非常规退出路径上调用，逐项列出是最稳的。新增相对名
+     * 用例时**必须同时**加进这个清单。
+     */
     {
         char p[PATH_MAX];
-        const char *rels[] = {"rel_f1", "rel_l1", "rel_g3", NULL};
+        const char *rels[] = {"rel_f1", "rel_l1", "rel_g3",
+                              "rel_rnsrc", "rel_f2", NULL};
         for (i = 0; rels[i] != NULL; i++) {
             sb_path(p, sizeof p, rels[i]);
             raw_unlink(p, 0);

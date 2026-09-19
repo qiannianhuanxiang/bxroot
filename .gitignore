@@ -82,3 +82,13 @@ vgcore.*
 # 它必须被忽略，否则每跑一次回归就会多出一堆未跟踪文件。
 .tmp-*
 work/
+
+# 系统调用路径参数表审计（test/test_syscall_table_audit.c）的 raw 侧沙箱。
+#
+# 它建在 **raw cwd**（宿主真实路径）下，所以落点是仓库根目录而不是
+# /tmp —— 每次跑 `sh test/RUN_SYSCALL_TABLE_AUDIT.sh` 都会新建一个。
+# 该测试已在 atexit 的 sb_purge() 里逐项清理（含 d1/rel_g3、rel_rnsrc、
+# rel_f2），正常情况下不会残留；这里加规则是**兜底**：清理清单一旦与新
+# 增用例脱节（本项目已发生过一次），残留的就是一个非空目录，
+# `git add -A` 会把它提交进去。
+.bxroot-scg-audit-*

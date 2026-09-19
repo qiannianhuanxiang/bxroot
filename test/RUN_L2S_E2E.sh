@@ -57,6 +57,9 @@ OFFICIAL="${OFFICIAL_RT:-/root/proroot-work/backup/libproroot-runtime.so}"
 STAGE_MKDIR="${BXROOT_STAGE:-/tmp/bxroot-l2s-$$}"
 STAGE_LOAD="$ROOTFS${STAGE_MKDIR}"
 
+# run_one 的原始输出落盘位置（见 run_one 内注释：不能让它被 grep 吃掉）
+RAW_OUT="/tmp/bxroot-l2s-raw-$$.log"
+
 # ★ 不要对 $APP_LIB 做任何存在性探测 ★
 #
 # 这是本项目的经典双视角陷阱，实测六种探测方式**全部失败**：
@@ -110,6 +113,9 @@ fi
 rm -rf "$STAGE_MKDIR" 2>/dev/null
 mkdir -p "$STAGE_MKDIR" || { echo "❌ 无法创建落地目录"; exit 2; }
 cp -f "$RUNTIME_SO" "$STAGE_MKDIR/libbxroot-runtime.so" || exit 2
+
+# 退出时清掉本次的原始输出（STAGE 目录在正常路径各自清理，这里兜底）
+trap 'rm -f "$RAW_OUT"' EXIT INT TERM
 
 # ---------------------------------------------------------------------
 # 探针：测 link() 之后的 st_nlink 与"是否被看成符号链接"
@@ -174,7 +180,20 @@ console.log("RESULT nlink=" + nlink + " islink=" + isLink +
 JSEOF
 
 run_one() {
-    # $1 = runtime 的 .so 路径（容器视角）
+    # $1 = runtime 的 .so 的**文件名**，拼到 $STAGE_LOAD（宿主视角）下给 --preload
+    #
+    # ★ 本函数里两种视角并存，不是笔误 ★
+    #
+    #   --preload <路径>   → 宿主视角（$STAGE_LOAD）：exec 直达内核，不做翻译
+    #   guest argv 里的路径 → 容器视角（$STAGE_MKDIR）：guest 自己还会翻译一次
+    #
+    # 踩过的坑：探针脚本路径原先写成 "$STAGE_LOAD/l2s_probe.js"（宿主视角），
+    # 而 guest(node) 拿到该 argv 后会**再翻译一次** → 变成
+    # "$ROOTFS$ROOTFS/..."，node 启动即
+    #     Error: ENOENT: lstat '/data/data/com.dsh.client'
+    # 于是整项报"探针没跑起来"（当时的判定是 l2s 功能缺陷，实为测试自身
+    # 传参视角错误 —— 功能侧用容器视角一跑就 PASS）。
+    # 判据不是"统一用某种视角"，而是**这个参数由谁消费**。
     #
     # ★ BXROOT_L2S_DIR 必须设 —— 否则测的不是生产路径 ★
     #
@@ -203,9 +222,23 @@ run_one() {
     timeout 150 "$APP_LIB/libproroot-bridge.so" "$APP_LIB/libproroot-linker.so" \
         --argv0 node \
         --preload "$STAGE_LOAD/$1" \
-        "$NODE" "$STAGE_LOAD/l2s_probe.js" 2>&1 \
-      | grep -vE '^\[NEXT\]|^\[bxroot\]|^node\[' \
-      | grep '^RESULT' | head -1
+        "$NODE" "$STAGE_MKDIR/l2s_probe.js" 2>&1 \
+      | grep -vE '^\[NEXT\]|^\[bxroot\]|^node\[' >"$RAW_OUT" 2>&1
+    # ★ 原始输出必须落盘，不能在管道里被 grep 丢弃 ★
+    #
+    # 原先整条链是 `... | grep '^RESULT' | head -1`，一旦探针**没跑起来**
+    # （例如 node 启动即抛 ENOENT），唯一能说明原因的 stderr 就被 grep 吃掉，
+    # 调用侧只看得到"没有产出 RESULT 行"—— 排查时无从下手（本项目把
+    # "静默失败"列为反复出现的缺陷模式）。现在留全量输出给调用侧按需打印。
+    grep '^RESULT' "$RAW_OUT" | head -1
+}
+
+# 打印上一次 run_one 的原始输出（用于"探针没跑起来"时给出真实原因）
+show_raw() {
+    echo "   --- 探针原始输出（末尾 15 行）---"
+    tail -15 "$RAW_OUT" 2>/dev/null | sed 's/^/   /'
+    echo "   --------------------------------"
+    rm -f "$RAW_OUT"
 }
 
 echo "== l2s 硬链接模拟端到端契约 =="
@@ -217,6 +250,7 @@ echo
 GOT=$(run_one libbxroot-runtime.so)
 if [ -z "$GOT" ]; then
     echo "❌ bxroot 侧没有产出 RESULT 行（探针没跑起来？）"
+    show_raw
     rm -rf "$STAGE_MKDIR"
     exit 1
 fi

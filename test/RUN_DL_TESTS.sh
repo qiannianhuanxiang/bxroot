@@ -15,11 +15,12 @@
 # 测不到真实缺陷（这一点是实测出来的）。
 #
 # ★ 环境不可用时不静默放过 ★
-# 拿不到 bridge/linker/rootfs 时**明确 SKIP 并 exit 0**（与 RUN_ALL 的
-# 其它项一致），但会把原因打出来 —— 静默跳过是本项目反复出现的缺陷模式。
+# 拿不到 bridge/linker/rootfs 时明确 SKIP 并 **exit 2**（"环境不满足"，
+# 与 RUN_ALL 的 rc=2 约定一致，见 RUN_NSS_EDGE.sh / RUN_PATH_FORMS.sh），
+# 且把原因打出来 —— 静默跳过是本项目反复出现的缺陷模式。
 #
 # 用法： sh test/RUN_DL_TESTS.sh
-# 退出码：0 = 通过或跳过；1 = 契约失败
+# 退出码：0 = 通过；1 = 契约失败；2 = 环境不满足（无法测）
 # =====================================================================
 set -u
 
@@ -27,7 +28,36 @@ SELF_DIR=$(dirname "$0")
 ROOT=$(cd "$SELF_DIR/.." && pwd)
 cd "$ROOT" || exit 1
 
-APP_LIB="${BXROOT_APP_LIB:-/data/app/~~IIMfcaE6bcH0NmTRD8KqpA==/com.dsh.client-7Lg5Zt8zAVL829axfo2lQQ==/lib/arm64}"
+# ---------------------------------------------------------------------
+# ★ APP_LIB 必须**动态探测**，不能硬编码 ★
+#
+# 踩过的坑（2026-09-19 发现）：这里原先硬编码了一个**过期**的 APK 路径
+# （`com.dsh.client-7Lg5Zt8zAVL829axfo2lQQ==`），而本机的真实路径是
+# `com.dsh.client-Bqbh8yjCugq4VmZdjRfkTg==` —— APK 一重装，那个随机
+# 后缀就变了。后果：`bridge_ok()` 恒失败 → 本项**每次静默跳过**，
+# 而跳过方式是 `exit 0`，于是 RUN_ALL 把它记成 **✅ dl 家族契约**。
+#
+# 危害不止"少测一项"：这是一个自述"只有真跑才测得到真实缺陷"的测试
+# （见头注：普通环境下 LD_PRELOAD 走的是另一条降级路径），它被跳过的
+# 时候恰恰是最需要它的时候。实测改用探测值后 11/11 全过。
+#
+# 注意本文件上面那段"可用性探测必须真跑一下、不能用 [ -f ]"的注释是
+# **对的**，但它只解决了"怎么判断可用"，没解决"去哪儿找" —— 同一个
+# 静默跳过换个入口又出现了一次。两者都要管。
+#
+# 探测方法与其他 runner 一致（RUN_NSS_EDGE.sh:173 / RUN_E2E.sh:88 /
+# RUN_PATH_FORMS.sh:399）：从 /proc/<pid>/maps 反查 bridge 的真实路径。
+# ---------------------------------------------------------------------
+detect_app_lib() {
+    for m in /proc/[0-9]*/maps; do
+        [ -r "$m" ] || continue
+        p=$(grep -a 'libproroot-bridge\.so' "$m" 2>/dev/null | head -1 | awk '{print $6}')
+        [ -n "${p:-}" ] && { echo "${p%/*}"; return 0; }
+    done
+    return 1
+}
+
+APP_LIB="${BXROOT_APP_LIB:-$(detect_app_lib || true)}"
 ROOTFS="${BXROOT_ROOTFS:-/data/data/com.dsh.client/files/linux/ubuntu}"
 RT="${BXROOT_DL_RT:-$ROOT/build/libbxroot-runtime.so}"
 TMPL="${BXROOT_DL_TMPL:-$ROOTFS/root/dlfix/test}"
@@ -36,7 +66,7 @@ say() { printf '%s\n' "$*"; }
 
 if [ ! -f "$RT" ]; then
     say "⏭️  跳过：缺构建产物 $RT（先跑 sh BUILD_RUNTIME.sh）"
-    exit 0
+    exit 2
 fi
 # ★ 可用性探测必须用"真跑一下"，不能用 [ -f ] ★
 #
@@ -59,16 +89,16 @@ if ! bridge_ok; then
     say "⏭️  跳过：proroot bridge/linker 不可用（$APP_LIB）"
     say "    本项只在 proroot linker 下有意义 —— 本库的 dlsym 走 linker 服务，"
     say "    在普通环境里走的是另一条降级路径，测不到真实缺陷。"
-    exit 0
+    exit 2
 fi
 if [ ! -d "$ROOTFS" ]; then
     say "⏭️  跳过：找不到 ROOTFS（$ROOTFS）"
-    exit 0
+    exit 2
 fi
 
 # 落盘目录必须**在 ROOTFS 内**（Python os.makedirs：shell 的 mkdir 在
 # ROOTFS 内会"成功但看不见"，见 docs/高频符号缺口调查.md §6.3）
-python3 - "$TMPL" <<'PY' 2>/dev/null || { say "⏭️  跳过：无法创建 $TMPL"; exit 0; }
+python3 - "$TMPL" <<'PY' 2>/dev/null || { say "⏭️  跳过：无法创建 $TMPL"; exit 2; }
 import os, sys
 os.makedirs(sys.argv[1], exist_ok=True)
 PY

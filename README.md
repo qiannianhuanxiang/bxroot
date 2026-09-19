@@ -292,8 +292,14 @@ sh test/RUN_SYSCALL_TABLE_AUDIT.sh  # 路径参数表实测审计（裸 svc 逐�
 sh test/RUN_RAW_SYSCALL.sh      # 非 Android 透传开关
 sh test/RUN_REALPATH_FIXUP.sh   # realpath 返回值反向翻译
 sh test/RUN_D3_FIXUP.sh         # /proc 泄漏反向翻译
-sh issue-regression-test.sh     # 上游 24 issue 的 25 用例回归
+bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 ```
+
+> ★ 最后一行必须是 `bash` 而不是 `sh` ★ 该脚本是 bash 脚本
+> （`#!/usr/bin/env bash`，并用了 `set -o pipefail`）。在 Debian/Ubuntu
+> 上 `sh` 是 dash，它不支持 `pipefail`，会直接
+> `set: Illegal option -o pipefail` 退出（rc=2）—— **一条用例都没跑**，
+> 而 README 此前写的正是 `sh`。用 `sh` 跑等于静默不执行。
 
 其中两项是「会主动发现问题」的审计型测试，不只是防回归：
 

@@ -108,7 +108,25 @@ detect_app_lib() {
 APP_LIB="${APP_LIB:-$(detect_app_lib)}"
 ROOTFS="${ROOTFS:-/data/data/com.dsh.client/files/linux/ubuntu}"
 NODE="$ROOTFS/usr/local/bin/node"
-DSH_JS="$ROOTFS/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
+
+# ★ DSH_JS 必须是**容器视角**（guest 会再翻译一次）★
+#
+# 踩过的坑（2026-09-19 发现）：这里原先写的是宿主视角
+# `$ROOTFS/usr/local/lib/.../bin.js`，而它被当作**参数传给 guest 的 node**。
+# node 收到后会自己做一次路径翻译 → 变成 `<rootfs><rootfs>/...` →
+# 实测报 `Error: ENOENT: no such file or directory, lstat '/data'`
+# （`/data/data/...` 被当成 guest 路径再拼一层 rootfs，于是只拼到 `/data`）。
+#
+# 对照实测（同一环境，只改这一个参数）：
+#     宿主视角 $ROOTFS/usr/local/lib/.../bin.js → ENOENT（如上）
+#     容器视角 /usr/local/lib/.../bin.js        → 0.1.5-rc.2  ✅
+#
+# 判据不是"统一用某种视角"，而是**这个值由谁消费**：
+#   --preload / --argv0 / BXROOT_TMP_DIR / BXROOT_GUEST_EXE → 宿主视角（内核/launcher 用）
+#   guest 可执行文件的 argv（脚本路径、目标文件）           → 容器视角（guest 会翻译）
+# 注意 NODE（guest 可执行文件本身）用宿主视角是**对的** —— 它由 exec 消费。
+DSH_JS_GUEST="${DSH_JS_GUEST:-/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js}"
+DSH_JS="$ROOTFS$DSH_JS_GUEST"   # 宿主视角，仅供本脚本做存在性检查
 
 # bxroot 运行时的来源：优先用与本脚本同级的 ../build/，其次用环境变量指定
 SELF_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
@@ -145,7 +163,23 @@ fi
 # 改为带 $$ 的私有目录后：可以并发跑、互不干扰；`rm -rf` 也
 # 只删自己的。需要保留现场的，用 BXROOT_STAGE 显式指定路径。
 STAGE_MKDIR="${BXROOT_STAGE:-/tmp/bxroot-e2e-$$}"   # 容器视角，供 mkdir/cp 使用
-STAGE_LOAD="$ROOTFS/tmp/bxroot-e2e"           # 内核视角，供 --preload 使用
+# ★ STAGE_LOAD 必须由 STAGE_MKDIR **派生**，不能另起一个固定名 ★
+#
+# 踩过的坑（2026-09-19 发现）：这里原先写死 `$ROOTFS/tmp/bxroot-e2e`
+# （**没有** `$$`），而 STAGE_MKDIR 带 `$$` —— 两者永远不是同一个目录。
+# 于是下面 `[ -d "$STAGE_LOAD" ]` 的守卫必然失败，脚本**永远跑不到 exec**，
+# 并且把自己造的 bug 打印成「proroot 双重翻译？」—— 把排查方向引向了
+# 外层运行时（那里其实没问题：本容器 /tmp 与 $ROOTFS/tmp 实测同 inode，
+# stat 均为 65086:5781241，所以这不是视角问题，只是名字不同）。
+#
+# 修法：内核视角 = ROOTFS 前缀 + 容器视角的相对部分。
+# 其他 runner 写的是 `STAGE_LOAD="$ROOTFS${STAGE_MKDIR}"`（要求
+# STAGE_MKDIR 在 guest 里可见），这里用去 /tmp 前缀的等价表达，
+# 同时兼容 BXROOT_STAGE 被指到别处的情形。
+case "$STAGE_MKDIR" in
+    /tmp/*) STAGE_LOAD="$ROOTFS/tmp/${STAGE_MKDIR#/tmp/}" ;;
+    *)      STAGE_LOAD="$ROOTFS$STAGE_MKDIR" ;;
+esac
 
 # ---------------------------------------------------------------------
 # 前置检查
@@ -240,4 +274,4 @@ fi
 exec "$APP_LIB/libproroot-bridge.so" "$APP_LIB/libproroot-linker.so" \
     --argv0 node \
     --preload "$STAGE_LOAD/libbxroot-runtime.so" \
-    "$NODE" "$DSH_JS" "$@"
+    "$NODE" "$DSH_JS_GUEST" "$@"

@@ -10,6 +10,30 @@
  * 【判别原理】屏蔽 SIGSYS → 用待测号解除屏蔽 → 读回掩码：
  *   号正确 → masked 变 0
  *   号错误 → masked 仍为 1（且返回值可能是 0，看不出异常）
+ *
+ * =====================================================================
+ * ★ 为什么本探针用裸 svc 建立/读回状态，而不是 libc sigprocmask ★
+ * =====================================================================
+ *
+ * 本仓库的测试经常跑在**外层 proroot 容器**内（bxroot 的对照实现，
+ * 由 DSHA 宿主注入：/proc/self/maps 里有 libproroot-runtime.so）。
+ * 实测该运行时**劫持 libc `sigprocmask`**，把 SIGSYS 从读回的掩码里
+ * 剔除 —— 于是本探针里两条**负向**断言（"175 号不能解除屏蔽"、
+ * "装 handler 后屏蔽位不变"）会**恒假**，整项报 FAIL，而源码其实是对的。
+ *
+ * 证据（同一进程内，两条路径互相矛盾）：
+ *
+ *     libc sigprocmask(SIG_BLOCK, SIGSYS) → sigismember 读回 0
+ *     裸 svc 135 读回同一掩码              → SIGSYS 位 = 1
+ *     /proc/self/status SigBlk             → 0000000040000000（确实屏蔽）
+ *
+ * 即：内核状态是正确的，被改掉的是**libc 符号这条观测路径**。
+ * 所以本探针的判据建立与读回一律走裸 svc（`SYS_rt_sigprocmask`=135），
+ * 只有 `sigismember` 这种纯用户态位测试仍可用（它在已填好的 sigset_t
+ * 上查位，不碰内核也不经被劫持的符号）。
+ *
+ * 判据独立性的通用教训：**用被测机制本身去观测被测机制，会得到假绿**；
+ * 用同一环境里另一个被劫持的符号去观测，会得到假红。本探针两个都不碰。
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -44,31 +68,62 @@ static long raw4(long nr, long a, long b, long c, long d)
     return x0;
 }
 
+/* ---- 状态建立/读回：一律裸 svc，不经 libc 被劫持的符号 ----
+ *
+ * sigsetsize 必须传 sizeof(unsigned long)=8（内核只接受它，见 T2）。
+ */
+#define KSET ((long)sizeof(unsigned long))
+
+static long ksig_block(const sigset_t *s)
+{
+    return raw4(SYS_RT_SIGPROCMASK_UNDER_TEST, SIG_BLOCK, (long)s, 0, KSET);
+}
+static long ksig_unblock(const sigset_t *s)
+{
+    return raw4(SYS_RT_SIGPROCMASK_UNDER_TEST, SIG_UNBLOCK, (long)s, 0, KSET);
+}
+static long ksig_query(sigset_t *out)
+{
+    return raw4(SYS_RT_SIGPROCMASK_UNDER_TEST, SIG_BLOCK, 0, (long)out, KSET);
+}
+
 int main(void)
 {
     sigset_t set, cur;
 
     printf("== sigsys 裸系统调用号 / sigsetsize 钉 ==\n\n");
 
-    /* ---- T1 号必须解析到 rt_sigprocmask，而不是 geteuid ---- */
-    printf("[T1] 号语义：aarch64 上 rt_sigprocmask=135, geteuid=175\n");
+    /* ---- T0 观测路径自检 ----
+     *
+     * 先确认"裸 svc 建立状态 → 裸 svc 读回"这条链真的看得见副作用。
+     * 没有这一步，下面那些"屏蔽位**保持**不变/变 0"的断言可能是
+     * 恒假的（观测路径本身失效），整项就失去判别力。
+     */
+    printf("[T0] 观测路径自检：裸 svc 建立的状态必须能被裸 svc 读回\n");
     {
-        /* geteuid 用一个几乎不可能相等的哨兵来识别：它不是 rt_sigprocmask */
         sigemptyset(&set); sigaddset(&set, SIGSYS);
-        sigprocmask(SIG_BLOCK, &set, NULL);
+        long rb = ksig_block(&set);
+        long rq = ksig_query(&cur);
+        int masked = sigismember(&cur, SIGSYS);
+        printf("     裸 block rc=%ld, 裸 query rc=%ld → masked=%d\n", rb, rq, masked);
+        check("裸 svc 屏蔽 SIGSYS 后，裸 svc 读回确实为 1（观测链有效）", masked == 1);
+    }
 
-        long r_ok = raw4(SYS_RT_SIGPROCMASK_UNDER_TEST, SIG_UNBLOCK,
-                         (long)&set, 0, (long)sizeof(unsigned long));
-        sigprocmask(SIG_BLOCK, NULL, &cur);
+    /* ---- T1 号必须解析到 rt_sigprocmask，而不是 geteuid ---- */
+    printf("\n[T1] 号语义：aarch64 上 rt_sigprocmask=135, geteuid=175\n");
+    {
+        ksig_block(&set);
+        long r_ok = ksig_unblock(&set);
+        ksig_query(&cur);
         int unblocked = !sigismember(&cur, SIGSYS);
         printf("     裸 135: rc=%ld, 解除屏蔽=%d\n", r_ok, unblocked);
         check("135 能解除 SIGSYS 屏蔽（号正确且 sigsetsize 正确）", unblocked);
 
         /* 反例：错号必须**不能**解除屏蔽 —— 证明本钉有区分力 */
-        sigprocmask(SIG_BLOCK, &set, NULL);
+        ksig_block(&set);
         long r_bug = raw4(SYS_RT_SIGPROCMASK_BUGGY, SIG_UNBLOCK,
-                          (long)&set, 0, (long)sizeof(unsigned long));
-        sigprocmask(SIG_BLOCK, NULL, &cur);
+                          (long)&set, 0, KSET);
+        ksig_query(&cur);
         int still = sigismember(&cur, SIGSYS);
         printf("     裸 175: rc=%ld, 仍屏蔽=%d\n", r_bug, still);
         check("175(=geteuid) 不能解除屏蔽 → 本钉能区分正确/错误号", still);
@@ -80,18 +135,17 @@ int main(void)
         long r_kernel, r_glibc;
         sigemptyset(&set); sigaddset(&set, SIGSYS);
 
-        sigprocmask(SIG_BLOCK, &set, NULL);
-        r_kernel = raw4(SYS_RT_SIGPROCMASK_UNDER_TEST, SIG_UNBLOCK, (long)&set,
-                        0, (long)sizeof(unsigned long));
-        sigprocmask(SIG_BLOCK, NULL, &cur);
+        ksig_block(&set);
+        r_kernel = ksig_unblock(&set);
+        ksig_query(&cur);
         int ok_kernel = (r_kernel == 0) && !sigismember(&cur, SIGSYS);
         printf("     sigsetsize=%-3zu rc=%ld\n", sizeof(unsigned long), r_kernel);
         check("内核大小(8) 被接受且生效", ok_kernel);
 
-        sigprocmask(SIG_BLOCK, &set, NULL);
+        ksig_block(&set);
         r_glibc = raw4(SYS_RT_SIGPROCMASK_UNDER_TEST, SIG_UNBLOCK, (long)&set,
                        0, (long)sizeof(sigset_t));
-        sigprocmask(SIG_BLOCK, NULL, &cur);
+        ksig_query(&cur);
         int bad = (r_glibc == -1 && errno == EINVAL);
         printf("     sigsetsize=%-3zu rc=%ld errno=%d\n",
                sizeof(sigset_t), r_glibc, errno);
@@ -103,14 +157,11 @@ int main(void)
     {
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
-        sa.sa_sigaction = (void (*)(int, siginfo_t *, void *))0; /* 只为探测，不真装 */
-        sa.sa_handler = SIG_DFL;
-        sa.sa_flags = SA_SIGINFO;
+        sa.sa_handler = SIG_DFL;   /* 只为探测，不真装 handler */
 
-        sigemptyset(&set); sigaddset(&set, SIGSYS);
-        sigprocmask(SIG_BLOCK, &set, NULL);
+        ksig_block(&set);
         sigaction(SIGSYS, &sa, NULL);
-        sigprocmask(SIG_BLOCK, NULL, &cur);
+        ksig_query(&cur);
         check("装处理器后屏蔽位保持不变 → 必须显式 SIG_UNBLOCK",
               sigismember(&cur, SIGSYS) != 0);
     }

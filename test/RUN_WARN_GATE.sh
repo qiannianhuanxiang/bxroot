@@ -119,9 +119,67 @@ src/runtime/fakeroot.c
 src/l2s/l2s.c
 src/l2s/l2s-runtime.c
 src/launcher/launcher.c
-src/bridge/bridge.c"
+src/bridge/bridge.c
+src/stub-loader/stub-loader.c
+src/linker/linker.c"
 
+# ★ 最后两项是 2026-09-19 补进来的 ★
+#
+# 它们此前**整体不在清单里**，于是被门禁静默漏检 —— 而两者都是
+# `make` 真正编译、并随发行产出的组件（见 Makefile 的 TARGETS：
+# libbxroot-stub-loader.so / libbxroot-linker.so）。
+#
+# 实测危害：stub-loader.c 积累了 **7 条告警**，其中
+#   - `-Wdangling-pointer`：load_runtime() 里 `runtime_path` 指向块内局部
+#     数组 `path`，出块后 dlopen/fprintf 仍在使用 → 真实 UB（活路径，
+#     该函数被 main 调用）；
+#   - `-Wformat-truncation`：两处 snprintf 无截断检查；
+#     ← 这两类正是门禁注释里自称要拦的"后端才产生的告警"
+# 一条告警都没拦住，因为门禁根本没编译这个文件。这与该注释描述的
+# 历史缺陷（用 -fsyntax-only 导致漏掉 3 条现存告警）是同一失效模式：
+# **门禁的覆盖面本身没有判据**。
+#
+# 教训：新增任何参与构建的 .c 都必须同时加进这个清单。清单与 Makefile
+# 的 TARGETS/BUILD_RUNTIME.sh 的源文件列表应保持一一对应。
 [ -n "$PROC_DIR" ] && UNITS="$UNITS $PROC_DIR/proc.c"
+
+# ---------------------------------------------------------------------
+# ★ 覆盖面自检：清单必须覆盖构建真正编译的每一个 .c ★
+#
+# 上面那次漏检（stub-loader.c 静默带 7 条告警）**没有判据能发现**——
+# 门禁只报"检查了 N 个单元、零告警"，而 N 少了没人知道。静态清单靠
+# 人记得维护，本项目已经漏过一次，所以这里加一条实测判据：
+# 从 Makefile/BUILD_RUNTIME.sh 里抽出所有被编译的 .c，逐个核对是否在
+# UNITS 里；不在就报出来（新组件一进来就会立刻被看见）。
+# ---------------------------------------------------------------------
+BUILT_CS=$(grep -hoE 'src/[a-z0-9_/-]+\.c' Makefile BUILD_RUNTIME.sh 2>/dev/null \
+           | sort -u)
+# ★ UNITS 是**多行**变量，匹配前必须归一化 ★
+#
+# `case " $UNITS " in *" $c "*)` 直接拿多行串去匹配**永远不中** ——
+# 模式里的空格对不上原文里的换行。第一版自检就踩了这个坑：它把
+# UNITS 里明明已有的 13 个单元全部报成"遗漏"（一个都没匹配上）。
+# 教训：这类"看起来在检查、实际恒为假"的断言比没有检查更危险，
+# 所以自检本身也要用"能区分正反例"的方式验证（见下面 NORM 用法 +
+# 结尾对空前缀的断言）。
+UNITS_NORM=$(printf '%s' "$UNITS" | tr '\n' ' ')
+MISSING=""
+for c in $BUILT_CS; do
+    # 注意 src/preload.c 与 src/config.h 是**不参与构建**的死文件
+    # （见 src/遗留文件说明.md），它们不会出现在 Makefile/BUILD_RUNTIME.sh
+    # 的源文件列表里，所以上面这条 grep 天然不会把它们抽进来。
+    case " $UNITS_NORM " in
+        *" $c "*) ;;
+        *) [ -f "$c" ] && MISSING="$MISSING $c" ;;
+    esac
+done
+if [ -n "$MISSING" ]; then
+    echo "❌ 告警门禁的 UNITS 清单漏了构建里真实编译的源文件:"
+    for c in $MISSING; do echo "     $c"; done
+    echo "   → 这些单元本轮**未被检查**（本项目已因此漏检过 stub-loader.c 的"
+    echo "     7 条告警，含真实 UB）。请把它们加进上面的 UNITS 后重跑。"
+    exit 1
+fi
 
 echo "== bxroot 编译告警门禁 =="
 echo "   编译器 : $CC ($("$CC" -dumpversion 2>/dev/null))"
@@ -138,7 +196,16 @@ SKIPPED=""
 
 for f in $UNITS; do
     [ -f "$f" ] || continue
-    CHECKED=$((CHECKED + 1))
+
+    # ★ CHECKED 必须在**编译成功之后**才自增 ★
+    #
+    # 踩过的坑（2026-09-19 发现）：这行原先在循环开头，于是"因 ICE 耗尽
+    # 而根本没被检查"的单元也被计入。实测：让 bridge.c（注入 2 条真实
+    # 告警）撞满 10 次 ICE，脚本照样打印
+    #     ✅ 零告警（检查了 13 个编译单元）   ← 实际只检查了 12 个
+    # 而 FAILED/TOTAL 仍为 0 → 带 2 条真实告警的单元被判"零告警"且 exit 0。
+    # 也就是说：**门禁唯一卖点（拦住告警）在 ICE 路径上完全失效**，
+    # 而它给出的数字还是虚的。下面把自增挪到编译判定之后。
 
     # gcc 13.3.0 在本环境有随机 ICE（RTL / IRA / sched-deps），重试即可。
     #
@@ -199,12 +266,16 @@ for f in $UNITS; do
             SKIPPED="$SKIPPED $f"
             continue
         fi
+        CHECKED=$((CHECKED + 1))
         echo "❌ $f —— 编译失败（非告警，是真错误）"
         head -20 "/tmp/bxroot-warn-$$.txt" | sed 's/^/     /'
         FAILED="$FAILED $f"
         TOTAL=$((TOTAL + 1))
         continue
     fi
+
+    # 走到这里 = 本轮真的编译过了（可能 0 条告警），才计入"已检查"
+    CHECKED=$((CHECKED + 1))
 
     n=$(grep -c 'warning:' "/tmp/bxroot-warn-$$.txt" 2>/dev/null)
     n=${n:-0}
@@ -231,11 +302,30 @@ if [ "$CHECKED" -eq 0 ]; then
     exit 2
 fi
 
-# ICE 跳过的单元单独汇报：它不构成失败，但必须让人看见"这一轮漏检了什么"。
+# ICE 跳过的单元单独汇报：它不构成"告警失败"，但**绝不能算通过**。
 # 静默跳过是本项目反复出现的缺陷模式（见 docs/测试基础设施红队报告.md）。
 if [ -n "$SKIPPED" ]; then
     echo "⚠️  因 gcc ICE 耗尽而**未被检查**的单元:$SKIPPED"
     echo "    （环境问题，非代码缺陷；重跑本脚本即可。上面已逐个列出原因）"
+fi
+
+if [ "$TOTAL" -eq 0 ] && [ -n "$SKIPPED" ]; then
+    # ★ 有单元未被检查 → 不是"零告警"，而是"无法完成检查" ★
+    #
+    # 踩过的坑（2026-09-19 发现）：这里原先无条件打印
+    #     ✅ 零告警（检查了 N 个编译单元）; exit 0
+    # 于是"某个单元撞满 10 次 ICE 而根本没被检查"这个状态被读成**通过**。
+    # 实测：给 bridge.c 注入 2 条真实告警、再让它撞满 ICE →
+    # 脚本报 `✅ 零告警 / exit 0`，2 条告警凭空消失。
+    #
+    # 门禁的价值全在"拦住告警"，而它恰恰在 ICE 路径上失效 —— 这类
+    # "看起来在检查、其实没检查"的绿灯比红灯危险得多。
+    # 处置：沿用本项目 rc=2 = "环境不满足，无法测"的约定（RUN_ALL.sh:178
+    # 会把 rc=2 记为 SKIP ⏭️ 并打印原因，既不算失败也不算通过）。
+    # 说"本轮无法完成检查"是准确的：未检查 ≠ 无告警。
+    echo "⚠️  本轮**无法完成检查**：$CHECKED 个单元已查、$(echo $SKIPPED | wc -w) 个因 ICE 未查"
+    echo "    → 按 rc=2（环境不满足）上报，**不代表零告警**。重跑本脚本即可。"
+    exit 2
 fi
 
 if [ "$TOTAL" -eq 0 ]; then
