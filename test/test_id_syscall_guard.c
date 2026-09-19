@@ -92,6 +92,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <signal.h>
 #include <linux/stat.h>          /* struct statx */
 
 #include "syscall_guard.h"      /* bxroot_test_path_arg_mask */
@@ -107,6 +108,29 @@ static long raw_svc1(long nr, long a0)
     __asm__ __volatile__("svc #0"
         : "+r"(x0)
         : "r"(x8)
+        : "memory", "cc");
+    return x0;
+}
+
+/*
+ * 4 参数裸 svc —— 本文件用它读回内核真实掩码。
+ *
+ * ★ 观测必须走裸 svc，不能走 libc ★
+ * 本容器自身跑在 proroot 之上，它会劫持 libc 的 sigprocmask，把 SIGSYS
+ * 从读回的掩码里剔除 —— 用 libc 读回会得到**假阴性**（实测踩过，见
+ * docs/接手报告 §2 与 test/probe_sigprocmask_num.c 的长注释）。
+ * 裸 svc 不经任何符号，读到的才是内核真相。
+ */
+static long raw_svc4(long nr, long a0, long a1, long a2, long a3)
+{
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    __asm__ __volatile__("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
         : "memory", "cc");
     return x0;
 }
@@ -317,6 +341,107 @@ static void seen_reset(void)
 /* ------------------------------------------------------------------ */
 /* 主流程                                                              */
 /* ------------------------------------------------------------------ */
+
+/*
+ * 裸 syscall 路径的 SIGSYS 剔除契约（sigsys.c 只挡 4 个 libc 符号）。
+ *
+ * 【问题】绕过 libc 直接发裸系统调用的程序（Go 运行时风格代码、部分
+ * Rust/静态链接程序）走 syscall(SYS_rt_sigprocmask=135, SIG_BLOCK, ...)
+ * —— 这条路上原先没有任何 SIGSYS 剔除。一旦屏蔽位被置上，而某个被宿主
+ * seccomp 过滤器 TRAP 的调用发生，内核直接杀进程（不投递信号，处理器
+ * 救不了），现场只有 rc=159。
+ *
+ * 【判据方向】用裸 svc 读回内核掩码（不经 libc —— 本容器的 proroot 会
+ * 劫持 libc sigprocmask 造成假阴性）：
+ *     SIG_BLOCK {SIGSYS} → masked 必须为 0（被剔除）
+ *     SIG_UNBLOCK{SIGSYS} → 必须能解除（别把解除请求改坏）
+ * 两个方向都要断言：只测前者的话，"一刀切把所有 135 调用都改坏"也 PASS。
+ *
+ * 【sigsetsize 必须传 8】传 sizeof(sigset_t)=128 时内核回 EINVAL，
+ * 调用根本不生效 —— 那样测出的"没被剔除"其实是"调用失败"。
+ *
+ * ★ 为什么抽成独立函数而不是写在 main() 里 ★
+ * 本文件是"include 源码"式测试，main() 已经很大。实测把这段直接写在
+ * main() 内会把 gcc 13.3.0 的 ICE 发生率从 **0/20 推到约 5/15**
+ * （`during GIMPLE pass: alias` 段错误）。抽成独立函数后回到 0 ——
+ * 不是规避编译器 bug 的权宜之计，而是本来就该这样组织：
+ * ICE 会被判成 rc=2"环境不满足"而被 SKIP，等于这项测试悄悄不跑。
+ */
+static void t_raw_syscall_sigsys_strip(void)
+{
+    sigset_t set;
+    char buf[128];
+    long rr;
+    int masked;
+
+    /* 收尾用：把 SIGSYS 解屏蔽，给本段一个干净起点 */
+    sigemptyset(&set); sigaddset(&set, SIGSYS);
+    (void)raw_svc4(135, SIG_UNBLOCK, (long)&set, 0,
+                   (long)sizeof(unsigned long));
+
+    /* --- T1: SIG_BLOCK{SIGSYS} 必须被剔除 --- */
+    sigemptyset(&set); sigaddset(&set, SIGSYS);
+    errno = 0;
+    rr = syscall(135, SIG_BLOCK, &set, NULL, (long)sizeof(unsigned long));
+    {
+        sigset_t cur;
+        memset(&cur, 0, sizeof cur);
+        (void)raw_svc4(135, SIG_BLOCK, 0, (long)&cur,
+                       (long)sizeof(unsigned long));
+        masked = sigismember(&cur, SIGSYS);
+    }
+    snprintf(buf, sizeof buf,
+             "rc=%ld errno=%d 内核读回 masked=%d", rr, errno, masked);
+    check("裸 syscall(135,SIG_BLOCK,{SIGSYS}) 被剔除（masked==0）",
+          masked == 0, buf);
+
+    /* --- T2: SIG_UNBLOCK{SIGSYS} 必须放行 --- */
+    sigemptyset(&set); sigaddset(&set, SIGSYS);
+    (void)raw_svc4(135, SIG_BLOCK, (long)&set, 0,
+                   (long)sizeof(unsigned long));   /* 内核里真屏蔽 */
+    (void)syscall(135, SIG_UNBLOCK, &set, NULL, (long)sizeof(unsigned long));
+    {
+        sigset_t cur;
+        memset(&cur, 0, sizeof cur);
+        (void)raw_svc4(135, SIG_BLOCK, 0, (long)&cur,
+                       (long)sizeof(unsigned long));
+        masked = sigismember(&cur, SIGSYS);
+    }
+    snprintf(buf, sizeof buf, "解除后内核读回 masked=%d", masked);
+    check("裸 syscall(135,SIG_UNBLOCK,{SIGSYS}) 能解除屏蔽（未被改坏）",
+          masked == 0, buf);
+
+    /* --- T3: 客户自己的 set 结构体不得被污染 --- */
+    sigemptyset(&set); sigaddset(&set, SIGSYS);
+    (void)syscall(135, SIG_BLOCK, &set, NULL, (long)sizeof(unsigned long));
+    check("调用后客户 set 仍含 SIGSYS（只改本次调用，不动客户数据）",
+          sigismember(&set, SIGSYS) == 1,
+          "客户 set 的 SIGSYS 位被污染了");
+
+    /* --- T4: 同集合里的其它信号必须照常生效 --- */
+    {
+        sigset_t cur;
+        sigemptyset(&set); sigaddset(&set, SIGUSR2);
+        (void)raw_svc4(135, SIG_UNBLOCK, (long)&set, 0,
+                       (long)sizeof(unsigned long));
+        sigemptyset(&set);
+        sigaddset(&set, SIGSYS);
+        sigaddset(&set, SIGUSR2);
+        (void)syscall(135, SIG_SETMASK, &set, NULL,
+                      (long)sizeof(unsigned long));
+        memset(&cur, 0, sizeof cur);
+        (void)raw_svc4(135, SIG_BLOCK, 0, (long)&cur,
+                       (long)sizeof(unsigned long));
+        snprintf(buf, sizeof buf, "SIGSYS=%d SIGUSR2=%d",
+                 sigismember(&cur, SIGSYS), sigismember(&cur, SIGUSR2));
+        check("SIG_SETMASK 里其它信号(SIGUSR2)仍生效、SIGSYS 被剔除",
+              sigismember(&cur, SIGUSR2) == 1 &&
+              sigismember(&cur, SIGSYS) == 0, buf);
+        sigemptyset(&set); sigaddset(&set, SIGUSR2);
+        (void)raw_svc4(135, SIG_UNBLOCK, (long)&set, 0,
+                       (long)sizeof(unsigned long));
+    }
+}
 
 int main(void)
 {
@@ -824,6 +949,8 @@ int main(void)
         snprintf(buf, sizeof buf, "桩被调 %d 次", g_seen_n);
         check("身份号调用完全不经过翻译层", g_seen_n == 0, buf);
     }
+
+    t_raw_syscall_sigsys_strip();
 
     /* ============================================================== */
     printf("\n------------------------------------------------------\n");

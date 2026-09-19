@@ -64,11 +64,42 @@ fi
 #
 # -D_GNU_SOURCE= （空定义）而不是 -D_GNU_SOURCE：与本仓库既有约定一致，
 # 自备 #define 的文件不会报"重定义"。
+#
+# ★ 必须带 gcc ICE 重试 ★
+#
+# 本脚本此前是**唯一没有 ICE 重试的 runner**，而 gcc 13.3.0 在本容器有
+# 间歇性 ICE（实测本文件 40 次编译撞 2 次 ≈ 5%，`during GIMPLE pass:
+# alias` 段错误）。没有重试的后果不是"偶尔变红"，而是**该项被静默跳过**：
+# 编译失败走 exit 2，RUN_ALL 按约定把 rc=2 记成"环境不满足"⏭️ ——
+# 看起来一切正常，实际这条契约那一轮没跑。实测确实发生过
+# （一次全量回归里 `身份 syscall 伪装` 显示 ⏭️ rc=2）。
+#
+# 重试次数与优化级回退策略与其余 runner 对齐（见 RUN_SIGSYS_NUM.sh /
+# RUN_RAW_SYSCALL.sh）。**不因为 ICE 就整体降优化级** —— 那是本项目的
+# 既定立场（BUILD_RUNTIME.sh 头注）：重试即可，只在全部重试失败时才回退。
 # ---------------------------------------------------------------------
-if ! "$CC" -std=c11 -O1 -Wall -Wextra \
-        -D_GNU_SOURCE= -Isrc/runtime \
-        test/test_id_syscall_guard.c src/runtime/syscall_guard.c \
-        -o "$BIN" 2>"${TMPDIR:-/tmp}/id-guard-cc.$$.err"; then
+CC_OK=0
+OPT="-O2"
+i=1
+while [ "$i" -le 10 ]; do
+    if "$CC" -std=c11 $OPT -Wall -Wextra \
+            -D_GNU_SOURCE= -Isrc/runtime \
+            test/test_id_syscall_guard.c src/runtime/syscall_guard.c \
+            -o "$BIN" 2>"${TMPDIR:-/tmp}/id-guard-cc.$$.err"; then
+        CC_OK=1
+        break
+    fi
+    if grep -q 'internal compiler error' "${TMPDIR:-/tmp}/id-guard-cc.$$.err" 2>/dev/null; then
+        # 撞 ICE：先重试同级别，仍不行再逐级降
+        if [ "$i" -ge 4 ] && [ "$OPT" = "-O2" ]; then OPT="-O1"; fi
+        if [ "$i" -ge 7 ] && [ "$OPT" = "-O1" ]; then OPT="-O0"; fi
+        i=$((i + 1))
+        continue
+    fi
+    break                      # 非 ICE = 真错误，立刻停
+done
+
+if [ "$CC_OK" -ne 1 ]; then
     echo "❌ 编译失败："
     cat "${TMPDIR:-/tmp}/id-guard-cc.$$.err"
     rm -f "${TMPDIR:-/tmp}/id-guard-cc.$$.err"

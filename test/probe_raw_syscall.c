@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 /* preload.c 自带 __dso_handle（供 D4/proc.c 桥接），静态编译时会与
  * crtbeginS 的冲突 —— 与 RUN_D3_FIXUP.sh 同一处理。 */
@@ -182,6 +183,84 @@ int main(void)
             continue;
         snprintf(nm, sizeof(nm), "unset: path-table nr=%d not blocked", i);
         check_int(nm, should_block(i), 0);
+    }
+
+    /* ================================================================
+     * 组 6：裸 syscall 路径的 SIGSYS 剔除（sigsys_strip_raw）
+     *          —— sigsys.c 只挡 4 个 libc 符号，裸 syscall(135) 那条路
+     *             原先没有任何剔除（上游 #134 引申，rc=159 的成因之一）
+     * ================================================================ */
+    {
+        sigset_t set;
+        unsigned long out, out2;
+
+        /* 6.1 SIG_BLOCK + 集合里有 SIGSYS → 必须剔除 */
+        sigemptyset(&set); sigaddset(&set, SIGSYS);
+        out = 0xdeadbeefUL;
+        check_int("strip: SIG_BLOCK{SIGSYS} 被剔除",
+                  sigsys_strip_raw(SIG_BLOCK, &set, (long)sizeof(unsigned long),
+                                   &out), 1);
+        check_int("strip: 剔除后 SIGSYS 位为 0",
+                  (int)((out >> SCG_SIGSYS_BIT_INDEX) & 1UL), 0);
+
+        /* 6.2 SIG_SETMASK 同样剔除 */
+        sigemptyset(&set); sigaddset(&set, SIGSYS);
+        check_int("strip: SIG_SETMASK{SIGSYS} 被剔除",
+                  sigsys_strip_raw(SIG_SETMASK, &set, (long)sizeof(unsigned long),
+                                   &out), 1);
+
+        /* 6.3 ★ SIG_UNBLOCK 必须**放行** ★
+         *     改写它会破坏客户"解除屏蔽"的请求 —— 这是本判据最易写错的
+         *     一条（把 how 判成"包含 SIGSYS 就动"会连解除一起改坏）。 */
+        sigemptyset(&set); sigaddset(&set, SIGSYS);
+        check_int("strip: SIG_UNBLOCK 不被改写（解除请求必须放行）",
+                  sigsys_strip_raw(SIG_UNBLOCK, &set,
+                                   (long)sizeof(unsigned long), &out), 0);
+
+        /* 6.4 集合里没有 SIGSYS → 不动 */
+        sigemptyset(&set); sigaddset(&set, SIGUSR1);
+        out = 0xdeadbeefUL;
+        check_int("strip: 无 SIGSYS 不改写",
+                  sigsys_strip_raw(SIG_BLOCK, &set, (long)sizeof(unsigned long),
+                                   &out), 0);
+        check_int("strip: 未改写时 out 不被写",
+                  (int)(out == 0xdeadbeefUL), 1);
+
+        /* 6.5 sigsetsize 不是 8 → 不动（那种调用内核自己回 EINVAL） */
+        sigemptyset(&set); sigaddset(&set, SIGSYS);
+        check_int("strip: sigsetsize=128 不改写（交内核裁决）",
+                  sigsys_strip_raw(SIG_BLOCK, &set, (long)sizeof(sigset_t),
+                                   &out), 0);
+        check_int("strip: sigsetsize=0 不改写",
+                  sigsys_strip_raw(SIG_BLOCK, &set, 0, &out), 0);
+
+        /* 6.6 NULL 集合 / NULL 出参 → 安全返回 0（客户可传 NULL） */
+        check_int("strip: set=NULL 不改写",
+                  sigsys_strip_raw(SIG_BLOCK, NULL, (long)sizeof(unsigned long),
+                                   &out), 0);
+        check_int("strip: out=NULL 不改写",
+                  sigsys_strip_raw(SIG_BLOCK, &set, (long)sizeof(unsigned long),
+                                   NULL), 0);
+
+        /* 6.7 ★ 客户的 set 结构体不得被污染 ★
+         *     只改本地副本 —— 客户之后读回自己的 set 仍应看到 SIGSYS 位。 */
+        sigemptyset(&set); sigaddset(&set, SIGSYS);
+        (void)sigsys_strip_raw(SIG_BLOCK, &set, (long)sizeof(unsigned long), &out);
+        check_int("strip: 客户原 set 未被污染（仍含 SIGSYS）",
+                  sigismember(&set, SIGSYS), 1);
+
+        /* 6.8 ★ 同集合里的**其他信号必须保留** ★（别把整个 word 清掉） */
+        sigemptyset(&set); sigaddset(&set, SIGSYS); sigaddset(&set, SIGUSR2);
+        out2 = 0;
+        (void)sigsys_strip_raw(SIG_SETMASK, &set, (long)sizeof(unsigned long),
+                               &out2);
+        {
+            unsigned long usr2bit = 1UL << (SIGUSR2 - 1);
+            check_int("strip: 其他信号(SIGUSR2)位保留",
+                      (int)((out2 & usr2bit) != 0), 1);
+            check_int("strip: 同集合里 SIGSYS 位已清",
+                      (int)((out2 >> SCG_SIGSYS_BIT_INDEX) & 1UL), 0);
+        }
     }
 
     printf("\n=== 结果: %d 通过 / %d 失败 ===\n", g_ok, g_fail);

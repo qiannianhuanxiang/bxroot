@@ -97,6 +97,25 @@ int l2s_rt_patch_dents64(const char *host_dir, void *buf, long len);
 #define SCG_NR_getdents64 61
 
 /*
+ * SIGSYS 防屏蔽所需的常量（本文件刻意不含 <signal.h>，与不含 <stdio.h>
+ * 同理由：它只做裸系统调用，且要能被单独链接的测试直接编译）。
+ *
+ * 取值已按本机实测核对（`printf` 探针）：
+ *     SIGSYS      = 31    → 位图里的**第 30 位**（0-based）
+ *     SIG_BLOCK   = 0
+ *     SIG_SETMASK = 2
+ *     rt_sigprocmask 的 how 传的就是这三个值（内核 ABI，不是 libc 私有常量）
+ *
+ * 位图布局：内核与 glibc 的 sigset_t 都是 128 字节 = 16 个 unsigned long，
+ * 位序为小端、bit N 对应信号 N+1。所以 SIGSYS(31) 落在
+ * 第 31/64 = 0 个 word 的第 30 位。
+ */
+#define SCG_NR_rt_sigprocmask 135
+#define SCG_SIGSYS_BIT_INDEX  30        /* SIGSYS=31 → 0-based 第 30 位 */
+#define SCG_SIG_BLOCK         0
+#define SCG_SIG_SETMASK       2
+
+/*
  * AT_FDCWD 的 ABI 值（-100）。
  *
  * 本文件刻意**不包含** <fcntl.h>（它只做裸系统调用，且要能被
@@ -446,6 +465,52 @@ static int should_block(long nr)
     default:
         return 0;
     }
+}
+
+/*
+ * rt_sigprocmask 的入参改写：把待屏蔽集合里的 SIGSYS 位清掉。
+ *
+ * 【为什么抽成独立函数】原先是内联在 syscall() 里的一段。抽出来有两个
+ * 直接好处：
+ *   1. 可被 test/probe_sigsys_raw_guard.c 按"include 源码"的方式直接
+ *      驱动 —— 本容器 LD_PRELOAD 惰性，端到端探针容易受环境影响，
+ *      这一层契约要能不依赖 interpose 地钉住（与 should_block 同理）。
+ *   2. 判据只有一处：syscall() 只负责"在发 svc 之前调它"。
+ *
+ * 【参数】与内核 ABI 一致（how, set, sigsetsize 由调用方从 a0/a1/a3 取）：
+ *     how         SIG_BLOCK=0 / SIG_UNBLOCK=1 / SIG_SETMASK=2
+ *     set         客户传的集合指针（可为 NULL）
+ *     sigsetsize  客户声明的集合大小（内核只接受 8）
+ *     out         改写后的集合副本（仅当返回 1 时有效）
+ *
+ * 【返回】1 = 已改写（调用方应把本次调用的 set 指向 *out）
+ *         0 = 无需改写（原样透传）
+ *
+ * 只处理 how == SIG_BLOCK / SIG_SETMASK：SIG_UNBLOCK 是"解除屏蔽"的请求，
+ * 改写它会把客户想解除的东西改坏。这与 sigsys.c 的 sigsys_strip 逐字一致。
+ *
+ * sigsetsize != 8 时不动：那种调用内核自己会回 EINVAL，我们不假装理解
+ * 它的布局（glibc sigset_t 是 128 字节，客户真传 128 时语义全由内核裁决）。
+ */
+static int sigsys_strip_raw(int how, const void *set, long sigsetsize,
+                            unsigned long *out)
+{
+    unsigned long w;
+
+    if (set == NULL || out == NULL)
+        return 0;
+    if (sigsetsize != (long)sizeof(unsigned long))
+        return 0;
+    if (how != SCG_SIG_BLOCK && how != SCG_SIG_SETMASK)
+        return 0;
+
+    memcpy(&w, set, sizeof w);
+    if ((w & (1UL << SCG_SIGSYS_BIT_INDEX)) == 0)
+        return 0;
+
+    w &= ~(1UL << SCG_SIGSYS_BIT_INDEX);
+    memcpy(out, &w, sizeof *out);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1029,7 +1094,62 @@ long syscall(long number, ...)
     }       /* if (pmask != 0) */
 
     {
-        long ret = raw_syscall6(number, a0, a1, a2, a3, a4, a5);
+        /*
+         * ================================================================
+         * SIGSYS 防屏蔽 —— 裸 syscall 路径上缺失的那一半
+         * ================================================================
+         *
+         * 【问题】sigsys.c 只在 **4 个 libc 符号**上剔除 SIGSYS：
+         *     sigprocmask / pthread_sigmask / signal / sigaction
+         * 而绕过 libc 直接发裸系统调用的程序（Go 运行时风格代码、部分
+         * Rust/静态链接程序）走的是
+         *     syscall(SYS_rt_sigprocmask=135, SIG_BLOCK, &set, 8)
+         * 这条路没有任何剔除。一旦 SIGSYS 被屏蔽，而某个被宿主 seccomp
+         * 过滤器 TRAP 的系统调用发生，内核**直接杀进程**（TRAP + 屏蔽位
+         * = 死亡，不投递信号，处理器救不了），现场只有 rc=159。
+         *
+         * 【为什么必须在本层做】裸 syscall 不经符号 —— 与上面 statx /
+         * 下面 getdents64 必须在本文件补是同一个道理。
+         *
+         * 【为什么在 raw_syscall6 之前】这是**入参**改写，不是结果改写：
+         * 必须在 svc 发出前清掉集合里的 SIGSYS 位。方向与下面两个结果
+         * 补丁相反，别被"补丁都在 raw_syscall6 之后"的印象带偏。
+         *
+         * ★ 参数下标极易写错，这里记死 ★
+         * rt_sigprocmask 的 ABI 是 (how, set, oldset, sigsetsize)：
+         *     a0 = how     （SIG_BLOCK=0 / SIG_UNBLOCK=1 / SIG_SETMASK=2）
+         *     a1 = **set**（要屏蔽/设置的集合 —— 就是它要被改写）
+         *     a2 = oldset  （出参；客户常传 NULL）
+         *     a3 = sigsetsize（内核只接受 sizeof(unsigned long) = 8）
+         * 本段代码**第一版把 set 写成了 a2**，于是条件恒假、整段从未执行
+         * —— 编译通过、符号导出、行为不变，探针原样报 masked=1（实测）。
+         * 裸系统调用没有类型检查，写错下标只会静默不生效。
+         *
+         * 【a3 门控】sigsetsize 不是 8 时**不动**：那种调用内核自己会回
+         * EINVAL，我们不假装理解它的布局（glibc 的 sigset_t 是 128 字节，
+         * 客户若真传 128，语义完全由内核裁决，与本层无关）。
+         *
+         * 【为什么 copy 出去而不是原地改】a1 是客户的指针。原地改会污染
+         * 客户的结构体 —— 客户之后读回自己的 set 会看到少了 SIGSYS 位，
+         * 而它并没有要求我们改它的数据。改到本地副本、只把**本次调用**
+         * 指向副本，客户的无状态视图保持不变（与 sigsys.c 的 sigsys_strip
+         * 用调用方栈上 tmp 是同一手法）。
+         */
+        unsigned long sigtmp;
+        long ret;
+
+        if (number == SCG_NR_rt_sigprocmask &&
+            sigsys_strip_raw((int)a0, (const void *)(uintptr_t)a1,
+                             a3, &sigtmp)) {
+            /*
+             * 只把**本次调用**指向改写后的副本；客户的 set 结构体不动
+             * （原地改会污染客户数据 —— 它之后读回自己的 set 会少一位，
+             * 而它并没要求我们改它的数据）。
+             */
+            a1 = (long)(uintptr_t)&sigtmp;
+        }
+
+        ret = raw_syscall6(number, a0, a1, a2, a3, a4, a5);
 
         /*
          * ============================================================
