@@ -143,8 +143,45 @@ static long raw4(long nr, long a, long b, long c, long d)
     return x0;
 }
 
-#define SYS_RT_SIGPROCMASK 175
+/*
+ * ★ 系统调用号必须与 aarch64 的 asm-generic/unistd.h 逐字核对 ★
+ *
+ * 这里曾写 `#define SYS_RT_SIGPROCMASK 175` —— 175 在 aarch64 上是
+ * **geteuid**，rt_sigprocmask 是 135。后果是下面那句"解除 SIGSYS 屏蔽"
+ * 实际只查询了一次 euid：调用成功返回 0（所以从不报错、看不出问题），
+ * 而 SIGSYS 的屏蔽位**原封不动**。实测输出：
+ *
+ *     裸 syscall(175) 返回 0，之后 SIGSYS masked = 1   ← 旧代码
+ *     裸 syscall(135=SIG_UNBLOCK) 返回 0，masked = 0   ← 正确
+ *
+ * 另实测确认：Linux **不**会在 sigaction() 安装处理器时自动解除该信号的
+ * 屏蔽（`sigaction 后 SIGSYS masked = 1`）。所以这行不是可有可无的兜底，
+ * 而是"处理器装了却收不到信号、进程被 159 杀掉"的唯一防线。
+ *
+ * 教训：裸 syscall 没有类型检查、没有 SYSCALL 宏兜底，写错号不会被任何
+ * 工具发现 —— 只会静默调用另一个语义无关的系统调用。凡是该文件里的
+ * 裸号，都必须能对应到 asm-generic/unistd.h 的具体行。
+ */
+#define SYS_RT_SIGPROCMASK 135
 #define SYS_RT_SIGACTION   134
+
+/*
+ * rt_sigprocmask 的 sigsetsize 参数是**内核** sigset_t 的大小，不是
+ * glibc sigset_t 的大小。内核侧是 `sizeof(unsigned long)`（64 位机上
+ * 8 字节，覆盖 64 个信号）；glibc 侧的 sigset_t 是 128 字节，但它自己
+ * 也只把 8 传下去。
+ *
+ * 这里原先传 `sizeof(sigset_t)` = 128，内核校验 `sigsetsize == kernel
+ * sizeof(sigset_t)` 不通过，返回 EINVAL。实测（本机 aarch64）：
+ *
+ *     sigsetsize=8   -> 0 OK
+ *     sigsetsize=16  -> -22 (EINVAL)
+ *     sigsetsize=128 -> -22 (EINVAL)
+ *
+ * 与调用号写错叠加后，这一整行是**完全无效**的：既调错了系统调用，
+ * 又传错了大小。
+ */
+#define SYS_SIGSETSIZE ((long)sizeof(unsigned long))
 
 /* ------------------------------------------------------------------ */
 /* 处理器                                                              */
@@ -482,12 +519,23 @@ int bxroot_sigsys_install(void)
     sigemptyset(&s);
     sigaddset(&s, SIGSYS);
     /*
-     * sigset_t 在内核与 glibc 里都是 128 字节位图，布局一致，
-     * 所以这里用裸 rt_sigprocmask 是安全的（与 sigaction 的情况不同）。
-     * 用裸调用而非 libc 包装，是为了避免绕到本文件自己的钩子（重入）。
+     * 解除屏蔽。两处易错点都实测过（见上方宏定义处的记录）：
+     *
+     *   1. 调用号：rt_sigprocmask = 135（不是 175 = geteuid）
+     *   2. sigsetsize：传内核大小 8（不是 glibc 的 sizeof(sigset_t) = 128，
+     *      传 128 会 EINVAL 而被静默丢弃 —— 这行代码此前正是如此）
+     *
+     * 这里仍然用裸调用而非 libc 包装，是为了避免绕回本文件自己的钩子（重入）。
+     *
+     * 【注意】此处的裸 rt_sigprocmask 只做"解除屏蔽"这一个动作，
+     * **不能**用它做任何"读取当前掩码"的判断：实测 glibc 与内核在
+     * sigsetsize 上并不一致，裸调用读回的掩码是垃圾值。
+     * 本项目曾因此误判"加载器已保护 SIGSYS，防护多余"—— 那个结论
+     * 是错的，真正的屏蔽检测必须用 libc 的 sigprocmask(SIG_BLOCK, NULL, &cur)
+     * 查询（见本文件上方的实测记录）。
      */
     (void)raw4(SYS_RT_SIGPROCMASK, SIG_UNBLOCK, (long)&s, 0,
-               (long)sizeof(sigset_t));
+               SYS_SIGSETSIZE);
 
     g_installed = 1;
 

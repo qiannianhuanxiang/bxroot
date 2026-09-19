@@ -26,6 +26,21 @@
 
 set -u
 
+# ★ 必须显式设 PATH ★
+# 实测：`nohup sh tools/autosync-daemon.sh &` 启动时继承到的环境里 PATH
+# 可能为空（本容器是嵌套 proroot 容器，中转会丢掉部分环境），于是
+# date/sleep/tee 全部 "command not found"。其中 sleep 失败会让 while
+# 循环退化成 **busy loop** 空转烧 CPU，而日志里只有一堆 "not found"
+# 噪音、看不出真因 —— 本脚本第一版就这样白跑了一轮。
+PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+export PATH
+export LC_ALL=C
+
+# 启动前先自检依赖命令存在，缺哪个直接说清楚（而不是每轮报 not found）
+for c in date sleep find cp mkdir git; do
+    command -v "$c" >/dev/null 2>&1 || { echo "❌ 缺命令: $c（PATH=$PATH）" >&2; exit 1; }
+done
+
 SRC="${BXROOT_SRC:-/root/proroot-work/agents/rename-bxroot}"
 DST="${BXROOT_GIT:-/tmp/bxroot-git}"
 INTERVAL="${BXROOT_AUTOSYNC_INTERVAL:-120}"
