@@ -5351,6 +5351,108 @@ int inotify_add_watch(int fd, const char *path, uint32_t mask) {
 }
 
 /* Hook: scandir —— 接受目录路径与过滤/排序回调 */
+
+/*
+ * ------------------------------------------------------------------
+ * l2s 目录项 d_type 补丁（上游 #407 / #418 的根因）
+ * ------------------------------------------------------------------
+ *
+ * 【问题】l2s 把客户眼里的"硬链接"落成"符号链接 + 中间层"。于是磁盘上
+ * 它是符号链接，**目录项流**（getdents64 / readdir / scandir）如实报
+ * DT_LNK，而同一文件的 lstat 经 l2s_rt_patch_stat 之后报 DT_REG。
+ * 客户同时看到两个互相矛盾的事实 —— pnpm / Turbopack 据此报
+ * "Invalid symlink" 而构建失败（上游 #407 与 #418 两条独立 issue 同根）。
+ *
+ * 【为什么每一环都要自己接，不能只 hook 一个】
+ * 反汇编 libc.so.6 实测（aarch64 / glibc 2.39）：
+ *     readdir 体内:  bl bcb80 <getdents64>        ← 本地 bl，不经 PLT
+ *     scandir 体内:  bl bcbf0 <readdir>           ← 同样本地 bl
+ * 所以 **hook getdents64 对 readdir 无效，hook readdir 对 scandir 也无效**
+ * （实测：给 readdir 挂钩子后跑 scandir，钩子命中 0 次）。
+ * 每一层都由 libc 内部直调下一层的真身，PLT 插不进去。
+ *
+ * 因此需要三处：
+ *   ① readdir / readdir64（glibc 里两者同址，但**符号名不同**，
+ *      必须都定义，否则调 readdir64 的程序会落到 libc 那份）；
+ *   ② scandir / scandir64（回调链，见下）；
+ *   ③ 裸 syscall(61 = getdents64) 的结果缓冲改写
+ *      —— node 静态链接的 libuv 走的就是裸 svc，见 syscall_guard.c。
+ *
+ * 判据一律复用 l2s_rt_dirent_type（内部 probe_fake_link），不另造一套
+ * "怎么认伪造链接"的规则 —— 本项目对此有明确约定。
+ */
+
+/*
+ * 布局静态断言：下面按 offsetof 访问字段，必须确认两个结构体的
+ * d_type / d_name 偏移一致。实测 glibc 的 dirent 与 dirent64 均为
+ * d_ino=0 d_off=8 d_reclen=16 d_type=18 d_name=19（sizeof=280）。
+ * 若将来 glibc 改了布局，编译期就会失败，而不是静默改错字节。
+ */
+_Static_assert(offsetof(struct dirent, d_type) == offsetof(struct dirent64, d_type),
+               "dirent/dirent64 的 d_type 偏移不一致");
+_Static_assert(offsetof(struct dirent, d_name) == offsetof(struct dirent64, d_name),
+               "dirent/dirent64 的 d_name 偏移不一致");
+
+/* 取 DIR* 所属目录的**宿主视角**绝对路径。
+ *
+ * 用 dirfd(DIR*) + /proc/self/fd/N + real_readlink：
+ * fd 指向的是宿主侧真实目录，所以读回的是宿主路径 —— 正是 l2s 判据
+ * 需要的形态（中间层与数据文件都在宿主侧，guest 路径永远 probe 不到）。
+ * 用 real_readlink 而非 readlink()，避免落到本文件的反向翻译钩子上。
+ *
+ * 返回 1 = 拿到路径；0 = 拿不到（调用方应放弃改写，**不要猜**）。 */
+static int dir_path_of(DIR *dp, char *out, size_t outsz)
+{
+    char proc[64];
+    ssize_t n;
+    int fd;
+
+    if (dp == NULL || out == NULL || outsz == 0)
+        return 0;
+    if (!l2s_rt_enabled())
+        return 0;
+
+    fd = dirfd(dp);
+    if (fd < 0)
+        return 0;
+
+    snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
+    n = (real_readlink != NULL) ? real_readlink(proc, out, outsz - 1) : -1;
+    if (n <= 0)
+        return 0;
+    out[n] = '\0';
+    return 1;
+}
+
+/* 改写 scandir 返回的目录项数组里各条的 d_type。
+ *
+ * n 用 int（scandir 的返回值），但某些实现可能返回很大的数 —— 调用方
+ * 传入前已限定范围，这里再判一次，避免负数被当无符号用。 */
+static void patch_dirents_d_type(void *const *list, int n, const char *host_dir)
+{
+    int i;
+
+    if (list == NULL || n <= 0 || host_dir == NULL)
+        return;
+    if (!l2s_rt_enabled())
+        return;
+
+    for (i = 0; i < n; i++) {
+        unsigned char *e = (unsigned char *)list[i];
+        unsigned char *dtype;
+        const char *name;
+
+        if (e == NULL)
+            continue;
+        dtype = e + offsetof(struct dirent, d_type);
+        if (*dtype != DT_LNK)
+            continue;               /* 热路径：非符号链接一律跳过 */
+        name = (const char *)(e + offsetof(struct dirent, d_name));
+        if (l2s_rt_dirent_type(host_dir, name) == DT_REG)
+            *dtype = DT_REG;
+    }
+}
+
 int scandir(const char *dirp, struct dirent ***namelist,
             int (*filter)(const struct dirent *),
             int (*compar)(const struct dirent **, const struct dirent **)) {
@@ -5359,6 +5461,7 @@ int scandir(const char *dirp, struct dirent ***namelist,
                      int (*)(const struct dirent **, const struct dirent **)) = NULL;
     char translated[MAX_PATH_LEN];
     const char *p = dirp;
+    int rc;
 
     if (fn == NULL)
         fn = (int (*)(const char *, struct dirent ***,
@@ -5369,7 +5472,68 @@ int scandir(const char *dirp, struct dirent ***namelist,
 
     if (translate_path(dirp, translated, sizeof(translated)) > 0)
         p = translated;
-    return fn(p, namelist, filter, compar);
+    rc = fn(p, namelist, filter, compar);
+
+    /* 只在成功后处理，且用翻译后的宿主路径 p（l2s 判据要宿主视角） */
+    if (rc > 0 && namelist != NULL)
+        patch_dirents_d_type((void *const *)*namelist, rc, p);
+
+    return rc;
+}
+
+/*
+ * readdir / readdir64 —— 目录项流的主入口。
+ *
+ * glibc 里 readdir 与 readdir64 **同址**（nm 实测均为 0xbcbf0），但符号名
+ * 是两个，所以两个都要定义：只定义 readdir 的话，调 readdir64 的程序会
+ * 解析到 libc 那份，钩子被完全绕过（与 scandir 直调 readdir 是同一类坑）。
+ *
+ * 【为什么把判据挂在 DT_LNK 上】readdir 是热路径，每个目录项都调一次。
+ * 只有 d_type == DT_LNK 才可能命中 l2s 判据，其余直接返回，避免为
+ * 每个普通文件付出一次 readlink(/proc/self/fd/N) 的代价。
+ */
+struct dirent *readdir(DIR *dirp)
+{
+    static struct dirent *(*fn)(DIR *) = NULL;
+    struct dirent *e;
+
+    if (fn == NULL)
+        fn = (struct dirent *(*)(DIR *))bxroot_next_symbol("readdir");
+    if (fn == NULL) { errno = ENOSYS; return NULL; }
+
+    e = fn(dirp);
+    if (e == NULL)
+        return NULL;
+
+    if (e->d_type == DT_LNK) {
+        char dir[MAX_PATH_LEN];
+        if (dir_path_of(dirp, dir, sizeof(dir)) &&
+            l2s_rt_dirent_type(dir, e->d_name) == DT_REG)
+            e->d_type = DT_REG;
+    }
+    return e;
+}
+
+struct dirent64 *readdir64(DIR *dirp)
+{
+    static struct dirent64 *(*fn)(DIR *) = NULL;
+    struct dirent64 *e;
+
+    if (fn == NULL)
+        fn = (struct dirent64 *(*)(DIR *))bxroot_next_symbol("readdir64");
+    if (fn == NULL) { errno = ENOSYS; return NULL; }
+
+    e = fn(dirp);
+    if (e == NULL)
+        return NULL;
+
+    if (e->d_type == DT_LNK) {
+        char dir[MAX_PATH_LEN];
+        if (dir_path_of(dirp, dir, sizeof(dir)) &&
+            l2s_rt_dirent_type(dir, e->d_name) == DT_REG)
+            e->d_type = DT_REG;
+    }
+    return e;
 }
 
 /* ------------------------------------------------------------------ */
@@ -7463,6 +7627,7 @@ int scandir64(const char *dirp, struct dirent64 ***namelist,
                              const struct dirent64 **)) = NULL;
     char translated[MAX_PATH_LEN];
     const char *p = dirp;
+    int rc;
 
     if (fn == NULL)
         fn = (int (*)(const char *, struct dirent64 ***,
@@ -7474,7 +7639,14 @@ int scandir64(const char *dirp, struct dirent64 ***namelist,
 
     if (translate_path(dirp, translated, sizeof(translated)) > 0)
         p = translated;
-    return fn(p, namelist, filter, compar);
+    rc = fn(p, namelist, filter, compar);
+
+    /* 与 scandir 同源同理由（l2s d_type 契约，见 scandir 处的长注释）。
+     * dirent64 的 d_type/d_name 偏移经静态断言确认与 dirent 一致。 */
+    if (rc > 0 && namelist != NULL)
+        patch_dirents_d_type((void *const *)*namelist, rc, p);
+
+    return rc;
 }
 
 /*

@@ -78,6 +78,35 @@ void l2s_rt_patch_statx_buf(void *sx, unsigned int statx_nlink_bit,
                             const char *path);
 
 /*
+ * l2s 目录项 d_type 补丁桥（实现体在 src/l2s/l2s-runtime.c）。
+ * 与上面 statx 那条同源同理由：判据只有 l2s 层有，这里不复制。
+ *
+ * 为什么裸 syscall 路径**必须**单独接一次：
+ *   node 静态链接的 libuv 走 `syscall(SYS_getdents64=61, fd, buf, len)`
+ *   直接发系统调用，**不经 libc 的 readdir/scandir 符号**。所以 preload.c
+ *   里挂的 readdir/scandir 钩子对它完全无效（这与 statx 必须在本文件补
+ *   是同一个道理，见上面那段"node 静态链接的 libuv 不经 libc 符号"）。
+ *
+ *   本函数按内核 linux_dirent64 布局遍历结果缓冲，逐条按 l2s 判据改写
+ *   d_type。参数：host_dir（该目录的宿主视角绝对路径）、buf、len（返回值）。
+ */
+__attribute__((weak))
+int l2s_rt_patch_dents64(const char *host_dir, void *buf, long len);
+
+/* __NR_getdents64（asm-generic / aarch64 均为 61，已按本机实测核对）。 */
+#define SCG_NR_getdents64 61
+
+/*
+ * AT_FDCWD 的 ABI 值（-100）。
+ *
+ * 本文件刻意**不包含** <fcntl.h>（它只做裸系统调用，且要能被
+ * test_syscall_argpos.c 等单独链接的测试直接编译）。而 readlinkat 的
+ * dirfd 需要一个"相对 cwd"的哨兵值，就用内核定义的这个常量。
+ * 值来自 include/uapi/linux/fcntl.h，aarch64 与 x86_64 同为 -100。
+ */
+#define SCG_AT_FDCWD (-100)
+
+/*
  * fakeroot 身份查询桥（实现体在 preload.c）。与本文件上面那条 weak 声明
  * **完全同一个理由**，这里不重复整段论述，只记差异：
  *
@@ -1075,6 +1104,79 @@ long syscall(long number, ...)
             l2s_rt_patch_statx_buf((void *)(uintptr_t)a4,
                                    SCG_STATX_NLINK,
                                    (const char *)(uintptr_t)a1);
+        }
+
+        /*
+         * ============================================================
+         * getdents64 的**结果补丁** —— 裸 syscall 路径上缺失的那一半
+         * ============================================================
+         *
+         * 【与 statx 完全同构，只是补的是"目录项流"】
+         * 上面那条补的是 `statx` 返回的结构体；这条补的是 `getdents64`
+         * 写入的结果缓冲。两者的 d_type/mode 必须**一致**，否则客户同时
+         * 看到"目录里这是个符号链接"（d_type=DT_LNK）和"lstat 说它是普通
+         * 文件"，自相矛盾 —— 上游 #407 + #418（pnpm / Turbopack 报
+         * "Invalid symlink"）就是这个矛盾的两种观测形态。
+         *
+         * 【为什么这里也要接一次】
+         * preload.c 里已挂了 readdir / scandir 的钩子，但 node 静态链接的
+         * libuv 走的是 `syscall(SYS_getdents64=61, fd, buf, len)`，**不经
+         * 任何 libc 符号** —— 与 statx 那条是同一个原因，实测 node 二进制
+         * 里 24 条 svc、0 处引用 readdir/readdir64 符号。
+         *
+         * 【三条门控，一条都不能少】
+         *   ret > 0      失败/目录结束时内核没写缓冲（ret<=0），改它就是碰运气
+         *   number==61   只碰 getdents64
+         *   a1 != 0      客户可能传空 buf（内核回 EFAULT），解引用即 SIGSEGV
+         *
+         * 【目录路径怎么来】靠 a0（目录 fd）读 /proc/self/fd/<fd>。
+         * 读回的是**宿主视角**路径，正是 l2s 判据需要的形态（中间层与
+         * 数据文件都在宿主侧，guest 路径永远 probe 不到）。
+         * 这里用 raw_syscall6 nr=78（readlinkat）而不是 libc readlink()：
+         * 本文件是"裸系统调用路径"，走 libc 会绕回我们自己的钩子。
+         */
+        if (ret > 0 && number == SCG_NR_getdents64 && a1 != 0 &&
+            l2s_rt_patch_dents64 != NULL) {
+            char dirbuf[4096];
+            char proc[64];
+            long rl;
+
+            /*
+             * 手工拼 "/proc/self/fd/<a0>"，**不用 snprintf**。
+             *
+             * 本文件刻意不 include <stdio.h>（见文件头实现要点第 4 条：
+             * 诊断输出不走 stdio，构造函数早期不可用）。为这一个常量前缀
+             * 引入整个 stdio 不划算，而前缀是编译期固定的，手工拼最直接。
+             * 数字部分用十进制逐位生成，避免依赖任何库函数。
+             */
+            {
+                static const char pfx[] = "/proc/self/fd/";
+                size_t k;
+                long v = (a0 < 0) ? -a0 : a0;
+                char digits[24];
+                int nd = 0;
+
+                for (k = 0; k < sizeof(pfx) - 1; k++)
+                    proc[k] = pfx[k];
+                if (a0 < 0)
+                    proc[k++] = '-';
+                do {
+                    digits[nd++] = (char)('0' + (int)(v % 10));
+                    v /= 10;
+                } while (v > 0 && nd < (int)sizeof(digits));
+                while (nd > 0 && k < sizeof(proc) - 1)
+                    proc[k++] = digits[--nd];
+                proc[k] = '\0';
+            }
+
+            rl = raw_syscall6(78 /*readlinkat*/, SCG_AT_FDCWD,
+                              (long)(uintptr_t)proc,
+                              (long)(uintptr_t)dirbuf,
+                              (long)sizeof(dirbuf) - 1, 0, 0);
+            if (rl > 0 && rl < (long)sizeof(dirbuf)) {
+                dirbuf[rl] = '\0';
+                l2s_rt_patch_dents64(dirbuf, (void *)(uintptr_t)a1, ret);
+            }
         }
 
         /*

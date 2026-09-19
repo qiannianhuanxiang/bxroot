@@ -1020,3 +1020,109 @@ void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
 {
     patch_statx_impl(stx_nlink, stx_mask, stx_mode, statx_nlink_bit, path);
 }
+
+/* ------------------------------------------------------------------ */
+/* 目录项 d_type 补丁                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * d_type 常量：本文件不 include <dirent.h>（保持"不碰系统头"的惯例，
+ * 且 <dirent.h> 的 struct dirent 与内核 linux_dirent64 布局不同，混用
+ * 极容易出错）。取值来自内核 include/uapi/linux/dirent.h：
+ *     DT_UNKNOWN 0, DT_FIFO 1, DT_CHR 2, DT_DIR 4, DT_BLK 6,
+ *     DT_REG 8, DT_LNK 10, DT_SOCK 12, DT_WHT 14
+ */
+#define L2S_DT_UNKNOWN 0
+#define L2S_DT_REG     8
+
+int l2s_rt_dirent_type(const char *host_dir, const char *name)
+{
+    char full[L2S_PATH_MAX];
+    char mid[L2S_PATH_MAX];
+
+    if (!l2s_rt_enabled() || !g_hide_symlink)
+        return L2S_DT_UNKNOWN;
+    if (host_dir == NULL || name == NULL || name[0] == '\0')
+        return L2S_DT_UNKNOWN;
+    /* 目录项名里不可能有斜杠；有斜杠说明调用方给错了，别去拼路径 */
+    if (strchr(name, '/') != NULL)
+        return L2S_DT_UNKNOWN;
+
+    /* 拼 <host_dir>/<name>，并检查截断（截断后再去 probe 会查错文件） */
+    if (snprintf(full, sizeof(full), "%s/%s", host_dir, name)
+            >= (int)sizeof(full))
+        return L2S_DT_UNKNOWN;
+
+    /*
+     * 判据复用 probe_fake_link —— 与 stat/statx 的伪装**同一把尺子**。
+     * 只有它认了（路径是符号链接、且 target 的 basename 带 .l2s. 前缀）
+     * 才改写；用户自己建的普通符号链接必须原样报 DT_LNK。
+     */
+    if (!probe_fake_link(full, mid, sizeof(mid)))
+        return L2S_DT_UNKNOWN;
+
+    return L2S_DT_REG;
+}
+
+/*
+ * 内核 linux_dirent64 布局（aarch64，与 x86_64 同）：
+ *
+ *     struct linux_dirent64 {
+ *         u64  d_ino;        // 0
+ *         s64  d_off;        // 8
+ *         u16  d_reclen;     // 16
+ *         u8   d_type;       // 18
+ *         char d_name[];     // 19
+ *     };
+ *
+ * ★ 不能直接 include <dirent.h> 并按 struct dirent 访问 ★
+ * glibc 的 `struct dirent` 是它自己的布局（d_ino/d_off/d_reclen/d_type/
+ * d_name 的顺序与宽度不同），按它遍历内核缓冲会读错字段 —— 这类错误
+ * 不会崩，只会静默改错字节。所以这里按**内核**布局手写偏移。
+ */
+#define L2S_DENT_D_RECLEN_OFF 16u
+#define L2S_DENT_D_TYPE_OFF   18u
+
+int l2s_rt_patch_dents64(const char *host_dir, void *buf, long len)
+{
+    unsigned char *p = (unsigned char *)buf;
+    long off = 0;
+    int changed = 0;
+
+    if (!l2s_rt_enabled() || !g_hide_symlink)
+        return 0;
+    if (host_dir == NULL || buf == NULL || len <= 0)
+        return 0;
+
+    while (off + (long)L2S_DENT_D_TYPE_OFF < len) {
+        unsigned char *e = p + off;
+        unsigned short reclen;
+        unsigned char dtype;
+        const char *name;
+
+        memcpy(&reclen, e + L2S_DENT_D_RECLEN_OFF, sizeof(reclen));
+        /* reclen 为 0 或越界说明缓冲不可信 —— 立即停手，不要继续走
+         * （继续走会越读，且改的是任意内存） */
+        if (reclen == 0 || off + (long)reclen > len)
+            break;
+
+        dtype = e[L2S_DENT_D_TYPE_OFF];
+        name = (const char *)(e + L2S_DENT_D_TYPE_OFF + 1);
+
+        /* ．/.. 不必查（它们永远是真目录，且 probe 也会否） */
+        if (dtype == 10 /* DT_LNK */ &&
+            !(name[0] == '.' && (name[1] == '\0' ||
+                                 (name[1] == '.' && name[2] == '\0')))) {
+            if (l2s_rt_dirent_type(host_dir, name) == L2S_DT_REG) {
+                e[L2S_DENT_D_TYPE_OFF] = (unsigned char)L2S_DT_REG;
+                changed++;
+            }
+        }
+
+        off += (long)reclen;
+    }
+
+    if (changed > 0)
+        g_stats.dents64_patched++;
+    return changed;
+}

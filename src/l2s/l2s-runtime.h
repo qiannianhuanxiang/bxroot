@@ -266,6 +266,47 @@ void l2s_rt_patch_statx_buf(void *sx, unsigned int statx_nlink_bit,
 /* 默认 1（客户不该看出这是符号链接）。置 0 便于诊断。 */
 void l2s_rt_set_hide_symlink(int on);
 
+/* ------------------------------------------------------------------ */
+/* 目录项 d_type 补丁                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 伪造链接在磁盘上是**符号链接**，所以目录项流（getdents64 / readdir /
+ * scandir）给出的 d_type 是 DT_LNK —— 而同一个文件的 lstat 经
+ * l2s_rt_patch_stat 之后报 DT_REG。**客户会同时看到这两个互相矛盾的
+ * 事实**，这正是上游 #407 / #418 的根因（pnpm / Turbopack 报
+ * "Invalid symlink" 而构建失败）。
+ *
+ * 判据与 l2s_rt_patch_stat 完全同源（内部复用 probe_fake_link），
+ * 不新造第二套"怎么认伪造链接"的规则。
+ *
+ * 【参数】
+ *   host_dir   目录的**宿主视角**绝对路径（如 /data/.../rootfs/tmp/d）
+ *   name       目录项的 basename（d_name，不含斜杠）
+ *
+ * 【返回】该目录项应对客户呈现的 d_type 值
+ *   DT_REG(8)  —— 伪造链接，应报普通文件（且 g_hide_symlink 打开时）
+ *   DT_UNKNOWN(0) —— 不是伪造链接，或已关闭伪装 → 调用方保持原值
+ *
+ * 返回 DT_UNKNOWN 表示"我不改"，**不是错误**：调用方应保留内核给的值。
+ */
+int l2s_rt_dirent_type(const char *host_dir, const char *name);
+
+/*
+ * 批量改写一段 getdents64 结果缓冲里的 d_type。
+ *
+ * 裸 syscall(SYS_getdents64) 客户（node 静态链接的 libuv 正是）拿到的
+ * 是内核原始缓冲，无法用符号钩子覆盖，只能在系统调用返回后按 linux_dirent64
+ * 结构逐条走。本函数封装该遍历，判据仍复用 l2s_rt_dirent_type。
+ *
+ *   host_dir  该目录的宿主视角绝对路径
+ *   buf       内核写入的结果缓冲
+ *   len       getdents64 的**返回值**（已写入的字节数）
+ *
+ * 【返回】改写的条目数（0 = 无需改或未启用）
+ */
+int l2s_rt_patch_dents64(const char *host_dir, void *buf, long len);
+
 /* 测试/诊断：统计各操作被真实接管的次数。 */
 typedef struct {
     unsigned long link_first;      /* 首次链接 */
@@ -275,6 +316,7 @@ typedef struct {
     unsigned long rename_moved;    /* 连带搬运中间层 */
     unsigned long readlink_fixed;  /* 反转译命中 */
     unsigned long nlink_patched;   /* stat 链长改写命中 */
+    unsigned long dents64_patched; /* getdents64 缓冲里改过 d_type 的次数 */
 } l2s_rt_stats;
 
 const l2s_rt_stats *l2s_rt_get_stats(void);

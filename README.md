@@ -132,7 +132,7 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 |---|---|
 | 路径翻译（含 bind mount、特殊路径透传） | ✅ |
 | fakeroot（伪装 uid=0，含身份账本：setter/getter 自洽） | ✅ |
-| l2s 硬链接模拟（含 `st_nlink` 契约；`link()` 失败时**自动启用**） | ✅ |
+| l2s 硬链接模拟（含 `st_nlink` 契约 + **目录项 `d_type` 契约**；`link()` 失败时**自动启用**） | ✅ |
 | 子进程派生（`fork`/`vfork`/`exec`/`posix_spawn` 全套 + trampoline + 账本） | ✅ |
 | `system()`/`popen()`（子进程带钩子 + 路径翻译） | ✅ |
 | seccomp 中和（Android 沙箱禁止的系统调用 + livepatch） | ✅ |
@@ -394,9 +394,26 @@ proroot/bxroot 环境下，同一份文件有两个名字：
 | 路径查询 | `stat` | `syscall(79/291)` | libuv 的 `uv__fs_statx` |
 | 子进程 | `system`/`popen` | `posix_spawn` | `execvp`/`vfork` |
 | 用户查询 | `getpwuid` | `getpwnam(_r)` | `getgrnam(_r)` |
+| **目录项流** | `readdir` | `scandir` | 裸 `syscall(61)`（libuv）|
 
 **教训**：修一条路径 ≠ 功能可用。每次"功能已实现"都要问——
 其余入口在哪，谁在用它们。
+
+### 入口之间还可能是"内部直调"，PLT 插不进去
+
+上表那三条目录项入口**不是并列的三条**，而是**一条链上互相直调**。
+反汇编 libc.so.6（aarch64 / glibc 2.39）实测：
+
+```
+readdir  体内:  bcc90: bl bcb80 <getdents64>   ← 本地 bl，不经 PLT
+scandir  体内:          bl bcbf0 <readdir>      ← 同样本地 bl
+```
+
+于是 hook 上一层**对下一层完全无效**：给 `readdir` 挂钩子后跑 `scandir`，
+钩子命中 **0 次**（实测）。三条链必须各自接。
+
+**判别方法**：`objdump -d <lib> | grep -A20 '<函数名>'`，看内部 `bl` 的目标是
+`<名字@plt>`（能拦）还是本地地址（拦不住）。**别靠"它应该会调那一层"来推断。**
 
 ### 内核 trap 集合不是一刀切
 

@@ -649,6 +649,179 @@ static void t_stat_patch(void)
 }
 
 /* ================================================================== */
+/* A5b/A5c. 目录项 d_type：必须与 stat 的伪装自洽（上游 #407 / #418）    */
+/* ================================================================== */
+
+/*
+ * 【为什么必须单独测这一项】
+ *
+ * 伪造链接在磁盘上是**符号链接**，所以目录项流（getdents64 / readdir /
+ * scandir）如实报 DT_LNK，而 lstat 经 l2s_rt_patch_stat 之后报 DT_REG。
+ * 客户**同时看到两个互相矛盾的事实** —— pnpm / Turbopack 据此报
+ * "Invalid symlink" 而构建失败（上游 #407 与 #418 两条独立 issue 同根）。
+ *
+ * 判据不是"看名字像不像中间层"，而是复用 probe_fake_link（看 target）。
+ * 所以这里必须同时验证**真符号链接不被误改** —— 那才是这个修复最容易
+ * 破坏的地方（用户自建的同名链接必须原样报 DT_LNK）。
+ */
+static void t_dirent_type(void)
+{
+    l2s_config cfg = cfg_beside();
+    char a[PATH_MAX], b[PATH_MAX], real[PATH_MAX], decoy[PATH_MAX];
+    char dir[PATH_MAX];
+    char namebuf[64];
+
+    CASE("A5b 目录项 d_type：伪造链接报普通文件，真符号链接不受影响");
+    sandbox_make("dtype");
+    l2s_rt_init(&REAL_OPS, &cfg);
+    l2s_rt_reset_stats();
+
+    sp(a, sizeof(a), "f1");
+    sp(b, sizeof(b), "f2");
+    sp(real, sizeof(real), "real.lnk");
+    write_file(a, "body");
+
+    CHECK_EQ_I(l2s_rt_link(a, b), 0);
+    /* 用户自建的普通符号链接（相对 target） */
+    CHECK(symlink("f1", real) == 0);
+
+    snprintf(dir, sizeof(dir), "%s", g_root);
+
+    /* 伪造链接 → DT_REG（这就是本项修复的核心断言） */
+    snprintf(namebuf, sizeof(namebuf), "%s", strrchr(a, '/') + 1);
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, namebuf), DT_REG);
+
+    /* 第二个伪造链接同样 */
+    snprintf(namebuf, sizeof(namebuf), "%s", strrchr(b, '/') + 1);
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, namebuf), DT_REG);
+
+    /* ★ 真符号链接 → DT_UNKNOWN（表示"我不改"，调用方保留内核给的原值）★ */
+    snprintf(namebuf, sizeof(namebuf), "%s", strrchr(real, '/') + 1);
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, namebuf), DT_UNKNOWN);
+
+    /* 不存在的名字、目录自身都不该被认成伪造链接 */
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, "no-such-entry"), DT_UNKNOWN);
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, "."), DT_UNKNOWN);
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, ".."), DT_UNKNOWN);
+
+    /* 带斜杠的"名字"是调用方给错了 —— 拒绝而非拼路径去 probe */
+    snprintf(namebuf, sizeof(namebuf), "sub/../%s", strrchr(a, '/') + 1);
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, namebuf), DT_UNKNOWN);
+
+    /* 关闭伪装后一律不改（诊断开关要真的生效） */
+    l2s_rt_set_hide_symlink(0);
+    snprintf(namebuf, sizeof(namebuf), "%s", strrchr(a, '/') + 1);
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, namebuf), DT_UNKNOWN);
+    l2s_rt_set_hide_symlink(1);
+
+    /* 未初始化/参数错时安全返回 */
+    CHECK_EQ_I(l2s_rt_dirent_type(NULL, "x"), DT_UNKNOWN);
+    CHECK_EQ_I(l2s_rt_dirent_type(dir, NULL), DT_UNKNOWN);
+
+    (void)decoy;
+    sandbox_drop();
+}
+
+/*
+ * A5c. 裸 getdents64 结果缓冲的遍历（内核 linux_dirent64 布局）
+ *
+ * 【为什么用**手工构造**的缓冲测】
+ * 这里测的是"按内核布局走缓冲"这段最容易静默出错的代码：写错偏移不会崩，
+ * 只会改错字节（本项目对此有过教训 —— stx_mode 曾被当成 4 字节写）。
+ * 手工构造能精确覆盖边界：reclen 为 0、reclen 超长，这些在真实目录里
+ * 很难稳定造出来，而它们正是"越读/改错内存"的入口。
+ */
+static void t_dents64_buffer(void)
+{
+    l2s_config cfg = cfg_beside();
+    char a[PATH_MAX], b[PATH_MAX], dir[PATH_MAX];
+    const char *fa, *fb;
+    unsigned char buf[512];
+    long off = 0;
+    int n;
+
+    CASE("A5c getdents64 缓冲改写：只改伪造链接，损坏缓冲立即停手");
+    sandbox_make("dents");
+    l2s_rt_init(&REAL_OPS, &cfg);
+
+    sp(a, sizeof(a), "g1");
+    sp(b, sizeof(b), "g2");
+    write_file(a, "body");
+    CHECK_EQ_I(l2s_rt_link(a, b), 0);
+    snprintf(dir, sizeof(dir), "%s", g_root);
+    fa = strrchr(a, '/') + 1;
+    fb = strrchr(b, '/') + 1;
+
+    /* 手工造两条 linux_dirent64：d_ino(0) d_off(8) d_reclen(16)
+     * d_type(18) d_name(19)，reclen 按 8 字节对齐 */
+    memset(buf, 0, sizeof(buf));
+    {
+        size_t nl = strlen(fa) + 1;
+        unsigned short rl = (unsigned short)((19 + nl + 7) & ~(size_t)7);
+        memcpy(buf + off + 16, &rl, 2);
+        buf[off + 18] = DT_LNK;
+        memcpy(buf + off + 19, fa, nl);
+        off += rl;
+    }
+    {
+        size_t nl = strlen(fb) + 1;
+        unsigned short rl = (unsigned short)((19 + nl + 7) & ~(size_t)7);
+        memcpy(buf + off + 16, &rl, 2);
+        buf[off + 18] = DT_LNK;
+        memcpy(buf + off + 19, fb, nl);
+        off += rl;
+    }
+
+    n = l2s_rt_patch_dents64(dir, buf, off);
+    CHECK_EQ_I(n, 2);
+    CHECK_EQ_I(buf[18], DT_REG);
+    {
+        unsigned short rl1;
+        memcpy(&rl1, buf + 16, 2);
+        CHECK_EQ_I(buf[rl1 + 18], DT_REG);
+    }
+
+    /* 幂等：再跑一次不改任何东西（已不是 DT_LNK） */
+    CHECK_EQ_I(l2s_rt_patch_dents64(dir, buf, off), 0);
+
+    /* ★ 损坏缓冲必须立即停手 ★ */
+    {
+        unsigned char bad[64];
+        unsigned short huge = 4096;
+
+        /* reclen = 0 → 立刻 break（否则会死循环） */
+        memset(bad, 0, sizeof(bad));
+        CHECK_EQ_I(l2s_rt_patch_dents64(dir, bad, (long)sizeof(bad)), 0);
+
+        /*
+         * reclen 超出 len → break，且**不得改写**。
+         *
+         * ★ 这一条必须放一个**真实的伪造链接名** ★
+         *
+         * 本用例第一版只把 d_type 设成 DT_LNK 而 d_name 留空，结果这条
+         * 断言**没有判别力**：即使把实现里的 `off + reclen > len` 越界
+         * 检查删掉，空名字 probe 不到，照样返回 0 —— 实测注入缺陷后
+         * 仍 PASS。钉子的价值全在"能区分正反例"，所以这里放真名字：
+         * 若实现少了越界检查，它会继续走进下一条（off 已越界）并把
+         * 这条文件名 probe 成功、改写 d_type → 断言立刻失败。
+         */
+        memset(bad, 0, sizeof(bad));
+        memcpy(bad + 16, &huge, 2);
+        bad[18] = DT_LNK;
+        memcpy(bad + 19, fa, strlen(fa) + 1);   /* 真实伪造链接名 */
+        CHECK_EQ_I(l2s_rt_patch_dents64(dir, bad, 32), 0);
+        CHECK_EQ_I(bad[18], DT_LNK);
+    }
+
+    /* len <= 0 / NULL 一律安全返回 0 */
+    CHECK_EQ_I(l2s_rt_patch_dents64(dir, buf, 0), 0);
+    CHECK_EQ_I(l2s_rt_patch_dents64(dir, NULL, 64), 0);
+    CHECK_EQ_I(l2s_rt_patch_dents64(NULL, buf, off), 0);
+
+    sandbox_drop();
+}
+
+/* ================================================================== */
 /* A6. 集中目录布局（DSHA 生产的 PROOT_L2S_DIR）                        */
 /* ================================================================== */
 
@@ -1152,6 +1325,8 @@ int main(void)
     t_readlink_rewrite();
     t_stat_patch();
     t_stat_size_is_real();
+    t_dirent_type();
+    t_dents64_buffer();
     t_central_dir();
     t_link_from_fake();
     t_dir_refused();

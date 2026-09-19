@@ -168,15 +168,37 @@ try {
     realLinkOk = (fs.readlinkSync(l) === "target.txt");
 } catch (e) { realLinkOk = false; realLinkErr = e.code || e.message; }
 
+/*
+ * ★ 目录项 d_type：pnpm / Turbopack 失败的那一条 ★
+ *
+ * 伪造链接在磁盘上是符号链接，所以目录项流报 DT_LNK，而 lstat 报普通
+ * 文件 —— 客户同时看到两个矛盾事实，pnpm 据此报 "Invalid symlink"
+ * （上游 #407 / #418，两条独立 issue 同根）。
+ *
+ * 这里必须用 node 自己的入口，因为**每一条入口都是独立的一段代码**：
+ *   readdirSync(d, {withFileTypes:true}) → libuv 走裸 syscall(61)
+ *   scandir                             → libc 内部本地 bl 调 readdir
+ * 反汇编实测这两条都**不经 PLT**，所以钩子必须分别挂（见 preload.c 与
+ * syscall_guard.c 里那两段长注释）。只测其中一条会漏掉另一条。
+ */
+let dtReaddir = null, dtErr = "";
+try {
+    const ents = fs.readdirSync(d, {withFileTypes: true});
+    const e = ents.find(function (x) { return x.name === "a.txt"; });
+    dtReaddir = e ? (e.isSymbolicLink() ? "LNK" : (e.isFile() ? "REG" : "?")) : "MISSING";
+} catch (e) { dtErr += "readdir:" + (e.code || e.message) + " "; }
+
 try { fs.rmSync(d, {recursive: true}); } catch (e) {}
 
 /* 单行、机器可解析的输出 —— 便于本脚本与人工核对 */
 console.log("RESULT nlink=" + nlink + " islink=" + isLink +
             " size=" + lsize + " stsize=" + ssize +
             " reallink=" + realLinkOk +
+            " dtype=" + dtReaddir +
             " content=" + JSON.stringify(content) +
             (err ? (" err=" + err) : "") +
-            (realLinkErr ? (" realLinkErr=" + realLinkErr) : ""));
+            (realLinkErr ? (" realLinkErr=" + realLinkErr) : "") +
+            (dtErr ? (" dtErr=" + dtErr) : ""));
 JSEOF
 
 run_one() {
@@ -282,6 +304,17 @@ reallink=$(echo "$GOT" | sed -n 's/.* reallink=\([a-z]*\).*/\1/p')
                               echo "     ★ 这是修复\"伪造链接 readlink 返回 EINVAL\"时最容易破坏的点："
                               echo "       一刀切会让正常符号链接也读不出来"; FAIL=1; }
 
+# 目录项 d_type 必须与 lstat 自洽（上游 #407 / #418）
+dtype=$(echo "$GOT" | sed -n 's/.* dtype=\([A-Z]*\).*/\1/p')
+[ "$dtype" = "REG" ] || { echo "  ❌ readdir(withFileTypes) 应报普通文件，实得 $dtype"; FAIL=1; }
+[ "$dtype" = "REG" ] || { echo "     ★ 这就是 pnpm/Turbopack 报 \"Invalid symlink\" 的原因："
+                          echo "       目录项报 symlink 而 lstat 报 regular，客户看到矛盾事实"
+                          echo "       （上游 #407 + #418，两条独立 issue 同根）"; }
+[ "$dtype" = "LNK" ] && { echo "     ★ 注意：lstat 已是 regular，只有目录项流没改 —— 说明"
+                          echo "       readdir/scandir/裸 svc 的钩子漏接了一条。反汇编实测"
+                          echo "       这三条都不经 PLT：scandir 本地 bl 调 readdir，readdir"
+                          echo "       本地 bl 调 getdents64，node 走裸 syscall(61)。"; }
+
 # ---------------------------------------------------------------------
 # 2) 官方对照（可选 —— 拿不到官方 runtime 就只做绝对判据）
 # ---------------------------------------------------------------------
@@ -316,10 +349,20 @@ rm -rf "$STAGE_MKDIR"
 
 echo
 if [ "$FAIL" -ne 0 ]; then
-    echo "RESULT: FAIL —— l2s 的 stat 伪装未生效"
-    echo "  已知根因方向：创建那半正常（目录里有 .l2s.* 中间文件），"
-    echo "  但 l2s_rt_patch_stat / _statx / _rewrite_readlink 这条链没接到"
-    echo "  实际的 stat/lstat/readlink 钩子上。详见 docs/l2s-stat伪装修复.md"
+    echo "RESULT: FAIL —— l2s 的伪装契约被破坏（上面逐条列出了不符的项）"
+    echo
+    echo "  本项覆盖四条**互相独立**的契约，按不符的项去看根因："
+    echo "    st_nlink / islink / size  → l2s_rt_patch_stat(+) 接线"
+    echo "    dtype                     → 目录项流钩子（readdir/scandir/裸 svc 61）"
+    echo "    reallink                  → readlink 反向翻译（别一刀切）"
+    echo
+    echo "  ★ 关于 dtype：这个值是 pnpm / Turbopack 报 \"Invalid symlink\" 的直接原因"
+    echo "    （上游 #407 + #418）。反汇编实测三条入口都**不经 PLT**，必须分别接："
+    echo "       node 的 readdirSync → 裸 syscall(61)"
+    echo "       libc scandir        → 本地 bl 调 readdir 真身"
+    echo "       libc readdir        → 本地 bl 调 getdents64 真身"
+    echo "    只接一条会得到\"看起来修了、pnpm 依然失败\"的假修复。"
+    echo "    相关报告：docs/l2s-stat伪装三缺陷分析.md"
     exit 1
 fi
 echo "RESULT: PASS"
