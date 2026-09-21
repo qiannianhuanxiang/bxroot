@@ -2187,6 +2187,7 @@ void px_reap_child_tolerant(pid_t child, px_wait_child_fn wait_fn, void *ud,
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -3779,6 +3780,96 @@ static int px_rewrite_shebang(const char *host, const char *guest,
     return 1;
 }
 
+/*
+ * 展开"目标是绝对路径"的符号链接，返回 1 = 已改写 host。
+ *
+ * 【为什么 execve 也必须要这一步】
+ *
+ * 内核解析符号链接目标是**内部行为**，bxroot 的符号钩子看不到。
+ * 若 host 是 `<rootfs>/usr/bin/awk`（一个 → `/etc/alternatives/awk`
+ * 的**绝对目标**链接），加载器打开它时，内核会用**真实根**去解析
+ * 那个 `/etc/alternatives/awk` —— 于是去找宿主的路径，ENOENT。
+ *
+ * 实测（`awk` 经 dash 的 PATH 搜索）：
+ *     command -v awk   → /usr/bin/awk      （stat 那一步已修，能找到）
+ *     awk '{print 1}'  → proroot-ldso: failure rc=2   ❌ 加载阶段才失败
+ *
+ * 也就是说 **"找得到" 与 "跑得起来" 是两条独立的路**：
+ * stat/open 修完只解决前者，exec 必须同样处理。
+ * `/usr/bin/awk`、`/usr/bin/cc`、`/usr/bin/c99` 等（实测 /usr/bin 与
+ * /etc/alternatives 下共 98 条绝对目标链接）全都会撞上这一条。
+ *
+ * 【实现】与 preload.c 的 resolve_abs_symlink 同一思路：逐层 readlink，
+ * 目标是绝对路径就按 rootfs 再翻译一次。层数上限 8（拦链接环）。
+ * 只处理**绝对目标**：相对目标由内核在同一目录内正确解析。
+ */
+static int px_resolve_abs_symlink(const char *in, char *out, size_t outsz)
+{
+    char cur[PX_PATH_MAX];
+    int depth;
+
+    if (in == NULL || out == NULL || outsz == 0)
+        return 0;
+    if (strlen(in) >= sizeof(cur))
+        return 0;
+    memcpy(cur, in, strlen(in) + 1);
+
+    for (depth = 0; depth < 8; depth++) {
+        char tgt[PX_PATH_MAX];
+        ssize_t n;
+        const char *rf;
+        size_t rl;
+
+        /*
+         * ★ 必须用**裸 syscall** 读链接目标 ★
+         *
+         * 用 libc 的 readlink() 会走 bxroot 自己的钩子链：那条链会做
+         * "反向翻译"（把宿主路径换回容器视角），于是我们拿到的是
+         * **容器视角**的目标，再去 prepend rootfs 就拼错了 ——
+         * 表现为"链明明该被展开，却什么都没发生"（实测 3/3）。
+         *
+         * 这里要的是**宿主视角的原样目标**，所以绕开符号层直接问内核。
+         */
+        n = syscall(SYS_readlinkat, AT_FDCWD, cur, tgt, sizeof(tgt) - 1);
+        if (n <= 0)
+            break;                  /* 不再是链接 → cur 即最终路径 */
+        tgt[n] = '\0';
+
+        /* 只跟绝对目标（相对目标内核能正确解析） */
+        if (tgt[0] != '/')
+            break;
+
+        /* 目标按 rootfs 再翻译一次（幂等：已带前缀的不重复拼） */
+        rf = g_rt_cfg.rootfs;
+        rl = (rf != NULL) ? strlen(rf) : 0;
+        if (rl > 0 && strncmp(tgt, rf, rl) == 0 &&
+            (tgt[rl] == '\0' || tgt[rl] == '/')) {
+            if (strlen(tgt) >= sizeof(cur))
+                return 0;
+            memcpy(cur, tgt, strlen(tgt) + 1);
+        } else {
+            /*
+             * 用显式长度拼接而不是 snprintf("%s%s")：
+             * 后者让 gcc 无法证明不发生截断（-Wformat-truncation），
+             * 而本项目的告警门禁是零容忍。手工 memcpy 的边界完全可见。
+             */
+            size_t tl = strlen(tgt);
+
+            if (rl + tl + 1u > sizeof(cur))
+                return 0;           /* 拼出来放不下 → 如实放弃 */
+            memcpy(cur, rf, rl);
+            memcpy(cur + rl, tgt, tl + 1u);
+        }
+    }
+
+    if (strcmp(cur, in) == 0)
+        return 0;                   /* 没变化 → 不需要改写 */
+    if (strlen(cur) >= outsz)
+        return 0;
+    memcpy(out, cur, strlen(cur) + 1);
+    return 1;
+}
+
 static int px_do_execve(const char *path, char *const argv[],
                         char *const envp[], const char *path_env,
                         int use_search)
@@ -3937,6 +4028,39 @@ static int px_do_execve(const char *path, char *const argv[],
         }
 
         /*
+         * ★ 先把"绝对目标符号链接"展开掉 —— 必须在 shebang 判断之前 ★
+         *
+         * 【为什么必须在前】内核解析链接目标时按**真实根**走，bxroot 拦不到，
+         * 于是 `/usr/bin/awk`（→ /etc/alternatives/awk）、`/usr/bin/cc`
+         * （4 跳链）这类链接在加载阶段 ENOENT。
+         *
+         * 顺序很关键：`/usr/bin/c99` 的链尾是 `/usr/bin/c99-gcc`，
+         * 而它是个 **`#! /bin/sh` 脚本**（不是 ELF）。若先做 shebang 判断，
+         * 那时 host 还指向 `<rootfs>/usr/bin/c99`（一个链接），
+         * `px_rewrite_shebang` 读它得到的是**链接解析失败**的结果，
+         * 于是判定"不是脚本"，随后交给 linker 又报
+         * `loader: reject .../c99-gcc: bad magic`。
+         * 先展开链接，shebang 判断拿到的就是真正的脚本内容。
+         */
+        {
+            char resolved[PX_PATH_MAX];
+            if (px_resolve_abs_symlink(host, resolved, sizeof(resolved))) {
+                px_cfg_str(host, sizeof(host), resolved);
+                /* guest 视角也要跟着更新（shebang 会用 guest 做 argv[1]） */
+                {
+                    const char *rf = g_rt_cfg.rootfs;
+                    size_t rl = (rf != NULL) ? strlen(rf) : 0;
+                    if (rl > 0 && strncmp(resolved, rf, rl) == 0 &&
+                        (resolved[rl] == '/' || resolved[rl] == '\0')) {
+                        const char *g2 = resolved + rl;
+                        px_cfg_str(guest, sizeof(guest),
+                                   (g2[0] != '\0') ? g2 : "/");
+                    }
+                }
+            }
+        }
+
+        /*
          * ★ shebang 重写**前**保存 raw user path（上游同款）★
          *
          * 上游 enter.c:620 注释明确 raw_path 的用途之一是
@@ -4052,11 +4176,107 @@ static int px_do_execve(const char *path, char *const argv[],
      *     内层 = bxroot       → node spawnSync status=null  ❌
      * 证明 trampoline 机制本身可用，缺的只是 bxroot 这一层。
      */
-    if (px_trampoline_exec(host, final_argv, final_env, guest,
-                           getenv("BXROOT_LD_PRELOAD")) == 0) {
-        /* 走到这里说明 trampoline exec 失败（成功则永不返回），
-         * 落到下面回退到直接 execve —— 保持普通环境的行为不变。 */
-        PX_LOG("proc: trampoline exec 失败，回退直接 execve %s", host);
+    /*
+     * ★★ 先做「目标是否存在」的前置检查，再决定是否进 trampoline ★★
+     *
+     * 【缺陷（实测，2026-09-20）】`exec <名字>` 在 bxroot 下 100% 失败，
+     * 而官方 proroot 成功。最小复现：
+     *
+     *     $ bxroot-run -- /bin/sh -c 'exec echo E'          # 外挂 PATH 目录时
+     *     proroot-ldso: failure rc=2                        rc=2
+     *     $ # 同一个命令在官方 runtime 下 → 正常打印 E
+     *
+     * 【根因】dash 的**名字解析不是自己做 PATH 搜索后只 exec 命中的那个**，
+     * 而是**逐个候选目录去 exec**，靠 execve 返回 ENOENT 来推进搜索：
+     *
+     *     官方实测（strace，/bin/dash -c 'exec echo HELLO'）：
+     *       execve("RF/usr/local/sbin/echo", …) = -1 ENOENT  → 下一候选
+     *       execve("RF/usr/local/bin/echo",  …) = -1 ENOENT  → 下一候选
+     *       execve("RF/usr/sbin/echo",       …) = -1 ENOENT  → 下一候选
+     *       execve("RF/usr/bin/echo",        …) =      0     → 命中
+     *
+     * 而 bxroot 的 trampoline 路径**一旦命中就永不返回**：它 exec 的是
+     * `bridge`（那个文件确实存在），于是 execve **返回 0（成功）**，
+     * dash 认为 `/usr/local/sbin/echo` 找到了 —— 搜索就此停止。
+     * 随后 bridge 里层才报 `proroot-ldso: failure rc=2`，但此时
+     * **已经没有任何人能把它翻译成 ENOENT 交给 dash 了**。
+     *
+     * 【为什么这个检查是「语义修正」而不是「打补丁」】
+     * POSIX 要求 execve 对「不存在的文件」返回 ENOENT。bxroot 用
+     * trampoline 时丢失了这个返回值 —— 这不是性能优化，是**语义回归**。
+     * 调用方（shell 的名字解析、python 的 shutil.which 回退、任何
+     * 遍历候选列表的代码）依赖它。
+     *
+     * 【只影响 trampoline 那条路】直接 execve 分支本来就返回真实 errno，
+     * 不需要（也不能）在这里拦 —— 那会把真实的内核错误吃掉。
+     * 所以判定「不是可执行文件」时**不 return**，而是把 trampoline 让过去、
+     * 落到下面的直接 execve，由内核给出权威 errno。
+     */
+    {
+        int definitive_no = 0;   /* 目标「确定不是可执行文件」 */
+        struct stat tst;
+
+        /*
+         * ★ 只在**确定性否定**时才跳过 trampoline ★
+         *
+         * 为什么不能对所有 stat 失败都跳过：真机上 guest 可执行文件在
+         * `/data/data/<pkg>/files/...`（SELinux app_data_file），而
+         * **trampoline 正是为了绕过那条 exec 限制存在的**。万一 stat
+         * 本身被策略拒绝（EACCES），跳过 trampoline 会把「本来能跑」
+         * 的环境弄坏 —— 那是比本缺陷严重得多的回归。
+         * 所以只认这两种确凿情形，其余一律照旧走 trampoline。
+         */
+        /*
+         * ★ 必须用**裸 syscall** 做这个内部判断，不能走 libc 的 stat ★
+         *
+         * 【踩过的坑，2026-09-20】这里原本调 `stat(host)`。而 `host` 是
+         * **已经翻译好的宿主路径**，`host` 又会被 preload 层的 stat 钩子
+         * 再处理一次 —— 钩子里的"中间组件链接解析"会把
+         *     <rootfs>/bin/echo
+         * 里的 `bin -> usr/bin` 再展开一遍（那是**宿主视角**的链接），
+         * 于是路径被拼错、stat 失败 → 误判为"不是可执行文件" →
+         * **跳过 trampoline** → 退化成直接 execve →
+         * SELinux `app_data_file` 拒绝 → `execv: Permission denied`。
+         *
+         * 实测症状（guest 内 fork+execv("/bin/echo")）：rc=127 EPERM，
+         * 而 execv("/usr/bin/true") 正常 —— 差别只在 `/bin` 是不是链接。
+         * 更隐蔽的是 `/bin/sh` 也在同一路径上，于是
+         * "fork+execv('/bin/sh','-c',...)" 全线失败。
+         *
+         * 修法：内部判断用 `syscall(SYS_newfstatat, …)` 直接问内核，
+         * 完全绕开本进程自己安装的钩子 —— 我们要的就是"磁盘上到底是
+         * 什么"，不需要任何客户视角的语义。
+         */
+        {
+            struct stat raw_st;
+            long rr = syscall(SYS_newfstatat, AT_FDCWD, host, &raw_st, 0);
+            if (rr != 0) {
+                if (errno == ENOENT || errno == ENOTDIR) {
+                    definitive_no = 1;  /* 确实不存在 */
+                }
+            } else {
+                tst = raw_st;
+            }
+        }
+        if (!definitive_no && S_ISDIR(tst.st_mode)) {
+            definitive_no = 1;          /* 目录不可 exec */
+        } else if (S_ISREG(tst.st_mode) && (tst.st_mode & 0111) == 0) {
+            definitive_no = 1;          /* 三个执行位全 0，必然不可 exec */
+        }
+
+        if (definitive_no) {
+            /*
+             * 跳过 trampoline，但**不在这里返回** —— 交给下面真实的
+             * execve：它会给出与内核完全一致的权威 errno
+             * （ENOENT / EACCES / ELOOP …），调用方拿到的语义不打折。
+             */
+            PX_LOG("proc: 目标不是可执行文件(%s)，跳过 trampoline", host);
+        } else if (px_trampoline_exec(host, final_argv, final_env, guest,
+                                      getenv("BXROOT_LD_PRELOAD")) == 0) {
+            /* 走到这里说明 trampoline exec 失败（成功则永不返回），
+             * 落到下面回退到直接 execve —— 保持普通环境的行为不变。 */
+            PX_LOG("proc: trampoline exec 失败，回退直接 execve %s", host);
+        }
     }
 
     if (real_execve == NULL) {
@@ -4327,6 +4547,23 @@ static int px_do_spawn(pid_t *pid, const char *path,
     const char *dl_name;
     int rc;
 
+    /*
+     * ★ shebang 改写结果必须放**函数作用域**，不能放块内 ★
+     *
+     * `argv` 会被重定向到 `sb_argv`，而 `sb_argv` 要一直用到函数末尾的
+     * `px_trampoline_spawn`。声明在块内的话，块一结束那些栈内存就失效 ——
+     * 后面用 `argv` 就是**野指针**，而且因为栈很可能还没被覆盖，
+     * 症状是"大多数时候正常、偶发读到垃圾 argv"，极难定位。
+     *
+     * 这与 px_do_execve 里同名变量的注释是同一个教训（那里已经踩过一次）。
+     * gcc 的 -Wdangling-pointer 正是抓这个的，本项目告警门禁零容忍。
+     */
+    char sb_host[PX_PATH_MAX];
+    char sb_guest[PX_PATH_MAX];
+    char sb_arg1[PX_PATH_MAX];
+    char sb_script[PX_PATH_MAX];
+    char *sb_argv[PX_ARGV_MAX + 1];
+
     g_rt_stats.spawn_calls++;
 
     /* 1) 路径解析 */
@@ -4334,6 +4571,39 @@ static int px_do_spawn(pid_t *pid, const char *path,
         if (px_resolve_exec_path(path, getenv("PATH"), host, sizeof(host),
                                  NULL, 0) != 0) {
             return errno ? errno : ENOENT;
+        }
+        /*
+         * ★ 展开"绝对目标符号链接" —— posix_spawn 也要做 ★
+         *
+         * 【为什么这条是 `make` 可用与否的关键】
+         *
+         * glibc 的 `posix_spawn` 在**内部**完成 fork+exec：真正发出 exec
+         * 的是 `__spawni` 里的**内联 svc**，不经过 `execve` 导出符号 ——
+         * 所以 `px_do_execve` 里那份展开逻辑**拦不到这条路**。
+         *
+         * 实测（`make` 跑 `cc -c …`）：
+         *   dash 为外部命令 fork 一个子进程，该子进程走 posix_spawn，
+         *   于是发生一次
+         *     clone3(CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND)
+         *   `CLONE_CLEAR_SIGHAND` 抹掉 SIGSYS 处理器，子进程带着
+         *   **未展开的** `<rootfs>/usr/bin/cc` 去 exec →
+         *   `proroot-ldso: failure rc=2` → 子进程 exit 2 →
+         *   `make: *** [Makefile:N: all] Error 2`
+         *
+         * 对照：不经 make、直接 `cc -c …` 时 clone3 计数为 **0**，
+         * 走的是导出符号 execve，展开逻辑生效 → 成功。
+         * 这就是"直接能编译、make 里编译不了"的全部原因。
+         *
+         * 在**父进程**里先把 host 展开掉，子进程拿到的就是真文件，
+         * 与它有没有 SIGSYS 处理器无关 —— 从这个角度绕开了
+         * `CLONE_CLEAR_SIGHAND` 造成的能力损失。
+         */
+        {
+            char resolved[PX_PATH_MAX];
+            if (px_resolve_abs_symlink(host, resolved, sizeof(resolved))) {
+                PX_LOG("spawn: 展开绝对目标符号链接 %s -> %s", host, resolved);
+                px_cfg_str(host, sizeof(host), resolved);
+            }
         }
         dl_name = "posix_spawnp";
         g_rt_stats.spawn_path_translated++;
@@ -4347,7 +4617,70 @@ static int px_do_spawn(pid_t *pid, const char *path,
         } else {
             px_cfg_str(host, sizeof(host), path);
         }
+        /* 非搜索分支同样要展开（理由见上面 use_search 分支的注释） */
+        {
+            char resolved[PX_PATH_MAX];
+            if (px_resolve_abs_symlink(host, resolved, sizeof(resolved))) {
+                PX_LOG("spawn: 展开绝对目标符号链接 %s -> %s", host, resolved);
+                px_cfg_str(host, sizeof(host), resolved);
+            }
+        }
         dl_name = "posix_spawn";
+    }
+
+    /*
+     * ★ 1b) shebang 重写 —— spawn 路径同样必需 ★
+     *
+     * 【缺陷（实测，2026-09-20，由独立测试子代理发现）】
+     *
+     *     # Makefile
+     *     all:
+     *     	./gen.sh              # gen.sh 是 #!/bin/sh 脚本
+     *
+     *     $ make
+     *     loader: reject ./gen.sh: bad read
+     *     proroot-ldso: failure rc=5
+     *     make: *** [Makefile:2: all] Error 2
+     *
+     * 而 `./gen.sh && true`（带元字符，被迫走 shell）**正常** ——
+     * 也就是说**只有 make 的直接执行路径坏**，且报错信息
+     * （"bad read"）指向脚本本身，完全没提真正的原因。
+     *
+     * 【根因】GNU make 对「不含元字符的配方」会**短路**：不经过 shell，
+     * 直接 `posix_spawn` 那个脚本。而 `px_do_spawn` 里**没有 shebang 重写**
+     * —— `px_do_execve` 有（见那里的长注释），spawn 路径漏了。
+     * 于是脚本被原样交给 linker，linker 只认 ELF，读文本就报
+     * `bad read`。
+     *
+     * 【影响面】`/usr/bin` 下 568 个文件里有 **93 个是 `#!` 脚本**
+     * （`which`、`ldd` 都在其中），所以这不是边角情形：
+     * `make` 跑任何脚本配方都会失败。
+     *
+     * 【修法】与 `px_do_execve` 同一套：先解析 `#!`，命中就把目标换成
+     * 解释器、按内核语义改写 argv（`[interp, script, 原argv[1..]]`）。
+     * 复用现成的 `px_rewrite_shebang()`，不复制判据。
+     *
+     * 【为什么放在链接展开之后】解释器路径也要翻译；而脚本本身可能是
+     * 绝对链接（如 `/usr/bin/c99` → 一个脚本），先展开才能读到内容。
+     */
+    {
+        int sb_rc;
+
+        sb_rc = px_rewrite_shebang(host, path, argv,
+                                   sb_host, sizeof(sb_host),
+                                   sb_guest, sizeof(sb_guest),
+                                   sb_arg1, sizeof(sb_arg1),
+                                   sb_script, sizeof(sb_script),
+                                   sb_argv, PX_ARGV_MAX + 1);
+        if (sb_rc < 0) {
+            return ENOEXEC;
+        }
+        if (sb_rc > 0) {
+            /* 命中 shebang：目标改成解释器，argv 换成改写后的 */
+            px_cfg_str(host, sizeof(host), sb_host);
+            argv = sb_argv;
+            PX_LOG("spawn: shebang 重写 %s -> %s", path, sb_host);
+        }
     }
 
     /* 2) argv 翻译 */

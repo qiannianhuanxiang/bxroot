@@ -245,6 +245,61 @@ typedef struct {
 static const lp_site g_sites[] = {
     { 0x855c4UL, MOV_X0_0,      "set_robust_list", 99  },
     { 0x85850UL, MOV_X0_0,      "rseq",            293 },
+    /*
+     * ★ `__spawni` 里的身份内联 svc（新增，2026-09-20）★
+     *
+     * 【为什么必须补这两条】
+     *
+     * `posix_spawn(..., POSIX_SPAWN_RESETIDS, ...)` 会让 glibc 在
+     * **子进程里**把 uid/gid 重置回真实值。这段代码在 `__spawni` 内部，
+     * 用的是**自己的内联 svc**，不经过 `setresuid`/`setresgid` 的
+     * 导出符号 —— 所以 bxroot 的符号钩子和 `syscall()` 钩子都拦不到。
+     *
+     * 更要命的是：glibc 创建这个子进程用的是
+     *     clone3(CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND)
+     * `CLONE_CLEAR_SIGHAND`（bit 32）会**把所有信号处置重置为默认**，
+     * 包括 bxroot 安装的 SIGSYS 处理器。于是：
+     *
+     *     子进程 SIGSYS = SIG_DFL
+     *       → 内联 svc setresgid 撞上外层 seccomp 的 TRAP
+     *       → 没有处理器可投递（且是 KILL_PROCESS 类）
+     *       → 子进程被直接杀死，父进程 wait4 收到
+     *         "{WIFSIGNALED(s) && WTERMSIG(s) == SIGSYS}"
+     *
+     * 最小复现（本容器实测，A/B/C 三方对照）：
+     *
+     *     posix_spawnattr_setflags(&a, POSIX_SPAWN_RESETIDS);
+     *     posix_spawn(&p, "/bin/echo", NULL, &a, av, environ);
+     *
+     *     无 runtime      → child rc=0          ✅
+     *     官方 proroot    → child rc=0          ✅
+     *     bxroot          → child sig=31 (SIGSYS) ❌
+     *
+     * 【为什么这直接解释 `make` 完全不可用】
+     *
+     * GNU make 用 `posix_spawn` 起配方子进程，并且**总是**设
+     * `POSIX_SPAWN_RESETIDS`。所以每条 recipe 的子进程都在
+     * `setresgid` 上被杀 —— 表现为：
+     *
+     *     $ make
+     *     make: *** [Makefile:2: all] Bad system call    ← strerror(SIGSYS)
+     *
+     * 【修成什么值】返回 0（成功）。
+     *
+     * 判据来自这两处站点的**后续指令**：svc 之后紧跟
+     *     cmn  x0, #0x1, lsl #12    ; 检查 x0 是否在 -4095..-1
+     *     b.hi <error>
+     *     cbz  x0, <ok>
+     * 即"x0 == 0 视为成功"。所以 MOV_X0_0 与 glibc 的预期一致。
+     *
+     * 这一点与 rseq 那条（必须 ENOSYS）**不同**，逐条判断而不是
+     * 一刀切，理由见上方站点表头的说明。
+     *
+     * 【安全性】与其余站点同款：打补丁前逐字节校验 `svc #0`，
+     * 换 glibc 版本时最坏是"不生效"，不会打错位置。
+     */
+    { 0xd6fa0UL, MOV_X0_0,      "__spawni setresuid", 147 },
+    { 0xd7160UL, MOV_X0_0,      "__spawni setresgid", 149 },
 };
 
 #define NSITES (sizeof(g_sites) / sizeof(g_sites[0]))

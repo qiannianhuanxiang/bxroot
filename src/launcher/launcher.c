@@ -1458,6 +1458,20 @@ int main(int argc, char **argv) {
     if (cfg.verbose)
         fprintf(stderr, "[bxroot-launcher] execve: %s\n", cfg.guest_exe);
 
+    /*
+     * ★ 用裸 syscall 执行 guest，绕过外层容器对 libc execve 的符号 hook ★
+     *
+     * 某些外层容器（实测：proroot）通过 LD_PRELOAD 挂钩 libc 的 `execve`
+     * 符号，把每一次 exec 都改写成它自己的加载器链
+     * （bridge + linker + --preload <外层 runtime>）。后果是 bxroot 自己
+     * 的 runtime 从未被加载 —— **路径翻译完全失效**，guest 实际跑在外层
+     * 容器的翻译下（实测：guest 里读到的是宿主的 /etc/os-release）。
+     *
+     * 裸 syscall 不经 PLT，外层符号钩子拦不到（已用最小探针实测：libc
+     * execve 被改写，syscall(SYS_execve) 不被改写）。失败时回退到 libc
+     * execve，保持原来的行为与错误信息。
+     */
+    syscall(SYS_execve, cfg.guest_exe, cfg.guest_argv, environ);
     execve(cfg.guest_exe, cfg.guest_argv, environ);
 
     /* 如果到这里说明 execve 失败了 */

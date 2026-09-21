@@ -11,6 +11,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
+#include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -45,6 +46,140 @@ static const char *base_of(const char *path)
     const char *slash = strrchr(path, '/');
     return slash == NULL ? path : slash + 1;
 }
+
+/*
+ * 把 `target` 表示成"相对于 `ref` 所在目录"的路径。
+ *
+ * 【为什么需要】符号链接的 target 是**相对链接所在目录**解析的。
+ * 当 target 与链接**不在同一目录**时，必须给出正确的相对路径，
+ * 否则内核会拼错（本文件曾因此产生断链，见
+ * docs/缺陷-l2s中间层相对路径断链导致git不可用.md）。
+ *
+ * 【为什么不用绝对路径】绝对路径会让中间层在 rootfs 迁移、
+ * 绑定挂载变化后失效；相对路径天然免疫。
+ *
+ * 【边界】
+ *   - 两者都不是绝对路径（**都相对 cwd**）时，可安全按目录层级算相对；
+ *   - 任一为绝对路径时，退回**绝对路径**（此时无法保证用相对形式）；
+ *   - 结果放不下 → 返回 -1，调用方退回绝对路径或原样。
+ *
+ * 返回 0 成功，-1 失败（out 未定义）。
+ */
+static int l2s_relpath(const char *target, const char *ref,
+                       char *out, size_t outsz)
+{
+    char tdir[L2S_PATH_MAX], rdir[L2S_PATH_MAX];
+    const char *tp, *rp;
+    const char *tseg[64], *rseg[64];
+    int tn = 0, rn = 0, i, common;
+    size_t used = 0;
+
+    if (target == NULL || ref == NULL || out == NULL || outsz == 0)
+        return -1;
+
+    /* 绝对路径无法用相对形式安全表达 → 交调用方处理 */
+    if (target[0] == '/' || ref[0] == '/')
+        return -1;
+
+    /* 拆出各自的目录部分（不含 basename） */
+    {
+        const char *sl;
+        size_t n;
+
+        sl = strrchr(target, '/');
+        if (sl == NULL) {
+            tdir[0] = '\0';
+        } else {
+            n = (size_t)(sl - target);
+            if (n >= sizeof(tdir))
+                return -1;
+            memcpy(tdir, target, n);
+            tdir[n] = '\0';
+        }
+
+        sl = strrchr(ref, '/');
+        if (sl == NULL) {
+            rdir[0] = '\0';
+        } else {
+            n = (size_t)(sl - ref);
+            if (n >= sizeof(rdir))
+                return -1;
+            memcpy(rdir, ref, n);
+            rdir[n] = '\0';
+        }
+    }
+
+    /* 逐段切分。空段与 "." 忽略；".." 保留（语义上要弹栈）。 */
+    tp = tdir;
+    while (*tp != '\0' && tn < 64) {
+        const char *e = strchr(tp, '/');
+        size_t n = (e != NULL) ? (size_t)(e - tp) : strlen(tp);
+        if (n != 0 && !(n == 1 && tp[0] == '.'))
+            tseg[tn++] = tp;
+        if (e == NULL)
+            break;
+        tp = e + 1;
+    }
+    rp = rdir;
+    while (*rp != '\0' && rn < 64) {
+        const char *e = strchr(rp, '/');
+        size_t n = (e != NULL) ? (size_t)(e - rp) : strlen(rp);
+        if (n != 0 && !(n == 1 && rp[0] == '.'))
+            rseg[rn++] = rp;
+        if (e == NULL)
+            break;
+        rp = e + 1;
+    }
+
+    /* 公共前缀长度（按整段比较，需要段长度相同且内容相同） */
+    common = 0;
+    while (common < tn && common < rn) {
+        const char *a = tseg[common], *b = rseg[common];
+        const char *ae = strchr(a, '/');
+        const char *be = strchr(b, '/');
+        size_t al = (ae != NULL) ? (size_t)(ae - a) : strlen(a);
+        size_t bl = (be != NULL) ? (size_t)(be - b) : strlen(b);
+        if (al != bl || strncmp(a, b, al) != 0)
+            break;
+        common++;
+    }
+
+    /*
+     * 每个 ref 剩余段 → 一个 "../"。
+     *
+     * ★ 写 3 字节就要推进 3 ★ 初版写成 `memcpy(...,"../",3); used += 2;`
+     * （把 "../" 当 2 字节），于是下一轮从第 2 个字符 ' .' 开始覆盖，
+     * 产出 `..src/.l2s.a0001` 这种少一个斜杠的路径 → 仍然断链。
+     * 实测：`cp -al src dst` 后 `dst/a -> ..src/.l2s.a0001`。
+     */
+    for (i = common; i < rn; i++) {
+        if (used + 3 >= outsz)
+            return -1;
+        memcpy(out + used, "../", 3);
+        used += 3;
+    }
+    /* 每个 target 剩余段原样 */
+    for (i = common; i < tn; i++) {
+        const char *a = tseg[i];
+        const char *ae = strchr(a, '/');
+        size_t al = (ae != NULL) ? (size_t)(ae - a) : strlen(a);
+        if (used + al + 1 >= outsz)
+            return -1;
+        memcpy(out + used, a, al);
+        used += al;
+        out[used++] = '/';
+    }
+    /* target 的 basename */
+    {
+        const char *b = strrchr(target, '/');
+        b = (b != NULL) ? b + 1 : target;
+        if (used + strlen(b) + 1 > outsz)
+            return -1;
+        memcpy(out + used, b, strlen(b) + 1);
+    }
+    return 0;
+}
+
 
 /*
  * 判断名字是否带 l2s 前缀。
@@ -256,6 +391,81 @@ static int probe_fake_link(const char *path, char *out_mid, size_t outsz)
      * 创建的、恰好同名的符号链接当成伪造链接。 */
     if (strlen(target) >= outsz)
         return 0;
+
+    /*
+     * ★ 返回**锚定到 path 所在目录**的 mid，而不是裸 basename ★
+     *
+     * 【缺陷（实测，2026-09-20，第十轮复核用判决性实验钉死）】
+     *
+     * 内核 readlink() 返回的 target 是**记录在链接里的字符串**；当它是
+     * 纯 basename（本层的正常布局）时，下游所有用它拼路径的地方都会
+     * **按进程 cwd 解析** —— 而正确基准是**链接所在目录**。
+     *
+     *     cwd=/tmp/piw,  文件在 sub/
+     *       cwd/.l2s.tmpX0001.0002.cnt = 9      ← decoy
+     *       sub/.l2s.tmpX0001.0002.cnt = 2      ← 真文件
+     *     unlink("sub/tmpX") 后：
+     *       cwd/...cnt = 8   ★ l2s 减的是 cwd 里那个 ★
+     *       sub/...cnt = 2   （真文件没动）
+     *
+     * 后果：read_nlink 读不到 → -EINVAL → git 报
+     * `unable to unlink '…': Invalid argument`；`.cnt` 计数错乱。
+     *
+     * 【为什么锚点取 path 的 dirname 而不是 target 的】
+     * target 是 basename（没有目录）；而 path 是客户给的完整路径，
+     * 它的 dirname 就是链接所在目录 —— 这正是内核解析 target 的基准。
+     *
+     * 【为什么在这里锚定，而不是在 read_nlink/write_nlink 里】
+     * 这两个函数的入参叫 `final_path`，语义就是"可解析的路径"。
+     * 在**源头**把它变成可解析的，所有调用点（共 6 处）自动受益，
+     * 不需要逐个改签名 —— 少一个改动点就少一次"漏一个入口"的机会。
+     */
+    /*
+     * ★ 只在 target 确实是**相对名**时才锚定 ★
+     *
+     * 上游的 readlink 钩子会把中间层路径做**反向翻译**（剥 rootfs 前缀），
+     * 于是这里可能拿到**已经是绝对路径**的 target。那种情况下再拼一次
+     * dirname 就是**双重锚定**：
+     *
+     *     <rootfs>/tmp/l2sx/ + <rootfs>/tmp/l2sx/.l2s.a0002
+     *     = <rootfs>/tmp/l2sx/<rootfs>/tmp/l2sx/.l2s.a0002   ← 不存在
+     *
+     * 实测症状（加诊断后一眼可见）：
+     *     PSDBG mid=<rootfs>/tmp/l2sx//data/data/.../tmp/l2sx/.l2s.a0002
+     *     PSDBG resolve_final FAILED
+     * 于是 `l2s_rt_patch_stat` 静默 return，**st_nlink/st_mode 的伪装
+     * 完全不发生** → lstat 报 islink=1 size=64（符号链接的 size）。
+     *
+     * 判据：target 带 '/' 或首字符是 '/' ⇒ 它自身已可解析，直接用。
+     */
+    if (strchr(target, '/') == NULL) {
+        const char *sl = strrchr(path, '/');
+        size_t dlen = (sl != NULL) ? (size_t)(sl - path) + 1 : 0;
+
+        if (dlen > 0) {
+            /* 相对路径（如 ".git/objects/45/a"）也要锚定，否则下游按 cwd 解析 */
+            if (path[0] != '/') {
+                char cwd[L2S_PATH_MAX];
+                if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                    size_t cl = strlen(cwd);
+                    if (cl + 1 + dlen + strlen(target) >= outsz)
+                        return 0;
+                    memcpy(out_mid, cwd, cl);
+                    out_mid[cl] = '/';
+                    memcpy(out_mid + cl + 1, path, dlen);
+                    memcpy(out_mid + cl + 1 + dlen, target,
+                           strlen(target) + 1);
+                    return 1;
+                }
+            }
+            if (dlen + strlen(target) >= outsz)
+                return 0;
+            memcpy(out_mid, path, dlen);
+            memcpy(out_mid + dlen, target, strlen(target) + 1);
+            return 1;
+        }
+    }
+
     memcpy(out_mid, target, strlen(target) + 1);
     return 1;
 }
@@ -276,12 +486,64 @@ static int resolve_final(const char *mid, char *out_final, size_t outsz)
     /*
      * 中间层必须指向一个数据文件（带 ".NNNN" 尾巴），指向别处说明链
      * 已经损坏 —— 按 参考实现 的做法静默跳过，反正调用方本来就要删它。
+     *
+     * ★ 但 target 可能是**纯 basename** ★ 内核按"相对 mid 所在目录"
+     * 解析它（这是 symlink 的语义），而 l2s_decode_ex 需要能自证的
+     * 形态。历史产物的 target 只有 basename，此处补上 mid 的目录前缀
+     * 再解码，避免把"格式能识别但缺上下文"误判成"链已损坏"。
      */
     {
         l2s_info info;
         int rc = l2s_decode_ex(&g_cfg, target, NULL, &info);
-        if (rc != L2S_OK || info.kind != L2S_KIND_FINAL)
+        if (rc != L2S_OK || info.kind != L2S_KIND_FINAL) {
+            if (target[0] != '/') {
+                char joined[L2S_PATH_MAX];
+                const char *sl = strrchr(mid, '/');
+                size_t dlen = (sl != NULL) ? (size_t)(sl - mid) + 1 : 0;
+                if (dlen > 0 && dlen + strlen(target) < sizeof(joined)) {
+                    memcpy(joined, mid, dlen);
+                    memcpy(joined + dlen, target, strlen(target) + 1);
+                    rc = l2s_decode_ex(&g_cfg, joined, NULL, &info);
+                    if (rc == L2S_OK && info.kind == L2S_KIND_FINAL) {
+                        if (strlen(target) >= outsz)
+                            return -ENAMETOOLONG;
+                        memcpy(out_final, joined, strlen(joined) + 1);
+                        return 0;
+                    }
+                }
+            }
             return -EINVAL;
+        }
+    }
+
+    /*
+     * ★ 出口统一锚定：把相对名变成"相对 mid 所在目录"的可解析路径 ★
+     *
+     * 【缺陷】readlink 给的是链接里记录的**字面量**。本层布局下它是纯
+     * basename（`.l2s.x0001.0002`），下游 `read_nlink`/`write_nlink`
+     * 会拿它拼 `.cnt` 并用**裸 syscall(openat, AT_FDCWD, …)** 打开 ——
+     * 于是按**进程 cwd** 解析，而正确基准是**链接所在目录**。
+     *
+     * 判决性实验（第十轮复核提供）：cwd 放一个同名 decoy，
+     * `unlink(sub/tmpX)` 减掉的是 **cwd 里那个** `.cnt`，真文件没动。
+     *
+     * 【为什么在这里锚定而不是改 read_nlink 签名】调用点共 6 处，
+     * 在出口统一锚定，全部受益 —— 少一个改动点就少一次漏入口的机会。
+     */
+    if (target[0] != '/' && strchr(target, '/') == NULL) {
+        const char *sl = strrchr(mid, '/');
+        size_t dlen = (sl != NULL) ? (size_t)(sl - mid) + 1 : 0;
+        if (dlen > 0) {
+            char anchored[L2S_PATH_MAX];
+            if (dlen + strlen(target) < sizeof(anchored)) {
+                memcpy(anchored, mid, dlen);
+                memcpy(anchored + dlen, target, strlen(target) + 1);
+                if (strlen(anchored) >= outsz)
+                    return -ENAMETOOLONG;
+                memcpy(out_final, anchored, strlen(anchored) + 1);
+                return 0;
+            }
+        }
     }
 
     if (strlen(target) >= outsz)
@@ -370,6 +632,35 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
     if (oldpath == NULL || newpath == NULL)
         return -EINVAL;
 
+    /*
+     * ★ 客户在搬运**本层的内部文件**时必须透传 ★
+     *
+     * 【缺陷（实测，2026-09-20，v10 验收的 make test 抓到）】
+     * `cp -al src dst` 会对 src 里**每一个文件**做 link()，包括本层
+     * 自己的中间层与数据文件：
+     *
+     *     link("./sub/.l2s.f0001",     "../dst2/./sub/.l2s.f0001")
+     *     link("./sub/.l2s.f0001.0002","../dst2/./sub/.l2s.f0001.0002")
+     *
+     * 这些**不是**客户语义的硬链接 —— 客户（cp）只是想把整个目录树
+     * （其中恰好含本层的内部文件）原样复制一份。若按 l2s 语义处理，
+     * 会把内部文件再"建档"一次：计数错乱、嵌套链接、
+     * `cannot create hard link … .l2s.f0001' to './sub/.l2s.f0001'`。
+     *
+     * 【判据】oldpath 的 **basename 以 `.l2s.` 开头** ⇒ 它是本层内部
+     * 文件，link 它不是客户语义 → 交内核直传（让 cp 拿到它想要的
+     * "普通文件之间的硬链接"）。
+     *
+     * 为什么不判断 newpath：newpath 是 cp 自己造的目标名，同样以
+     * `.l2s.` 开头 —— 判任一侧即可，判 oldpath 语义更直接。
+     */
+    {
+        const char *ob = strrchr(oldpath, '/');
+        ob = (ob != NULL) ? ob + 1 : oldpath;
+        if (strncmp(ob, L2S_PREFIX, strlen(L2S_PREFIX)) == 0)
+            return L2S_RT_PASSTHRU;
+    }
+
     /* 目录不能硬链接。 */
     if (g_ops->lstat(oldpath, &st) != 0)
         return -errno;
@@ -404,19 +695,104 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
         if (g_ops->rename(oldpath, final) != 0)
             return -errno;
 
-        /* 中间层 -> final。 */
-        if (g_ops->symlink(final, mid) != 0) {
-            int e = errno;
-            (void)g_ops->rename(final, oldpath); /* 尽力回滚 */
-            return -e;
+        /*
+         * 中间层 -> final。
+         *
+         * ★ target 必须是**同目录下的名字**，不能是含目录的路径 ★
+         *
+         * 【缺陷（实测，2026-09-20）】`final` 是由 `oldpath` 派生的
+         * **cwd 相对路径**（如 `.git/objects/45/.l2s.x0001.0002`），
+         * 而符号链接的 target 是**相对链接所在目录**解析的 —— 于是
+         * 内核把它拼成
+         *     <mid 所在目录>/.git/objects/45/.l2s.x0001.0002
+         * 多了一层目录，**必然断链**。
+         *
+         * 触发条件很常见：**cwd ≠ 链接所在目录**。git 就是这样 ——
+         * cwd 是仓库根，对象在 `.git/objects/xx/` 下：
+         *
+         *     $ git add f.txt            # 首次 link → l2s 建档
+         *     $ git commit               # 读对象 → 断链
+         *     fatal: <hash> is not a valid object
+         *
+         * 宿主上看不出问题（真硬链接，不走 l2s），**只有 Android/bxroot
+         * 这种必须模拟硬链接的环境才暴露**。
+         *
+         * 【修法】`final` 与 `mid` 由 `l2s_make_paths_ex` 保证**恒同目录**
+         * （`final = mid + ".<NNNN>"`，见 l2s.c），所以 target 只需
+         * **basename**。用 basename 还顺带免疫 cwd 变化 —— 比绝对路径更稳
+         * （绝对路径会让中间层在 rootfs 迁移后失效）。
+         */
+        {
+            /*
+             * ★ target 要"相对 mid 所在目录"，且**保留目录信息** ★
+             *
+             * 初版只用 basename，虽然修好了内核解析，却**破坏了本层的
+             * 内部解析**：`resolve_final()` 会对 mid 做 readlink 拿到
+             * target，再交给 `l2s_decode_ex()`；后者需要能识别出
+             * "这是 .l2s.<name>NNNN.<NNNN> 形态的数据文件路径"，
+             * 纯 basename 缺少必要上下文 → 解码失败 → 返回 -EINVAL
+             * （实测：git 报 `unable to unlink '...': Invalid argument`）。
+             *
+             * 正解是 `l2s_relpath()`：算出的相对路径既有正确的解析基准
+             * （相对 mid 所在目录），又保留了完整目录信息供内部解码。
+             * 由于 final 与 mid **恒同目录**，正常情况下它就是 basename；
+             * 一旦将来两者不再同目录，这里也依然正确。
+             */
+            char ftarget[L2S_PATH_MAX];
+            const char *use = final;
+            const char *fbase = strrchr(final, '/');
+            fbase = (fbase != NULL) ? fbase + 1 : final;
+
+            if (l2s_relpath(final, mid, ftarget, sizeof(ftarget)) == 0)
+                use = ftarget;
+            else
+                use = fbase;    /* 兜底：同目录 ⇒ basename 足够 */
+
+            if (g_ops->symlink(use, mid) != 0) {
+                int e = errno;
+                (void)g_ops->rename(final, oldpath); /* 尽力回滚 */
+                return -e;
+            }
         }
 
-        /* 客户路径 -> 中间层，此时 oldpath 已经空出来。 */
-        if (g_ops->symlink(mid, oldpath) != 0) {
-            int e = errno;
-            (void)g_ops->unlink(mid);
-            (void)g_ops->rename(final, oldpath);
-            return -e;
+        /*
+         * 客户路径 -> 中间层，此时 oldpath 已经空出来。
+         *
+         * ★ target 必须**相对 oldpath 所在目录**（不是相对 cwd）★
+         *
+         * 【缺陷（实测，2026-09-20，第十轮验收）】这里原先直接把 `mid`
+         * 当 target。而 `mid` 是从 `oldpath` 派生的**含目录的**路径：
+         *
+         *     cd /tmp/lf && ln d1/a d1/b
+         *       oldpath = d1/a       mid = d1/.l2s.a0001
+         *       symlink("d1/.l2s.a0001", "d1/a")
+         *       ⇒ 内核按**链接所在目录**（d1/）解析 target
+         *       ⇒ d1/a -> d1/d1/.l2s.a0001   ★断链★
+         *
+         * 症状极具迷惑性：`link()` 返回 rc=0，**新名字 b 能读**，
+         * 而**原始名字 a 读不了**（ENOENT）—— 看起来像数据丢失。
+         * 只有**不含目录**的相对名（`ln a b`）恰好正确。
+         *
+         * 【为什么之前漏了】第一环只修了「中间层 -> 数据文件」那一处
+         * （`symlink(use, mid)`），这处「客户路径 -> 中间层」是**另一个
+         * 调用点**，当时没一并处理。子代理两轮都点出来了。
+         *
+         * 【修法】用 `l2s_relpath(mid, oldpath, …)`：oldpath 与 mid
+         * **恒同目录**（mid 由 oldpath 派生）⇒ 正确结果就是 basename。
+         */
+        {
+            char mtarget[L2S_PATH_MAX];
+            const char *use = mid;
+
+            if (l2s_relpath(mid, oldpath, mtarget, sizeof(mtarget)) == 0)
+                use = mtarget;
+
+            if (g_ops->symlink(use, oldpath) != 0) {
+                int e = errno;
+                (void)g_ops->unlink(mid);
+                (void)g_ops->rename(final, oldpath);
+                return -e;
+            }
         }
 
         /*
@@ -463,14 +839,53 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
         g_stats.link_more++;
     }
 
-    /* 为 newpath 建一条指向同一中间层的符号链接 —— 这就是「硬链接」。 */
-    if (g_ops->symlink(mid, newpath) != 0) {
-        int e = errno;
-        /*
-         * 参考实现 在这里做 decrement_link_count() 回滚。本层不静默重放，
-         * 把错误如实上抛，由调用方决定（EXECUTION_UNKNOWN 原则）。
-         */
-        return -e;
+    /*
+     * 为 newpath 建一条指向同一中间层的符号链接 —— 这就是「硬链接」。
+     *
+     * ★ target 必须是**相对于 newpath 所在目录**的路径 ★
+     *
+     * 【缺陷（实测，2026-09-20）】`mid` 是从 `oldpath` 派生的
+     * **cwd 相对路径**。当 `newpath` 与 `oldpath` **不同目录**时
+     * （`cp -al src dst` 正是如此），直接把 `mid` 当 target 会被
+     * 内核按"相对 newpath 所在目录"解析 → 多一层目录 → 断链：
+     *
+     *     $ cp -al src dst
+     *     $ cat dst/a
+     *     cat: dst/a: No such file or directory
+     *     $ readlink dst/a
+     *     src/.l2s.a0001          ← 从 dst/ 解析变成 dst/src/... 不存在
+     *
+     * 宿主上是真硬链接，看不出问题。
+     */
+    {
+        char midrel[L2S_PATH_MAX];
+        const char *mtarget = mid;
+
+        if (l2s_relpath(mid, newpath, midrel, sizeof(midrel)) == 0)
+            mtarget = midrel;
+        else if (mid[0] != '/' && newpath[0] != '/') {
+            /*
+             * 相对路径算不出来（层数过深/缓冲不足）→ 退回**绝对路径**。
+             * 绝对路径在任何 cwd 下都正确，只是对 rootfs 迁移敏感；
+             * 宁可"迁移时可能失效"也不能"当场就断链"。
+             */
+            static char abuf[L2S_PATH_MAX];
+            char cwd[L2S_PATH_MAX];
+            if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                if (snprintf(abuf, sizeof(abuf), "%s/%s", cwd, mid)
+                    < (int)sizeof(abuf))
+                    mtarget = abuf;
+            }
+        }
+
+        if (g_ops->symlink(mtarget, newpath) != 0) {
+            int e = errno;
+            /*
+             * 参考实现 在这里做 decrement_link_count() 回滚。本层不静默重放，
+             * 把错误如实上抛，由调用方决定（EXECUTION_UNKNOWN 原则）。
+             */
+            return -e;
+        }
     }
 
     return 0;
@@ -519,6 +934,28 @@ int l2s_rt_unlink(const char *path)
             return -errno;
         if (g_ops->unlink(final) != 0)
             return -errno;
+
+        /*
+         * ★ 一并删除 `.cnt` 旁路计数文件 ★
+         *
+         * 【缺陷（实测，2026-09-20，第十轮复核）】回收了中间层与数据文件，
+         * 却把 `<final>.cnt` 留在原地。后果有三：
+         *
+         *   1. **污染 `git fsck`**：对象目录里出现无法识别的
+         *      `.l2s.*.cnt` 文件 → `bad sha1 file: …`（宿主 0 条）；
+         *   2. **下次同 basename 重建链时读到脏计数** —— 该文件本应
+         *      随链一起消失，残留值会被当成"已有引用"；
+         *   3. 磁盘泄漏（每次 link/unlink 循环留一个）。
+         *
+         * 删除失败**不算错误**：文件本就不存在时 ENOENT 是正常的，
+         * 其它 errno 也不该让"已经删掉主体的 unlink"报失败 —— 主体
+         * 已回收是客户关心的事实。所以尽力删、忽略返回值。
+         */
+        {
+            char cnt[L2S_PATH_MAX];
+            if (l2s_refcount_path(final, cnt, sizeof(cnt)) == L2S_OK)
+                (void)g_ops->unlink(cnt);
+        }
         g_stats.unlink_free++;
     }
 
