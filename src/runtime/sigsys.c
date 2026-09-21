@@ -56,6 +56,7 @@
 /* ------------------------------------------------------------------ */
 
 static volatile int g_installed = 0;
+
 static volatile int g_verbose = 0;
 static volatile unsigned long g_total = 0;
 
@@ -200,6 +201,69 @@ static int emulate_errno(long sc)
     return ENOSYS;
 }
 
+/*
+ * 用**白名单内的等价调用**重放一次被拦的调用。
+ *
+ * 【为什么不能一律回 ENOSYS】
+ *
+ * 回 ENOSYS 只在"内核本来就不支持、且客户有回退路径"时才对
+ * （io_uring 家族就是设计目标）。对**内核其实支持**、只是被外层
+ * seccomp 顺带拦下的号，回 ENOSYS 是在**撒谎**，而且这个谎会
+ * 一路传下去：
+ *
+ *     实测（syscall 439 = faccessat2）
+ *       无 runtime  : faccessat2 → 0        ← 外层自己会仿真
+ *       官方 proroot: faccessat2 → 0
+ *       bxroot      : faccessat2 → -1 ENOSYS
+ *
+ *     glibc 的 faccessat(AT_EACCESS) 走的就是 439；拿到 ENOSYS 后
+ *     make 做 PATH 解析时会报 `make: cc: No such file or directory`
+ *     （Error 127），而那个文件明明存在且可执行。
+ *
+ * 【修法】挑一个**功能等价且在白名单内**的调用重放。
+ * faccessat2(dfd, path, mode, flags) 与 faccessat(dfd, path, mode)
+ * 在 flags==0 时语义完全相同 —— 实测 48 号（faccessat）在外层
+ * 白名单里（探针返回 0）。所以：
+ *
+ *     flags == 0  → 用 48 号重放，返回真实结果
+ *     flags != 0  → 无法等价表达（AT_EACCESS/AT_SYMLINK_NOFOLLOW
+ *                   语义不同），退回 ENOSYS 让客户走回退路径
+ *
+ * 返回值写进 x0 即可（与 emulate_errno 同一机制，不推进 PC）。
+ */
+static long replay_faccessat2(long dfd, long path, long mode, long flags)
+{
+    /*
+     * flags != 0 时 faccessat(48) 表达不了（AT_EACCESS /
+     * AT_SYMLINK_NOFOLLOW 语义不同），如实回 ENOSYS —— glibc 与
+     * 其它调用方见 ENOSYS 都有自己的回退路径（glibc 会改用 stat
+     * 自算），这正是 ENOSYS 该被使用的方式。
+     */
+    if (flags != 0) {
+        return -ENOSYS;
+    }
+
+    /*
+     * ★ 返回值必须按**内核 ABI** 编码：成功 0，失败 -errno ★
+     *
+     * 这里踩过一次：raw4() 用的是 libc 约定（失败返回 -1 并把
+     * errno 设好），而信号处理器要往 x0 里写的是**内核约定**的值。
+     * 直接把 raw4 的 -1 写进 x0，guest 的 glibc 会把它解码成
+     * `errno = 1 = EPERM` —— 于是"文件不存在"变成了"权限不足"。
+     *
+     * 实测症状（同一探针，guest 对不存在的路径）：
+     *     raw faccessat(48)   → ENOENT   （正确）
+     *     raw faccessat2(439) → EPERM    （错，就是上面这条编码错误）
+     *
+     * 所以：raw4 返回 -1 时取 `-errno` 写回，真实 errno 得以保留
+     * （ENOENT 仍是 ENOENT，EACCES 仍是 EACCES）。
+     */
+    if (raw4(48 /* faccessat */, dfd, path, mode, 0) == 0) {
+        return 0;
+    }
+    return (long)(-(long)errno);
+}
+
 static void sigsys_handler(int sig, siginfo_t *si, void *uc)
 {
     struct raw_sigsys_info *rs;
@@ -231,6 +295,20 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
     }
 
     /* 只设返回值，**不推进 PC** —— 理由见文件头。 */
+
+    /*
+     * 439 = faccessat2：用白名单内的 faccessat(48) 重放，给出真实结果
+     * 而不是谎报 ENOSYS。理由与边界见 replay_faccessat2()。
+     */
+    if (sc == 439) {
+        u->uc_mcontext.regs[0] = (unsigned long)replay_faccessat2(
+            (long)u->uc_mcontext.regs[0],
+            (long)u->uc_mcontext.regs[1],
+            (long)u->uc_mcontext.regs[2],
+            (long)u->uc_mcontext.regs[3]);
+        return;
+    }
+
     u->uc_mcontext.regs[0] = (unsigned long)(-emulate_errno(sc));
 }
 

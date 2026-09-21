@@ -229,6 +229,50 @@ int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
  */
 int bxroot_translate_path(const char *path, char *out, size_t out_size);
 
+/*
+ * 符号链接解析桥（见 preload.c 里的完整说明）。
+ * 只解析**中间组件**：叶子语义留给调用方的 flags。
+ * >0 已改写 / ==0 无需改写 / <0 失败。
+ *
+ * ★ weak 声明 ★ 本文件会被若干**单测单独编译并链接**
+ * （test/test_syscall_guard.c、test_rename_link_argpos.c、
+ *  test_id_syscall_guard.c —— 见 RUN_ALL.sh 第 300 行附近），
+ * 那时没有 preload.c，强符号会让链接直接失败：
+ *
+ *     undefined reference to `bxroot_resolve_intermediate_links'
+ *
+ * 与 proc.c 引用 bxroot_translate_path/bxroot_log 是同一种情形，
+ * 项目里已有先例（proc.c 用 weak 符号 + 缺失时回落）。
+ * 缺失时的语义是"不做额外解析" —— 与修复前的行为一致，安全。
+ */
+extern int bxroot_resolve_intermediate_links(const char *path, char *out,
+                                             size_t out_size)
+    __attribute__((weak));
+
+/* 裸 syscall 专用的"解析到底"（叶子链接也展开；说明见 preload.c 的
+ * bxroot_resolve_leaf_links）。同样是 weak：单测单独编译本文件时
+ * 缺失即不解析 —— 与修复前行为一致，安全。 */
+extern int bxroot_resolve_leaf_links(const char *path, char *out,
+                                     size_t out_size)
+    __attribute__((weak));
+
+/* 读路径上的 l2s 懒启用（定义在 preload.c；说明见那里）。
+ * weak 同上：单测单独编译本文件时缺失即不启用，安全。 */
+extern int bxroot_l2s_lazy_enable(const char *host_path)
+    __attribute__((weak));
+
+/* 把 l2s 伪造链接解析成数据文件路径（O_NOFOLLOW 用；实现见
+ * l2s-runtime.c）。weak 同上：缺失即不解析，与修复前一致。 */
+extern int l2s_rt_resolve_fake_link(const char *path, char *out,
+                                    size_t outsz)
+    __attribute__((weak));
+
+/* 相对路径按 cwd 绝对化（完整说明见 preload.c 的 bxroot_absolutize）。
+ * 同样是 weak：若干单测单独编译本文件，缺失即不绝对化 —— 与修复前
+ * 行为一致，安全。 */
+extern int bxroot_absolutize(const char *path, char *out, size_t outsz)
+    __attribute__((weak));
+
 /* ------------------------------------------------------------------ */
 /* 裸系统调用                                                          */
 /* ------------------------------------------------------------------ */
@@ -253,6 +297,17 @@ static long raw_syscall6(long nr, long a0, long a1, long a2,
         errno = (int)(-x0);
         return -1;
     }
+    /*
+     * ★ 成功路径必须清 errno ★
+     *
+     * 【缺陷（实测，2026-09-20，v15 验收 D-2）】原先成功时不清理
+     * errno —— 但本函数可能被先行逻辑污染（例如路径翻译链上的
+     * 探测调用设了 EINVAL/EEXIST）。glibc 的 syscall 包装成功时
+     * 不碰 errno，而客户"成功后检查 errno"是合法且常见的写法，
+     * 残留值会被误读成失败。libc 路径实测 errno=0，裸路径必须
+     * 对齐。
+     */
+    errno = 0;
     return x0;
 }
 
@@ -820,6 +875,25 @@ long syscall(long number, ...)
     unsigned pmask;
     int i;
 
+    /*
+     * ★ 需要"叶子解析"的路径槽位（补丁段末尾用；说明见 pmask 循环内
+     *   "顺序约束"的注释）。-1 = 不需要。
+     */
+    const char *leaf_pre = NULL;   /* 叶子解析前的路径（l2s 补丁 probe 用） */
+
+    /*
+     * ★ 翻译槽位池：提升到函数作用域 ★
+     *
+     * 原先声明在 pmask 循环内的块里，后来"叶子解析"挪到了
+     * raw_syscall6 之后的补丁段（必须在 l2s 结果补丁之后，见那里
+     * 的注释），补丁段也要从池里取槽 —— 块作用域够不着。
+     * 只挪位置，尺寸与语义一字不改。
+     */
+#define SG_POOL_SIZE (64 * 1024)
+#define SG_SLOT_SIZE 4096
+#define SG_SLOT_COUNT (SG_POOL_SIZE / SG_SLOT_SIZE)
+    static char sg_pool[SG_POOL_SIZE];
+
     init_trace();
 
     va_start(ap, number);
@@ -1013,7 +1087,31 @@ long syscall(long number, ...)
          * 全局静态缓冲也有），而 TLS 方案的风险是**内存被写坏**，
          * 严重得多。
          */
-        if (looks_like_guest_abs_path(pth)) {
+        /*
+         * ★ 相对路径先绝对化，**再**过 guest 门 ★
+         *
+         * 【缺陷（实测，2026-09-20，第十五轮验收 /tmp/relprobe）】
+         * 门 `looks_like_guest_abs_path()` 只认 `p[0]=='/'`。把绝对化
+         * 放在**门内**的话，相对路径根本进不来 —— `statx(AT_FDCWD,
+         * "absleaf")` 直接原样透传，`absleaf -> /etc/hosts` 按真实根
+         * 展开读外层 56 字节（实测 REL 3 条全 FAIL，ABS 全 PASS）。
+         *
+         * 【为什么 cwd 可靠】chdir 钩子（preload.c）已把工作目录钉在
+         * 容器内，getcwd 钩子做反向翻译 —— absolutize 拿到的 cwd 已是
+         * 客户视角路径，translate_path 能正确处理它。
+         *
+         * 【缓冲】absb 必须在门**外**声明（这里就声明了）；
+         * 绝不能把输入与输出共用一块缓冲（历史回归见门内注释）。
+         */
+        {
+            char absb[8192];
+            const char *src = pth;
+
+            if (pth[0] != '/' && pth != NULL && bxroot_absolutize != NULL &&
+                bxroot_absolutize(pth, absb, sizeof(absb)) > 0)
+                src = absb;
+
+        if (looks_like_guest_abs_path(src)) {
             /*
              * 大环形池：64 KB，只在池内前进，到末尾回绕。
              *
@@ -1036,10 +1134,7 @@ long syscall(long number, ...)
              * 不完整（rodata 里有 "tls: runtime static TLS surplus
              * exhausted"），用它反而会写坏相邻数据。
              */
-            #define SG_POOL_SIZE (64 * 1024)
-            #define SG_SLOT_SIZE 4096
-            #define SG_SLOT_COUNT (SG_POOL_SIZE / SG_SLOT_SIZE)
-            static char sg_pool[SG_POOL_SIZE];
+            /* 池与宏已提升到函数作用域（见函数头部的说明）。 */
             /*
              * ★ 槽位索引用**原子取号**，不是"读-改-写"。
              *
@@ -1077,7 +1172,156 @@ long syscall(long number, ...)
             char *tbuf = sg_pool + (size_t)(seq % SG_SLOT_COUNT) * SG_SLOT_SIZE;
             size_t need = SG_SLOT_SIZE;
 
-            int tr = bxroot_translate_path(pth, tbuf, need);
+            int tr;
+            /*
+             * ★ 相对路径要先按 cwd 绝对化，否则整个翻译被跳过 ★
+             *
+             * 【缺陷（实测，2026-09-20，第十三轮验收）】
+             * `looks_like_guest_abs_path()` 只认 `p[0]=='/'`，而
+             * **`AT_FDCWD` + 相对名** 是最常见的形态 —— dash 的
+             * `< file` 重定向、工具的裸 syscall 都这么调：
+             *
+             *     cd /tmp/tarw && ln -s /etc D
+             *     cat < D/hosts | wc -c   → 56  ❌（外层 /system/etc/hosts）
+             *     cat D/hosts | wc -c     → 0   ✅
+             *
+             * 【为什么必须在这里修】裸 syscall 不经 libc 符号，
+             * libc 那侧的 statx/open 钩子管不到它。
+             *
+             * 【★ 我曾在这里引入的回归 —— 务必引以为戒 ★】
+             * 第一版写成 `bxroot_translate_path(tbuf, tbuf, need)`：
+             * 输入与输出**同一个缓冲**。translate_path 是"把 rootfs
+             * 前缀前插"，一边读源一边写目标，同缓冲时源被自己的输出
+             * 覆盖 → 截断/错乱的路径。症状比原缺陷更糟：
+             *     statx(ABS 无链接 /etc/hosts) → 56 或 -1  ❌
+             *     statx(ABS 相对目标链接)      → -1        ❌
+             * 即**从"读到错误数据"退化成"直接报错"，并波及根本没有
+             * 符号链接的路径**。
+             *
+             * 【正确写法】绝对化已在**门外**完成（src 就是最终源），
+             * 这里只做前缀翻译。历史教训仍然有效：输入与输出
+             * 绝不复用同一块空间。
+             */
+            tr = bxroot_translate_path(src, tbuf, need);
+
+            /*
+             * ★ 翻译之后还要解析**中间组件**的符号链接 ★
+             *
+             * 【缺陷（实测，2026-09-20，第九轮验收）】
+             * 只加 rootfs 前缀的话，路径里的绝对目标目录链接会被内核
+             * 按**真实根**展开 → 跑到外层命名空间：
+             *
+             *     raw syscall(SYS_statx, …, "<dir>/dlabs/f", …)
+             *       宿主 : rc=0
+             *       bxroot: rc=-1 ENOENT
+             *     真实命中 /usr/lib/ssl/certs/ca-certificates.crt
+             *     （/usr/lib/ssl/certs -> /etc/ssl/certs）
+             *
+             * 只有**裸 syscall** 会踩到；符号钩子各有自己的解析。
+             *
+             * 解析结果仍放槽位池（与 tr 同款），保持无锁与信号安全。
+             */
+            if (tr > 0) {
+                static unsigned int sg_pool_seq2;
+                unsigned int s2 = __atomic_fetch_add(&sg_pool_seq2, 1,
+                                                     __ATOMIC_RELAXED);
+                char *rbuf = sg_pool + (size_t)(s2 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
+
+                if (bxroot_resolve_intermediate_links != NULL &&
+                    bxroot_resolve_intermediate_links(tbuf, rbuf,
+                                                      SG_SLOT_SIZE) > 0)
+                    memcpy(tbuf, rbuf, strlen(rbuf) + 1);
+            }
+
+            /*
+             * ★ 末端组件的符号链接：statx(291) / newfstatat(79) 且
+             *   **flags==0**（跟随叶子）时必须解析到底 ★
+             *
+             * 【缺陷（实测，2026-09-20，第十五轮验收 /tmp/relprobe）】
+             * 上面那步只解析**中间组件**，叶子留给内核。内核跟随
+             * `absleaf -> /etc/hosts` 时，绝对目标按**真实根**展开：
+             *
+             *     libc stat()   （stat_pre_resolve 解析到底）→ 0 字节 ✅
+             *     裸 statx()                              → 56 字节 ❌
+             *
+             * 同一路径两条入口 size 不同 —— AGREE 断言失败，Ubuntu
+             * 24.04 coreutils（stat/ls/wc 全走 statx）全部读到外层。
+             *
+             * 【为什么只在 flags==0 时做】
+             * AT_SYMLINK_NOFOLLOW 位存在时客户明确要看叶子本身，
+             * 内核自会处理 —— 我们展开反而是语义改写。flags 的位置
+             * 两个调用**不同**：statx(dfd, path, flags, mask, buf)
+             * 在 a2，newfstatat(dfd, path, buf, flags) 在 a3 ——
+             * 不能写成统一的 i+1（那对 newfstatat 是 buf 指针，
+             * 恰好常为 0，会误判成"跟随叶子"）。
+             *
+             * 解析到底复用 resolve_symlink_full（含 ELOOP 环检测），
+             * 与 libc 钩子同一条链，保证两入口最终路径一致。
+             *
+             * ★★ 顺序约束：叶子解析必须在 svc **之前**（在这里就地
+             *    执行），同时把**解析前**的路径留给 l2s 结果补丁 ★★
+             *
+             * 【同一处代码被两次实测逼着改 —— 完整记录】
+             *
+             * 第一版（/tmp/hl4c 判决）：叶子解析放在这里就地改 tbuf。
+             * 结果 l2s 的结果补丁（raw_syscall6 之后）的
+             * probe_fake_link() 拿到的是**已展开的数据文件路径**，
+             * lstat 不再是 S_IFLNK → probe 失败 → stx_nlink 停在 1
+             * （libc stat=2、裸 statx=1 自相矛盾）。
+             *
+             * 第二版（/tmp/hlx 判决）：为保住 l2s probe，把叶子解析
+             * 挪到 svc **之后**改 args[i]。结果普通符号链接
+             * （absleaf -> /etc/hosts）的内核结果在 svc 时已写成
+             * 外层 56 字节，事后改 args 对**本次调用**毫无意义 ——
+             * 外层泄漏复现（relprobe 9/11）。
+             *
+             * 【正解】两个需求分别服务两类路径，都要满足：
+             *   a) 普通符号链接：内核必须在 svc 前看到**叶子已展开**
+             *      的路径 —— 解析必须在 svc 前；
+             *   b) l2s 伪造链接：结果补丁的 probe 需要在 svc 后看到
+             *      **原始链接形态** —— 解析前的路径必须留存。
+             * 实现：svc 前就地解析并把结果写进**新槽**，args[i] 指向
+             * 新槽（满足 a）；tbuf 保留解析前的形态，其指针存入
+             * leaf_pre（满足 b），l2s 补丁段改用 leaf_pre 做 probe。
+             */
+            int need_leaf = 0;
+            if (tr > 0 &&
+                bxroot_resolve_leaf_links != NULL) {
+                /*
+                 * 各调用的"要不要展开叶子 / flags 在哪"逐条判定：
+                 *   statx(291)      flags=a2，==0 时跟随叶子
+                 *   newfstatat(79)  flags=a3（a2 是 buf），==0 时跟随
+                 *   openat(56)      flags=a2，O_NOFOLLOW(0x800) 未置
+                 *                   时跟随叶子（与 libc openat 语义
+                 *                   一致 —— 那边 O_NOFOLLOW 也不展开）
+                 * 判据是"客户这次调用会不会让内核跟随叶子"：会，就
+                 * 必须由我们在 svc 前展开完，否则绝对目标按真实根
+                 * 解析 → 外层泄漏（实测 /tmp/openat_abs 探针，
+                 * 第十六轮验收子代理复核发现）。
+                 */
+                if (number == 291)
+                    need_leaf = (*args[2] == 0);
+                else if (number == 79)
+                    need_leaf = (*args[3] == 0);
+                else if (number == 56)
+                    /* O_NOFOLLOW 的 ABI 值**按架构不同**！
+                     * aarch64（本机）：0100000 = 0x8000（内核实测
+                     * ELOOP 判定，/tmp/nfo.c 对照实验）。
+                     * asm-generic/fcntl.h 的 00400000 在本平台是另一
+                     * 个位 —— 历史教训：第一版写 0x800（O_APPEND，
+                     * 错），第二版写 00400000（asm-generic，也错，
+                     * v15 验收探针抓到）。两次都是"不核对就写数"。
+                     * 本文件刻意不含 <fcntl.h>（单测独立编译），
+                     * 所以只能写实测值并钉住证据；换架构必须重测。 */
+                    need_leaf = ((*args[2] & 0100000 /*O_NOFOLLOW aarch64*/) == 0)
+                                 ? 1    /* 跟随叶子：svc 前展开（a)） */
+                                 : -1;  /* NOFOLLOW：不展开叶子，但 l2s
+                                           伪造链接要先替换成数据文件
+                                           （见 need_leaf < 0 分支）——
+                                           l2s 链接对客户是普通文件，
+                                           官方 NOFOLLOW 语义是成功；
+                                           不替换内核就 ELOOP */
+            }
 
             if (tr > 0) {
                 *args[i] = (long)(uintptr_t)tbuf;
@@ -1089,7 +1333,40 @@ long syscall(long number, ...)
                     log_str("\n");
                 }
             }
-        }   /* if (looks_like_guest_abs_path(pth)) */
+
+            if (need_leaf == 1) {
+                static unsigned int sg_pool_seq3;
+                unsigned int s3 = __atomic_fetch_add(&sg_pool_seq3, 1,
+                                                     __ATOMIC_RELAXED);
+                char *lbuf = sg_pool + (size_t)(s3 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
+
+                if (bxroot_resolve_leaf_links(tbuf, lbuf, SG_SLOT_SIZE) > 0) {
+                    *args[i] = (long)(uintptr_t)lbuf;   /* a) 内核见展开后 */
+                    leaf_pre = tbuf;                    /* b) l2s 见原始 */
+                }
+            } else if (need_leaf == -1) {
+                /*
+                 * openat + O_NOFOLLOW：官方语义是"l2s 伪造链接对客户是
+                 * 普通文件，打开应成功"（cp -a 的 TOCTOU 防护就靠它）。
+                 * 不替换路径的话内核看到磁盘上的符号链接 → ELOOP。
+                 * 判据在 l2s 层（l2s_rt_resolve_fake_link），这里只
+                 * 搬运 —— 与本文件其余 l2s 协作同一模式。用户自己的
+                 * 真符号链接不会被命中，保持 ELOOP。
+                 */
+                if (l2s_rt_resolve_fake_link != NULL) {
+                    static unsigned int sg_pool_seq4;
+                    unsigned int s4 = __atomic_fetch_add(&sg_pool_seq4, 1,
+                                                         __ATOMIC_RELAXED);
+                    char *lbuf = sg_pool + (size_t)(s4 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
+
+                    if (bxroot_l2s_lazy_enable != NULL)
+                        (void)bxroot_l2s_lazy_enable(tbuf);
+                    if (l2s_rt_resolve_fake_link(tbuf, lbuf, SG_SLOT_SIZE) == 1)
+                        *args[i] = (long)(uintptr_t)lbuf;
+                }
+            }
+        }   /* if (looks_like_guest_abs_path(src)) */
+        }   /* 相对路径绝对化块结束 */
         }   /* for (i = 0; i < 6; i++) */
     }       /* if (pmask != 0) */
 
@@ -1208,6 +1485,30 @@ long syscall(long number, ...)
         if (ret == 0 && number == SCG_NR_statx && a4 != 0 && a1 != 0 &&
             l2s_rt_patch_statx_buf != NULL) {
             /*
+             * ★ 懒启用必须在补丁**之前** ★
+             *
+             * 【缺陷（实测，2026-09-20，第十五轮验收 /tmp/hlu-hlw）】
+             * l2s 是**进程级**状态：新进程里若从未 link 过，
+             * l2s_rt_enabled()==0，l2s_rt_patch_statx_buf 内部第一行
+             * 就 return —— 补丁静默失效，stx_nlink 停在内核值 1。
+             * 更隐蔽的是**进程内时序**：同一进程里先调过 libc
+             * stat/lstat（那些钩子挂了懒启用）的话本补丁就"看起来
+             * 正常"—— 探针单测裸 statx 时稳定 nlink=1，混测时又
+             * 是 2，极易误判为随机。
+             *
+             * 实测判决（同进程对照）：
+             *     冷裸 statx            → nlink=1 ❌
+             *     一次 libc lstat 后    → nlink=2 ✅
+             * 差异只有 l2s 是否已启用。
+             *
+             * preload.c 的 statx 符号钩子早有同款处理（"statx 也要
+             * 懒启用"注释），裸 syscall 这条是**最后一个没挂的入口**
+             * —— 同一句教训第三次应验：判据是"客户会走哪条路"，
+             * 不是"我在哪条路上修过"。
+             */
+            if (bxroot_l2s_lazy_enable != NULL)
+                (void)bxroot_l2s_lazy_enable((const char *)(uintptr_t)a1);
+            /*
              * ★ 用 `_buf` 版本（传整个结构体指针）★
              *
              * 早前这里调的是三指针版本（nlink/mask/mode），后来发现那
@@ -1221,10 +1522,21 @@ long syscall(long number, ...)
              * 也不会出现"调用方与实现方对同一布局有两套理解"的漂移
              * （本项目在 statx 的 stx_mode 宽度上刚踩过一次）。
              */
+            /*
+             * ★ probe 路径：优先用"叶子解析前"的形态 ★
+             *
+             * probe_fake_link() 需要看到 a 在磁盘上是**符号链接**
+             * （S_IFLNK）才能识别伪造链接。上面 svc 前的叶子解析已把
+             * args[1] 指到展开后的数据文件 —— 用它 probe 必然失败
+             * （实测 /tmp/hl4c：nlink 停在 1）。leaf_pre 保存了解析前
+             * 的原始形态（"顺序约束"注释里的需求 b）。
+             */
             l2s_rt_patch_statx_buf((void *)(uintptr_t)a4,
                                    SCG_STATX_NLINK,
-                                   (const char *)(uintptr_t)a1);
+                                   (leaf_pre != NULL) ? leaf_pre
+                                       : (const char *)(uintptr_t)a1);
         }
+
 
         /*
          * ============================================================

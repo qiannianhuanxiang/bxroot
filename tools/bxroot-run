@@ -1,0 +1,375 @@
+#!/bin/sh
+# =====================================================================
+# bxroot-run —— 在 proroot 容器内用 bxroot 运行时启动 guest 程序
+# =====================================================================
+#
+# 为什么需要这个脚本
+# ------------------
+# bxroot 有两种加载路径，**只有一种**在 proroot 容器内可用：
+#
+#   ❌ launcher + LD_PRELOAD
+#      外层 proroot 用自研 ELF 加载器接管 execve，不实现 LD_PRELOAD 语义。
+#      实测：连一个空构造函数都不执行。用它做测试会得到**假绿** ——
+#      程序跑起来了，但跑的是外层 proroot，bxroot 一行代码都没执行。
+#
+#   ✅ bridge + linker + --argv0 + --preload
+#      这是 proroot 自己的加载链路（自研加载器），与 LD_PRELOAD 无关。
+#      换上 bxroot 的 runtime 即可。
+#
+# 本脚本把第二种路径固化下来，并且**每次运行都自证注入成功**，
+# 这样就不会再有"看起来通过、其实没加载"的结果。
+#
+# 用法
+# ----
+#   tools/bxroot-run -- /bin/echo hello
+#   tools/bxroot-run --rootfs /root/bxtest-pd/rootfs -- /bin/sh -c 'cat /etc/os-release'
+#   tools/bxroot-run --no-check -- /usr/bin/node --version
+#   tools/bxroot-run --check-only          # 只做注入自检
+#
+# 环境变量
+# --------
+#   BXROOT_RUN_ROOTFS       容器视角的 rootfs 根（默认 = 容器自己 /）
+#   BXROOT_RUN_ROOTFS_HOST  内核视角的 rootfs 根（默认自动推导）
+#   BXROOT_RUN_APP_LIB      proroot 库目录（默认从 /proc/*/maps 探测）
+#   BXROOT_RUN_RUNTIME      bxroot runtime .so（默认 <仓库>/build/libbxroot-runtime.so）
+#   BXROOT_VERBOSE          透传给 guest 的 bxroot 日志开关
+#
+# 退出码
+# ------
+#   guest 的退出码；本脚本自身出错（含注入自检失败）用 125。
+#
+# =====================================================================
+
+set -u
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(CDPATH= cd -- "$SELF_DIR/.." && pwd)
+
+die() { printf 'bxroot-run: %s\n' "$*" >&2; exit 125; }
+
+# ---------------------------------------------------------------------
+# 参数解析
+# ---------------------------------------------------------------------
+ROOTFS=${BXROOT_RUN_ROOTFS:-/}
+ROOTFS_HOST=${BXROOT_RUN_ROOTFS_HOST:-}
+APP_LIB=${BXROOT_RUN_APP_LIB:-}
+RUNTIME=${BXROOT_RUN_RUNTIME:-$REPO/build/libbxroot-runtime.so}
+VERBOSE=${BXROOT_VERBOSE:-0}
+DO_CHECK=1
+CHECK_ONLY=0
+GUEST_ARGV0=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --rootfs)     ROOTFS=$2; shift 2 ;;
+    --rootfs-host) ROOTFS_HOST=$2; shift 2 ;;
+    --app-lib)    APP_LIB=$2; shift 2 ;;
+    --runtime)    RUNTIME=$2; shift 2 ;;
+    --argv0)      GUEST_ARGV0=$2; shift 2 ;;
+    --verbose)    VERBOSE=1; shift ;;
+    --no-check)   DO_CHECK=0; shift ;;
+    --check-only) CHECK_ONLY=1; shift ;;
+    --)           shift; break ;;
+    -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
+    *)            break ;;
+    esac
+done
+
+[ "$CHECK_ONLY" = 1 ] || [ $# -ge 1 ] || die "没有给出 guest 程序；见 --help"
+
+# ---------------------------------------------------------------------
+# 探测 proroot 库目录
+#
+# 不能硬编码 APK 路径：它含随机后缀（~~XXXXXXXX==），重装即变。
+# 也不能用 [ -f ] 校验：容器视角下那个路径**看不见**（被 proroot 翻译成
+# rootfs 内路径），但 exec 由内核/外层加载器按真实路径处理，能跑。
+# 所以只负责"找出字符串"，可用性交给后面的 exec 去证明。
+# ---------------------------------------------------------------------
+if [ -z "$APP_LIB" ]; then
+    for m in /proc/[0-9]*/maps; do
+        [ -r "$m" ] || continue
+        p=$(grep -a 'libproroot-bridge\.so' "$m" 2>/dev/null | head -1 | awk '{print $6}')
+        if [ -n "${p:-}" ]; then APP_LIB=${p%/*}; break; fi
+    done
+fi
+if [ -z "$APP_LIB" ]; then
+    for d in /data/app/*/com.dsh.client-*/lib/arm64; do
+        [ -n "${d:-}" ] && { APP_LIB=$d; break; }
+    done
+fi
+[ -n "$APP_LIB" ] || die "探测不到 proroot 库目录（/proc/*/maps 里没有 libproroot-bridge.so）"
+
+BRIDGE=$APP_LIB/libproroot-bridge.so
+LINKER=$APP_LIB/libproroot-linker.so
+
+# ---------------------------------------------------------------------
+# 推导两个视角的 rootfs 路径
+#
+# proroot 是纯用户态路径翻译，同一份文件有两个名字：
+#   容器视角  /                        （guest 看到的名字，经翻译）
+#   内核视角  $PROROOT_ROOTFS          （未翻译，加载器实际打开的名字）
+#
+# 若 rootfs 就是容器自己（inode 相同），内核视角 = $PROROOT_ROOTFS。
+# 若 rootfs 是容器内的一个子目录（如 /root/bxtest-pd/rootfs），
+# 内核视角 = $PROROOT_ROOTFS + 该子目录。
+# ---------------------------------------------------------------------
+HOST_ROOT=${PROROOT_ROOTFS:-}
+derive_host_rootfs() {
+    _r=$1
+    [ "$_r" = "/" ] && { printf '%s\n' "$HOST_ROOT"; return; }
+    case "$_r" in
+    /*) printf '%s%s\n' "$HOST_ROOT" "$_r" ;;
+    *)  return 1 ;;
+    esac
+}
+if [ -z "$ROOTFS_HOST" ]; then
+    [ -n "$HOST_ROOT" ] || die "环境里没有 PROROOT_ROOTFS，无法推导内核视角路径；请设 BXROOT_RUN_ROOTFS_HOST"
+    ROOTFS_HOST=$(derive_host_rootfs "$ROOTFS") || die "rootfs 必须是绝对路径: $ROOTFS"
+fi
+
+[ -f "$RUNTIME" ] || die "找不到 bxroot runtime: $RUNTIME"
+
+# ---------------------------------------------------------------------
+# 落地 runtime
+#
+# ★ 必须落在 rootfs **内部** ★ —— proroot 的自研加载器只认内核视角路径，
+# 放外面它打不开。
+#
+# ★ 且 mkdir/cp 只认容器视角，--preload 只认内核视角 ★
+# 所以下面：用 $ROOTFS 建目录写文件，用 $ROOTFS_HOST 引用给加载器。
+# 给 mkdir 内核视角路径会**返回 0 却不创建**（静默失败）。
+# ---------------------------------------------------------------------
+STAGE_REL=tmp/bxroot-run-$$
+STAGE_MK=$ROOTFS/$STAGE_REL
+STAGE_LOAD=$ROOTFS_HOST/$STAGE_REL
+mkdir -p "$STAGE_MK" || die "无法创建落地目录 $STAGE_MK"
+cp -f "$RUNTIME" "$STAGE_MK/libbxroot-runtime.so" || die "复制 runtime 失败"
+[ -f "$STAGE_LOAD/libbxroot-runtime.so" ] || die "复制后 $STAGE_LOAD/libbxroot-runtime.so 不存在（视角推导错了？）"
+cleanup() { rm -rf "$STAGE_MK" 2>/dev/null; }
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------
+# 注入自检
+#
+# ★ 这是本脚本存在的核心理由 ★
+# 只看"程序跑起来了"是不够的：在 proroot 容器内，一次失败的注入会让
+# guest **正常地**跑在外层 proroot 下，输出看起来完全合理。唯一可靠的
+# 判据是 bxroot 自己打的痕迹：BXROOT_VERBOSE=1 时的
+#     [bxroot] proc: init inject=1 have_preload=1 rootfs=...
+# ---------------------------------------------------------------------
+BXROOT_ROOTFS=$ROOTFS_HOST
+export BXROOT_ROOTFS
+export BXROOT_FAKEROOT=${BXROOT_FAKEROOT:-1}
+
+# ---------------------------------------------------------------------
+# ★ l2s 的集中目录 —— 默认必须给一个 ★
+#
+# 【缺陷（实测，2026-09-20，第 11 轮验收）】本脚本**直接调 bridge**，
+# 绕过 launcher；而 launcher.c 只在显式 `--link2symlink` 时才设
+# `BXROOT_L2S_DIR=<rootfs>/.l2s`（launcher.c:1213 附近）。于是经本
+# 脚本跑的 guest 走的是 **l2s 散落布局**：中间层与 `.cnt` 生成在
+# **客户文件旁边**。
+#
+# 后果（两个都被验收实测抓到）：
+#   1. `git commit` 后 `.git/objects/xx/` 里留下 `.l2s.tmp_obj_*`
+#      → `git fsck` 报 15 行 `bad sha1 file`；
+#   2. `git clone <本地路径>` 把那些内部文件当成要复制的对象
+#      → `failed to copy file to '.../.l2s.tmp_obj_*.0002'`，
+#      且 **rc=0 但目标目录没建成**（脚本无从判断成败）。
+#
+# 【修法】与 launcher 的 fallback 对齐：未显式设置时默认
+# `<rootfs>/.l2s`。集中目录由运行时自建（l2s_enable_core 里的
+# mkdirat，EEXIST 视为成功），不需要调用方准备。
+#
+# 【为什么不留在散落布局】散落布局会让客户 `ls -a` / `tar .`
+# 看到本不该存在的 `.l2s.*` 文件 —— 生产（DSHA）已明确选择集中布局
+# （launcher.c 的注释：与 PROOT_L2S_DIR 对齐）。默认行为应当与生产一致。
+#
+# 【为什么允许覆盖】调用方可能有自己的约定（测试要固定路径、
+# 或要观察散落布局的行为），所以只在不设时兜底，不强行改写。
+# ---------------------------------------------------------------------
+# ${VAR:-} 而非 $VAR：本脚本跑在 `set -u` 下，直接引用未设的变量会
+# 以 "parameter not set" 终止（实测）。
+if [ -z "${BXROOT_L2S_DIR:-}" ]; then
+    BXROOT_L2S_DIR="$ROOTFS_HOST/.l2s"
+    export BXROOT_L2S_DIR
+fi
+
+run_loader() {
+    # $1 = argv0 名；其余 = guest 程序与参数
+    # 注意：用调用方已设的 BXROOT_VERBOSE（若存在），否则用 $VERBOSE。
+    # 不能写成 `BXROOT_VERBOSE=$VERBOSE ...` —— 那会把自检显式设的
+    # BXROOT_VERBOSE=1 覆盖回 0，日志变空，自检必然误报失败。
+    _a0=$1; shift
+    _vb=${BXROOT_VERBOSE:-$VERBOSE}
+    BXROOT_VERBOSE=$_vb "$BRIDGE" "$LINKER" \
+        --argv0 "$_a0" \
+        --preload "$STAGE_LOAD/libbxroot-runtime.so" \
+        "$@"
+}
+
+SELFCHECK_GUEST=$ROOTFS_HOST/bin/true
+if [ "$DO_CHECK" = 1 ]; then
+    [ -e "$SELFCHECK_GUEST" ] || SELFCHECK_GUEST=$ROOTFS_HOST/usr/bin/true
+    if [ -x "$SELFCHECK_GUEST" ] || [ -e "$SELFCHECK_GUEST" ]; then
+        _log=$(BXROOT_VERBOSE=1 run_loader check "$SELFCHECK_GUEST" 2>&1 >/dev/null || true)
+        if ! printf '%s\n' "$_log" | grep -q 'inject=1'; then
+            printf '%s\n' "$_log" >&2
+            die "注入自检失败：日志里没有 inject=1。拒绝在未加载 bxroot 的情况下继续（那会得到假绿）。"
+        fi
+        if [ "$CHECK_ONLY" = 1 ]; then
+            printf 'bxroot-run: 注入自检通过（inject=1, rootfs=%s）\n' "$ROOTFS_HOST"
+            exit 0
+        fi
+    else
+        [ "$CHECK_ONLY" = 1 ] && die "自检用的 true 不存在: $SELFCHECK_GUEST"
+        printf 'bxroot-run: 警告：找不到自检程序，跳过注入自检\n' >&2
+    fi
+fi
+
+[ "$CHECK_ONLY" = 1 ] && exit 0
+
+# ---------------------------------------------------------------------
+# 启动 guest
+#
+# ★ 视角规则（判据是"这个值由谁消费"）★
+#   guest 可执行文件路径   → 内核视角（由外层 exec 消费）
+#   guest 的参数（脚本等） → 容器视角（guest 自己会再翻译一次）
+#     ↑ 这一条很重要：把内核视角路径当参数传给 guest，会被再拼一层 rootfs，
+#       实测报 ENOENT（'/data/data/...' 被拼成 '<rootfs>/data'）。
+# ---------------------------------------------------------------------
+GUEST_EXE=$1; shift
+case "$GUEST_EXE" in
+/*) GUEST_EXE_HOST=$ROOTFS_HOST$GUEST_EXE ;;
+*)
+    # -----------------------------------------------------------------
+    # 裸名（不含 '/'）：按 guest 的 PATH 搜索解析
+    #
+    # 【为什么要有这一段】`bxroot-run -- python3 …` 之前会直接把
+    # "python3" 交给加载器 → `proroot-ldso: failure rc=2`，没有一句
+    # 人话提示。而普通 shell 的行为是去 PATH 里找。
+    #
+    # 【坑】PATH 搜索不能用容器的 PATH 环境变量——我们运行在容器里，
+    # 这里拿到的就是容器的 PATH，恰巧一致；但在真机上两者可能不同。
+    # 更稳妥的是按 rootfs 里实际存在的目录逐个探测（对齐
+    # px_resolve_exec_path 的语义：存在且可执行才用）。
+    # -----------------------------------------------------------------
+    _GUEST_PATH="/usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin"
+    GUEST_EXE_HOST=""
+    for _d in $_GUEST_PATH; do
+        _cand=$ROOTFS_HOST$_d/$GUEST_EXE
+        if [ -f "$_cand" ] && [ -x "$_cand" ]; then
+            GUEST_EXE_HOST=$_cand
+            break
+        fi
+    done
+    if [ -z "$GUEST_EXE_HOST" ]; then
+        printf 'bxroot-run: %s: command not found (searched guest PATH)\n' "$GUEST_EXE" >&2
+        exit 127
+    fi
+    ;;
+esac
+
+# ---------------------------------------------------------------------
+# 展开"绝对目标符号链接"
+#
+# 【为什么必须在**加载器之外**做这一步】
+#
+# 加载器（proroot-ldso）打开目标时，内核会解析符号链接；而链接目标是
+# **绝对路径**时，内核按**真实根**解析 —— 于是
+#   <rootfs>/usr/bin/cc -> /etc/alternatives/cc -> /usr/bin/gcc -> gcc-13
+# 在真实根下找不到，报 `proroot-ldso: failure rc=2`。
+#
+# bxroot 运行时内部也有同样的展开逻辑（给 guest 自己 execve 用），
+# 但那是在**进程内**生效的；这里要启动的**第一个**进程还没有运行时，
+# 所以只能由包装脚本先展开。
+#
+# 只跟绝对与相对目标都算：任何一跳都不能漏，否则后续跳又会掉回老问题。
+# 层数上限 16（拦链接环）。
+# ---------------------------------------------------------------------
+resolve_symlink_chain() {
+    _p=$1
+    _n=0
+    while [ "$_n" -lt 16 ]; do
+        _t=$(readlink "$_p" 2>/dev/null) || break
+        [ -n "$_t" ] || break
+        case "$_t" in
+        /*) _p=$ROOTFS_HOST$_t ;;
+        *)  _p=${_p%/*}/$_t ;;
+        esac
+        _n=$((_n + 1))
+    done
+    printf '%s\n' "$_p"
+}
+
+GUEST_EXE_HOST=$(resolve_symlink_chain "$GUEST_EXE_HOST")
+
+# ---------------------------------------------------------------------
+# 顶层目标若是 `#!` 脚本，改成用它的解释器启动
+#
+# 【为什么必须在这里做】
+# proroot 的加载器只认 ELF：给它一个脚本会报
+#     loader: reject ...: bad read   /   proroot-ldso: failure rc=*
+# 而**顶层**要启动的进程还没有 bxroot 运行时（运行时是被启动的那个
+# 进程加载的），所以 bxroot 内部的 shebang 重写（px_rewrite_shebang）
+# 在这一步帮不上忙 —— 它只能管**进程内**发起的 exec。
+#
+# 实测触发的常见命令：`which`、`ldd`（都是 `#! /bin/sh` 脚本），
+# /usr/bin 下 568 个文件里 93 个是脚本。
+#
+# 修法：读第一行取解释器，等价于内核的 shebang 语义
+#     [interp, script, 原argv[1..]]
+# （内核也是这么做的，见 px_rewrite_shebang 的长注释。）
+# ---------------------------------------------------------------------
+if [ -f "$GUEST_EXE_HOST" ]; then
+    _first=$(head -c 256 "$GUEST_EXE_HOST" 2>/dev/null | head -n 1)
+    case "$_first" in
+    '#!'*)
+        # 取 `#!` 之后到行尾，去掉前导空白；忽略解释器参数里的空格
+        # （形如 `#!/usr/bin/env python3` 的第二个词在容器里不常见，
+        #   真遇到时按"解释器 + 参数"拆开处理）
+        _interp=$(printf '%s' "${_first#\#!}" | sed 's/^[[:space:]]*//; s/[[:space:]].*$//')
+        if [ -n "$_interp" ]; then
+            # 解释器路径按 rootfs 前缀解析（脚本写的是容器视角的绝对路径）
+            case "$_interp" in
+            /*) _interp_host=$ROOTFS_HOST$_interp ;;
+            *)  _interp_host=$_interp ;;
+            esac
+            _interp_host=$(resolve_symlink_chain "$_interp_host")
+            # 内核语义：argv = [interp, script, 原 argv[1..]]
+            set -- "$GUEST_EXE" "$@"
+            GUEST_EXE=$_interp
+            GUEST_EXE_HOST=$_interp_host
+            # argv0 保持调用者给的名字（与内核 shebang 行为一致）
+        fi
+        ;;
+    esac
+fi
+
+[ -n "$GUEST_ARGV0" ] || GUEST_ARGV0=$(basename -- "$GUEST_EXE")
+
+# ---------------------------------------------------------------------
+# 目标不存在时给出明确的错误（而不是让加载器报一句看不懂的话）
+#
+# 【为什么要加】直接启动一个不存在的路径时，加载器只会打
+#     proroot-ldso: failure rc=2
+# 并以 rc=2 退出 —— 没有 ENOENT 字样、没有路径、没有"找不到"，
+# 与正常 shell 的 `command not found`/`No such file or directory`
+# 相差很远（这是独立测试者报的可用性问题）。
+#
+# 注意**不能**用 `[ -x ]` 判：容器视角与内核视角不同，而 `-x` 走的是
+# 容器视角（见本文件上方 detect_app_lib 的说明，那里踩过同一个坑）。
+# 这里判的是我们已经拼好的**内核视角**路径，所以用 `[ -e ]` 是安全的。
+#
+# 只做提示、不改退出码语义：仍然以加载器会用的 rc=2 退出，
+# 保证调用方按原先的约定处理。
+# ---------------------------------------------------------------------
+if [ ! -e "$GUEST_EXE_HOST" ]; then
+    printf 'bxroot-run: %s: No such file or directory\n' "$GUEST_EXE" >&2
+    printf 'bxroot-run: （内核视角路径: %s）\n' "$GUEST_EXE_HOST" >&2
+    exit 2
+fi
+
+run_loader "$GUEST_ARGV0" "$GUEST_EXE_HOST" "$@"
+_rc=$?
+exit $_rc
