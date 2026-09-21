@@ -11,7 +11,11 @@ BUILD_DIR = build
 #   与 -O2→-O1→-O0 回退。这里的 make 规则是直接编译，ICE 时重跑即可。
 COMMON_CFLAGS = -O2 -Wall -Wextra -D_GNU_SOURCE
 SO_CFLAGS = -shared -fPIC $(COMMON_CFLAGS)
-SO_LDFLAGS = -ldl -nostartfiles
+# ★ 16KB 页对齐（Android 15+ 16KB 内核设备硬要求；DSHA 集成的
+#   调研报告 §六.2 点名缺失）。对静态 launcher 同样需要——
+#   可执行文件的加载段对齐由链接器按 max-page-size 决定。
+SO_LDFLAGS = -ldl -nostartfiles -Wl,-z,max-page-size=16384
+LAUNCH_LDFLAGS = -static -Wl,-z,max-page-size=16384
 
 # D4 进程管理层的源目录（proc.c / proc.h）。
 #
@@ -43,7 +47,7 @@ runtime:
 # === Launcher (静态二进制，伪装为 libbxroot.so) ===
 $(BUILD_DIR)/libbxroot.so: src/launcher/launcher.c
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(COMMON_CFLAGS) -static -o $@ $<
+	$(CC) $(COMMON_CFLAGS) $(LAUNCH_LDFLAGS) -o $@ $<
 
 # === Runtime (LD_PRELOAD hook + l2s 硬链接模拟 + D4 进程管理) ===
 #

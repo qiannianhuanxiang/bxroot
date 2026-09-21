@@ -90,7 +90,8 @@ WARN="-Wall -Wextra -Wformat=2 -Wno-nonnull-compare -Wno-unused-parameter"
 CFLAGS="-shared -fPIC $WARN -D_GNU_SOURCE="
 INCS="-Isrc/l2s -Isrc/runtime"
 DEFS="-DFAKEROOT_PURE_LOGIC -DPX_PURE_LOGIC=0"
-LDFLAGS="-ldl -nostartfiles"
+# ★ 16KB 页对齐（Android 15+ 16KB 内核设备硬要求；DSHA 集成调研 §六.2）
+LDFLAGS="-ldl -nostartfiles -Wl,-z,max-page-size=16384"
 
 case "${1:-}" in
 clean)
