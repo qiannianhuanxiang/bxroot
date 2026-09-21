@@ -122,17 +122,31 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 
 ## 当前状态
 
-**v0.1.1 可用**（已在 Android 真机容器内对照官方 proroot 实测）：
+**v0.1.2 可用**（已在 Android 真机容器内对照官方 proroot 实测）：
 
-> v0.1.0 → v0.1.1 的完整变更见下文「修复历史」两批清单；一句话概括：
-> 第一环境（Android 真机）之外的第二环境（纯 Linux）从"加载即崩"
-> 修到"全量回归 25/25 + 上游选项表 35/35 + 路径参数表审计遗漏 0"。
+> v0.1.1 → v0.1.2：**符号链接解析族收敛**。第 13-17 轮迭代验收（每轮由独立
+> 子代理从零构建真实 C 项目做验收）把"绝对目标符号链接"从已知限制修成了
+> 全链路覆盖，最终验收结论 **ZERO ERRORS**。要点：
+>
+> - **裸 syscall 层**（node/libuv 的 `syscall(291)` 等）：前缀翻译 + 中间组件
+>   + 末端叶子三层解析补齐，且与 l2s 结果补丁正确排序
+>   （[`docs/缺陷-裸syscall-statx末端符号链接逃逸.md`](docs/缺陷-裸syscall-statx末端符号链接逃逸.md)）
+> - **相对路径**：绝对化移出 guest 门（此前相对名整体跳过翻译）
+> - **open64**：dash 重定向（`cmd < link`）不再读外层
+> - **O_NOFOLLOW 双语义**：用户链接 → ELOOP；l2s 伪链接 → 成功
+>   （aarch64 的 O_NOFOLLOW 是 `0100000`，不是 asm-generic 的 `00400000`）
+> - **l2s 内部探测改裸 syscall**：readlink/lstat 不再被符号解析层污染
+> - **errno 契约**：open 家族与 `raw_syscall6` 成功路径清 errno
+> - **16KB 页对齐**：五件套 LOAD 段 0x4000（Android 15+ 16KB 内核设备要求）
+> - 已作为**第三运行时接入 [DSHA](https://github.com/DSH-APP/DSHA)**
+>   （契约见 [`docs/DSHA-适配说明.md`](docs/DSHA-适配说明.md)）
 
 | 能力 | 状态 |
 |---|---|
-| 路径翻译（含 bind mount、特殊路径透传） | ✅ |
+| 路径翻译（含 bind mount、特殊路径透传；**含裸 syscall 与相对路径形态**） | ✅ |
 | fakeroot（伪装 uid=0，含身份账本：setter/getter 自洽） | ✅ |
-| l2s 硬链接模拟（含 `st_nlink` 契约 + **目录项 `d_type` 契约**；`link()` 失败时**自动启用**） | ✅ |
+| l2s 硬链接模拟（含 `st_nlink` 契约 + **目录项 `d_type` 契约**；`link()` 失败时**自动启用**；裸 statx 同样伪装） | ✅ |
+| 符号链接矩阵（libc open/open64/openat 与裸 openat 同答案；stat 与裸 statx 同答案；O_NOFOLLOW 双语义） | ✅ |
 | 子进程派生（`fork`/`vfork`/`exec`/`posix_spawn` 全套 + trampoline + 账本） | ✅ |
 | `system()`/`popen()`（子进程带钩子 + 路径翻译） | ✅ |
 | seccomp 中和（Android 沙箱禁止的系统调用 + livepatch） | ✅ |
@@ -144,7 +158,7 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 | `syscall(174..177/148/150/158)` 身份查询（裸 syscall 层） | ✅ |
 | 运行 `node` + `dsh` | ✅ `dsh --version` → `0.1.5-rc.2` |
 
-**导出符号 375 个**（对照闭源 proroot 的 259 个）。
+**导出符号 385 个**（对照闭源 proroot 的 259 个）。
 
 ## 上游 24 个 issue 回归
 
@@ -174,12 +188,13 @@ PASS  14    FAIL  0    NOCTL 7    SKIP 4
 
 | 限制 | 影响 | 说明 |
 |---|---|---|
-| `make` 配方子进程 | 构建链 | glibc 私有 spawn 路径不经任何导出符号钩子（LD_PRELOAD 架构原理性不可观测；官方 ptrace 架构可见） |
-| **绝对目标的符号链接** | 依赖绝对链接的软件 | `open()` 经"目标为绝对路径"的链接会 ENOENT（官方正常）。内核在内部解析链接目标，不经过任何 libc 符号。**l2s 生成的链接不踩此坑**（已实测）。详见 [`docs/缺陷-绝对目标符号链接打不开.md`](docs/缺陷-绝对目标符号链接打不开.md) |
+| ~~`make` 配方子进程~~ | 构建链 | **已修复**（曾是"架构级"误判，现纳入回归） |
+| ~~绝对目标的符号链接~~ | 依赖绝对链接的软件 | **已修复**（v0.1.2 全链路收敛：libc 四入口 + 裸 syscall 层 + 相对形态；内核内联解析的边界仍由 svc 前叶子展开覆盖）。详见 [`docs/缺陷-裸syscall-statx末端符号链接逃逸.md`](docs/缺陷-裸syscall-statx末端符号链接逃逸.md) |
 | NSS `getpwnam_r` 内部分派 | `df` 标签 | 已用 /etc/passwd 直解回退修复主流程；仅 `df` 的挂载点标签显示差异（数值正确） |
 | `dpkg -i` 的 timestamp | 非致命 | 包内容/状态/配置全正确，仅 mtime 为当前时间（`AT_EMPTY_PATH` 需要 CAP，fakeroot 无真实 CAP） |
 | livepatch 站点表版本绑定 | 换 glibc 时 | 站点偏移针对特定 glibc 版本；已加运行期版本断言，不匹配时**打印告警并跳过**（原先会静默失效） |
 | `-H`/`-p`/`-q` 等 CLI 选项 | 少数用户 | 官方 proroot 同样未实现；bxroot **明确报错**而非静默忽略 |
+| 架构死绑 aarch64 | 其他架构 | syscall 编号表与寄存器上下文 arm64 硬编码（O_NOFOLLOW 等常量也按本机实测）；armv7/x86_64 需要独立工作 |
 
 ## 构建
 
@@ -188,6 +203,10 @@ PASS  14    FAIL  0    NOCTL 7    SKIP 4
 make                        # 构建全部 5 个组件
 make test                   # 跑测试
 ```
+
+★ 全部产物带 **16KB 页对齐**（`-Wl,-z,max-page-size=16384`）——
+Android 15+ 的 16KB 内存页内核设备硬要求，且 DSHA 集成要求 jniLibs
+内的原生库满足此对齐。交叉编译时链接 flag 已内置，无需手工加。
 
 产出 5 个文件（名字沿用原 proroot 的布局，便于替换）：
 
@@ -263,8 +282,9 @@ Node 全部 `ENOENT`。
   断言、部分 npm 安全校验）可能与真 root 有出入 —— 与官方 proot
   同样的边界。
 - **架构死绑 aarch64**：syscall 编号表、寄存器上下文均为 arm64
-  硬编码。armv7/x86_64 需要独立的参数表工作，当前不支持，也不在
-  v0.x 路线图内。
+  硬编码（另见上方限制表：O_NOFOLLOW 等 ABI 常量按本机实测写入，
+  换架构必须重测）。armv7/x86_64 需要独立的参数表工作，当前不支持，
+  也不在 v0.x 路线图内。
 
 ## 测试
 

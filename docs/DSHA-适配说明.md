@@ -81,3 +81,30 @@ bxroot 侧的默认值（`<rootfs>/.l2s`）已与 DSHA 的 `PROOT_L2S_DIR` 对�
 
 产物：`build/libbxroot-runtime.so`，225896 字节，**328 导出符号**。
 实测可独立跑通 `dsh --version` → `0.1.5-rc.2`。
+
+
+## 集成状态（2026-09-21）
+
+**已完成**：DSHA 侧 `feat/bxroot-runtime` 分支（提交 `c083bf4`）已按本文契约
+实现第三运行时：
+
+- `runtime/BxrootRuntime.java`：`ContainerRuntime` 第三实现（形态 A launcher 直启）
+- `ProotBootstrap.runtime()`：bxroot → proroot → proot 三选一降级链（API 26+）
+- `WebProcSel.isBxrootWebPayload`：上述第三个 trap 已修（DSHA 侧
+  `WebProcSelTest` 15/15 通过，含 `neverMistakesBxrootLauncherForWeb`）
+- jniLibs 五件套全部 16KB 页对齐（LOAD 段 0x4000）
+- `THIRD_PARTY_NOTICES.md` MIT 条目 + 产物 sha256
+- ConfigStore 三值泛化（旧 prefs 键兼容）、ConfigFragment 三选一 UI
+
+**集成后发现并修复的 bxroot 自身缺陷**（均为 v0.1.2 已含）：
+
+| 缺陷 | 触发 | 修复 |
+|---|---|---|
+| O_NOFOLLOW 常量按架构不同 | 裸 openat 的 NOFOLLOW 判定 | aarch64 实测 `0100000`，非 asm-generic `00400000` |
+| l2s 内部探测被符号层污染 | probe 拿不到磁盘真值 | readlink/lstat ops 改裸 syscall |
+| open64 相对路径缺口 | dash 重定向 | 钩子补绝对化 |
+| errno 残留 | 成功 open 后 errno=EINVAL | open 家族四处 + raw_syscall6 成功清 errno |
+
+**真机验证待办**：按 [`docs/真机验证清单.md`](真机验证清单.md) A1–E5 逐项验收
+（`dsh web` 完整启动、WebProcSel 停止路径、长稳使用）。开发容器内只能验
+形态 B（bridge+linker），形态 A（launcher）在真机顶层才有效。
