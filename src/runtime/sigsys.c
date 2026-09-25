@@ -50,6 +50,16 @@
 #include <dlfcn.h>
 
 #include "sigsys.h"
+#include <sys/stat.h>
+#include <sys/shm.h>
+
+/*
+ * SysV shm 模拟直接编进本编译单元（而不是独立 .c）：
+ * 构建脚本、Makefile 和 4 个测试脚本都按固定清单拼 runtime 源文件，
+ * 新增编译单元要同步改 7 处；include 进来零改动，且它本来就只被
+ * SIGSYS 处理器调用。
+ */
+#include "sysvshm.c"
 
 /* ------------------------------------------------------------------ */
 /* 状态                                                                */
@@ -395,6 +405,19 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
         if (emulate_identity(sc, u->uc_mcontext.regs[0],
                              u->uc_mcontext.regs[1],
                              u->uc_mcontext.regs[2], &x0)) {
+            u->uc_mcontext.regs[0] = (unsigned long)x0;
+            errno = saved;
+            return;
+        }
+    }
+
+    /* 194..197 SysV shm：见 sysvshm.c。未初始化时不处理（保持 ENOSYS） */
+    {
+        long x0;
+        int saved = errno;
+        if (bxroot_sysvshm_emulate(sc, u->uc_mcontext.regs[0],
+                                   u->uc_mcontext.regs[1],
+                                   u->uc_mcontext.regs[2], &x0)) {
             u->uc_mcontext.regs[0] = (unsigned long)x0;
             errno = saved;
             return;

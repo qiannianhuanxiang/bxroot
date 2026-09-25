@@ -22,6 +22,12 @@ int bxroot_sigsys_install(void);
 /* 是否已安装。 */
 int bxroot_sigsys_installed(void);
 
+/*
+ * SysV shm 模拟层的段目录（**内核视角**绝对路径）。构造函数里调用一次；
+ * 不调用则 194..197 保持 ENOSYS。定义在 sysvshm.c（被 sigsys.c 包含）。
+ */
+int bxroot_sysvshm_init(const char *host_dir);
+
 /* 累计模拟次数（诊断用）。 */
 unsigned long bxroot_sigsys_total(void);
 

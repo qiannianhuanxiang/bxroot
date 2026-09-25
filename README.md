@@ -161,7 +161,7 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 | glibc `accept()`（syscall 202，Android 白名单外）→ SIGSYS 层 `accept4(…,0)` 精确重放 | ✅ |
 | launcher 设 `$PWD` = guest 视角 workdir（上游 #64） | ✅ |
 | 降权族内联 svc（glibc `initgroups()`、nptl setxid 广播）→ SIGSYS 层接 fakeroot 账本 | ✅ |
-| SysV 共享内存（shmget/shmat/shmctl/shmdt；官方用 `/tmp/.proroot-shm` 文件模拟） | ❌ 未实现（`RUN_TRAP_PARITY.sh` 已知差异） |
+| SysV 共享内存（shmget/shmat/shmctl/shmdt；SIGSYS 层模拟，与官方共用 `/tmp/.proroot-shm` 格式，双向互通） | ✅ |
 
 **导出符号 385 个**（对照闭源 proroot 的 259 个）。
 
@@ -238,7 +238,7 @@ libbxroot-bridge.so  libbxroot-linker.so --argv0 node \
 | `l2s/` | 硬链接模拟（符号链接 + 中间层，含 `st_nlink` 契约） |
 | `fakeroot.c` | 伪造 root 身份（含身份账本：setter 写 / getter 读） |
 | `crash.c` | 崩溃现场捕获（寄存器/回溯打印） |
-| `sigsys.c` | SIGSYS 兼容层（含信号屏蔽防护） |
+| `sigsys.c` | SIGSYS 兼容层（含信号屏蔽防护；accept/降权族/SysV shm 的模拟，shm 在 `sysvshm.c`） |
 | `syscall_guard.c` | `syscall()` 接管：seccomp 中和 + 路径翻译 + 身份改写 |
 | `livepatch.c` | 运行时指令补丁（seccomp 中和，112 处） |
 
@@ -294,7 +294,7 @@ Node 全部 `ENOENT`。
 ## 测试
 
 ```sh
-sh test/RUN_ALL.sh --quick      # 主回归（29 项，一键全跑；本容器内 2 项按环境 SKIP）
+sh test/RUN_ALL.sh --quick      # 主回归（30 项，一键全跑；本容器内 2 项按环境 SKIP）
 ```
 
 分项：
@@ -319,6 +319,7 @@ sh test/RUN_REALPATH_FIXUP.sh   # realpath 返回值反向翻译
 sh test/RUN_D3_FIXUP.sh         # /proc 泄漏反向翻译
 sh test/RUN_UNIX_SOCKADDR.sh    # AF_UNIX 地址双向翻译 + accept 重放（带官方对照）
 sh test/RUN_TRAP_PARITY.sh      # seccomp TRAP 号逐号对照官方（审计型）
+sh test/RUN_SYSVSHM.sh          # SysV 共享内存（对照官方 + 互通 + 并发）
 bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 ```
 

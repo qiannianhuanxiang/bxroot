@@ -28,9 +28,8 @@ command -v gcc >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || {
     echo "⏭️  跳过：缺 gcc 或 python3"; exit 2; }
 
 # 已知差异（号: 理由）。**只许带理由加，不许为了变绿加。**
-#   194-197 SysV shm：官方用 /tmp/.proroot-shm/seg-<id> 文件模拟（含 key 表、
-#           跨进程可见、IPC_RMID 删文件），bxroot 尚未实现 —— 已记入行动清单。
-KNOWN="194 195 196 197"
+#   （空）—— 194-197 SysV shm 曾在此列，2026-09-25 实现 sysvshm.c 后移除。
+KNOWN=""
 
 i=1
 while [ $i -le 10 ]; do
@@ -45,9 +44,9 @@ NOH=1 timeout 300 "$W/p" 0 462 2>/dev/null | sort -un -k1,1 > "$W/off.txt"
 NOH=1 timeout 600 "$ROOT/tools/bxroot-run" -- "$W/p" 0 462 2>/dev/null \
     | sort -un -k1,1 > "$W/bx.txt"
 
-python3 - "$W" "$KNOWN" <<'EOF'
+python3 - "$W" "${KNOWN:-}" <<'EOF'
 import re, sys
-w, known = sys.argv[1], set(int(x) for x in sys.argv[2].split())
+w, known = sys.argv[1], set(int(x) for x in sys.argv[2].split() if x)
 names = {}
 for l in open('/usr/include/asm-generic/unistd.h'):
     m = re.match(r'#define __NR(?:3264)?_(\w+)\s+(\d+)', l)

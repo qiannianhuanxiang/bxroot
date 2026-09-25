@@ -10990,6 +10990,18 @@ static void constructor(void) {
     bxroot_sigsys_install();
 
     /*
+     * SysV shm 模拟（sysvshm.c）的段目录：guest 视角 /tmp/.proroot-shm，
+     * 翻译成内核视角交给处理器（处理器里只能裸 svc，不能再翻译）。
+     * ★ 与官方 proroot 用**同一个目录、同一种格式** ★ —— 两边建的段
+     * 互相可见，混跑（外层官方、内层 bxroot）时 shm 不会被切成两半。
+     */
+    {
+        char shm_dir[MAX_PATH_LEN];
+        if (translate_path("/tmp/.proroot-shm", shm_dir, sizeof(shm_dir)) >= 0)
+            bxroot_sysvshm_init(shm_dir);
+    }
+
+    /*
      * 运行时指令补丁（seccomp 中和）—— 本轮实测定位的关键一层。
      *
      * 为什么必须有：宿主 loader 用 seccomp 以 KILL_PROCESS 方式禁止
