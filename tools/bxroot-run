@@ -25,6 +25,7 @@
 #   tools/bxroot-run --rootfs /root/bxtest-pd/rootfs -- /bin/sh -c 'cat /etc/os-release'
 #   tools/bxroot-run --no-check -- /usr/bin/node --version
 #   tools/bxroot-run --check-only          # 只做注入自检
+#   tools/bxroot-run --no-l2s-default -- … # 不兜底 BXROOT_L2S_DIR（测 runtime 默认）
 #
 # 环境变量
 # --------
@@ -57,6 +58,7 @@ RUNTIME=${BXROOT_RUN_RUNTIME:-$REPO/build/libbxroot-runtime.so}
 VERBOSE=${BXROOT_VERBOSE:-0}
 DO_CHECK=1
 CHECK_ONLY=0
+NO_L2S_DEFAULT=0
 GUEST_ARGV0=""
 
 while [ $# -gt 0 ]; do
@@ -69,6 +71,7 @@ while [ $# -gt 0 ]; do
     --verbose)    VERBOSE=1; shift ;;
     --no-check)   DO_CHECK=0; shift ;;
     --check-only) CHECK_ONLY=1; shift ;;
+    --no-l2s-default) NO_L2S_DEFAULT=1; shift ;;
     --)           shift; break ;;
     -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
     *)            break ;;
@@ -188,10 +191,25 @@ export BXROOT_FAKEROOT=${BXROOT_FAKEROOT:-1}
 # 【为什么允许覆盖】调用方可能有自己的约定（测试要固定路径、
 # 或要观察散落布局的行为），所以只在不设时兜底，不强行改写。
 # ---------------------------------------------------------------------
-# ${VAR:-} 而非 $VAR：本脚本跑在 `set -u` 下，直接引用未设的变量会
-# 以 "parameter not set" 终止（实测）。
-if [ -z "${BXROOT_L2S_DIR:-}" ]; then
+# ★ 只在**未设置**时兜底；**显式设为空**表示"要散落布局"，必须保留 ★
+#
+# 原写法 `[ -z "${BXROOT_L2S_DIR:-}" ]` 把"未设"与"设为空"混为一谈：
+# test/RUN_L2S_SCATTERED.sh 用 `BXROOT_L2S_DIR= bxroot-run …` 强制散落
+# 布局，结果被这里改回集中目录 —— 那个测试**从未测到散落布局**，
+# 一直在重复测集中布局（2026-09-25 实测：外层 readlink 看到
+# `/.l2s/.l2s.f0005`，客户目录下 .l2s 产物数为 0）。
+# runtime 侧对空串的约定本来就是"散落"（l2s_enable_core：空串 → NULL）。
+# `${VAR+x}` 区分未设/设为空，且在 `set -u` 下安全。
+#
+# --no-l2s-default：**不**给默认值、并确保变量处于"未设"状态 —— 用来
+# 测 runtime 自己的默认（link 失败自动启用 / 懒启用两条路径不经本脚本
+# 与 launcher 的兜底，见 preload.c l2s_enable_core 的三态注释）。
+if [ "$NO_L2S_DEFAULT" = 1 ]; then
+    unset BXROOT_L2S_DIR
+elif [ -z "${BXROOT_L2S_DIR+x}" ]; then
     BXROOT_L2S_DIR="$ROOTFS_HOST/.l2s"
+    export BXROOT_L2S_DIR
+else
     export BXROOT_L2S_DIR
 fi
 

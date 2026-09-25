@@ -570,6 +570,18 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# l2s × 真实 git，三种 BXROOT_L2S_DIR 入口形态（行动清单 #2）
+# 未设 / 容器视角路径 两形态曾静默退化为散落布局 → git fsck 报损坏、
+# 本地 clone 失败。强制 l2s 并先证明它真的生效（tmpfs 上真硬链接可用，
+# 不强制就是假绿）。
+# ---------------------------------------------------------------------
+if [ -f test/RUN_L2S_GIT.sh ]; then
+    run_step "l2s × 真实 git" sh test/RUN_L2S_GIT.sh
+else
+    run_step "l2s × 真实 git"
+fi
+
+# ---------------------------------------------------------------------
 # AF_UNIX sockaddr 双向翻译 + accept(202) 重放（行动清单 #5）
 #
 # sendto/sendmsg 的目标地址正向翻译；getsockname/getpeername/accept/

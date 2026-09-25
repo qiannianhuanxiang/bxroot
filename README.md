@@ -259,7 +259,7 @@ Node 全部 `ENOENT`。
 | `BXROOT_WORKDIR` | 工作目录（由 `-w` 派生） |
 | `BXROOT_FAKEROOT` | 伪装 uid=0（由 `-0` 派生） |
 | `BXROOT_LINK2SYMLINK` | 启用 l2s（由 `--link2symlink` 派生；`link()` 失败时也会自动启用） |
-| `BXROOT_L2S_DIR` | l2s 中间层目录，默认 `<rootfs>/.l2s` |
+| `BXROOT_L2S_DIR` | l2s 中间层目录。**未设** → `<rootfs>/.l2s`（集中布局，所有启用路径一致）；**设为空** → 散落布局（中间层落在客户文件旁，git 等会报损坏，仅供测试）；容器/宿主视角路径均可 |
 | `BXROOT_BINDS` | bind 列表（`src:dst;src:dst`） |
 | `BXROOT_LIB_PATH` | 显式指定 runtime `.so` 路径 |
 | `BXROOT_TMP_DIR` | 临时目录 |
@@ -294,7 +294,7 @@ Node 全部 `ENOENT`。
 ## 测试
 
 ```sh
-sh test/RUN_ALL.sh --quick      # 主回归（30 项，一键全跑；本容器内 2 项按环境 SKIP）
+sh test/RUN_ALL.sh --quick      # 主回归（31 项，一键全跑；本容器内 2 项按环境 SKIP）
 ```
 
 分项：
@@ -320,6 +320,7 @@ sh test/RUN_D3_FIXUP.sh         # /proc 泄漏反向翻译
 sh test/RUN_UNIX_SOCKADDR.sh    # AF_UNIX 地址双向翻译 + accept 重放（带官方对照）
 sh test/RUN_TRAP_PARITY.sh      # seccomp TRAP 号逐号对照官方（审计型）
 sh test/RUN_SYSVSHM.sh          # SysV 共享内存（对照官方 + 互通 + 并发）
+sh test/RUN_L2S_GIT.sh          # l2s × 真实 git，三种 L2S_DIR 形态
 bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 ```
 

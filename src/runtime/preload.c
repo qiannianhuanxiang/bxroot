@@ -10596,25 +10596,66 @@ static void l2s_enable_core(void) {
     l2s_config cfg;
 
     /*
-     * ★ 翻译后 l2s_dir 的存放处：必须在**函数作用域** ★
+     * ★ 翻译后 l2s_dir 的存放处：必须是 **static**（活过整个进程）★
      *
-     * 【为什么不能挪进下面的 if 块】`l2s_rt_init()` 做的是
-     * `g_cfg = *cfg` —— **浅拷贝**，只复制 `l2s_dir` 这个指针，不 strdup
-     * （l2s-runtime.c:258）。`cfg_embed()` 只服务于 `l2s_paths`，管不到
-     * g_cfg。于是这块缓冲区必须活过整个进程：l2s 层会在**每一次**
-     * link/unlink/stat 里反复读 `g_cfg.l2s_dir`。放在块作用域里就是
-     * 悬垂指针（本项目的 -Wdangling-pointer 也正是拦这一类的）。
+     * `l2s_rt_init()` 做的是 `g_cfg = *cfg` —— **浅拷贝**，只复制
+     * `l2s_dir` 这个指针，不 strdup（l2s-runtime.c:258）。l2s 层会在
+     * **每一次** link/unlink/stat 里反复读 `g_cfg.l2s_dir`。
+     *
+     * 【缺陷（2026-09-25 实测）】这里原先是**函数作用域的栈数组**，注释
+     * 还写着"放在函数作用域就能活过整个进程" —— 这是错的：函数一返回
+     * 栈帧就被复用，g_cfg.l2s_dir 成了悬垂指针。-Wdangling-pointer 抓不到
+     * （指针经结构体浅拷贝逃逸到另一个编译单元）。
+     *
+     * 只有**需要翻译**的 l2s_dir 会指向这块栈（translate_path>0 才改指向）：
+     *   BXROOT_L2S_DIR=<rootfs>/.l2s（宿主视角，launcher/bxroot-run 默认）
+     *       → 翻译是空操作，指向 getenv 的内存 → 一直正常，掩盖了缺陷
+     *   BXROOT_L2S_DIR=/tmp/x（容器视角）
+     *       → 指向栈 → 之后 cfg_l2s_dir() 读到垃圾（首字节常不是 '/'）
+     *       → 当作未设 → **静默退化成散落布局**
+     * 实测：显式 /tmp/l2sleak 时 git commit 的中间层全部落进
+     * .git/objects/xx/，集中目录里 0 个文件。
      */
-    char l2s_dir_buf[MAX_PATH_LEN];
+    static char l2s_dir_buf[MAX_PATH_LEN];
 
     cfg = (l2s_config)L2S_CONFIG_DEFAULT;
     /*
      * 集中目录布局。DSHA 生产走这条路径（PROOT_L2S_DIR）。
-     * 不设时留在 NULL，中间层会生成在客户文件旁边。
+     *
+     * ★ 三态：未设 → 默认 <rootfs>/.l2s；设为空 → 散落；设了值 → 用它 ★
+     *
+     * 【缺陷（行动清单 #2，2026-09-25 用真实 git 钉死）】原先"未设"与
+     * "设为空"都落到 NULL = 散落布局。launcher 只在 `--link2symlink`
+     * 时补默认目录，而 l2s 还有两条**不经 launcher 默认值**的启用路径：
+     *   ① link() 被内核拒绝后的自动启用（l2s_autostart_on_link_failure）
+     *   ② 读到既有 l2s 产物时的懒启用
+     * 这两条在未设变量时全走散落布局，中间层 `.l2s.*` 落进客户目录。
+     * 实测（散落布局 + 真实 git）：
+     *     git fsck        → bad sha1 file: .git/objects/1b/.l2s.tmp_obj_…
+     *     .git 内 .l2s.*  → 27 个
+     *     git clone 本地  → fatal: failed to copy file to '…/.l2s.tmp_obj_…0002'
+     * 而同一脚本在集中布局下 0 残留、fsck/clone 全通过。
+     *
+     * 散落布局对 git 这类"目录即数据"的程序**原理上**不可修（它无法区分
+     * 运行时产物与损坏对象，docs/缺陷-l2s中间层…md §七），所以修法是
+     * 让所有入口都默认集中布局，与 launcher 的 fallback 同一个值。
+     * 仍保留"显式设为空 = 散落"作为可观测的逃生口（RUN_L2S_SCATTERED 用它）。
      */
-    cfg.l2s_dir = getenv("BXROOT_L2S_DIR");
-    if (cfg.l2s_dir != NULL && cfg.l2s_dir[0] == '\0')
-        cfg.l2s_dir = NULL;
+    {
+        static char l2s_default_dir[MAX_PATH_LEN];
+        const char *env = getenv("BXROOT_L2S_DIR");
+        if (env == NULL) {
+            const char *rf = g_config.rootfs ? g_config.rootfs : "";
+            int n = snprintf(l2s_default_dir, sizeof(l2s_default_dir),
+                             "%s/.l2s", rf);
+            cfg.l2s_dir = (n > 0 && (size_t)n < sizeof(l2s_default_dir))
+                          ? l2s_default_dir : NULL;
+        } else if (env[0] == '\0') {
+            cfg.l2s_dir = NULL;                 /* 显式散落 */
+        } else {
+            cfg.l2s_dir = env;
+        }
+    }
 
     /*
      * ★ 集中目录必须存在，否则 l2s 会**静默失效** —— 所以这里自建 ★
