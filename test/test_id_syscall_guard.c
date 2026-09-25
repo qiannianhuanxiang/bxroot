@@ -696,20 +696,30 @@ int main(void)
          * setuid（在 fakeroot 语义下都是"改身份"，不报错但改错字段）。
          * 所以逐个号验证 op 与参数位置。
          */
+        /*
+         * ★ 号码必须取自 <sys/syscall.h> 的 SYS_ 宏，不许手写 ★
+         *
+         * 这张表曾手写成 { 143, "setreuid" } / { 145, "setregid" } ——
+         * 与 syscall_guard.c **同错**（实际 143=setregid、145=setreuid）。
+         * 两边抄同一份错误记忆，测试于是把缺陷钉成了"正确答案"
+         * （2026-09-25 靠 seccomp 全号枚举 + 官方对照才发现）。
+         * 用 SYS_ 宏后，号码来源独立于被测代码，同类错误无法再互相掩护。
+         * op 编号（1..9）是 bxroot_fakeroot_setter 的约定，按函数名对应。
+         */
         static const struct {
             long nr;
             int  op;
             const char *name;
         } setters[] = {
-            { 143, 3, "setreuid"  },
-            { 144, 2, "setgid"    },
-            { 145, 4, "setregid"  },
-            { 146, 1, "setuid"    },
-            { 147, 5, "setresuid" },
-            { 149, 6, "setresgid" },
-            { 151, 8, "setfsuid"  },
-            { 152, 9, "setfsgid"  },
-            { 159, 7, "setgroups" },
+            { SYS_setreuid,  3, "setreuid"  },
+            { SYS_setgid,    2, "setgid"    },
+            { SYS_setregid,  4, "setregid"  },
+            { SYS_setuid,    1, "setuid"    },
+            { SYS_setresuid, 5, "setresuid" },
+            { SYS_setresgid, 6, "setresgid" },
+            { SYS_setfsuid,  8, "setfsuid"  },
+            { SYS_setfsgid,  9, "setfsgid"  },
+            { SYS_setgroups, 7, "setgroups" },
         };
 
         /*

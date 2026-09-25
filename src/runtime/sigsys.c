@@ -282,6 +282,60 @@ static long replay_faccessat2(long dfd, long path, long mode, long flags)
  * （net/socket.c: __sys_accept4(fd, addr, len, 0)），重放是**精确等价**，
  * 不是近似。错误码照 replay_faccessat2 的教训按内核约定写回 -errno。
  */
+/*
+ * 降权/身份族（143..152、159）走 fakeroot 账本。
+ *
+ * 【实测，2026-09-25，seccomp 全号枚举】Android 白名单 TRAP 掉 setuid/
+ * setgid/setreuid/setregid/setresgid/setfsuid/setfsgid/setgroups。
+ * syscall_guard.c 早已在 **`syscall()` 符号层**把它们接到账本（缺口 C），
+ * 但**内联 svc** 不经那一层 —— 典型就是 glibc 的 initgroups()：它在
+ * libc 内部直接 svc 159，于是：
+ *
+ *     官方 proroot : initgroups("root",0) → 0
+ *     bxroot(修前) : initgroups("root",0) → -1 ENOSYS
+ *
+ * `su`/`login`/`sshd`/`cron`/`sudo` 这类降权程序都先 initgroups 再 setgid/
+ * setuid —— 第一步就失败。另外多线程程序的 setuid 走 glibc 的
+ * nptl setxid 广播（每线程内联 svc），同样不经符号层。
+ *
+ * bxroot_fakeroot_setter 只做纯内存读写（无锁、无分配、无 stdio），可以
+ * 在信号处理器里调。它是 preload.c 的强符号；这里用 weak 引用，
+ * 单独编 sigsys.c 的单测里它是 NULL → 保持原 ENOSYS 行为。
+ * fakeroot 未启用时 setter 返回 0 → 同样保持 ENOSYS（不假装成功）。
+ */
+extern int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
+                                  unsigned long a2, long *out_ret,
+                                  int *out_errno) __attribute__((weak));
+
+/* 返回 1 = 已由账本处理（*x0 为内核约定返回值）；0 = 不处理 */
+static int emulate_identity(long sc, unsigned long a0, unsigned long a1,
+                            unsigned long a2, long *x0)
+{
+    int op;
+    long r = 0;
+    int e = 0;
+
+    switch (sc) {
+    case 146: op = 1; break;   /* setuid    */
+    case 144: op = 2; break;   /* setgid    */
+    case 145: op = 3; break;   /* setreuid  */
+    case 143: op = 4; break;   /* setregid  */
+    case 147: op = 5; break;   /* setresuid */
+    case 149: op = 6; break;   /* setresgid */
+    case 159: op = 7; break;   /* setgroups */
+    case 151: op = 8; break;   /* setfsuid  */
+    case 152: op = 9; break;   /* setfsgid  */
+    default:  return 0;
+    }
+    if (bxroot_fakeroot_setter == NULL)
+        return 0;
+    if (bxroot_fakeroot_setter(op, a0, a1, a2, &r, &e) != 1)
+        return 0;
+    /* setter 用 libc 约定（-1 + errno）；x0 要内核约定（-errno） */
+    *x0 = (r == -1 && e != 0) ? -(long)e : r;
+    return 1;
+}
+
 static long replay_accept(long fd, long addr, long addrlen)
 {
     long r = raw4(242 /* accept4 */, fd, addr, addrlen, 0);
@@ -333,6 +387,18 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
             (long)u->uc_mcontext.regs[2],
             (long)u->uc_mcontext.regs[3]);
         return;
+    }
+
+    {
+        long x0;
+        int saved = errno;
+        if (emulate_identity(sc, u->uc_mcontext.regs[0],
+                             u->uc_mcontext.regs[1],
+                             u->uc_mcontext.regs[2], &x0)) {
+            u->uc_mcontext.regs[0] = (unsigned long)x0;
+            errno = saved;
+            return;
+        }
     }
 
     if (sc == 202) {

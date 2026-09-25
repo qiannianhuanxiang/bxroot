@@ -160,6 +160,8 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 | AF_UNIX 地址双向翻译（bind/connect/**sendto/sendmsg** 正向；getsockname/getpeername/accept/recvfrom/recvmsg 回填反向） | ✅ |
 | glibc `accept()`（syscall 202，Android 白名单外）→ SIGSYS 层 `accept4(…,0)` 精确重放 | ✅ |
 | launcher 设 `$PWD` = guest 视角 workdir（上游 #64） | ✅ |
+| 降权族内联 svc（glibc `initgroups()`、nptl setxid 广播）→ SIGSYS 层接 fakeroot 账本 | ✅ |
+| SysV 共享内存（shmget/shmat/shmctl/shmdt；官方用 `/tmp/.proroot-shm` 文件模拟） | ❌ 未实现（`RUN_TRAP_PARITY.sh` 已知差异） |
 
 **导出符号 385 个**（对照闭源 proroot 的 259 个）。
 
@@ -292,7 +294,7 @@ Node 全部 `ENOENT`。
 ## 测试
 
 ```sh
-sh test/RUN_ALL.sh --quick      # 主回归（28 项，一键全跑；本容器内 2 项按环境 SKIP）
+sh test/RUN_ALL.sh --quick      # 主回归（29 项，一键全跑；本容器内 2 项按环境 SKIP）
 ```
 
 分项：
@@ -316,6 +318,7 @@ sh test/RUN_RAW_SYSCALL.sh      # 非 Android 透传开关
 sh test/RUN_REALPATH_FIXUP.sh   # realpath 返回值反向翻译
 sh test/RUN_D3_FIXUP.sh         # /proc 泄漏反向翻译
 sh test/RUN_UNIX_SOCKADDR.sh    # AF_UNIX 地址双向翻译 + accept 重放（带官方对照）
+sh test/RUN_TRAP_PARITY.sh      # seccomp TRAP 号逐号对照官方（审计型）
 bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 ```
 
@@ -325,7 +328,13 @@ bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 > `set: Illegal option -o pipefail` 退出（rc=2）—— **一条用例都没跑**，
 > 而 README 此前写的正是 `sh`。用 `sh` 跑等于静默不执行。
 
-其中两项是「会主动发现问题」的审计型测试，不只是防回归：
+其中三项是「会主动发现问题」的审计型测试，不只是防回归：
+
+- **`RUN_TRAP_PARITY.sh`**：枚举本环境被 seccomp TRAP 的全部真实调用，
+  逐号比较官方与 bxroot 的返回值。2026-09-25 首跑即发现 `accept(202)`
+  与 glibc `initgroups()` 内联的 `setgroups(159)` 在 bxroot 下是 ENOSYS
+  （官方可用），顺带揪出 `syscall_guard.c` 把 143/145（setregid/setreuid）
+  写反 —— 而单测表与源码**抄了同一份错误**，一直把缺陷钉成"正确"。
 
 - **`RUN_SYSCALL_TABLE_AUDIT.sh`**：用裸 `svc` 对内核逐号实测哪些系统
   调用的哪个参数是路径，再与我们源码里的表比对。2026-09-18 用它发现

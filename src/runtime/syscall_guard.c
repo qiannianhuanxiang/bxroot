@@ -1950,9 +1950,9 @@ long syscall(long number, ...)
              * 但 bxroot 这里走的是 `syscall()` **符号层**，与 seccomp 无关，
              * 所以它同样应该被模拟（否则 `setresuid` 与 `setuid` 行为不一致）。
              */
-            case 143:   /* setreuid   (r, e)          */
+            case 143:   /* setregid   (r, e)          */
             case 144:   /* setgid     (gid)           */
-            case 145:   /* setregid   (r, e)          */
+            case 145:   /* setreuid   (r, e)          */
             case 146:   /* setuid     (uid)           */
             case 147:   /* setresuid  (r, e, s)       */
             case 149:   /* setresgid  (r, e, s)       */
@@ -1970,9 +1970,17 @@ long syscall(long number, ...)
                     break;
 
                 switch (number) {
-                case 143: sop = 3; break;   /* setreuid  */
+                /*
+                 * ★ 143 = setregid、145 = setreuid（asm-generic/unistd.h）★
+                 * 曾写反（143→setreuid、145→setregid），实测后果
+                 * （2026-09-25）：syscall(SYS_setregid, 777, 777) 在 bxroot
+                 * 下把 **uid** 改成 777/777/777、gid 纹丝不动；官方为
+                 * uid 0/0/0、gid 777/777/0。回归钉：RUN_ID_SYSCALL 的
+                 * 「143/145 号码表」用例，按 <sys/syscall.h> 的 SYS_ 宏比对。
+                 */
+                case 143: sop = 4; break;   /* setregid  */
                 case 144: sop = 2; break;   /* setgid    */
-                case 145: sop = 4; break;   /* setregid  */
+                case 145: sop = 3; break;   /* setreuid  */
                 case 146: sop = 1; break;   /* setuid    */
                 case 147: sop = 5; break;   /* setresuid */
                 case 149: sop = 6; break;   /* setresgid */
