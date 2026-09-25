@@ -5760,11 +5760,12 @@ int tkill(int tid, int sig)
  * ld.so 下正常执行），所以"用 destructor 做清理"在本项目的真实运行
  * 方式下是死路。atexit 覆盖 return/exit() 两条路径，是可得的最优点。
  *
- * ★ 边界（如实记录，不假装覆盖）★
- * 走 _exit()/exit_group/信号致死的进程不会触发清理 —— 这与参考实现一致：
- * 官方 proot 的 kill-on-exit 同样挂在正常退出路径上。要做到"任何死法
- * 都清理"需要父进程侧监控（如 pidfd 或 subreaper），属独立工作量，
- * 不在本次范围内。
+ * ★ 边界 ★
+ * 走 _exit()/exit_group/信号致死的进程不会触发本处的清理。这一面由
+ * **launcher 的监督进程**覆盖（2026-09-25，launcher.c
+ * supervise_or_return_in_child：PR_SET_CHILD_SUBREAPER + guest 退出后清光
+ * 后代树，回归 test/RUN_KILL_ON_EXIT.sh）。本处 atexit 仍保留：经 bridge
+ * 直接加载、不经 launcher 的入口（如 tools/bxroot-run）只有这一层。
  *
  * ── ★★ 继承陷阱：为什么必须记「挂载者的 pid」★★ ──────────────
  *

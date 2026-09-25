@@ -582,6 +582,16 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# --kill-on-exit 监督进程（行动清单 #3）：六种退出方式 × 3 个后代
+# （含 setsid 脱离的孙进程），带无监督对照；信号转发；PDEATHSIG。
+# ---------------------------------------------------------------------
+if [ -f test/RUN_KILL_ON_EXIT.sh ]; then
+    run_step "kill-on-exit 监督" sh test/RUN_KILL_ON_EXIT.sh
+else
+    run_step "kill-on-exit 监督"
+fi
+
+# ---------------------------------------------------------------------
 # AF_UNIX sockaddr 双向翻译 + accept(202) 重放（行动清单 #5）
 #
 # sendto/sendmsg 的目标地址正向翻译；getsockname/getpeername/accept/

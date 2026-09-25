@@ -30,6 +30,11 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <time.h>
 
 /*
  * 版本号。
@@ -908,6 +913,213 @@ static int join_dir_name(char *out, size_t out_size,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* --kill-on-exit 监督进程（行动清单 #3）                              */
+/* ------------------------------------------------------------------ */
+/*
+ * 【缺口（2026-09-25 实测）】runtime 侧的 kill-on-exit 挂在 atexit 上
+ * （proc.c），只覆盖 return/exit()。六种退出方式实测（guest fork 2 个
+ * 长睡子进程后退出）：
+ *     exit()      → 孤儿 0/2      _exit()     → 孤儿 2/2
+ *     exit_group  → 孤儿 2/2      SIGSEGV     → 孤儿 2/2
+ *     SIGKILL     → 孤儿 2/2      abort()     → 孤儿 2/2
+ * 进程死了就没有代码能在它里面跑 —— 只能由**活得比它久**的进程清理。
+ *
+ * 【方案】launcher 不再 exec 成 guest，而是：
+ *   1. 自己设 PR_SET_CHILD_SUBREAPER —— 其后代里的孤儿（含 double-fork
+ *      + setsid 的守护进程）一律改挂到它名下，而不是 init；
+ *   2. fork 出 guest（照原路径 exec）；
+ *   3. 等 guest 退出，然后反复「枚举自己的子进程 → SIGKILL → 回收」，
+ *      直到 waitpid 报 ECHILD（= 再无任何后代）；
+ *   4. 以 guest 的退出状态退出（被信号杀的就用同一信号自杀，
+ *      shell 看到的 $? 与直接跑 guest 一致）。
+ *
+ * 【安全（docs/杀进程安全规则.md）】只对「ppid == 自己」的 pid 发信号。
+ * 这些是**尚未回收**的直接子进程：在我们 waitpid 之前内核不会复用它们
+ * 的 pid，所以「读 /proc → kill」之间不存在 pid 复用竞态。不按名字、
+ * 不按进程组、不广播。
+ *
+ * 【只在 --kill-on-exit 时生效】默认路径仍是 launcher 直接 exec 成
+ * guest，进程树、getppid、信号语义与之前完全一致。
+ *
+ * 【信号】SIGTERM/SIGHUP/SIGUSR1/SIGUSR2 转发给 guest（发给 launcher
+ * pid 的停止请求要落到 guest 上）。SIGINT/SIGQUIT 监督者自己忽略：
+ * 终端产生的这两个信号投递给整个前台进程组，guest 已经直接收到，
+ * 再转发会让 guest 收到两次。
+ *
+ * 【边界】监督者本身被 SIGKILL 时无法清理整棵树；给 guest 设了
+ * PR_SET_PDEATHSIG(SIGKILL)，至少 guest 主进程会随之结束。
+ */
+static volatile pid_t g_sup_child = 0;
+
+static void sup_forward(int sig)
+{
+    pid_t c = g_sup_child;
+    if (c > 0)
+        kill(c, sig);
+}
+
+/* 读 /proc/<pid>/stat 的 ppid（第 4 字段；comm 可含空格与括号，从最后一个 ')' 起数） */
+static pid_t sup_read_ppid(const char *pidstr)
+{
+    char path[64], buf[512], *q;
+    int fd;
+    ssize_t n;
+    long ppid;
+
+    if (snprintf(path, sizeof(path), "/proc/%s/stat", pidstr) >= (int)sizeof(path))
+        return -1;
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    q = strrchr(buf, ')');
+    if (q == NULL || q[1] != ' ' || q[2] == '\0' || q[3] != ' ')
+        return -1;
+    ppid = strtol(q + 4, NULL, 10);   /* ") S <ppid>" */
+    return (pid_t)ppid;
+}
+
+/* SIGKILL 所有 ppid == self 的进程，返回发出的数量 */
+static int sup_kill_children(pid_t self)
+{
+    DIR *d = opendir("/proc");
+    struct dirent *e;
+    int n = 0;
+
+    if (d == NULL)
+        return 0;
+    while ((e = readdir(d)) != NULL) {
+        const char *s = e->d_name;
+        pid_t pid;
+        if (*s < '1' || *s > '9')
+            continue;
+        pid = (pid_t)strtol(s, NULL, 10);
+        if (pid <= 1 || pid == self)
+            continue;
+        if (sup_read_ppid(s) != self)
+            continue;
+        if (kill(pid, SIGKILL) == 0)
+            n++;
+    }
+    closedir(d);
+    return n;
+}
+
+/*
+ * 清理：直到再无后代（waitpid 报 ECHILD）。
+ *
+ * 每轮先杀光当前能看到的子进程，再**非阻塞**回收。被杀进程的孩子在它
+ * 退出时已改挂到我们名下（subreaper），下一轮扫描就能看到。
+ *
+ * ★ 不能用阻塞 waitpid ★ 若某个子进程在 /proc 里看不到（hidepid、
+ * /proc 未挂载），我们杀不到它，阻塞等待就会让监督者**永远挂住**，
+ * 连带用户的 shell。所以：连续一段时间既没杀到也没收到任何进程时，
+ * 放弃并明确告警 —— 留下进程比卡死更好。
+ */
+static void sup_reap_all(pid_t self, int verbose)
+{
+    int st, idle = 0;
+    for (;;) {
+        int killed = sup_kill_children(self);
+        int reaped = 0;
+        pid_t w;
+        while ((w = waitpid(-1, &st, WNOHANG)) > 0)
+            reaped++;
+        if (w < 0 && errno == ECHILD)
+            return;             /* 清理完毕 */
+        if (killed || reaped) {
+            idle = 0;
+        } else if (++idle > 200) {  /* 约 2 秒无进展 */
+            fprintf(stderr, "[bxroot-launcher] 警告: kill-on-exit 仍有后代无法"
+                    "枚举（/proc 不可见？），放弃清理\n");
+            return;
+        }
+        {
+            struct timespec ts = { 0, 10 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+        (void)verbose;
+    }
+}
+
+/*
+ * fork + 监督。子进程里返回 0（调用方继续走原 exec 路径）；
+ * 父进程里永不返回（以 guest 的状态退出）。fork 失败返回 -1。
+ */
+static int supervise_or_return_in_child(int verbose)
+{
+    pid_t self = getpid(), c;
+    int st = 0;
+
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0 && verbose)
+        fprintf(stderr, "[bxroot-launcher] 警告: PR_SET_CHILD_SUBREAPER 失败: %s"
+                "（脱离的孙进程将无法清理）\n", strerror(errno));
+    /* 继承来的 SIGCHLD=SIG_IGN 会让内核自动回收，waitpid 拿不到状态 */
+    signal(SIGCHLD, SIG_DFL);
+
+    c = fork();
+    if (c < 0)
+        return -1;
+    if (c == 0) {
+        /* guest：监督者死了就跟着死；fork 与 prctl 之间监督者已死则自行退出 */
+        prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+        if (getppid() != self)
+            _exit(137);
+        return 0;
+    }
+
+    g_sup_child = c;
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sup_forward;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP,  &sa, NULL);
+        sigaction(SIGUSR1, &sa, NULL);
+        sigaction(SIGUSR2, &sa, NULL);
+        signal(SIGINT,  SIG_IGN);
+        signal(SIGQUIT, SIG_IGN);
+    }
+    if (verbose)
+        fprintf(stderr, "[bxroot-launcher] kill-on-exit 监督: guest pid=%d\n", (int)c);
+
+    for (;;) {
+        pid_t w = waitpid(-1, &st, 0);
+        if (w == c)
+            break;
+        if (w < 0 && errno != EINTR) {
+            st = 0;             /* 不应发生：guest 还没回收就 ECHILD */
+            break;
+        }
+        /* 其它 w：先于 guest 退出、改挂过来的孤儿，顺手回收 */
+    }
+    g_sup_child = 0;
+
+    sup_reap_all(self, verbose);
+
+    if (WIFSIGNALED(st)) {
+        int sig = WTERMSIG(st);
+        signal(sig, SIG_DFL);
+        {
+            sigset_t m;
+            sigemptyset(&m);
+            sigaddset(&m, sig);
+            sigprocmask(SIG_UNBLOCK, &m, NULL);
+        }
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);   /* guest 已按需产生过 core，这里不重复 */
+        kill(self, sig);
+        _exit(128 + sig);
+    }
+    _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 1);
+}
+
 int main(int argc, char **argv) {
     launcher_config_t cfg = {0};
 
@@ -1474,6 +1686,17 @@ int main(int argc, char **argv) {
      * 链直接加载、绕过 launcher 的路径）。
      */
     signal(SIGPIPE, SIG_DFL);
+
+    /*
+     * --kill-on-exit：launcher 留下来当监督者，guest 在子进程里照常 exec。
+     * 见 supervise_or_return_in_child() 的说明。fork 失败时退回直接 exec
+     * （不清理，但至少 guest 能跑）并明确告警。
+     */
+    if (cfg.kill_on_exit) {
+        if (supervise_or_return_in_child(cfg.verbose) < 0)
+            fprintf(stderr, "[bxroot-launcher] 警告: fork 失败（%s），"
+                    "--kill-on-exit 仅剩 atexit 路径\n", strerror(errno));
+    }
 
     /* execve guest 程序 */
     if (cfg.verbose)

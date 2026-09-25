@@ -350,7 +350,7 @@ launcher 侧我该做的（把值交给运行时）已经做完且**实测值确
 
 | 项 | 状态 | 原因 |
 |---|---|---|
-| `_exit()` / 信号致死路径的清理 | ❌ 未覆盖 | 与官方 proot 一致；需父进程侧监控（pidfd/subreaper），属独立工作量 |
+| `_exit()` / 信号致死路径的清理 | ✅ 已覆盖（2026-09-25） | launcher 作 subreaper 监督者，见 `launcher.c` supervise_or_return_in_child 与 `test/RUN_KILL_ON_EXIT.sh` |
 | launcher 裸 `LD_PRELOAD` 路径的生效 | ❌ 环境限制 | 本容器 `LD_PRELOAD` 全面不被采纳（已三方交叉验证），非本次改动引入 |
 | 真机 (DSHA) 端到端 | ⚠️ 未做 | 本次在 Ubuntu 容器内以 bridge/linker `--preload`（生产同构路径）验证 |
 | 静态链接 guest 的 atexit | ⚠️ 未单独验证 | 静态程序仍有 `exit()`→atexit 链，但未经实测，不宣称 |
