@@ -16,7 +16,9 @@
 
 set -u
 
-ROOT=/root/bxroot
+# ★ 不能硬编码 /root/bxroot：换个克隆位置就是 rc=127「找不到 bxroot-run」，
+#   而且会被误读成 l2s 缺陷（2026-09-25 在 /root/work/bxroot 克隆里实测）。
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PROBE_C=${TMPDIR:-/tmp}/l2s_scatter_probe.c
 PROBE=${TMPDIR:-/tmp}/l2s_scatter_probe
 WORK=${TMPDIR:-/tmp}/l2s_scatter_work

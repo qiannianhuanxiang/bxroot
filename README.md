@@ -157,6 +157,9 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 | `dlerror`/`dl_iterate_phdr`/`pthread_create`（栈下限与官方一致） | ✅ |
 | `syscall(174..177/148/150/158)` 身份查询（裸 syscall 层） | ✅ |
 | 运行 `node` + `dsh` | ✅ `dsh --version` → `0.1.5-rc.2` |
+| AF_UNIX 地址双向翻译（bind/connect/**sendto/sendmsg** 正向；getsockname/getpeername/accept/recvfrom/recvmsg 回填反向） | ✅ |
+| glibc `accept()`（syscall 202，Android 白名单外）→ SIGSYS 层 `accept4(…,0)` 精确重放 | ✅ |
+| launcher 设 `$PWD` = guest 视角 workdir（上游 #64） | ✅ |
 
 **导出符号 385 个**（对照闭源 proroot 的 259 个）。
 
@@ -289,7 +292,7 @@ Node 全部 `ENOENT`。
 ## 测试
 
 ```sh
-sh test/RUN_ALL.sh --quick      # 主回归（25 项，一键全跑）
+sh test/RUN_ALL.sh --quick      # 主回归（28 项，一键全跑；本容器内 2 项按环境 SKIP）
 ```
 
 分项：
@@ -312,6 +315,7 @@ sh test/RUN_SYSCALL_TABLE_AUDIT.sh  # 路径参数表实测审计（裸 svc 逐�
 sh test/RUN_RAW_SYSCALL.sh      # 非 Android 透传开关
 sh test/RUN_REALPATH_FIXUP.sh   # realpath 返回值反向翻译
 sh test/RUN_D3_FIXUP.sh         # /proc 泄漏反向翻译
+sh test/RUN_UNIX_SOCKADDR.sh    # AF_UNIX 地址双向翻译 + accept 重放（带官方对照）
 bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 ```
 

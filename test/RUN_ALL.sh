@@ -569,6 +569,20 @@ else
     run_step "l2s 散落布局端到端"
 fi
 
+# ---------------------------------------------------------------------
+# AF_UNIX sockaddr 双向翻译 + accept(202) 重放（行动清单 #5）
+#
+# sendto/sendmsg 的目标地址正向翻译；getsockname/getpeername/accept/
+# recvfrom/recvmsg 回填地址反向剥前缀；Android 白名单缺 202，glibc
+# accept() 由 SIGSYS 层用 accept4(…,0) 精确重放。带官方对照：对照组
+# 若也全绿则按 rc=2 上报（缺口在本环境不可观测）。
+# ---------------------------------------------------------------------
+if [ -f test/RUN_UNIX_SOCKADDR.sh ]; then
+    run_step "AF_UNIX 地址翻译" sh test/RUN_UNIX_SOCKADDR.sh
+else
+    run_step "AF_UNIX 地址翻译"
+fi
+
 # =====================================================================
 # 9. wait 家族钩子（依赖上一步的构建产物）
 # =====================================================================

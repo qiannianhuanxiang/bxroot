@@ -270,6 +270,30 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# H. $PWD 随 -w 改写（上游 #64 / v4.0.1）
+# ---------------------------------------------------------------------
+#
+# bash/dash 启动时若 $PWD 与 "." 同 inode 就直接沿用 $PWD 字符串。
+# launcher 不改写 $PWD → 在 bind 目标 == -w 的场景 `pwd` 回显宿主路径。
+# 上游在 initialize_cwd() 末尾 setenv("PWD", cwd)。这里用 -v 的诊断行
+# 观测 launcher 交给 guest 的环境（本容器里 guest 跑不起来，见
+# RUN_UPSTREAM_CLI.sh 的说明，所以只能观测 exec 前的环境）。
+echo
+echo "--- H) \$PWD 随 -w 改写 ---"
+PWD=/definitely/host/path timeout 10 "$LAUNCHER" -v 1 -r /tmp -w /tmp /bin/true >"$WORK/o" 2>&1
+if grep -q '^\[bxroot-launcher\] PWD=/tmp$' "$WORK/o"; then
+    ok "PWD=-w" "launcher 把 \$PWD 改写为 guest 视角 workdir"
+else
+    bad "PWD=-w" "★ \$PWD 未随 -w 改写（shell pwd 会回显宿主路径，上游 #64）"
+fi
+PWD=/definitely/host/path timeout 10 "$LAUNCHER" -v 1 -r /tmp /bin/true >"$WORK/o" 2>&1
+if grep -q '^\[bxroot-launcher\] PWD=/definitely/host/path$' "$WORK/o"; then
+    bad "PWD 默认" "★ 未给 -w 时 \$PWD 仍是启动前的陈旧值"
+else
+    ok "PWD 默认" "未给 -w 时 \$PWD 与实际 cwd 一致"
+fi
+
+# ---------------------------------------------------------------------
 # 汇总
 # ---------------------------------------------------------------------
 rm -rf "$WORK"

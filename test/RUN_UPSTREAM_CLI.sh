@@ -98,6 +98,22 @@ case "$CANARY" in
         exit 1 ;;
 esac
 if [ "$CANARY_RC" -ne 0 ]; then
+    # ★ 环境边界（2026-09-25 实测）：本仓库的开发容器自身跑在 proroot 上，
+    #   外层 proroot 用自研加载器接管 execve，**不实现 LD_PRELOAD 语义**
+    #   （README「不要用 LD_PRELOAD 在 proroot 容器内测试本库」）。此时
+    #   launcher 走 LD_PRELOAD 的 canary 必然是：
+    #     CANNOT LINK EXECUTABLE "/bin/true": library ".../libbxroot-runtime.so" not found
+    #   这不是 launcher 的缺陷，而是"此环境测不了这条路径"。按 RUN_ALL 的
+    #   口径归入 rc=2（环境不满足，显式给出原因），**不能**静默过、也不能
+    #   记成产品失败。判定依据是 /proc/self/maps 里确实有外层 proroot。
+    if grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null; then
+        echo "⏭️  前置能力自检无法在本环境完成：launcher 的 LD_PRELOAD 注入被外层 proroot 拦截"
+        echo "   输出: $(printf '%s' "$CANARY" | head -2)"
+        echo "   → 请在真机（非嵌套容器）验证 launcher 正向能力；"
+        echo "     选项识别本身仍由 RUN_CLI_COMPAT.sh 覆盖（它不依赖 guest 真跑起来）。"
+        rm -rf "$WORK"
+        exit 2
+    fi
     echo "❌ 前置能力自检失败：launcher -r / -w / /bin/true 退出码 $CANARY_RC"
     echo "   输出: $(printf '%s' "$CANARY" | head -2)"
     echo "   → 同上：否定式判据无法发现'整体不可用'。"

@@ -264,6 +264,32 @@ static long replay_faccessat2(long dfd, long path, long mode, long flags)
     return (long)(-(long)errno);
 }
 
+/*
+ * 202 = accept：用白名单内的 accept4(242, fd, addr, addrlen, 0) 重放。
+ *
+ * 【实测，2026-09-25】Android 的 seccomp 白名单**没有 202**：bionic 自己的
+ * accept() 就是 accept4(..., 0) 的包装，Android 从来不需要 202，于是
+ * 它被外层过滤器拦下。但 glibc 的 accept() 发的正是裸 202 ——
+ *
+ *     官方 proroot : raw accept → fd（外层自行仿真）
+ *     bxroot(修前) : raw accept → -1 ENOSYS，accept4 → fd
+ *
+ * 后果比 faccessat2 更重：**容器内任何用 accept() 的服务端全部不可用**
+ * （Python socketserver、多数 C 守护进程、node 以外的一切 IPC 服务端），
+ * 而 ENOSYS 对 accept 没有回退路径 —— 客户只会报错或空转。
+ *
+ * accept(fd, addr, len) 与 accept4(fd, addr, len, 0) 由内核定义为同一实现
+ * （net/socket.c: __sys_accept4(fd, addr, len, 0)），重放是**精确等价**，
+ * 不是近似。错误码照 replay_faccessat2 的教训按内核约定写回 -errno。
+ */
+static long replay_accept(long fd, long addr, long addrlen)
+{
+    long r = raw4(242 /* accept4 */, fd, addr, addrlen, 0);
+    if (r >= 0)
+        return r;
+    return (long)(-(long)errno);
+}
+
 static void sigsys_handler(int sig, siginfo_t *si, void *uc)
 {
     struct raw_sigsys_info *rs;
@@ -306,6 +332,14 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
             (long)u->uc_mcontext.regs[1],
             (long)u->uc_mcontext.regs[2],
             (long)u->uc_mcontext.regs[3]);
+        return;
+    }
+
+    if (sc == 202) {
+        u->uc_mcontext.regs[0] = (unsigned long)replay_accept(
+            (long)u->uc_mcontext.regs[0],
+            (long)u->uc_mcontext.regs[1],
+            (long)u->uc_mcontext.regs[2]);
         return;
     }
 

@@ -17,7 +17,9 @@
  *   -h / --help          帮助
  */
 
+#ifndef _GNU_SOURCE   /* Makefile 已用 -D_GNU_SOURCE 定义；单独编译时仍需要 */
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +39,7 @@
  * 既有设计，兼容层必须照做，不能"统一"成同一个小写选项。
  */
 #ifndef BXROOT_VERSION
-#define BXROOT_VERSION "0.1.1"
+#define BXROOT_VERSION "0.1.2"
 #endif
 
 /*
@@ -987,6 +989,24 @@ int main(int argc, char **argv) {
     setenv("BXROOT_WORKDIR", cfg.workdir, 1);
 
     /*
+     * ★ $PWD 必须与 guest 视角的 workdir 一致（上游 #64，v4.0.1 解法）★
+     *
+     * bash/dash 启动时若 $PWD 存在且 stat($PWD) 与 stat(".") 同 inode，
+     * 就**直接沿用 $PWD 字符串**作为当前目录名，不再 getcwd。于是：
+     * launcher 从宿主目录 H 启动、-w /x 且 /x 被 -b 绑到 H 时，shell
+     * 继承的 $PWD 仍是宿主路径 H，`pwd` 回显的就是宿主路径 —— 路径视角
+     * 泄漏。runtime 的 getcwd 钩子在这条路上根本没被问到。
+     *
+     * 上游 proot 在 cli/cli.c 的 initialize_cwd() 末尾无条件
+     * setenv("PWD", cwd) 修掉此事。这里同样：workdir 已是 guest 视角
+     * 绝对路径（默认继承宿主 cwd 时，runtime 端 translate 后 chdir，
+     * 而 guest 看到的名字仍是这个字符串），直接写 $PWD 即可。
+     * runtime 侧 chdir 失败（目录不存在）时 stat 校验会失败，shell 会
+     * 回退 getcwd，不会因此拿到错值。
+     */
+    setenv("PWD", cfg.workdir, 1);
+
+    /*
      * ★ BXROOT_ORIG_COMM：容器**首命令**的名字（上游 /proc/pid/comm 语义）★
      *
      * 上游 proot 用 execve 的 raw user path 修正 /proc/pid/comm
@@ -1241,6 +1261,7 @@ int main(int argc, char **argv) {
     if (cfg.verbose) {
         fprintf(stderr, "[bxroot-launcher] rootfs=%s\n", cfg.rootfs);
         fprintf(stderr, "[bxroot-launcher] workdir=%s\n", cfg.workdir);
+        fprintf(stderr, "[bxroot-launcher] PWD=%s\n", getenv("PWD"));
         fprintf(stderr, "[bxroot-launcher] guest=%s\n", cfg.guest_exe);
         fprintf(stderr, "[bxroot-launcher] runtime_lib=%s\n", cfg.runtime_lib);
         fprintf(stderr, "[bxroot-launcher] LD_PRELOAD=%s\n", getenv("LD_PRELOAD"));

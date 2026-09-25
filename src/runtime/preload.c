@@ -9281,80 +9281,177 @@ static int is_unix_path_sockaddr(const struct sockaddr *addr, socklen_t len,
     return 1;
 }
 
-int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    static int (*fn)(int, const struct sockaddr *, socklen_t) = NULL;
+/*
+ * 正向翻译一个 sockaddr（guest → host）。
+ *
+ * 返回值：
+ *    1  已翻译，*out 指向 buf（调用方传 buf 去 syscall），*out_len 为新长度
+ *    0  不需要翻译（非 AF_UNIX 路径 / 抽象命名空间 / 翻译无变化），
+ *       *out 指向原 addr、*out_len 为原 len —— 调用方直接透传
+ *   -1  翻译后放不进 sun_path（errno=ENAMETOOLONG）。**不截断** ——
+ *       截断会静默连到/发到错误的 socket
+ *
+ * 这段原先在 bind/connect 各写一份；sendto/sendmsg（AF_UNIX DGRAM 的
+ * 目标地址在 dest_addr / msg_name 里，不经 connect）此前完全没翻译
+ * （上游 proot #8 的残留面）：容器内 `sendto("/run/x.sock")` 直接打到
+ * 宿主的 /run/x.sock。抽出来让六个入口共用同一套判据。
+ */
+#define UNIX_SOCKADDR_BUF (sizeof(struct sockaddr_un) + MAX_PATH_LEN)
+
+static int translate_unix_sockaddr(const struct sockaddr *addr, socklen_t len,
+                                   char *buf, size_t bufsz,
+                                   const struct sockaddr **out,
+                                   socklen_t *out_len)
+{
     const char *path = NULL;
     size_t off = 0;
+    char translated[MAX_PATH_LEN];
+    size_t tl;
+
+    *out = addr;
+    *out_len = len;
+
+    if (!is_unix_path_sockaddr(addr, len, &path, &off))
+        return 0;
+    if (translate_path(path, translated, sizeof(translated)) <= 0)
+        return 0;
+
+    tl = strlen(translated);
+    if (tl + 1 > sizeof(((struct sockaddr_un *)0)->sun_path) ||
+        off + tl + 1 > bufsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memset(buf, 0, bufsz);
+    memcpy(buf, addr, off);
+    memcpy(buf + off, translated, tl + 1);
+    *out = (const struct sockaddr *)buf;
+    *out_len = (socklen_t)(off + tl + 1);
+    return 1;
+}
+
+/*
+ * 反向翻译内核**回填**的 sockaddr（host → guest），原地改写。
+ *
+ * getsockname / getpeername / accept / recvfrom / recvmsg 回给客户的
+ * AF_UNIX 地址是内核视角 —— 即 bind 时我们翻译过去的**宿主路径**
+ * `<rootfs>/run/x.sock`。客户拿它做相等比较（`strcmp(peer, "/run/x.sock")`）、
+ * 或喂回 connect/sendto 都会错（后者双重翻译 → ENOENT）。
+ * 与 D3 的 /proc readlink 反向翻译同一思路：剥 rootfs 前缀。
+ *
+ * 只会**变短**（剥前缀），所以原地改写不会越界；*len 同步缩小。
+ * len 为 NULL、地址非 AF_UNIX 路径、或前缀不匹配时不动。
+ */
+static void untranslate_unix_sockaddr_inplace(struct sockaddr *addr,
+                                              socklen_t *len)
+{
+    struct sockaddr_un *un;
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    size_t room, plen;
+    char tmp[MAX_PATH_LEN];
+
+    if (addr == NULL || len == NULL)
+        return;
+    if (*len <= (socklen_t)off + 1 || *len > sizeof(struct sockaddr_un))
+        return;
+    if (addr->sa_family != AF_UNIX)
+        return;
+    un = (struct sockaddr_un *)addr;
+    if (un->sun_path[0] == '\0')
+        return;
+    room = (size_t)*len - off;
+    if (memchr(un->sun_path, '\0', room) == NULL)
+        return;
+    plen = strlen(un->sun_path);
+    if (plen >= sizeof(tmp))
+        return;
+    memcpy(tmp, un->sun_path, plen + 1);
+    if (!strip_rootfs_prefix_inplace(tmp))
+        return;
+    plen = strlen(tmp);
+    memcpy(un->sun_path, tmp, plen + 1);
+    *len = (socklen_t)(off + plen + 1);
+}
+
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    static int (*fn)(int, const struct sockaddr *, socklen_t) = NULL;
+    char buf[UNIX_SOCKADDR_BUF];
+    const struct sockaddr *use;
+    socklen_t use_len;
 
     if (fn == NULL)
         fn = (int (*)(int, const struct sockaddr *, socklen_t))
              bxroot_next_symbol("bind");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (is_unix_path_sockaddr(addr, addrlen, &path, &off)) {
-        char translated[MAX_PATH_LEN];
-        char buf[sizeof(struct sockaddr_un) + MAX_PATH_LEN];
-        struct sockaddr_un *copy;
-
-        if (translate_path(path, translated, sizeof(translated)) > 0) {
-            size_t tl = strlen(translated);
-
-            /* 翻译后可能超过 sun_path 的 108 字节上限 —— 那就如实报错，
-             * 而不是截断（截断会静默连到错误的 socket） */
-            if (off + tl + 1 > sizeof(copy->sun_path)) {
-                errno = ENAMETOOLONG;
-                return -1;
-            }
-            if (off + tl + 1 > sizeof(buf)) {
-                errno = ENAMETOOLONG;
-                return -1;
-            }
-
-            memset(buf, 0, sizeof(buf));
-            memcpy(buf, addr, off);
-            memcpy(buf + off, translated, tl + 1);
-            copy = (struct sockaddr_un *)buf;
-
-            return fn(sockfd, (const struct sockaddr *)copy,
-                      (socklen_t)(off + tl + 1));
-        }
-    }
-    return fn(sockfd, addr, addrlen);
+    if (translate_unix_sockaddr(addr, addrlen, buf, sizeof(buf),
+                                &use, &use_len) < 0)
+        return -1;
+    return fn(sockfd, use, use_len);
 }
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     static int (*fn)(int, const struct sockaddr *, socklen_t) = NULL;
-    const char *path = NULL;
-    size_t off = 0;
+    char buf[UNIX_SOCKADDR_BUF];
+    const struct sockaddr *use;
+    socklen_t use_len;
 
     if (fn == NULL)
         fn = (int (*)(int, const struct sockaddr *, socklen_t))
              bxroot_next_symbol("connect");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (is_unix_path_sockaddr(addr, addrlen, &path, &off)) {
-        char translated[MAX_PATH_LEN];
-        char buf[sizeof(struct sockaddr_un) + MAX_PATH_LEN];
-        struct sockaddr_un *copy;
+    if (translate_unix_sockaddr(addr, addrlen, buf, sizeof(buf),
+                                &use, &use_len) < 0)
+        return -1;
+    return fn(sockfd, use, use_len);
+}
 
-        if (translate_path(path, translated, sizeof(translated)) > 0) {
-            size_t tl = strlen(translated);
+/*
+ * AF_UNIX **数据报**：目标地址走 sendto 的 dest_addr / sendmsg 的
+ * msg_name，不经 connect —— 上游 #8 修的就是这一面（syslog(3) 的
+ * /dev/log、systemd-journald、dbus 的 DGRAM 模式都是这形态）。
+ * recvfrom / recvmsg 回填的源地址则反向剥前缀。
+ */
+ssize_t sendto(int sockfd, const void *msgbuf, size_t len, int flags,
+               const struct sockaddr *dest_addr, socklen_t addrlen) {
+    static ssize_t (*fn)(int, const void *, size_t, int,
+                         const struct sockaddr *, socklen_t) = NULL;
+    char buf[UNIX_SOCKADDR_BUF];
+    const struct sockaddr *use;
+    socklen_t use_len;
 
-            if (off + tl + 1 > sizeof(copy->sun_path) ||
-                off + tl + 1 > sizeof(buf)) {
-                errno = ENAMETOOLONG;
-                return -1;
-            }
-            memset(buf, 0, sizeof(buf));
-            memcpy(buf, addr, off);
-            memcpy(buf + off, translated, tl + 1);
-            copy = (struct sockaddr_un *)buf;
+    if (fn == NULL)
+        fn = (ssize_t (*)(int, const void *, size_t, int,
+                          const struct sockaddr *, socklen_t))
+             bxroot_next_symbol("sendto");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
 
-            return fn(sockfd, (const struct sockaddr *)copy,
-                      (socklen_t)(off + tl + 1));
-        }
+    if (translate_unix_sockaddr(dest_addr, addrlen, buf, sizeof(buf),
+                                &use, &use_len) < 0)
+        return -1;
+    return fn(sockfd, msgbuf, len, flags, use, use_len);
+}
+
+ssize_t recvfrom(int sockfd, void *msgbuf, size_t len, int flags,
+                 struct sockaddr *src_addr, socklen_t *addrlen) {
+    static ssize_t (*fn)(int, void *, size_t, int,
+                         struct sockaddr *, socklen_t *) = NULL;
+    ssize_t r;
+
+    if (fn == NULL)
+        fn = (ssize_t (*)(int, void *, size_t, int,
+                          struct sockaddr *, socklen_t *))
+             bxroot_next_symbol("recvfrom");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    r = fn(sockfd, msgbuf, len, flags, src_addr, addrlen);
+    if (r >= 0 && src_addr != NULL && addrlen != NULL) {
+        int saved = errno;
+        untranslate_unix_sockaddr_inplace(src_addr, addrlen);
+        errno = saved;
     }
-    return fn(sockfd, addr, addrlen);
+    return r;
 }
 
 /*
@@ -9373,11 +9470,60 @@ int socket(int domain, int type, int protocol) {
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     static int (*fn)(int, struct sockaddr *, socklen_t *) = NULL;
+    int r;
     if (fn == NULL)
         fn = (int (*)(int, struct sockaddr *, socklen_t *))
              bxroot_next_symbol("getsockname");
     if (fn == NULL) { errno = ENOSYS; return -1; }
-    return fn(sockfd, addr, addrlen);
+    r = fn(sockfd, addr, addrlen);
+    if (r == 0)
+        untranslate_unix_sockaddr_inplace(addr, addrlen);
+    return r;
+}
+
+int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    static int (*fn)(int, struct sockaddr *, socklen_t *) = NULL;
+    int r;
+    if (fn == NULL)
+        fn = (int (*)(int, struct sockaddr *, socklen_t *))
+             bxroot_next_symbol("getpeername");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+    r = fn(sockfd, addr, addrlen);
+    if (r == 0)
+        untranslate_unix_sockaddr_inplace(addr, addrlen);
+    return r;
+}
+
+int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
+    static int (*fn)(int, struct sockaddr *, socklen_t *, int) = NULL;
+    int r;
+    if (fn == NULL)
+        fn = (int (*)(int, struct sockaddr *, socklen_t *, int))
+             bxroot_next_symbol("accept4");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+    r = fn(sockfd, addr, addrlen, flags);
+    if (r >= 0 && addr != NULL && addrlen != NULL) {
+        int saved = errno;
+        untranslate_unix_sockaddr_inplace(addr, addrlen);
+        errno = saved;
+    }
+    return r;
+}
+
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    static int (*fn)(int, struct sockaddr *, socklen_t *) = NULL;
+    int r;
+    if (fn == NULL)
+        fn = (int (*)(int, struct sockaddr *, socklen_t *))
+             bxroot_next_symbol("accept");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+    r = fn(sockfd, addr, addrlen);
+    if (r >= 0 && addr != NULL && addrlen != NULL) {
+        int saved = errno;
+        untranslate_unix_sockaddr_inplace(addr, addrlen);
+        errno = saved;
+    }
+    return r;
 }
 
 int getsockopt(int sockfd, int level, int optname, void *optval,
@@ -9402,20 +9548,51 @@ int setsockopt(int sockfd, int level, int optname, const void *optval,
 
 ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
     static ssize_t (*fn)(int, const struct msghdr *, int) = NULL;
+    char buf[UNIX_SOCKADDR_BUF];
+    const struct sockaddr *use;
+    socklen_t use_len;
+    int t;
+
     if (fn == NULL)
         fn = (ssize_t (*)(int, const struct msghdr *, int))
              bxroot_next_symbol("sendmsg");
     if (fn == NULL) { errno = ENOSYS; return -1; }
-    return fn(sockfd, msg, flags);
+
+    if (msg == NULL || msg->msg_name == NULL)
+        return fn(sockfd, msg, flags);
+
+    /* msg_name 是 DGRAM 的目标地址（与 sendto 的 dest_addr 同义） */
+    t = translate_unix_sockaddr((const struct sockaddr *)msg->msg_name,
+                                msg->msg_namelen, buf, sizeof(buf),
+                                &use, &use_len);
+    if (t < 0)
+        return -1;
+    if (t == 0)
+        return fn(sockfd, msg, flags);
+    {
+        /* 浅拷贝 msghdr，只换 msg_name —— 不碰客户的 iov/control */
+        struct msghdr copy = *msg;
+        copy.msg_name = (void *)use;
+        copy.msg_namelen = use_len;
+        return fn(sockfd, &copy, flags);
+    }
 }
 
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
     static ssize_t (*fn)(int, struct msghdr *, int) = NULL;
+    ssize_t r;
     if (fn == NULL)
         fn = (ssize_t (*)(int, struct msghdr *, int))
              bxroot_next_symbol("recvmsg");
     if (fn == NULL) { errno = ENOSYS; return -1; }
-    return fn(sockfd, msg, flags);
+    r = fn(sockfd, msg, flags);
+    if (r >= 0 && msg != NULL && msg->msg_name != NULL) {
+        int saved = errno;
+        untranslate_unix_sockaddr_inplace((struct sockaddr *)msg->msg_name,
+                                          &msg->msg_namelen);
+        errno = saved;
+    }
+    return r;
 }
 
 /* getifaddrs —— node 用它枚举网络接口（官方有 FORCE_FAKE_GETIFADDRS 开关） */
