@@ -27,7 +27,7 @@ static long raw(long nr){
 int main(int argc,char**argv){
   int lo=atoi(argv[1]), hi=atoi(argv[2]);
   /* 跳过会伤害父进程或挂住的号 */
-  static const int skip[]={93,94,/*exit*/ 129,130,131,/*kill tkill tgkill*/ 220,435,/*clone*/ 101,115,/*nanosleep clock_nanosleep*/ 98,/*futex*/ 
+  static const int skip[]={93,94,/*exit*/ 129,130,131,/*kill tkill tgkill*/ 220,435,/*clone*/ 101,115,/*nanosleep clock_nanosleep*/ 98,/*futex*/
     142,/*reboot*/ 139,/*rt_sigreturn*/ 72,73,22,/*pselect ppoll epoll_pwait*/ 241,/*perf*/ 260,/*wait4*/ 95,/*waitid*/ 81,/*sync*/ 267,/*syncfs*/ 215,/*munmap*/ 226,/*mprotect*/ 216,/*mremap*/ 233,/*madvise*/ 280,/*bpf*/ 441,/*epoll_pwait2*/ 449, -1};
   for(int nr=lo; nr<=hi; nr++){
     int sk=0; for(int i=0;skip[i]!=-1;i++) if(skip[i]==nr) sk=1;
