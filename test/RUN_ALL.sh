@@ -602,6 +602,24 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# 无 PT_INTERP 的 ELF（静态 / static-PIE / ld.so / ldd）经 stub-loader（行动清单 #6）
+# ---------------------------------------------------------------------
+if [ -f test/RUN_STATIC_ELF.sh ]; then
+    run_step "静态 ELF / ld.so / ldd" sh test/RUN_STATIC_ELF.sh
+else
+    run_step "静态 ELF / ld.so / ldd"
+fi
+
+# ---------------------------------------------------------------------
+# bxroot stub-loader 的 patch_static_elf：临时目录 + 产物 ELF 结构（行动清单 #6）
+# ---------------------------------------------------------------------
+if [ -f test/RUN_STUB_PATCH.sh ]; then
+    run_step "stub-loader PT_INTERP 补丁" sh test/RUN_STUB_PATCH.sh
+else
+    run_step "stub-loader PT_INTERP 补丁"
+fi
+
+# ---------------------------------------------------------------------
 # AF_UNIX sockaddr 双向翻译 + accept(202) 重放（行动清单 #5）
 #
 # sendto/sendmsg 的目标地址正向翻译；getsockname/getpeername/accept/

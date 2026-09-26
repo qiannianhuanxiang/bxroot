@@ -163,6 +163,7 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 | `--kill-on-exit` 覆盖任何退出方式（`_exit`/exit_group/信号致死；launcher 作 subreaper 监督者） | ✅ |
 | `execveat`/`fexecve`（含 AT_EMPTY_PATH、dirfd 相对、#! 脚本 fd）经 trampoline 执行 | ✅ |
 | exec 失败给出具体原因（缺解释器/CRLF/无执行位/外部架构…），退出码 127/126 | ✅ |
+| 静态链接 / static-PIE 程序、`ld.so` 直接调用、`ldd`（经 stub-loader，含非默认 rootfs 路径翻译） | ✅ |
 | 降权族内联 svc（glibc `initgroups()`、nptl setxid 广播）→ SIGSYS 层接 fakeroot 账本 | ✅ |
 | SysV 共享内存（shmget/shmat/shmctl/shmdt；SIGSYS 层模拟，与官方共用 `/tmp/.proroot-shm` 格式，双向互通） | ✅ |
 
@@ -297,7 +298,7 @@ Node 全部 `ENOENT`。
 ## 测试
 
 ```sh
-sh test/RUN_ALL.sh --quick      # 主回归（33 项，一键全跑；本容器内 2 项按环境 SKIP）
+sh test/RUN_ALL.sh --quick      # 主回归（35 项，一键全跑；本容器内 2 项按环境 SKIP）
 ```
 
 分项：
@@ -326,6 +327,8 @@ sh test/RUN_SYSVSHM.sh          # SysV 共享内存（对照官方 + 互通 + �
 sh test/RUN_L2S_GIT.sh          # l2s × 真实 git，三种 L2S_DIR 形态
 sh test/RUN_KILL_ON_EXIT.sh     # --kill-on-exit 监督进程（6 种退出方式，带对照）
 sh test/RUN_EXEC_DIAG.sh        # execveat/fexecve + exec 失败诊断 + 127/126
+sh test/RUN_STATIC_ELF.sh       # 静态/static-PIE/ld.so/ldd 经 stub-loader（带官方对照）
+sh test/RUN_STUB_PATCH.sh       # stub-loader PT_INTERP 补丁：临时目录 + 产物结构
 bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 ```
 

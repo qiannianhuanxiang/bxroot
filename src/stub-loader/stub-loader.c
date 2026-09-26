@@ -29,8 +29,18 @@
  * 所以：本 .so 目前是"构建得出、被 launcher 探测到、但功能未启用"的
  * 状态。README 的产出表据此描述为"PT_INTERP 修补器（**非独立 ELF
  * 加载器**）"，见 docs/已知限制与架构能力边界.md 的对应条目。
- * 验证命令与后果见 docs/issue扫描/汇总-行动清单.md 第 6 项
- * （正确顺序是**先接线，再修 /tmp 硬编码**，否则修了也无人走到）。
+ *
+ * ★ 2026-09-25 更新（行动清单 #6）★
+ * 静态程序的**实际执行**已由 runtime 接到外层/DSHA 提供的完整 stub-loader
+ * （PROROOT_STUB_LOADER，见 proc.c px_elf_needs_stub / px_stub_exec，
+ * 回归 test/RUN_STATIC_ELF.sh）—— 它自带 ELF 装载与 syscall 翻译，
+ * 本文件的 execve+LD_PRELOAD 回退对静态程序本来就无效（静态程序不读
+ * LD_PRELOAD），所以没有把本库接进那条路径。
+ * 本文件仍修了两处会在将来接线时咬人的缺陷，由 test/RUN_STUB_PATCH.sh 钉住：
+ *   - patch_static_elf 的临时副本不再硬编码 /tmp（BXROOT_TMP_DIR → TMPDIR）；
+ *   - patch_static_elf 产物原本是损坏的 ELF（e_phoff 未改，新增项落在节
+ *     数据上），现改为新 phdr 表追加到末尾。
+ * 另：诊断输出改为仅 BXROOT_VERBOSE 时打印。
  */
 
 #ifndef _GNU_SOURCE
@@ -66,6 +76,16 @@
  * 损坏/恶意输入挡在外面。
  */
 #define STUB_MAX_PHNUM 128
+
+/* 诊断输出只在 BXROOT_VERBOSE 时打印：原先每次运行都往 stderr 写 5 行，
+ * 污染客户程序的输出（与 launcher 的 stat 行同一类问题）。 */
+static int stub_verbose(void)
+{
+    const char *v = getenv("BXROOT_VERBOSE");
+    return v != NULL && v[0] != '\0' && v[0] != '0';
+}
+#define SLOG(...) do { if (stub_verbose()) fprintf(stderr, __VA_ARGS__); } while (0)
+
 
 /* 获取本库所在目录 */
 static int get_lib_dir(char *dir, size_t dir_size) {
@@ -268,8 +288,19 @@ static char *patch_static_elf(const char *original_path, const char *interpreter
         /* 原名可能很长：必须检查截断，否则会静默用错文件名 */
         const char *slash = strrchr(original_path, '/');
         const char *base = slash ? slash + 1 : "binary";
-        int n = snprintf(tmp_path, sizeof(tmp_path), "/tmp/.bxroot_stub_%ld_%s",
-                         (long)getpid(), base);
+        /*
+         * ★ 不能硬编码 /tmp（行动清单 #6，上游 #79 同类）★
+         * Android 与部分容器里 /tmp 不存在、或挂载为 noexec —— 写进去的
+         * 副本 exec 时 EACCES，且失败是静默的。按 BXROOT_TMP_DIR（launcher
+         * 与 DSHA 设置）→ TMPDIR → /tmp 的顺序取目录。
+         */
+        const char *td = getenv("BXROOT_TMP_DIR");
+        if (td == NULL || td[0] != '/')
+            td = getenv("TMPDIR");
+        if (td == NULL || td[0] != '/')
+            td = "/tmp";
+        int n = snprintf(tmp_path, sizeof(tmp_path), "%s/.bxroot_stub_%ld_%s",
+                         td, (long)getpid(), base);
         if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
             free(phdr);
             close(fd);
@@ -303,51 +334,72 @@ static char *patch_static_elf(const char *original_path, const char *interpreter
     }
     close(fd);
 
-    /* 在文件末尾添加解释器路径字符串 */
+    /*
+     * ★ 正确的补丁布局：新 phdr 表 + 解释器字符串都追加到文件末尾，
+     *   e_phoff 改指向新表 ★（2026-09-25 重写）
+     *
+     * 【原实现的缺陷（单测 test/stub/test_stub_tmpdir.c 抓出）】原先把新的
+     * PT_INTERP 追加在文件末尾，却只把 e_phnum+1、e_phoff 不动 —— 于是
+     * 头部声明的第 N+1 个 phdr 落在**原表之后紧邻的节数据**上（实测是
+     * .note 的内容，p_type=0x4），真正的 PT_INTERP 没人引用。产物是一个
+     * **损坏的 ELF**：readelf 看不到 INTERP，内核按垃圾 phdr 解释。
+     *
+     * 新表放在文件末尾（8 字节对齐）。内核要求 phdr 表被某个 PT_LOAD 覆盖
+     * 才会建 PT_PHDR 映射，但对 PT_INTERP 而言只需要**文件内可读**，
+     * 内核在 load_elf_binary 里直接按 e_phoff 从文件读 phdr 表 —— 不需要
+     * 被映射。解释器字符串同理（按 p_offset 从文件读）。
+     */
     char interp_str[PATH_MAX];
-    strncpy(interp_str, interpreter_path, sizeof(interp_str));
-    interp_str[sizeof(interp_str) - 1] = '\0';
-    size_t interp_len = strlen(interp_str) + 1;
-
-    /* 写入修补后的文件 */
-    write(tmp_fd, file_data, st.st_size);
-
-    /* 添加 PT_INTERP 段 */
+    size_t interp_len;
+    off_t base = st.st_size;
+    off_t new_phoff = (base + 7) & ~(off_t)7;
+    off_t interp_off = new_phoff + (off_t)(ehdr.e_phnum + 1) * (off_t)sizeof(Elf64_Phdr);
     Elf64_Phdr interp_phdr;
+    Elf64_Ehdr new_ehdr;
+    int wbad = 0;
+    static const char zeros[8] = {0};
+
+    if (strlen(interpreter_path) >= sizeof(interp_str)) {
+        free(file_data); free(phdr); close(tmp_fd); unlink(tmp_path);
+        return NULL;
+    }
+    memcpy(interp_str, interpreter_path, strlen(interpreter_path) + 1);
+    interp_len = strlen(interp_str) + 1;
+
     memset(&interp_phdr, 0, sizeof(interp_phdr));
     interp_phdr.p_type = PT_INTERP;
     interp_phdr.p_flags = PF_R;
-    interp_phdr.p_offset = st.st_size;  /* 解释器路径在文件末尾 */
-    interp_phdr.p_vaddr = 0;
-    interp_phdr.p_paddr = 0;
+    interp_phdr.p_offset = (Elf64_Off)interp_off;
     interp_phdr.p_filesz = interp_len;
     interp_phdr.p_memsz = interp_len;
     interp_phdr.p_align = 1;
-    write(tmp_fd, &interp_phdr, sizeof(interp_phdr));
 
-    /* 写入解释器路径字符串 */
-    write(tmp_fd, interp_str, interp_len);
-
-    /* 更新 ELF header */
-    Elf64_Ehdr new_ehdr;
     memcpy(&new_ehdr, &ehdr, sizeof(ehdr));
-    new_ehdr.e_phnum++;  /* 增加一个 program header */
+    new_ehdr.e_phoff = (Elf64_Off)new_phoff;
+    new_ehdr.e_phnum = (Elf64_Half)(ehdr.e_phnum + 1);
+    new_ehdr.e_phentsize = (Elf64_Half)sizeof(Elf64_Phdr);
 
-    /* 需要重写 ELF header 和所有 program headers */
-    lseek(tmp_fd, 0, SEEK_SET);
-    write(tmp_fd, &new_ehdr, sizeof(ehdr));
-
-    /* 重写 program headers（需要跳过被移动的） */
-    lseek(tmp_fd, new_ehdr.e_phoff, SEEK_SET);
-    for (int i = 0; i < ehdr.e_phnum; i++) {
-        write(tmp_fd, &phdr[i], sizeof(Elf64_Phdr));
+    /* 原内容（头部用新 ehdr 覆盖）→ 对齐填充 → [PT_INTERP + 原 phdr 表] → 解释器串。
+     * PT_INTERP 必须排在所有 PT_LOAD 之前（ELF 规范），所以放表首。 */
+    memcpy(file_data, &new_ehdr, sizeof(new_ehdr));
+    if (write(tmp_fd, file_data, (size_t)base) != (ssize_t)base) wbad = 1;
+    if (new_phoff > base &&
+        write(tmp_fd, zeros, (size_t)(new_phoff - base)) != (ssize_t)(new_phoff - base)) wbad = 1;
+    if (write(tmp_fd, &interp_phdr, sizeof(interp_phdr)) != (ssize_t)sizeof(interp_phdr)) wbad = 1;
+    for (int i = 0; i < ehdr.e_phnum; i++)
+        if (write(tmp_fd, &phdr[i], sizeof(Elf64_Phdr)) != (ssize_t)sizeof(Elf64_Phdr)) wbad = 1;
+    if (write(tmp_fd, interp_str, interp_len) != (ssize_t)interp_len) wbad = 1;
+    if (wbad) {
+        /* 写不全就是损坏文件：删掉，不交给调用方 */
+        free(file_data); free(phdr); close(tmp_fd); unlink(tmp_path);
+        return NULL;
     }
 
     close(tmp_fd);
     free(file_data);
     free(phdr);
 
-    fprintf(stderr, "[stub-loader] patched: %s -> %s\n", original_path, tmp_path);
+    SLOG("[stub-loader] patched: %s -> %s\n", original_path, tmp_path);
 
     return strdup(tmp_path);
 }
@@ -358,7 +410,7 @@ static char *patch_static_elf(const char *original_path, const char *interpreter
  * 参数与 ld-linux.so 相同。
  */
 int main(int argc, char **argv, char **envp) {
-    fprintf(stderr, "[stub-loader] main: argc=%d\n", argc);
+    SLOG("[stub-loader] main: argc=%d\n", argc);
 
     if (argc < 2) {
         fprintf(stderr, "[stub-loader] usage: %s <binary>\n", argv[0]);
@@ -367,7 +419,7 @@ int main(int argc, char **argv, char **envp) {
 
     /* argv[0] 是解释器路径，argv[1] 是目标程序 */
     const char *target = argv[1];
-    fprintf(stderr, "[stub-loader] target: %s\n", target);
+    SLOG("[stub-loader] target: %s\n", target);
 
     /* 获取本库目录 */
     char lib_dir[PATH_MAX];
@@ -400,8 +452,8 @@ int main(int argc, char **argv, char **envp) {
      * 这是一个复杂的实现，涉及 ELF 加载器逻辑。
      */
 
-    fprintf(stderr, "[stub-loader] TODO: implement ELF loader and jump to _start\n");
-    fprintf(stderr, "[stub-loader] fallback: execve with LD_PRELOAD\n");
+    SLOG("[stub-loader] TODO: implement ELF loader and jump to _start\n");
+    SLOG("[stub-loader] fallback: execve with LD_PRELOAD\n");
 
     /* 回退方案：直接 execve，依赖 LD_PRELOAD */
     const char *preload = getenv("LD_PRELOAD");

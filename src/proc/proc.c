@@ -3407,6 +3407,174 @@ static int px_trampoline_exec(const char *host, char *const argv[],
 }
 
 /*
+ * ★ 无 PT_INTERP 的 ELF（静态 EXEC / static-PIE / ld.so 自身）走 stub-loader ★
+ *
+ * 【缺陷（2026-09-25 实测，行动清单 #6 复核）】trampoline 的 linker 只会
+ * 加载**动态**可执行文件（它要 PT_DYNAMIC 做重定位）。于是 bxroot 下：
+ *
+ *                                   官方 proroot     bxroot(修前)
+ *     静态 EXEC（gcc -static）       ✅             loader: failed no PT_DYNAMIC
+ *     static-PIE / ldconfig.real     ✅             reloc: unsupported type 0
+ *     /lib/ld-linux-*.so.1 --version ✅             SIGSEGV
+ *     ldd /bin/true                  ✅             "not a dynamic executable"
+ *
+ * ldd 那条尤其危险：是"成功形状的错答案"（docs/已知限制-ld.so直接调用段错误.md
+ * 把它记为"官方同样失败、不修" —— 该结论经本次**用官方 runtime 作内层**复核
+ * 推翻：官方经 stub-loader 正常）。
+ *
+ * 【修法】官方 runtime 的做法（实测其子进程 argv/env）：
+ *     execve(<STUB_LOADER>, [<STUB_LOADER>, <宿主 exe>, <argv[1..]>], env)
+ *     env += PROROOT_STUB_GUEST_EXE=<guest 路径>  PROROOT_STUB_ROOTFS=<rootfs>
+ * stub-loader 自己做 ELF 装载与 syscall 路径翻译（静态程序里没有我们的
+ * 钩子可挂）。实测在 bxroot 进程内这样 exec，非默认 rootfs 下的静态程序
+ * 读到的是 rootfs 内的 /etc 文件 —— 翻译确实生效。
+ *
+ * 只识别**确定**无 PT_INTERP 的 64 位 aarch64 ELF；读不到/不是 ELF/有 INTERP
+ * 一律返回 0（走原 trampoline），不改变任何既有行为。
+ */
+static int px_elf_needs_stub(const char *host)
+{
+    unsigned char h[64];
+    unsigned char ph[56];
+    unsigned long phoff;
+    unsigned phentsize, phnum, i;
+    int fd;
+    long n;
+
+    fd = (int)syscall(SYS_openat, AT_FDCWD, host, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    n = (long)syscall(SYS_pread64, fd, h, sizeof(h), 0L);
+    if (n != (long)sizeof(h) || memcmp(h, "\177ELF", 4) != 0 ||
+        h[4] != 2 /* 64 位 */ || h[5] != 1 /* LE */) {
+        (void)syscall(SYS_close, fd);
+        return 0;
+    }
+    {
+        unsigned type = (unsigned)h[16] | ((unsigned)h[17] << 8);
+        unsigned mach = (unsigned)h[18] | ((unsigned)h[19] << 8);
+        if ((type != 2 /* EXEC */ && type != 3 /* DYN */) || mach != 183 /* AArch64 */) {
+            (void)syscall(SYS_close, fd);
+            return 0;
+        }
+    }
+    memcpy(&phoff, h + 32, 8);
+    phentsize = (unsigned)h[54] | ((unsigned)h[55] << 8);
+    phnum = (unsigned)h[56] | ((unsigned)h[57] << 8);
+    if (phentsize < sizeof(ph) || phnum == 0 || phnum > 128) {
+        (void)syscall(SYS_close, fd);
+        return 0;
+    }
+    for (i = 0; i < phnum; i++) {
+        unsigned ptype;
+        n = (long)syscall(SYS_pread64, fd, ph, sizeof(ph),
+                          (long)(phoff + (unsigned long)i * phentsize));
+        if (n != (long)sizeof(ph)) {
+            (void)syscall(SYS_close, fd);
+            return 0;               /* 读不全 → 不确定 → 不改路径 */
+        }
+        memcpy(&ptype, ph, 4);
+        if (ptype == 3 /* PT_INTERP */) {
+            (void)syscall(SYS_close, fd);
+            return 0;               /* 普通动态可执行文件 */
+        }
+    }
+    (void)syscall(SYS_close, fd);
+    return 1;
+}
+
+/*
+ * exec 到 stub-loader。返回 -1 = 环境未配置（调用方继续走 trampoline）；
+ * 返回 0 = 已尝试（成功则不返回）。
+ */
+static int px_stub_exec(const char *host, char *const argv[],
+                        char *const *envp, const char *guest)
+{
+    const char *stub = getenv("BXROOT_STUB_LOADER_EXEC");
+    char stub_path[PX_PATH_MAX];
+    char genv[PX_PATH_MAX + 32], renv[PX_PATH_MAX + 32];
+    char *nv[PX_ARGV_MAX + 4];
+    char **ne;
+    size_t n = 0, i, ec = 0;
+    const char *rf = g_rt_cfg.have_rootfs ? g_rt_cfg.rootfs : NULL;
+
+    /*
+     * 优先 bxroot 自己的变量，回落官方的 PROROOT_STUB_LOADER（DSHA 与外层
+     * proroot 都提供它）。bxroot 自己的 libbxroot-stub-loader.so **不能**
+     * 当这个用 —— 它只是 execve+LD_PRELOAD 回退（文件头注释），不做装载。
+     */
+    if (stub == NULL || stub[0] == '\0')
+        stub = getenv("PROROOT_STUB_LOADER");
+    if (stub == NULL || stub[0] != '/' || rf == NULL || rf[0] == '\0')
+        return -1;
+    /* 与 trampoline 同理：/data/app 下的路径要经 /proc/self/root 绕开翻译 */
+    if (strncmp(stub, "/proc/", 6) == 0) {
+        if (strlen(stub) >= sizeof(stub_path))
+            return -1;
+        memcpy(stub_path, stub, strlen(stub) + 1);
+    } else if (snprintf(stub_path, sizeof(stub_path), "/proc/self/root%s", stub)
+               >= (int)sizeof(stub_path)) {
+        return -1;
+    }
+
+    nv[n++] = stub_path;
+    nv[n++] = (char *)(uintptr_t)host;
+    if (argv != NULL)
+        for (i = 1; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 2; i++)
+            nv[n++] = argv[i];
+    nv[n] = NULL;
+
+    if (snprintf(genv, sizeof(genv), "PROROOT_STUB_GUEST_EXE=%s",
+                 (guest != NULL && guest[0] != '\0') ? guest : host) >= (int)sizeof(genv))
+        return -1;
+    if (snprintf(renv, sizeof(renv), "PROROOT_STUB_ROOTFS=%s", rf) >= (int)sizeof(renv))
+        return -1;
+
+    /* 新 envp：去掉旧的两个同名变量，追加新值 */
+    if (envp != NULL)
+        while (envp[ec] != NULL)
+            ec++;
+    ne = (char **)malloc((ec + 3) * sizeof(char *));
+    if (ne == NULL)
+        return -1;
+    n = 0;
+    for (i = 0; i < ec; i++) {
+        if (strncmp(envp[i], "PROROOT_STUB_GUEST_EXE=", 23) == 0 ||
+            strncmp(envp[i], "PROROOT_STUB_ROOTFS=", 20) == 0)
+            continue;
+        /*
+         * ★ LD_PRELOAD：只在 ldd 模式（LD_TRACE_LOADED_OBJECTS 非空）时去掉 ★
+         *
+         * 目标是 ld.so 本身时，真 ld.so 会照 LD_PRELOAD 把 bxroot runtime
+         * 装进被加载的程序：
+         *   - `ld.so /tmp/prog`：**需要**它 —— 否则 prog 没有钩子，路径
+         *     翻译失效（实测非默认 rootfs 下读到宿主 /etc，rc=3）；
+         *   - `ldd prog`（= LD_TRACE_LOADED_OBJECTS=1 ld.so prog）：只列依赖
+         *     不运行，保留它会多列出一行 libbxroot-runtime.so，与官方输出不一致。
+         */
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
+            size_t k;
+            int tracing = 0;
+            for (k = 0; k < ec; k++)
+                if (strncmp(envp[k], "LD_TRACE_LOADED_OBJECTS=", 24) == 0 &&
+                    envp[k][24] != '\0')
+                    tracing = 1;
+            if (tracing)
+                continue;
+        }
+        ne[n++] = envp[i];
+    }
+    ne[n++] = genv;
+    ne[n++] = renv;
+    ne[n] = NULL;
+
+    PX_LOG("proc: 无 PT_INTERP 的 ELF，经 stub-loader 执行 %s", host);
+    (void)syscall(SYS_execve, stub_path, nv, ne);
+    free(ne);
+    return 0;
+}
+
+/*
  * posix_spawn 的 trampoline 版本。
  *
  * posix_spawn **不能**像 execve 那样「就地 exec」—— 它必须在父进程里
@@ -4270,6 +4438,9 @@ static int px_do_execve(const char *path, char *const argv[],
              * （ENOENT / EACCES / ELOOP …），调用方拿到的语义不打折。
              */
             PX_LOG("proc: 目标不是可执行文件(%s)，跳过 trampoline", host);
+        } else if (px_elf_needs_stub(host) &&
+                   px_stub_exec(host, final_argv, final_env, guest) == 0) {
+            PX_LOG("proc: stub-loader exec 失败，回退 %s", host);
         } else if (px_trampoline_exec(host, final_argv, final_env, guest,
                                       getenv("BXROOT_LD_PRELOAD")) == 0) {
             /* 走到这里说明 trampoline exec 失败（成功则永不返回），

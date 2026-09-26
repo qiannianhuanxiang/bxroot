@@ -1,5 +1,19 @@
 # 已知限制：直接调用 `ld.so` 段错误（外层加载器限制，**非 bxroot 缺陷**）
 
+> ## ⚠️ 2026-09-25 更正：本文结论**已被推翻**，缺陷已修
+>
+> 下文"官方 runtime 同样段错误"的对照做错了：它在 bxroot-run **顶层**
+> 直接把 ld.so 交给 bridge/linker（那一步两边确实都段错误），但真实使用
+> 是 guest 里的程序去 exec ld.so —— 走 runtime 的 exec 钩子。在那条路径上，
+> **官方 runtime 经 stub-loader 正常**（`ld.so --version`、`ldd` 都对），
+> bxroot 因为把无 PT_INTERP 的 ELF 也塞进只认动态 ELF 的 linker 而失败。
+> 现 proc.c 已改为对这类 ELF 走 stub-loader，`ldd` 输出与官方逐行一致。
+> 回归：`test/RUN_STATIC_ELF.sh`。
+>
+> 教训：**对照实验必须走与用户相同的入口**，否则"两边一样坏"只说明
+> 测试入口坏了。
+
+
 > **状态：不修（不属于本项目）。** 三方对照证明这是**外层 proroot 加载器**
 > 的限制：不加载任何 runtime 时正常，加载**官方 proroot runtime 同样
 > 段错误** —— 与 bxroot 无关。
