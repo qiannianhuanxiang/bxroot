@@ -1120,6 +1120,164 @@ static int supervise_or_return_in_child(int verbose)
     _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 1);
 }
 
+/* ------------------------------------------------------------------ */
+/* exec 失败诊断（行动清单 #8，上游 #402/#21）                          */
+/* ------------------------------------------------------------------ */
+/*
+ * 上游 proot 在 execve 失败时打印 5 条"可能原因"（cli.c print_execve_help），
+ * bxroot 原先只有一行 strerror —— 而 Android 上 exec 失败几乎全是 EACCES，
+ * 这一行对定位毫无帮助（实测：缺解释器的脚本、纯文本文件、无执行位的文件、
+ * x86 二进制，四种完全不同的原因全都只报 "Permission denied"）。
+ *
+ * 这里不照抄上游的"可能原因"列表，而是**读文件头判定具体是哪一条**，
+ * 只打印命中的那一条；判不出来时才退回上游式的通用列表。
+ * 全部是只读检查，不改变任何行为；quiet（-v 负数）时不打印。
+ */
+static void guest_to_host(char *out, size_t sz, const char *rootfs, const char *g)
+{
+    size_t rl = rootfs ? strlen(rootfs) : 0;
+    if (g[0] == '/' && rl > 0 && !(strncmp(g, rootfs, rl) == 0 && (g[rl] == '/' || g[rl] == '\0')))
+        snprintf(out, sz, "%s%s", rootfs, g);
+    else
+        snprintf(out, sz, "%s", g);
+}
+
+static void explain_exec_failure(const char *exe, const char *rootfs, int err)
+{
+    unsigned char h[128];
+    struct stat st;
+    ssize_t n;
+    int fd;
+
+    fprintf(stderr, "可能原因：\n");
+    if (stat(exe, &st) != 0) {
+        fprintf(stderr, "  * 文件不存在（或路径中某一级不是目录）：%s\n", exe);
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "  * 这是一个目录，不能执行\n");
+        return;
+    }
+    if ((st.st_mode & 0111) == 0) {
+        fprintf(stderr, "  * 文件没有执行权限（mode=%o）—— 试试 chmod +x，"
+                "或用解释器显式运行（如 sh %s）\n", st.st_mode & 07777, exe);
+        return;
+    }
+    fd = open(exe, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "  * 文件无法读取（%s）\n", strerror(errno));
+        return;
+    }
+    n = read(fd, h, sizeof(h) - 1);
+    close(fd);
+    if (n < 0)
+        n = 0;
+    h[n] = '\0';
+
+    if (n >= 2 && h[0] == '#' && h[1] == '!') {
+        /* 脚本：取解释器路径（跳过空白，到空白/换行为止） */
+        char interp[PATH_MAX], host[PATH_MAX * 2];
+        size_t i = 2, j = 0;
+        while (i < (size_t)n && (h[i] == ' ' || h[i] == '\t'))
+            i++;
+        while (i < (size_t)n && h[i] != ' ' && h[i] != '\t' && h[i] != '\n' &&
+               h[i] != '\r' && j + 1 < sizeof(interp))
+            interp[j++] = (char)h[i++];
+        interp[j] = '\0';
+        if (j == 0) {
+            fprintf(stderr, "  * 脚本的 #! 行没有写解释器\n");
+            return;
+        }
+        if (i < (size_t)n && h[i] == '\r') {
+            fprintf(stderr, "  * 脚本是 Windows 换行（CRLF）：内核找的解释器是 \"%s\\r\"，"
+                    "用 dos2unix 或 sed -i 's/\\r$//' 转换\n", interp);
+            return;
+        }
+        guest_to_host(host, sizeof(host), rootfs, interp);
+        if (stat(host, &st) != 0) {
+            fprintf(stderr, "  * 脚本的解释器 %s 在 rootfs 内不存在"
+                    "（需要安装它，或改 #! 行）\n", interp);
+            return;
+        }
+        fprintf(stderr, "  * 脚本解释器 %s 存在，但它本身无法执行（见其自身的错误）\n", interp);
+        return;
+    }
+    if (n >= 4 && h[0] == 0x7f && h[1] == 'E' && h[2] == 'L' && h[3] == 'F') {
+        if (n >= 20) {
+            unsigned mach = (unsigned)h[18] | ((unsigned)h[19] << 8);
+            if (mach != 183 /* EM_AARCH64 */) {
+                const char *nm = mach == 62 ? "x86_64" : mach == 3 ? "i386" :
+                                 mach == 40 ? "ARM 32 位" : mach == 243 ? "RISC-V" : "非 aarch64";
+                fprintf(stderr, "  * 这是 %s 架构的二进制（e_machine=%u），本机是 aarch64，"
+                        "无法直接运行（bxroot 不做 qemu 转译）\n", nm, mach);
+                return;
+            }
+            if (h[4] != 2) {
+                fprintf(stderr, "  * 这是 32 位 ELF，本机 rootfs 是 64 位 aarch64\n");
+                return;
+            }
+        }
+        /* ELF 解释器（PT_INTERP）：只看 64 位 LE，程序头在首 4K 内的常见布局 */
+        {
+            unsigned char buf[4096];
+            int f2 = open(exe, O_RDONLY | O_CLOEXEC);
+            ssize_t m = f2 >= 0 ? read(f2, buf, sizeof(buf)) : -1;
+            if (f2 >= 0)
+                close(f2);
+            if (m >= 64) {
+                unsigned long phoff = 0; unsigned phentsize, phnum, k;
+                memcpy(&phoff, buf + 32, 8);
+                phentsize = buf[54] | (buf[55] << 8);
+                phnum = buf[56] | (buf[57] << 8);
+                for (k = 0; k < phnum && phentsize >= 56; k++) {
+                    unsigned long off = phoff + (unsigned long)k * phentsize;
+                    unsigned type; unsigned long poff, psz;
+                    if (off + 56 > (unsigned long)m)
+                        break;
+                    memcpy(&type, buf + off, 4);
+                    if (type != 3 /* PT_INTERP */)
+                        continue;
+                    memcpy(&poff, buf + off + 8, 8);
+                    memcpy(&psz, buf + off + 32, 8);
+                    if (psz > 0 && psz < PATH_MAX && poff + psz <= (unsigned long)m) {
+                        char interp[PATH_MAX], host[PATH_MAX * 2];
+                        memcpy(interp, buf + poff, psz);
+                        interp[psz - 1] = '\0';
+                        guest_to_host(host, sizeof(host), rootfs, interp);
+                        if (stat(host, &st) != 0) {
+                            fprintf(stderr, "  * 这是动态链接的 ELF，但它的加载器 %s 在 rootfs 内"
+                                    "不存在（缺 libc6 / 架构不符的 rootfs）\n", interp);
+                            return;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "  * aarch64 ELF 本身格式正常；若 errno 为 EACCES，多半是宿主"
+                "策略（SELinux app_data_file）禁止直接 exec —— 经 DSHA/bridge 启动可绕过\n");
+        return;
+    }
+    if (n == 0) {
+        fprintf(stderr, "  * 文件是空的\n");
+        return;
+    }
+    {
+        size_t k, bin = 0;
+        for (k = 0; k < (size_t)n; k++)
+            if (h[k] == 0)
+                bin++;
+        if (bin == 0) {
+            fprintf(stderr, "  * 这是没有 #! 行的文本文件：内核不知道用什么解释器"
+                    "（加上 #!/bin/sh 之类的首行，或用 sh %s 运行）\n", exe);
+            return;
+        }
+    }
+    (void)err;
+    fprintf(stderr, "  * 文件格式无法识别（既不是 ELF 也不是 #! 脚本）\n"
+            "  * （通用）程序的解释器/加载器缺失，或是外部架构的二进制\n");
+}
+
 int main(int argc, char **argv) {
     launcher_config_t cfg = {0};
 
@@ -1538,7 +1696,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "错误: rootfs 内找不到命令 %s (实际路径: %s) errno=%d %s\n",
                     cmd, resolved_path, errno, strerror(errno));
             free_config(&cfg);
-            return 1;
+            return 127;     /* shell 约定：命令不存在 = 127 */
         }
         cfg.guest_exe = strdup(resolved_path);
         snprintf(caller_guest_path, sizeof(caller_guest_path), "%s", cmd);
@@ -1567,7 +1725,7 @@ int main(int argc, char **argv) {
         if (!found) {
             fprintf(stderr, "错误: rootfs 内找不到命令 %s\n", cmd);
             free_config(&cfg);
-            return 1;
+            return 127;     /* shell 约定：命令不存在 = 127 */
         }
     }
     
@@ -1660,7 +1818,13 @@ int main(int argc, char **argv) {
      * `[bxroot-launcher] stat(...) OK` —— 破坏与上游的输出一致性
      * （上游默认静默，上游用例 test-dddddddd 用 cmp 逐字节比对）。
      */
-    if (!cfg.quiet) {
+    /*
+     * ★ 门控是 verbose，不是 !quiet ★（2026-09-25 修）
+     * 上面注释说的"受 quiet/verbose 门控"原先落成了 `if (!cfg.quiet)`，
+     * 而 quiet 默认 0 —— 于是**默认就打印**，正是注释要消灭的行为
+     * （实测：`libbxroot.so -r / /bin/true` 每次 stderr 多一行 stat OK）。
+     */
+    if (cfg.verbose && !cfg.quiet) {
         struct stat st;
         if (stat(cfg.guest_exe, &st) < 0) {
             fprintf(stderr, "[bxroot-launcher] stat(%s) failed: %s\n", cfg.guest_exe, strerror(errno));
@@ -1719,7 +1883,16 @@ int main(int argc, char **argv) {
     execve(cfg.guest_exe, cfg.guest_argv, environ);
 
     /* 如果到这里说明 execve 失败了 */
-    fprintf(stderr, "错误: execve(%s) 失败: %s\n", cfg.guest_exe, strerror(errno));
-    free_config(&cfg);
-    return 1;
+    {
+        int e = errno;   /* 先存：下面的诊断会调 stat/open，改写 errno */
+        fprintf(stderr, "错误: execve(%s) 失败: %s\n", cfg.guest_exe, strerror(e));
+        if (!cfg.quiet)
+            explain_exec_failure(cfg.guest_exe, cfg.rootfs, e);
+        free_config(&cfg);
+        /*
+         * 与 shell 约定一致：找不到 127，找到但不能执行 126
+         * （原先一律 1，脚本无法区分"命令不存在"与"命令自己失败返回 1"）。
+         */
+        return (e == ENOENT) ? 127 : 126;
+    }
 }

@@ -592,6 +592,16 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# exec 家族与失败诊断（行动清单 #8）：execveat/fexecve 走 trampoline；
+# launcher 按文件内容给出具体失败原因；127/126 退出码；默认静默。
+# ---------------------------------------------------------------------
+if [ -f test/RUN_EXEC_DIAG.sh ]; then
+    run_step "exec 家族与失败诊断" sh test/RUN_EXEC_DIAG.sh
+else
+    run_step "exec 家族与失败诊断"
+fi
+
+# ---------------------------------------------------------------------
 # AF_UNIX sockaddr 双向翻译 + accept(202) 重放（行动清单 #5）
 #
 # sendto/sendmsg 的目标地址正向翻译；getsockname/getpeername/accept/

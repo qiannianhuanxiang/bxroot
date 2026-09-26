@@ -3145,7 +3145,6 @@ static int px_resolve_exec_path(const char *path, const char *path_env,
 /* 真实函数指针。全部懒加载 + 每次判空 —— 空指针解引用在 LD_PRELOAD 里
  * 等于整个容器进程 SIGSEGV，本项目已踩过一次。 */
 static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
-static int (*real_fexecve)(int, char *const[], char *const[]) = NULL;
 static int (*real_execveat)(int, const char *, char *const[], char *const[], int) = NULL;
 static int (*real_posix_spawn)(pid_t *, const char *, const posix_spawn_file_actions_t *,
                                const posix_spawnattr_t *, char *const[], char *const[]) = NULL;
@@ -4417,38 +4416,86 @@ int execle(const char *path, const char *arg, ...)
     return px_do_execve(path, vec, (char *const *)envp, NULL, 0);
 }
 
-int fexecve(int fd, char *const argv[], char *const envp[])
+/*
+ * ★ fexecve / execveat 必须走 px_do_execve（即 trampoline）★
+ *
+ * 【缺陷（2026-09-25 实测）】这两个入口原先把 fd/路径直接交给真实的
+ * fexecve/execveat。而 guest 可执行文件在 app 数据目录（SELinux
+ * app_data_file），**内核禁止直接 exec** —— 正是 px_do_execve 走
+ * trampoline 的原因。于是（guest 内，/usr/bin/true 为例）：
+ *
+ *                                         官方 proroot   bxroot(修前)
+ *     execve("/usr/bin/true")                OK             OK
+ *     execveat(AT_FDCWD,"/usr/bin/true",0)   ENOENT         EACCES
+ *     execveat(dirfd(/usr/bin),"true",0)     EACCES         EACCES
+ *     execveat(fd,"",AT_EMPTY_PATH)          EACCES         EACCES
+ *     fexecve(fd)                            EACCES         EACCES
+ *
+ * 用户面：glibc 的 fexecve、systemd/runc 类工具、Python os.execve(fd,…)、
+ * 以及 "先 open 校验再 exec 同一文件" 的防 TOCTOU 写法全部不可用。
+ *
+ * 【修法】把 (dirfd, path, flags) 还原成一个路径，交给 px_do_execve：
+ *   - path 绝对                         → 原样（dirfd 被忽略，POSIX 语义）
+ *   - path 相对 且 dirfd == AT_FDCWD    → 原样（相对 cwd）
+ *   - path 相对 且 dirfd 是真 fd        → readlink(/proc/self/fd/dirfd)/path
+ *   - AT_EMPTY_PATH 且 path == ""       → readlink(/proc/self/fd/fd)
+ * readlink 拿到的是**宿主视角**路径，px_do_execve 对宿主路径的处理本就
+ * 幂等（翻译不重复拼前缀，guest 视角由它剥前缀得到）。
+ *
+ * 【还原不出来时】（readlink 失败、fd 指向已删除文件 / memfd 等没有
+ * 可用路径的对象）→ 退回真实 execveat，由内核给出权威 errno。那条路径
+ * 在 Android 上仍会 EACCES，但不会比修前更差。
+ *
+ * AT_SYMLINK_NOFOLLOW：末端是符号链接时按内核语义返回 ELOOP，
+ * 不交给 px_do_execve（后者会展开链接）。
+ */
+static int px_fd_host_path(int fd, char *out, size_t outsz)
 {
-    /*
-     * fexecve 没有路径可翻译 —— fd 已经指向宿主上的真实文件，
-     * 而 fd 是调用方通过我们 hook 过的 open 拿到的（已经翻译过）。
-     * 所以这里**只做 envp 重建**，不做路径处理。
-     *
-     * 这仍然必要：不重建 envp 的话，fexecve 出来的进程没有任何钩子，
-     * 前面对 open 的翻译就白做了。
-     */
+    char p[64];
+    long n;
+    struct stat st;
+
+    if (fd < 0 || outsz < 2)
+        return -1;
+    snprintf(p, sizeof(p), "/proc/self/fd/%d", fd);
+    /* 裸 syscall：要内核给的原始宿主路径，不要 readlink 钩子的反向翻译 */
+    n = syscall(SYS_readlinkat, AT_FDCWD, p, out, outsz - 1);
+    if (n <= 0 || (size_t)n >= outsz - 1)
+        return -1;
+    out[n] = '\0';
+    if (out[0] != '/')
+        return -1;                      /* socket:[…]、anon_inode:… 之类 */
+    /* 已删除 / memfd 等：路径不再指向同一对象 → 不能按路径 exec */
+    if (syscall(SYS_newfstatat, AT_FDCWD, out, &st, 0) != 0)
+        return -1;
+    {
+        struct stat fst;
+        if (syscall(SYS_fstat, fd, &fst) != 0 ||
+            fst.st_dev != st.st_dev || fst.st_ino != st.st_ino)
+            return -1;
+    }
+    return 0;
+}
+
+static int px_real_execveat(int dirfd, const char *path, char *const argv[],
+                            char *const envp[], int flags)
+{
     px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     char *const *final_env = envp;
     int rc;
 
-    g_rt_stats.exec_calls++;
     if (px_runtime_build_env(envp, &env) == 0) {
         final_env = env.v;
         g_rt_stats.exec_env_injected++;
     }
-    if (real_fexecve == NULL) {
-        real_fexecve = (int (*)(int, char *const[], char *const[]))
-                           px_dlsym("fexecve");
+    if (real_execveat == NULL) {
+        real_execveat = (int (*)(int, const char *, char *const[], char *const[], int))
+                            px_dlsym("execveat");
     }
-    if (real_fexecve == NULL) {
-        /* fexecve 在部分环境里缺失（Android bionic 早期版本）。
-         * 回落到 /proc/self/fd/N 路径执行 —— 这是 POSIX 允许的等价实现，
-         * 且那条路径会经过我们的 execve（于是路径翻译也生效）。 */
-        char p[64];
-        snprintf(p, sizeof(p), "/proc/self/fd/%d", fd);
-        rc = px_do_execve(p, argv, final_env, NULL, 0);
+    if (real_execveat == NULL) {
+        rc = (int)syscall(SYS_execveat, dirfd, path, argv, final_env, flags);
     } else {
-        rc = real_fexecve(fd, argv, final_env);
+        rc = real_execveat(dirfd, path, argv, final_env, flags);
     }
     if (env.v != NULL) {
         px_env_dispose(&env);
@@ -4459,42 +4506,76 @@ int fexecve(int fd, char *const argv[], char *const envp[])
 int execveat(int dirfd, const char *path, char *const argv[],
              char *const envp[], int flags)
 {
-    /*
-     * execveat 的 path 语义与 openat 相同：绝对路径忽略 dirfd，
-     * 相对路径相对 dirfd。我们只翻译**绝对路径**，相对路径原样转发
-     * （dirfd 已由 open 钩子翻译过）。
-     */
-    char host[PX_PATH_MAX];
-    const char *use = path;
-    px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
-    char *const *final_env = envp;
-    int rc;
+    char full[PX_PATH_MAX];
+    const char *use = NULL;
 
-    g_rt_stats.exec_calls++;
-    if (!px_is_null(path) && path[0] == '/') {
-        int tr = px_runtime_translate(path, host, sizeof(host));
-        if (tr > 0) {
-            use = host;
+    if (px_is_null(path)) {
+        errno = EFAULT;
+        return -1;
+    }
+    if ((flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (path[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH)) {
+            errno = ENOENT;
+            return -1;
+        }
+        if (dirfd == AT_FDCWD) {
+            errno = EACCES;             /* 内核：cwd 是目录，不可 exec */
+            return -1;
+        }
+        if (px_fd_host_path(dirfd, full, sizeof(full)) == 0)
+            use = full;
+    } else if (path[0] == '/' || dirfd == AT_FDCWD) {
+        use = path;
+    } else {
+        char dir[PX_PATH_MAX];
+        size_t dl, pl = strlen(path);
+        if (px_fd_host_path(dirfd, dir, sizeof(dir)) == 0) {
+            dl = strlen(dir);
+            if (dl + 1 + pl + 1 <= sizeof(full)) {
+                memcpy(full, dir, dl);
+                full[dl] = '/';
+                memcpy(full + dl + 1, path, pl + 1);
+                use = full;
+            } else {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
         }
     }
-    if (px_runtime_build_env(envp, &env) == 0) {
-        final_env = env.v;
-        g_rt_stats.exec_env_injected++;
+
+    if (use == NULL) {
+        g_rt_stats.exec_calls++;
+        return px_real_execveat(dirfd, path, argv, envp, flags);
     }
-    if (real_execveat == NULL) {
-        real_execveat = (int (*)(int, const char *, char *const[], char *const[], int))
-                            px_dlsym("execveat");
+
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        char host[PX_PATH_MAX];
+        struct stat lst;
+        const char *probe = use;
+        if (use[0] == '/' && px_runtime_translate(use, host, sizeof(host)) > 0)
+            probe = host;
+        if (syscall(SYS_newfstatat, AT_FDCWD, probe, &lst,
+                    AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lst.st_mode)) {
+            errno = ELOOP;
+            return -1;
+        }
     }
-    if (real_execveat == NULL) {
-        errno = ENOSYS;
-        rc = -1;
-    } else {
-        rc = real_execveat(dirfd, use, argv, final_env, flags);
+    return px_do_execve(use, argv, envp, NULL, 0);
+}
+
+int fexecve(int fd, char *const argv[], char *const envp[])
+{
+    /* fexecve(fd) ≡ execveat(fd, "", argv, envp, AT_EMPTY_PATH)（glibc 同此实现） */
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
     }
-    if (env.v != NULL) {
-        px_env_dispose(&env);
-    }
-    return rc;
+    return execveat(fd, "", argv, envp, AT_EMPTY_PATH);
 }
 
 /* ------------------------------------------------------------------ */
