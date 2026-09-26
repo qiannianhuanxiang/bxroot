@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <gnu/libc-version.h>
 
 /* ================================================================== */
 /* §0  分配器注入                                                      */
@@ -2301,15 +2302,48 @@ static void px_rt_unlock(void *ud)
  */
 void px_heal_thread_list(void);
 
-/* 实测常量：glibc 2.39 aarch64 的 struct pthread 布局。
- * 这两个值由两条独立证据交叉确认（tcb-pthread_self 差值 + 崩溃指令
- * 反推出的偏移），不是从某个版本的头文件里抄的。 */
-#define PX_TCB_TO_PD      0x740u   /* pthread_self = tpidr_el0 - 0x740 */
+/* 实测常量：glibc aarch64 的 struct pthread 布局。
+ * 2.39 的两个值由两条独立证据交叉确认（tcb-pthread_self 差值 + 崩溃指令
+ * 反推出的偏移），不是从某个版本的头文件里抄的。
+ *
+ * ★ 2.41 的 pd 偏移变了（2026-09-26，Debian 13 rootfs 实测）★
+ * `objdump -d libc.so.6` 里 __libc_fork 的形态：
+ *     2.39:  sub x23, x26, #0x740   ; pd = TCB-0x740   ldp x4,x3,[x1,#-128] (x1=TCB-0x600 → 节点 TCB-0x680)
+ *     2.41:  sub x22, x26, #0x720   ; pd = TCB-0x720   ldp x4,x3,[x1,#-96]  (x1=TCB-0x600 → 节点 TCB-0x660)
+ * 两版 list 都在 pd+0xC0；变的是 struct pthread 的总大小。用 2.39 的
+ * 0x740 去修 2.41 会把自环写到 pd-0x20 处的别的字段上，真正的 list
+ * 节点仍是 NULL → fork 子进程照旧 SIGSEGV（实测 fault=0x8，
+ * 与原缺陷同址）。所以按 gnu_get_libc_version() 精确选偏移；
+ * 没有登记的版本**不动**（宁可少修，不可错写）。 */
+#define PX_TCB_TO_PD_2_39 0x740u   /* pthread_self = tpidr_el0 - 0x740 */
+#define PX_TCB_TO_PD_2_41 0x720u
 #define PX_PD_LIST_OFF    0xC0u    /* offsetof(struct pthread, list)   */
+
+static unsigned px_tcb_to_pd(void)
+{
+    const char *v = gnu_get_libc_version();
+
+    if (v == NULL) {
+        return 0;
+    }
+    if (strcmp(v, "2.39") == 0) {
+        return PX_TCB_TO_PD_2_39;
+    }
+    if (strcmp(v, "2.41") == 0) {
+        return PX_TCB_TO_PD_2_41;
+    }
+    return 0;
+}
 
 void px_heal_thread_list(void)
 {
     unsigned long tcb;
+    unsigned tcb_to_pd = px_tcb_to_pd();
+
+    if (tcb_to_pd == 0) {
+        PX_LOG("proc: 未登记的 glibc 版本，跳过线程链表修复");
+        return;
+    }
 
     /*
      * tpidr_el0 就是 TCB 基址：glibc 把 struct pthread 放在它下面，
@@ -2321,7 +2355,7 @@ void px_heal_thread_list(void)
     }
 
     {
-        uintptr_t pd   = (uintptr_t)tcb - PX_TCB_TO_PD;
+        uintptr_t pd   = (uintptr_t)tcb - tcb_to_pd;
         uintptr_t *lst = (uintptr_t *)(pd + PX_PD_LIST_OFF);
 
         /*
