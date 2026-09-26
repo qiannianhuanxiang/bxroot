@@ -3283,6 +3283,35 @@ static void *px_dlsym(const char *name)
  *
  * 返回 0 表示「本函数已经尝试过 exec；能返回就说明失败了」。
  */
+/*
+ * ★ 内部 exec 必须发**真 svc**，不能调 syscall() ★
+ *
+ * proc.c 编进 runtime 后，`syscall` 这个符号解析到的是 syscall_guard.c 的
+ * **钩子**。而钩子（2026-09-25 起）把 221/281 转回本文件的 exec 钩子 →
+ * trampoline → syscall(SYS_execve) → 钩子 … 无限递归，实测栈溢出 SIGSEGV。
+ * 所以 trampoline/stub/回退路径一律用这个内联 svc。
+ */
+static long px_raw_svc5(long nr, long a, long b, long c, long d, long e)
+{
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    register long x4 __asm__("x4") = e;
+    __asm__ __volatile__("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+        : "memory", "cc");
+    if (x0 < 0 && x0 > -4096) {
+        errno = (int)-x0;
+        return -1;
+    }
+    return x0;
+}
+#define PX_RAW_EXECVE(p, a, e) \
+    px_raw_svc5(SYS_execve, (long)(p), (long)(a), (long)(e), 0, 0)
+
 static int px_trampoline_exec(const char *host, char *const argv[],
                               char *const *envp, const char *argv0,
                               const char *preload)
@@ -3402,7 +3431,7 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * 而且裸 syscall 也顺带绕开了 syscall_guard 对 execve 的路径翻译
      * （bridge 在 /data/app 下，翻译后必然不存在）。
      */
-    (void)syscall(SYS_execve, tramp_path, nv, (char *const *)envp);
+    (void)PX_RAW_EXECVE(tramp_path, nv, (char *const *)envp);
     return 0;   /* 能返回就是失败了 */
 }
 
@@ -3590,7 +3619,7 @@ static int px_stub_exec(const char *host, char *const argv[],
         return -1;
     }
     PX_LOG("proc: 无 PT_INTERP 的 ELF，经 stub-loader 执行 %s", host);
-    (void)syscall(SYS_execve, sp->path, sp->nv, sp->ne);
+    (void)PX_RAW_EXECVE(sp->path, sp->nv, sp->ne);
     free(sp->ne);
     free(sp);
     return 0;
@@ -4715,7 +4744,8 @@ static int px_real_execveat(int dirfd, const char *path, char *const argv[],
                             px_dlsym("execveat");
     }
     if (real_execveat == NULL) {
-        rc = (int)syscall(SYS_execveat, dirfd, path, argv, final_env, flags);
+        rc = (int)px_raw_svc5(SYS_execveat, dirfd, (long)path, (long)argv,
+                              (long)final_env, flags);
     } else {
         rc = real_execveat(dirfd, path, argv, final_env, flags);
     }
@@ -4788,6 +4818,22 @@ int execveat(int dirfd, const char *path, char *const argv[],
         }
     }
     return px_do_execve(use, argv, envp, NULL, 0);
+}
+
+/*
+ * 给 syscall_guard.c 的桥：`syscall(SYS_execve/SYS_execveat, …)` 转到这里。
+ * 返回值按 syscall(3) 的 libc 约定（-1 + errno）。
+ */
+int bxroot_exec_hook_execve(const char *path, char *const argv[],
+                            char *const envp[])
+{
+    return px_do_execve(path, argv, envp, NULL, 0);
+}
+
+int bxroot_exec_hook_execveat(int dirfd, const char *path, char *const argv[],
+                              char *const envp[], int flags)
+{
+    return execveat(dirfd, path, argv, envp, flags);
 }
 
 int fexecve(int fd, char *const argv[], char *const envp[])

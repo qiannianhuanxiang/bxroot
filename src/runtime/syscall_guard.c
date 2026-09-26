@@ -45,6 +45,18 @@
 #include <stddef.h>
 #include <unistd.h>
 #include <string.h>
+#include <limits.h>   /* PATH_MAX：exec 转发判定用 */
+
+/*
+ * AT_FDCWD 的 ABI 值（-100）。
+ *
+ * 本文件刻意**不包含** <fcntl.h>（它只做裸系统调用，且要能被
+ * 单测单独编译），所以这里自带常量 —— 与文件既有的
+ * SG_AT_FDCWD 用法一致。
+ */
+#ifndef SG_AT_FDCWD
+#define SG_AT_FDCWD (-100)
+#endif
 
 #include "syscall_guard.h"
 
@@ -867,6 +879,12 @@ unsigned bxroot_test_path_arg_mask(long nr)
 /* 对外接口                                                            */
 /* ------------------------------------------------------------------ */
 
+/* proc.c 的 exec 钩子（强符号在 runtime 里；单测里为 NULL） */
+extern int bxroot_exec_hook_execve(const char *, char *const[], char *const[])
+    __attribute__((weak));
+extern int bxroot_exec_hook_execveat(int, const char *, char *const[],
+                                     char *const[], int) __attribute__((weak));
+
 long syscall(long number, ...)
 {
     va_list ap;
@@ -925,6 +943,72 @@ long syscall(long number, ...)
             log_num("[bxroot] syscall_guard: 拦截 ", number, " -> ENOSYS\n");
         errno = ENOSYS;
         return -1;
+    }
+
+    /*
+     * ★ 裸 syscall(SYS_execve / SYS_execveat) 交给 exec 钩子 ★
+     *
+     * 【缺陷（2026-09-25 实测）】exec 必须走 trampoline（guest 可执行文件
+     * 在 app_data_file 目录，内核禁止直接 exec），而 `syscall(221/281, …)`
+     * 原先只做路径翻译就发真 svc → 恒 EACCES。libc 钩子早已覆盖
+     * execve/execveat/fexecve（proc.c），这里把两个号转过去即可 ——
+     * 同一套 trampoline / shebang / 静态 ELF 逻辑，不再维护第二份。
+     * 用 weak 引用：单独编译本文件的单测里没有它们，退回原路径。
+     */
+    if (number == 221 /* execve */ && bxroot_exec_hook_execve != NULL) {
+        const char *ep = (const char *)a0;
+        /*
+         * ★ 只转**容器内**目标（rootfs 内 guest 路径）★
+         *
+         * 【回归（2026-09-25 实测）】首版无条件转发，把**宿主视角**目标
+         * 也推进了 trampoline：
+         *     syscall(SYS_execve, "/proc/self/root/system/bin/sh", …)
+         *       旧行为（翻译后发真 svc）: status=0   ✅（宿主 sh 起得来）
+         *       无条件转发后            : status=512 ❌（被 linker 拒绝）
+         * 而宿主程序**本来就不该**走容器装载链 —— 它不在 rootfs 内，
+         * 由内核直接加载即可。trampoline 是为绕开 app_data_file 的
+         * exec 限制而存在的，与宿主路径无关。
+         *
+         * 判据用 bxroot_translate_path 的返回值（约定与 translate_path
+         * 一致）：>0 = 需要加 rootfs 前缀 = 容器内目标 → 转发；
+         * ==0 = 无需翻译（宿主视角/相对名）→ 保持旧行为发真 svc。
+         */
+        if (ep != NULL && ep[0] == '/') {
+            char tr[PATH_MAX * 2];
+            if (bxroot_translate_path(ep, tr, sizeof(tr)) > 0)
+                return bxroot_exec_hook_execve(ep, (char *const *)a1,
+                                               (char *const *)a2);
+        }
+    }
+    if (number == 281 /* execveat */ && bxroot_exec_hook_execveat != NULL) {
+        const char *ep = (const char *)a1;
+        int dfd = (int)a0;
+        /*
+         * ★ execveat 的三种形态都要覆盖 ★
+         *
+         *   ① 绝对路径            → 与 execve 同判据（rootfs 内才转发）
+         *   ② 真 dirfd + 相对路径 → 本层还原不了（要 dirfd），直接转发，
+         *      由 proc.c 的 execveat 用 readlink(/proc/self/fd/N) 还原
+         *   ③ AT_EMPTY_PATH + ""  → **必须转发**：fd 指向的是容器内可执行
+         *      文件，只有 exec 钩子那条路能走 trampoline。
+         *      首版用 `ep[0] == '/'` 判定，把这一形态排除在外 → 实测
+         *      `syscall(SYS_execveat, fd, "", …, AT_EMPTY_PATH)` 恒 EACCES。
+         *
+         * 只有"宿主视角绝对路径"（/proc/self/root/…、/system/…）需要
+         * 留在本地发真 svc —— 与 execve 分支同一个理由。
+         */
+        if (ep == NULL) {
+            /* 空指针：交给下面的翻译分支（它会如实报 EFAULT） */
+        } else if (ep[0] == '\0' || dfd != SG_AT_FDCWD || ep[0] != '/') {
+            /* ②③ 与"真 dirfd 相对"：容器内可能性高，一律转发 */
+            return bxroot_exec_hook_execveat(dfd, ep, (char *const *)a2,
+                                             (char *const *)a3, (int)a4);
+        } else {
+            char tr[PATH_MAX * 2];
+            if (bxroot_translate_path(ep, tr, sizeof(tr)) > 0)
+                return bxroot_exec_hook_execveat(dfd, ep, (char *const *)a2,
+                                                 (char *const *)a3, (int)a4);
+        }
     }
 
     pmask = path_arg_mask(number);

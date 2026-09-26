@@ -58,6 +58,10 @@ else
         || bad "不存在：$(grep nonexist "$W/bx.txt")"
     grep 'fexecve(-1)' "$W/bx.txt" | grep -q 'errno=9 ' && good "fexecve(-1) → EBADF" \
         || bad "fexecve(-1)：$(grep 'fexecve(-1)' "$W/bx.txt")"
+    for k in 'syscall(SYS_execve)' 'syscall(SYS_execveat,AT_FDCWD)' 'syscall(SYS_execveat,fd,EMPTY)'; do
+        grep -F "$k " "$W/bx.txt" | grep -q 'OK out=hi' && good "$k 执行成功（裸 syscall 入口）" \
+            || bad "$k：$(grep -F "$k " "$W/bx.txt" | head -1)"
+    done
 fi
 
 echo "--- B) launcher 失败诊断 ---"

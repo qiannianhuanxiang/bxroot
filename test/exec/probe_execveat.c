@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 extern char**environ;
 #define T(name, call) do{ int pp[2]; pipe(pp); if(fork()==0){ close(pp[0]); dup2(pp[1],1); errno=0; call; dprintf(2,"%-44s FAIL errno=%d %s\n",name,errno,strerror(errno)); _exit(99);} close(pp[1]); char b[256]={0}; int n=read(pp[0],b,255); close(pp[0]); int st; wait(&st); if(WIFEXITED(st)&&WEXITSTATUS(st)==0) printf("%-44s OK out=%.*s",name,n>0?n:0,b); }while(0)
 int main(void){ setvbuf(stdout,0,_IONBF,0); char *a[]={"echo","hi",0}; char *s[]={"s.sh",0};
@@ -27,4 +28,8 @@ int main(void){ setvbuf(stdout,0,_IONBF,0); char *a[]={"echo","hi",0}; char *s[]
  T("execveat(link,NOFOLLOW) 期望ELOOP", execveat(AT_FDCWD,"/tmp/xlnk",a,environ,AT_SYMLINK_NOFOLLOW));
  T("execveat(AT_FDCWD,\"/nonexist\",0) 期望ENOENT", execveat(AT_FDCWD,"/nonexist",a,environ,0));
  T("fexecve(-1) 期望EBADF", fexecve(-1,a,environ));
+ /* 裸 syscall(3) 形式：syscall_guard 的钩子要把 221/281 转给 exec 钩子（走 trampoline） */
+ T("syscall(SYS_execve)", syscall(SYS_execve,"/usr/bin/echo",a,environ));
+ T("syscall(SYS_execveat,AT_FDCWD)", syscall(SYS_execveat,AT_FDCWD,"/usr/bin/echo",a,environ,0));
+ T("syscall(SYS_execveat,fd,EMPTY)", syscall(SYS_execveat,fd,"",a,environ,AT_EMPTY_PATH));
  unlink("/tmp/xs.sh"); unlink("/tmp/xlnk"); return 0; }
