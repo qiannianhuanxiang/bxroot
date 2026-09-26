@@ -125,6 +125,17 @@ echo; echo "=== K kill-on-exit / 内核版本伪装 ==="
 out=$(bxw -k 4.19.0-bx -r "$RF" /usr/bin/uname -r 2>&1)
 [ "$out" = "4.19.0-bx" ] && pass K1 "uname -r 伪装 -> $out" || fail K1 "[$out]"
 
+echo; echo "=== X 沙箱逃逸（需先把 test/probe_escape_*.c 编译为 rootfs/tmp/esc 与 esc2）==="
+echo CANARY > "$HERE/canary"; mkdir -p "$HERE/hd"; echo CANARY > "$HERE/hd/canary"
+if [ -x "$RF/tmp/esc" ]; then
+    out=$(bxw -r "$RF" /tmp/esc "$HERE" 2>&1 | tail -1)
+    [ "$out" = "DONE escapes=0" ] && pass X1 "\`..\` 0 逃逸" || fail X1 "$out"
+else info X1 "跳过（无 /tmp/esc）"; fi
+if [ -x "$RF/tmp/esc2" ]; then
+    out=$(bxw -r "$RF" /tmp/esc2 "$HERE/hd" 2>&1 | tail -1)
+    [ "$out" = "DONE escapes=0" ] && [ "$(ls "$HERE/hd" | wc -l)" -eq 1 ] && pass X2 "宿主绝对链接 0 逃逸" || fail X2 "$out"
+else info X2 "跳过（无 /tmp/esc2）"; fi
+
 echo; echo "=== 详细诊断（FAIL 时看这里）==="
 bxw -v 1 -r "$RF" /bin/cat /etc/hostname 2>&1 | head -30
 

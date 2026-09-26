@@ -495,10 +495,192 @@ static void init_config(void) {
         g_config.bind_count);
 }
 
+/*
+ * ★ `..` 沙箱逃逸修复（2026-09-27，真机爆破测试发现）★
+ *
+ * 【缺陷】translate_path 只做"加 rootfs 前缀"，从不处理 `..`。于是
+ *     open("/../canary")  →  open("<rootfs>/../canary")
+ * 由**内核**解析，`..` 直接走出 rootfs —— guest 能读写 rootfs 之外的
+ * 任意文件。实测（Termux 真机 14 种写法、容器 11 种全部逃逸）：
+ *     /../x  /tmp/../../x  //..//x  /./../x  /proc/self/root/../x
+ *     /proc/self/cwd/../x  syscall(SYS_openat,…)  openat(dirfd "/",
+ *     "../x")  符号链接目标 "/../x" ……
+ * 另：`/dev/../x`、`/proc/../x` 走"特殊路径透传"，同样直达宿主。
+ * 上游 proot 语义：guest 的根就是根，`/..` == `/`（canonicalize 夹紧）。
+ *
+ * 【修法】路径含 `..` 组件时，在 **guest 视角**逐组件解析：
+ *   - `.` 跳过；`..` 弹出上一组件，到根即停（夹紧）；
+ *   - 普通组件若**后面还有组件**且是符号链接，就地展开（绝对目标从 guest
+ *     根重来、相对目标拼到父目录），与内核一样先解链接再 `..`，所以
+ *     `/bin/../x`（bin -> usr/bin）得到 `/usr/x` 而不是字面的 `/x`；
+ *   - 叶子不展开（留给调用方按 O_NOFOLLOW / AT_SYMLINK_NOFOLLOW 处理）；
+ *   - /proc 魔法链接（root/cwd/fd/N/exe）用 proc_magic_link_target 取
+ *     guest 视角目标（内核给的是宿主视角）。
+ * 结果不含 `..`，再走原来的翻译逻辑（bind / 特殊路径 / 加前缀）。
+ * 不含 `..` 的路径完全不受影响（只多一次 strstr）。
+ */
+static int proc_magic_link_target(const char *hostp, char *out, size_t outsz);
+static int translate_path(const char *path, char *out, size_t out_size);
+
+static int path_has_dotdot(const char *p)
+{
+    const char *q;
+    for (q = p; (q = strstr(q, "..")) != NULL; q += 2) {
+        if ((q == p || q[-1] == '/') && (q[2] == '\0' || q[2] == '/'))
+            return 1;
+    }
+    return 0;
+}
+
+/* 0 = out 为解析后的 guest 绝对路径；-1 = 过长；-2 = 链接过多（errno=ELOOP） */
+static int guest_resolve_dotdot(const char *in, char *out, size_t outsz)
+{
+    char rest[MAX_PATH_LEN];
+    char cur[MAX_PATH_LEN];
+    char tmp[MAX_PATH_LEN];
+    size_t cl = 0;
+    int links = 0;
+    int trailing;
+    char *r;
+    size_t il = strlen(in);
+
+    if (il >= sizeof(rest))
+        return -1;
+    trailing = (il > 1 && in[il - 1] == '/');
+    memcpy(rest, in, il + 1);
+    cur[0] = '\0';
+    r = rest;
+    ensure_real_functions();
+
+    for (;;) {
+        char *e;
+        size_t n;
+        int last;
+        char tgt[MAX_PATH_LEN];
+        ssize_t tn = -1;
+
+        while (*r == '/')
+            r++;
+        if (*r == '\0')
+            break;
+        e = strchr(r, '/');
+        n = e ? (size_t)(e - r) : strlen(r);
+        last = (e == NULL) || (e[strspn(e, "/")] == '\0');
+
+        if (n == 1 && r[0] == '.') {
+            r += n;
+            continue;
+        }
+        if (n == 2 && r[0] == '.' && r[1] == '.') {
+            char *s = strrchr(cur, '/');
+            if (s != NULL) {
+                *s = '\0';
+                cl = (size_t)(s - cur);
+            }
+            r += n;
+            continue;
+        }
+        if (cl + 1 + n + 1 > sizeof(cur))
+            return -1;
+        cur[cl++] = '/';
+        memcpy(cur + cl, r, n);
+        cl += n;
+        cur[cl] = '\0';
+        r += n;
+        if (last)
+            break;                      /* 叶子不展开 */
+
+        /* 中间组件：是链接就展开 */
+        if (strncmp(cur, "/proc/", 6) == 0 &&
+            proc_magic_link_target(cur, tgt, sizeof(tgt)) == 1) {
+            tn = (ssize_t)strlen(tgt);
+        } else if (real_readlink != NULL) {
+            char host[MAX_PATH_LEN];
+            if (translate_path(cur, host, sizeof(host)) >= 0)
+                tn = real_readlink(host, tgt, sizeof(tgt) - 1);
+            if (tn > 0)
+                tgt[tn] = '\0';
+        }
+        if (tn <= 0)
+            continue;
+        if (++links > 40) {
+            errno = ELOOP;
+            return -2;
+        }
+        /* 新的待处理串 = tgt + "/" + 剩余 */
+        {
+            size_t rl = strlen(r);
+            if ((size_t)tn + 1 + rl + 1 > sizeof(tmp))
+                return -1;
+            memcpy(tmp, tgt, (size_t)tn);
+            tmp[tn] = '/';
+            memcpy(tmp + tn + 1, r, rl + 1);
+        }
+        memcpy(rest, tmp, strlen(tmp) + 1);
+        r = rest;
+        if (tgt[0] == '/') {
+            cl = 0;                     /* 绝对目标：从 guest 根重来 */
+            cur[0] = '\0';
+        } else {
+            char *s = strrchr(cur, '/');  /* 相对目标：去掉链接自身 */
+            if (s != NULL) {
+                *s = '\0';
+                cl = (size_t)(s - cur);
+            }
+        }
+    }
+
+    if (cl == 0) {
+        if (outsz < 2)
+            return -1;
+        memcpy(out, "/", 2);
+        return 0;
+    }
+    if (cl + (trailing ? 1 : 0) + 1 > outsz)
+        return -1;
+    memcpy(out, cur, cl);
+    if (trailing)
+        out[cl++] = '/';
+    out[cl] = '\0';
+    return 0;
+}
+
 /* 翻译路径：绝对路径加上 rootfs 前缀，处理 bind mount */
 static int translate_path(const char *path, char *out, size_t out_size) {
     if (!path || !out || out_size == 0) {
         return -1;
+    }
+
+    /* `..` 夹紧（见 guest_resolve_dotdot 的说明）。rootfs 前缀的宿主路径
+     * （resolve_dirfd_path 拼出的 "<rootfs>/../x"）先剥回 guest 视角。 */
+    if (path[0] == '/' && path_has_dotdot(path)) {
+        char g[MAX_PATH_LEN];
+        const char *gp = path;
+        const char *rf = g_config.rootfs ? g_config.rootfs : "";
+        size_t rl = strlen(rf);
+        int rr;
+
+        if (rl > 0 && strncmp(path, rf, rl) == 0 &&
+            (path[rl] == '\0' || path[rl] == '/'))
+            gp = path[rl] ? path + rl : "/";
+        rr = guest_resolve_dotdot(gp, g, sizeof(g));
+        if (rr == 0)
+            return translate_path(g, out, out_size);
+        /*
+         * ★ 失败必须"关闭"（fail closed）★ 调用方普遍是
+         * `if (translate_path(...) > 0) p = translated;`，返回 <0 会让原串
+         * `/../x` 原样进内核 —— 从**宿主根**解析，比不修还糟。所以给一个
+         * rootfs 内必不存在的路径（→ ENOENT），而不是报错放行。
+         */
+        LOG("translate: `..` 解析失败(%d): %s", rr, path);
+        {
+            int saved = errno;
+            int w = snprintf(out, out_size, "%s/.bxroot-unresolvable-path", rf);
+            errno = saved;
+            if (w < 0 || (size_t)w >= out_size)
+                return -1;
+        }
+        return 1;
     }
 
     /* 相对路径，不翻译 */
@@ -2431,6 +2613,57 @@ int bxroot_resolve_leaf_links(const char *path, char *out, size_t out_size) {
     return 0;
 }
 
+
+/*
+ * ★ translate_follow：翻译 + 按 guest 视角跟随全部符号链接（BXR-ESC-3）★
+ *
+ * 【缺陷（2026-09-27 真机爆破）】大批"跟随型"钩子只做
+ *     if (translate_path(path, tr, sz) > 0) p = tr;
+ * 然后把 `<rootfs>/tmp/L` 交给内核。L 若是**绝对目标**链接
+ * （`ln -s /data/data/.../canary /tmp/L`），内核按**宿主根**跟随 ——
+ * fopen / access / opendir / truncate / chmod / chown / creat /
+ * __open_nocancel / statfs / *xattr / inotify / mkdir 全部读写到 rootfs 之外
+ * （真机实测 fopen/access/opendir/truncate/chmod 5 项逃逸）。
+ *
+ * 修法：这些钩子统一走本函数。stat_pre_resolve 负责中间组件 + 叶子
+ * （它已是 stat 家族的实现）；AT_SYMLINK_NOFOLLOW 语义的钩子（lchown、
+ * l*xattr、mkdir 的叶子等）调用时传 nofollow=1，只展开中间组件。
+ * 返回值约定同 translate_path（>0 = out 可用），链接环返回 -1 且 errno=ELOOP。
+ */
+static int stat_pre_resolve(const char *translated, int dirfd, int flags,
+                            char *out, size_t out_size);
+static int translate_follow(const char *path, char *out, size_t out_size, int nofollow)
+{
+    char tr[MAX_PATH_LEN];
+    char res[MAX_PATH_LEN];
+    int t = translate_path(path, tr, sizeof(tr));
+    int rr;
+
+    if (t <= 0)
+        return t;
+    if (nofollow) {
+        int saved = errno;
+        rr = resolve_intermediate_symlinks(tr, res, sizeof(res));
+        errno = saved;
+        if (rr == -2)
+            return -1;
+    } else {
+        rr = stat_pre_resolve(tr, AT_FDCWD, 0, res, sizeof(res));
+        if (rr == -2)
+            return -1;
+    }
+    if (rr == 1) {
+        if (strlen(res) >= out_size)
+            return -1;
+        memcpy(out, res, strlen(res) + 1);
+    } else {
+        if (strlen(tr) >= out_size)
+            return -1;
+        memcpy(out, tr, strlen(tr) + 1);
+    }
+    return 1;
+}
+
 static int stat_pre_resolve(const char *translated, int dirfd, int flags,
                             char *out, size_t out_size)
 {
@@ -2663,9 +2896,18 @@ int open(const char *path, int flags, ...) {
                         errno = 0;
                         return fd2;
                     }
+                    return -1;  /* ★ 见 BXR-ESC-2：不得回退让内核按宿主根跟随 ★ */
                 }
             }
-            /* 解析失败 → 退回原语义（让内核给权威 errno） */
+            /*
+             * ★ BXR-ESC-2（2026-09-27 真机爆破）★ rr==1（已按 guest 视角解析出
+             * 目标）但打开失败时**直接返回该失败**，绝不回退到 open(q)：
+             * q 是链接本体，交给内核会按**宿主根**跟随绝对目标。实测
+             *     ln -s /data/data/com.termux/files/home/canary /tmp/l3
+             *     cat /tmp/l3   → 读到 rootfs 外的 canary（修前）/ ENOENT（修后）
+             * guest 视角目标不存在时 ENOENT 才是权威 errno（悬空链接语义）。
+             * 仅 rr==0（解析器未能处理）时仍退回原语义。
+             */
             return call_real_open(q, flags, mode);
         }
         return open_retry_abs_symlink(q, flags, mode);
@@ -2767,6 +3009,7 @@ int open64(const char *path, int flags, ...) {
                         errno = 0;   /* 见 open() 钩子 BXR-16-01 注释 */
                         return fd2;
                     }
+                    return -1;  /* 见 BXR-ESC-2 */
                 }
                 return real_open64(q, flags, mode);
             }
@@ -2972,6 +3215,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
                     errno = 0;   /* 见 open() 钩子 BXR-16-01 注释 */
                     return fd2;
                 }
+                return -1;  /* 见 BXR-ESC-2 */
             }
             return call_real_openat(dirfd, q, flags, mode);
         }
@@ -3026,6 +3270,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
                     errno = 0;   /* 见 open() 钩子 BXR-16-01 注释 */
                     return fd2;
                 }
+                return -1;  /* 见 BXR-ESC-2 */
             }
             return real_openat64(dirfd, q, flags, mode);
         }
@@ -3464,7 +3709,7 @@ int access(const char *path, int mode) {
     int have_st = 0;
     int rc;
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
 
     /*
@@ -3723,7 +3968,7 @@ int chown(const char *path, uid_t uid, gid_t gid) {
     char translated[MAX_PATH_LEN];
     const char *p = path;
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fr_do_chown(p, uid, gid, 0);
 }
@@ -3732,7 +3977,7 @@ int lchown(const char *path, uid_t uid, gid_t gid) {
     char translated[MAX_PATH_LEN];
     const char *p = path;
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fr_do_chown(p, uid, gid, 1);
 }
@@ -5259,7 +5504,7 @@ char *canonicalize_file_name(const char *path) {
         fn = (char *(*)(const char *))bxroot_next_symbol("canonicalize_file_name");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
 
     {
@@ -5525,7 +5770,7 @@ int mkdir(const char *path, mode_t mode) {
         fn = (int (*)(const char *, mode_t))bxroot_next_symbol("mkdir");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fn(p, mode);
 }
@@ -5553,7 +5798,7 @@ int rmdir(const char *path) {
         fn = (int (*)(const char *))bxroot_next_symbol("rmdir");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fn(p);
 }
@@ -5690,7 +5935,7 @@ int chmod(const char *path, mode_t mode) {
         fn = (int (*)(const char *, mode_t))bxroot_next_symbol("chmod");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
 
     rc = fn(p, mode);
@@ -6207,7 +6452,7 @@ int statfs(const char *path, struct statfs *buf) {
         fn = (int (*)(const char *, struct statfs *))bxroot_next_symbol("statfs");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, buf);
 }
@@ -6221,7 +6466,7 @@ int statvfs(const char *path, struct statvfs *buf) {
         fn = (int (*)(const char *, struct statvfs *))bxroot_next_symbol("statvfs");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, buf);
 }
@@ -6235,7 +6480,7 @@ int truncate(const char *path, off_t length) {
         fn = (int (*)(const char *, off_t))bxroot_next_symbol("truncate");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, length);
 }
@@ -6249,7 +6494,7 @@ int creat(const char *path, mode_t mode) {
         fn = (int (*)(const char *, mode_t))bxroot_next_symbol("creat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
 
     {
@@ -7288,7 +7533,8 @@ int __open_nocancel(const char *path, int flags, mode_t mode) {
         fn = (int (*)(const char *, int, mode_t))bxroot_next_symbol("__open_nocancel");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated),
+                         (flags & (O_NOFOLLOW | O_CREAT)) != 0) > 0)
         p = translated;
     return fn(p, flags, mode);
 }
@@ -7302,7 +7548,8 @@ int __open64_nocancel(const char *path, int flags, mode_t mode) {
         fn = (int (*)(const char *, int, mode_t))bxroot_next_symbol("__open64_nocancel");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated),
+                         (flags & (O_NOFOLLOW | O_CREAT)) != 0) > 0)
         p = translated;
     return fn(p, flags, mode);
 }
@@ -7533,7 +7780,7 @@ ssize_t getxattr(const char *path, const char *name, void *value, size_t size) {
              bxroot_next_symbol("getxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, name, value, size);
 }
@@ -7548,7 +7795,7 @@ ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) 
              bxroot_next_symbol("lgetxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fn(p, name, value, size);
 }
@@ -7564,7 +7811,7 @@ int setxattr(const char *path, const char *name, const void *value,
              bxroot_next_symbol("setxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, name, value, size, flags);
 }
@@ -7580,7 +7827,7 @@ int lsetxattr(const char *path, const char *name, const void *value,
              bxroot_next_symbol("lsetxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fn(p, name, value, size, flags);
 }
@@ -7595,7 +7842,7 @@ ssize_t listxattr(const char *path, char *list, size_t size) {
              bxroot_next_symbol("listxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, list, size);
 }
@@ -7610,7 +7857,7 @@ ssize_t llistxattr(const char *path, char *list, size_t size) {
              bxroot_next_symbol("llistxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fn(p, list, size);
 }
@@ -7624,7 +7871,7 @@ int removexattr(const char *path, const char *name) {
         fn = (int (*)(const char *, const char *))bxroot_next_symbol("removexattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, name);
 }
@@ -7638,7 +7885,7 @@ int lremovexattr(const char *path, const char *name) {
         fn = (int (*)(const char *, const char *))bxroot_next_symbol("lremovexattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fn(p, name);
 }
@@ -7653,7 +7900,7 @@ int inotify_add_watch(int fd, const char *path, uint32_t mask) {
         fn = (int (*)(int, const char *, uint32_t))bxroot_next_symbol("inotify_add_watch");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(fd, p, mask);
 }
@@ -7857,7 +8104,7 @@ int statfs64(const char *path, struct statfs64 *buf) {
         fn = (int (*)(const char *, struct statfs64 *))bxroot_next_symbol("statfs64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, buf);
 }
@@ -7871,7 +8118,7 @@ int statvfs64(const char *path, struct statvfs64 *buf) {
         fn = (int (*)(const char *, struct statvfs64 *))bxroot_next_symbol("statvfs64");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, buf);
 }
@@ -10221,7 +10468,7 @@ DIR *opendir(const char *path) {
     ensure_real_functions();
 
     char translated[MAX_PATH_LEN];
-    if (translate_path(path, translated, sizeof(translated)) > 0) {
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0) {
         LOG("opendir: %s -> %s", path, translated);
         return real_opendir(translated);
     }
@@ -10233,7 +10480,7 @@ FILE *fopen(const char *path, const char *mode) {
     ensure_real_functions();
 
     char translated[MAX_PATH_LEN];
-    if (translate_path(path, translated, sizeof(translated)) > 0) {
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0) {
         LOG("fopen: %s -> %s", path, translated);
         return real_fopen(translated, mode);
     }
@@ -10245,7 +10492,7 @@ FILE *fopen64(const char *path, const char *mode) {
     ensure_real_functions();
 
     char translated[MAX_PATH_LEN];
-    if (translate_path(path, translated, sizeof(translated)) > 0) {
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0) {
         return real_fopen64(translated, mode);
     }
     return real_fopen64(path, mode);
@@ -10296,7 +10543,7 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
     /* path == NULL 时 freopen 用于"改 mode"，没有路径可翻译 */
     if (path != NULL) {
         char translated[MAX_PATH_LEN];
-        if (translate_path(path, translated, sizeof(translated)) > 0) {
+        if (translate_follow(path, translated, sizeof(translated), 0) > 0) {
             LOG("freopen: %s -> %s", path, translated);
             return fn(translated, mode, stream);
         }
@@ -10315,7 +10562,7 @@ FILE *freopen64(const char *path, const char *mode, FILE *stream) {
 
     if (path != NULL) {
         char translated[MAX_PATH_LEN];
-        if (translate_path(path, translated, sizeof(translated)) > 0) {
+        if (translate_follow(path, translated, sizeof(translated), 0) > 0) {
             LOG("freopen64: %s -> %s", path, translated);
             return fn(translated, mode, stream);
         }
