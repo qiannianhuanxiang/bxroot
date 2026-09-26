@@ -1501,6 +1501,15 @@ static void l2s_fix_symlink_size(struct stat *st, const char *p)
 static int proc_other_pid_guest_exe(const char *exe_path, char *out, size_t outsz)
 {
     char envp[128];
+    /*
+     * ★ 必须先 ensure_real_functions ★ —— 本函数会从 readlinkat /
+     * __readlink_chk 等**不**调 ensure_real_functions 的钩子进来；进程的
+     * 第一个 FS 调用若正是它（coreutils readlink 走 __readlink_chk），
+     * real_open 还是 NULL → 直接放弃 → 回退成调用者自己的 guest_exe。
+     * 表现为 `readlink /proc/$$/exe` 偶发答 /usr/bin/readlink 而非 /bin/sh
+     * （RUN_ALL 里复现、单跑不复现 —— 取决于哪条钩子先被触发）。
+     */
+    ensure_real_functions();
     const size_t cap = 65536;           /* environ 上限（线程安全：堆分配） */
     char *big;
     const char *e;
@@ -1557,6 +1566,7 @@ static int proc_magic_link_target(const char *hostp, char *out, size_t outsz)
         return 0;
     if (strncmp(hostp, "/proc/", 6) != 0)
         return 0;
+    ensure_real_functions();        /* 下面要用 real_readlink / real_open（见 proc_other_pid_guest_exe） */
     rest = hostp + 6;
     if (strncmp(rest, "self", 4) == 0 && rest[4] == '/') {
         slash = rest + 4;
