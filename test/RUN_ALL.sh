@@ -621,6 +621,17 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# clone3 回退链（行动清单 #9）：人为拦 clone3(435) 为 ENOSYS 后，
+# pthread_create / fork 必须仍然成功（glibc 回退到 clone(2)）。
+# 本容器无 glib，但这条链不依赖 glib —— g_spawn_async 只是调用方之一。
+# ---------------------------------------------------------------------
+if [ -f test/RUN_CLONE3_FALLBACK.sh ]; then
+    run_step "clone3 回退链" sh test/RUN_CLONE3_FALLBACK.sh
+else
+    run_step "clone3 回退链"
+fi
+
+# ---------------------------------------------------------------------
 # bxroot stub-loader 的 patch_static_elf：临时目录 + 产物 ELF 结构（行动清单 #6）
 # ---------------------------------------------------------------------
 if [ -f test/RUN_STUB_PATCH.sh ]; then
