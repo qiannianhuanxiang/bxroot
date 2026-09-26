@@ -1492,6 +1492,60 @@ static void l2s_fix_symlink_size(struct stat *st, const char *p)
  *
  * 返回 1 = out 是 guest 视角目标；0 = 不是我们认识的 /proc 魔法链接。
  */
+
+/*
+ * 读 /proc/<pid>/environ 里的 BXROOT_GUEST_EXE（其它 guest 进程的 exe 身份）。
+ * 只用裸 open/read（real_* 指针），不经钩子；environ 最多读 64 KiB。
+ * 返回 1 = out 已写入绝对路径；0 = 读不到/没有/非绝对。
+ */
+static int proc_other_pid_guest_exe(const char *exe_path, char *out, size_t outsz)
+{
+    char envp[128];
+    const size_t cap = 65536;           /* environ 上限（线程安全：堆分配） */
+    char *big;
+    const char *e;
+    int fd, rc = 0;
+    ssize_t n, total = 0;
+    size_t pfx = (size_t)(strrchr(exe_path, '/') - exe_path);   /* "/proc/<pid>" */
+
+    if (out == NULL || outsz == 0 || pfx + 9 >= sizeof(envp))
+        return 0;
+    memcpy(envp, exe_path, pfx);
+    memcpy(envp + pfx, "/environ", 9);
+    if (real_open == NULL)
+        return 0;
+    fd = real_open(envp, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    big = (char *)malloc(cap);
+    if (big == NULL) {
+        close(fd);
+        return 0;
+    }
+    while (total < (ssize_t)cap - 1) {
+        n = read(fd, big + total, cap - 1 - (size_t)total);
+        if (n <= 0)
+            break;
+        total += n;
+    }
+    close(fd);
+    if (total > 0) {
+        big[total] = '\0';
+        for (e = big; e < big + total; e += strlen(e) + 1) {
+            if (strncmp(e, "BXROOT_GUEST_EXE=", 17) == 0) {
+                const char *v = e + 17;
+                if (v[0] == '/' && strlen(v) < outsz) {
+                    memcpy(out, v, strlen(v) + 1);
+                    rc = 1;
+                }
+                break;
+            }
+        }
+    }
+    free(big);
+    return rc;
+}
+
 static int proc_magic_link_target(const char *hostp, char *out, size_t outsz)
 {
     const char *rest;
@@ -1525,14 +1579,21 @@ static int proc_magic_link_target(const char *hostp, char *out, size_t outsz)
     }
     if (strcmp(slash, "/exe") == 0) {
         /*
-         * 同 readlink 钩子：只在 guest_exe 是绝对路径时伪装，且不校验
-         * pid 是否是自己 —— bxroot 下每个 guest 进程都经同一条 bridge
-         * 链启动，内核对任何 guest 进程的 exe 都答 bridge.so，用它必错；
-         * guest_exe 至少对本进程是对的。对**其它** guest 进程的 exe
-         * 我们拿不到它的 guest_exe（在它自己的 env 里），属已知边界，
-         * 与 readlink 钩子的"只认形状、不校验 pid"一致。
+         * 同 readlink 钩子：只在 guest_exe 是绝对路径时伪装。
+         *
+         * 【/proc/<其它pid>/exe】bxroot 下每个 guest 进程都经同一条 bridge
+         * 链启动，内核对任何 guest 进程的 exe 都答 bridge.so，用它必错。
+         * 但每个 guest 的 BXROOT_GUEST_EXE 就在它自己的 /proc/<pid>/environ
+         * 里（proc.c 每次 exec 都写；同 uid 可读）—— 直接去读，于是
+         *     sh -c 'readlink /proc/$$/exe'   → /usr/bin/dash（与官方一致）
+         * 而不是 readlink 进程自己的名字。读不到（非 guest 进程、已退出、
+         * 权限）时回退到本进程的 guest_exe（fork 未 exec 的子进程 environ
+         * 与父相同，回退值恰好正确）。
          */
         if (g_config.guest_exe != NULL && g_config.guest_exe[0] == '/') {
+            if (slash != rest + 4 && slash != rest + 11 &&
+                proc_other_pid_guest_exe(hostp, out, outsz) == 1)
+                return 1;
             snprintf(out, outsz, "%s", g_config.guest_exe);
             return 1;
         }
@@ -1631,6 +1692,46 @@ static int proc_magic_leaf_resolve(const char *hostp, char *out, size_t outsz)
         return 0;
     if (translate_path(guest, out, outsz) < 0)
         return 0;
+    return 1;
+}
+
+static int resolve_intermediate_symlinks(const char *translated, char *out, size_t out_size);
+static int resolve_symlink_full(const char *translated, char *out, size_t out_size);
+
+/*
+ * realpath 族（realpath / __realpath_chk / canonicalize_file_name）在
+ * **未翻译分支**（/proc 透传）对 /proc 魔法链接的宿主路径预解析。
+ *
+ * 【缺陷（实测，2026-09-26）】
+ *     realpath("/proc/self/exe")        官方: /tmp/rp   bxroot: …/libproroot-bridge.so ❌
+ *     realpath("/proc/self/root/etc")   官方: /etc      bxroot: /system/etc（外层）     ❌
+ *     readlink -f /proc/self/exe（子目录 rootfs）        bxroot: rc=1                    ❌
+ * translate_path 对 /proc 返回 0，三个入口直接把原路径交给 libc realpath，
+ * 内核按宿主视角展开魔法链接。修法：先把魔法链接（中间组件或叶子）换成
+ * guest 目标再翻译成宿主路径，随后走与已翻译分支同款的链接解析；返回值
+ * 再由 realpath_fixup_inplace 反向翻译。返回 1 = out 是可交给 realpath 的宿主路径。
+ */
+static int proc_magic_realpath_pre(const char *p, char *out, size_t outsz)
+{
+    char pm[MAX_PATH_LEN];
+    char mid_[MAX_PATH_LEN];
+    char full_[MAX_PATH_LEN];
+    const char *pre;
+    int rr;
+
+    if (!proc_magic_intermediate_resolve(p, pm, sizeof(pm)) &&
+        !proc_magic_leaf_resolve(p, pm, sizeof(pm)))
+        return 0;
+    pre = pm;
+    if (resolve_intermediate_symlinks(pre, mid_, sizeof(mid_)))
+        pre = mid_;
+    rr = resolve_symlink_full(pre, full_, sizeof(full_));
+    if (rr == 1)
+        pre = full_;
+    /* rr == -2（环）：不改 pre，让内核给出 ELOOP */
+    if (strlen(pre) >= outsz)
+        return 0;
+    memcpy(out, pre, strlen(pre) + 1);
     return 1;
 }
 
@@ -3739,32 +3840,37 @@ static int readlink_fake_exe(int dirfd, const char *path,
 
     if (path[0] == '/') {
         const char *tail = strrchr(path, '/');
-        /* 形状 /proc/<who>/exe：交给 proc_magic_link_target 判 <who> 合法性 */
+        /* 形状 /proc/<who>/exe：proc_magic_link_target 判 <who> 合法性并
+         * 给出目标（self → 本进程 guest_exe；<pid> → 该进程 environ 里的） */
         if (tail != NULL && strcmp(tail, "/exe") == 0 &&
             proc_magic_link_target(path, tgt, sizeof(tgt)) == 1)
             is_self_exe = 1;
     } else if (dirfd != AT_FDCWD && strcmp(path, "exe") == 0) {
-        /* 相对 /proc/<who> 目录 fd 的 "exe"：确认 dirfd 真是 /proc 目录 */
+        /* 相对 /proc/<who> 目录 fd 的 "exe"：确认 dirfd 真是 /proc 目录，
+         * 再拼成绝对路径走同一判定（/proc/<pid> 形态能读到该进程的身份） */
         char dir[MAX_PATH_LEN];
         char proc[64];
         ssize_t dn;
 
         snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dirfd);
         dn = real_readlink != NULL ? real_readlink(proc, dir, sizeof(dir) - 1) : -1;
-        if (dn > 0) {
+        if (dn > 0 && (size_t)dn + 5 < sizeof(dir)) {
             dir[dn] = '\0';
-            if (strncmp(dir, "/proc/", 6) == 0 && strchr(dir + 6, '/') == NULL)
-                is_self_exe = 1;
+            if (strncmp(dir, "/proc/", 6) == 0 && strchr(dir + 6, '/') == NULL) {
+                memcpy(dir + dn, "/exe", 5);
+                if (proc_magic_link_target(dir, tgt, sizeof(tgt)) == 1)
+                    is_self_exe = 1;
+            }
         }
     }
 
     if (!is_self_exe)
         return 0;
     {
-        size_t len = strlen(g_config.guest_exe);
+        size_t len = strlen(tgt);
         if (len > bufsiz)
             len = bufsiz;
-        memcpy(buf, g_config.guest_exe, len);
+        memcpy(buf, tgt, len);
         *out_n = (ssize_t)len;
     }
     return 1;
@@ -4022,7 +4128,12 @@ char *realpath(const char *path, char *resolved) {
         if (pre == NULL && resolved != NULL)
             resolved[0] = '\0';
     } else {
-        r = real_realpath(path, resolved);
+        char pm_[MAX_PATH_LEN];
+        /* /proc 透传分支：魔法链接按 guest 视角预解析（见 proc_magic_realpath_pre） */
+        if (proc_magic_realpath_pre(eff, pm_, sizeof(pm_)))
+            r = real_realpath(pm_, resolved);
+        else
+            r = real_realpath(path, resolved);
     }
     }   /* 绝对化块结束 */
 
@@ -4534,7 +4645,12 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
         p = pre;
     }
 
-    r = fn(p, resolved, resolvedlen);
+    {
+        char pm_[MAX_PATH_LEN];
+        if (p == path && proc_magic_realpath_pre(p, pm_, sizeof(pm_)))
+            p = pm_;      /* /proc 透传分支：同 realpath() */
+        r = fn(p, resolved, resolvedlen);
+    }
     if (r == NULL)
         return NULL;   /* 失败路径：不动 */
 
@@ -5136,7 +5252,12 @@ char *canonicalize_file_name(const char *path) {
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
 
-    r = fn(p);
+    {
+        char pm_[MAX_PATH_LEN];
+        if (p == path && proc_magic_realpath_pre(p, pm_, sizeof(pm_)))
+            p = pm_;      /* /proc 透传分支：同 realpath() */
+        r = fn(p);
+    }
     if (r == NULL)
         return NULL;   /* 失败路径：不动 */
 

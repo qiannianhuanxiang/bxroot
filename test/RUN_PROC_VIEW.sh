@@ -91,6 +91,9 @@ o=$(run_rf 'cd /etc && cat /proc/self/cwd/hostname'); [ "$o" = "PROCVIEW-MARK" ]
 o=$(run_rf 'wc -c </proc/self/exe; stat -c %s /usr/bin/dash' | tr '\n' ' ')
 set -- $o; [ -n "${1:-}" ] && [ "${1:-a}" = "${2:-b}" ] && good "wc -c </proc/self/exe = dash 大小（$1）" || bad "wc exe: $o（读到宿主映像？）"
 o=$(run_rf '/proc/self/exe -c "echo reexec-ok"'); [ "$o" = "reexec-ok" ] && good "exec /proc/self/exe 自重执行" || bad "exec exe: $o"
+# realpath 族（readlink -f 走 realpath/canonicalize）：#421 的验证命令
+o=$(run_rf 'readlink -f /proc/self/exe; echo rc=$?' | tr '\n' ' '); [ "$o" = "/usr/bin/readlink rc=0 " ] && good "readlink -f /proc/self/exe = /usr/bin/readlink" || bad "readlink -f exe: $o"
+o=$(run_rf 'readlink -f /proc/self/root/etc/hostname'); [ "$o" = "/etc/hostname" ] && good "readlink -f /proc/self/root/etc/hostname = $o" || bad "readlink -f root/etc: $o"
 # 顶层首进程（bxroot-run 直接启动的进程）也要有 guest_exe
 o=$(timeout 30 "$BX" --no-check --rootfs "$RF" -- /usr/bin/readlink /proc/self/exe 2>&1); [ "$o" = "/usr/bin/readlink" ] && good "首进程 readlink self/exe = $o" || bad "首进程 self/exe: $o"
 
