@@ -57,6 +57,16 @@ fi
 # 与默认 rootfs 不同的 hostname —— 判据 2 靠它区分"读的是哪棵树"
 echo "alt-rootfs-hl-$$" > "$HL/etc/hostname"
 
+bld_probe() {   # $1 输出  $2 源码；gcc 间歇 ICE 重试
+    i=1
+    while [ $i -le 8 ]; do
+        gcc -O1 -o "$1" "$2" -lpthread 2>/tmp/alt-cc.$$ && { rm -f /tmp/alt-cc.$$; return 0; }
+        grep -q 'internal compiler error' /tmp/alt-cc.$$ || { cat /tmp/alt-cc.$$; rm -f /tmp/alt-cc.$$; return 1; }
+        i=$((i + 1))
+    done
+    rm -f /tmp/alt-cc.$$; return 1
+}
+
 run_case() {   # $1 标签  $2 rootfs
     lbl=$1; rfs=$2
     want=$(cat "$rfs/etc/hostname")
@@ -115,6 +125,22 @@ if [ -n "$ALT" ] && [ -x "$ALT/usr/bin/cat" ] && [ -f "$ALT/etc/hostname" ]; the
     echo "  rootfs=$ALT"
     echo "  libc: ${ver:-未知}"
     run_case "异glibc" "$ALT"
+    # 派生族探针：_Fork / fork / pthread_create / posix_spawn(RESETIDS)。
+    # 探针先 exec 自身一次 —— 首进程加载的是容器自己的 glibc，只有经
+    # bxroot exec 钩子重入后才真正加载该 rootfs 的 glibc（缺陷藏在那一层）。
+    # 探针放进 rootfs 的 /tmp（rootfs 之外的路径在 guest 视角不存在）。
+    PB="$ALT/tmp/.bxroot-probe-fork-$$"
+    if bld_probe "$PB" "$ROOT/test/altrootfs/probe_fork_family.c"; then
+        out=$(timeout 60 "$ROOT/tools/bxroot-run" --rootfs "$ALT" -- "/tmp/$(basename "$PB")" "/tmp/$(basename "$PB")" 2>&1); rc=$?
+        if [ $rc -eq 0 ]; then
+            good "异glibc：exec 重入后 _Fork/fork/pthread_create/posix_spawn 全部成功"
+        else
+            bad "异glibc：派生族探针 rc=$rc"; echo "$out" | grep -v livepatch | sed 's/^/      /' | head -8
+        fi
+        rm -f "$PB"
+    else
+        echo "  ⏭️  派生族探针编译失败，跳过该子用例"
+    fi
 else
     echo "  ⏭️  跳过 B：没有异 glibc rootfs（可设 BXROOT_ALT_ROOTFS=/path/to/rootfs；"
     echo "      前提：其中有 /bin/sh、/bin/cat、/etc/hostname，且与本机同架构）"
