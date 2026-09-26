@@ -2356,6 +2356,22 @@ static int stat_pre_resolve(const char *translated, int dirfd, int flags,
     if (r != 0)
         return 0;                   /* 取不到 → 交给原调用报错 */
 
+    /*
+     * ★ /proc 魔法链接的叶子不能靠 S_ISLNK 判 ★
+     *
+     * 实测（2026-09-26）：本容器里 libc fstatat(AT_SYMLINK_NOFOLLOW)
+     * 对 /proc/self/exe 返回 **islnk=0**（外层加载链的干扰），于是
+     * 这里判定"不是链接"直接放行，内核随后跟随到 bridge.so ——
+     * `stat("/proc/self/exe")` 拿到 20200 字节的 bridge.so 元数据，
+     * 而 fstatat/statx 同路径是对的。判据改为"形状"：是我们认识的
+     * 魔法链接就交给 resolve_symlink_full（首步即 proc_magic_leaf_resolve）。
+     */
+    {
+        char pm[MAX_PATH_LEN];
+        if (proc_magic_leaf_resolve(translated, pm, sizeof(pm)))
+            return resolve_symlink_full(translated, out, out_size);
+    }
+
     if (!S_ISLNK(lst.st_mode))
         return 0;                   /* 不是链接：**零额外开销** */
 
