@@ -3487,17 +3487,28 @@ static int px_elf_needs_stub(const char *host)
  * exec 到 stub-loader。返回 -1 = 环境未配置（调用方继续走 trampoline）；
  * 返回 0 = 已尝试（成功则不返回）。
  */
-static int px_stub_exec(const char *host, char *const argv[],
-                        char *const *envp, const char *guest)
-{
-    const char *stub = getenv("BXROOT_STUB_LOADER_EXEC");
-    char stub_path[PX_PATH_MAX];
-    char genv[PX_PATH_MAX + 32], renv[PX_PATH_MAX + 32];
+/*
+ * 组装 stub-loader 的 argv 与 envp（exec 与 spawn 两条路径共用）。
+ * 返回 0 成功（*ne_out 需调用方 free）；-1 = 环境未配置或放不下。
+ */
+typedef struct {
+    char path[PX_PATH_MAX];
+    char genv[PX_PATH_MAX + 32];
+    char renv[PX_PATH_MAX + 32];
     char *nv[PX_ARGV_MAX + 4];
     char **ne;
-    size_t n = 0, i, ec = 0;
-    const char *rf = g_rt_cfg.have_rootfs ? g_rt_cfg.rootfs : NULL;
+} px_stub_plan;
 
+static int px_stub_prepare(px_stub_plan *sp, const char *host,
+                           char *const argv[], char *const *envp,
+                           const char *guest)
+{
+    const char *stub = getenv("BXROOT_STUB_LOADER_EXEC");
+    const char *rf = g_rt_cfg.have_rootfs ? g_rt_cfg.rootfs : NULL;
+    size_t n = 0, i, ec = 0;
+    int tracing = 0;
+
+    sp->ne = NULL;
     /*
      * 优先 bxroot 自己的变量，回落官方的 PROROOT_STUB_LOADER（DSHA 与外层
      * proroot 都提供它）。bxroot 自己的 libbxroot-stub-loader.so **不能**
@@ -3509,33 +3520,35 @@ static int px_stub_exec(const char *host, char *const argv[],
         return -1;
     /* 与 trampoline 同理：/data/app 下的路径要经 /proc/self/root 绕开翻译 */
     if (strncmp(stub, "/proc/", 6) == 0) {
-        if (strlen(stub) >= sizeof(stub_path))
+        if (strlen(stub) >= sizeof(sp->path))
             return -1;
-        memcpy(stub_path, stub, strlen(stub) + 1);
-    } else if (snprintf(stub_path, sizeof(stub_path), "/proc/self/root%s", stub)
-               >= (int)sizeof(stub_path)) {
+        memcpy(sp->path, stub, strlen(stub) + 1);
+    } else if (snprintf(sp->path, sizeof(sp->path), "/proc/self/root%s", stub)
+               >= (int)sizeof(sp->path)) {
         return -1;
     }
 
-    nv[n++] = stub_path;
-    nv[n++] = (char *)(uintptr_t)host;
+    sp->nv[n++] = sp->path;
+    sp->nv[n++] = (char *)(uintptr_t)host;
     if (argv != NULL)
         for (i = 1; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 2; i++)
-            nv[n++] = argv[i];
-    nv[n] = NULL;
+            sp->nv[n++] = argv[i];
+    sp->nv[n] = NULL;
 
-    if (snprintf(genv, sizeof(genv), "PROROOT_STUB_GUEST_EXE=%s",
-                 (guest != NULL && guest[0] != '\0') ? guest : host) >= (int)sizeof(genv))
+    if (snprintf(sp->genv, sizeof(sp->genv), "PROROOT_STUB_GUEST_EXE=%s",
+                 (guest != NULL && guest[0] != '\0') ? guest : host) >= (int)sizeof(sp->genv))
         return -1;
-    if (snprintf(renv, sizeof(renv), "PROROOT_STUB_ROOTFS=%s", rf) >= (int)sizeof(renv))
+    if (snprintf(sp->renv, sizeof(sp->renv), "PROROOT_STUB_ROOTFS=%s", rf) >= (int)sizeof(sp->renv))
         return -1;
 
-    /* 新 envp：去掉旧的两个同名变量，追加新值 */
     if (envp != NULL)
         while (envp[ec] != NULL)
             ec++;
-    ne = (char **)malloc((ec + 3) * sizeof(char *));
-    if (ne == NULL)
+    for (i = 0; i < ec; i++)
+        if (strncmp(envp[i], "LD_TRACE_LOADED_OBJECTS=", 24) == 0 && envp[i][24] != '\0')
+            tracing = 1;
+    sp->ne = (char **)malloc((ec + 3) * sizeof(char *));
+    if (sp->ne == NULL)
         return -1;
     n = 0;
     for (i = 0; i < ec; i++) {
@@ -3552,25 +3565,34 @@ static int px_stub_exec(const char *host, char *const argv[],
          *   - `ldd prog`（= LD_TRACE_LOADED_OBJECTS=1 ld.so prog）：只列依赖
          *     不运行，保留它会多列出一行 libbxroot-runtime.so，与官方输出不一致。
          */
-        if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
-            size_t k;
-            int tracing = 0;
-            for (k = 0; k < ec; k++)
-                if (strncmp(envp[k], "LD_TRACE_LOADED_OBJECTS=", 24) == 0 &&
-                    envp[k][24] != '\0')
-                    tracing = 1;
-            if (tracing)
-                continue;
-        }
-        ne[n++] = envp[i];
+        if (tracing && strncmp(envp[i], "LD_PRELOAD=", 11) == 0)
+            continue;
+        sp->ne[n++] = envp[i];
     }
-    ne[n++] = genv;
-    ne[n++] = renv;
-    ne[n] = NULL;
+    sp->ne[n++] = sp->genv;
+    sp->ne[n++] = sp->renv;
+    sp->ne[n] = NULL;
+    return 0;
+}
 
+/*
+ * exec 到 stub-loader。返回 -1 = 环境未配置（调用方继续走 trampoline）；
+ * 返回 0 = 已尝试（成功则不返回）。
+ */
+static int px_stub_exec(const char *host, char *const argv[],
+                        char *const *envp, const char *guest)
+{
+    px_stub_plan *sp = (px_stub_plan *)malloc(sizeof(*sp));
+    if (sp == NULL)
+        return -1;
+    if (px_stub_prepare(sp, host, argv, envp, guest) != 0) {
+        free(sp);
+        return -1;
+    }
     PX_LOG("proc: 无 PT_INTERP 的 ELF，经 stub-loader 执行 %s", host);
-    (void)syscall(SYS_execve, stub_path, nv, ne);
-    free(ne);
+    (void)syscall(SYS_execve, sp->path, sp->nv, sp->ne);
+    free(sp->ne);
+    free(sp);
     return 0;
 }
 
@@ -3641,6 +3663,35 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
     if (tramp == NULL || tramp[0] == '\0' || linker == NULL ||
         linker[0] == '\0') {
         return -1;          /* 普通环境：走真实 posix_spawn，行为不变 */
+    }
+
+    /*
+     * ★ 无 PT_INTERP 的 ELF（静态 / static-PIE / ld.so）→ spawn stub-loader ★
+     * 与 px_do_execve 的同名分支对称（2026-09-25：C 程序 posix_spawn 静态
+     * 程序实测 "loader: failed no PT_DYNAMIC"，而 fork+exec 路径已修好）。
+     * 仍经 real_posix_spawn，file_actions/attr 由 glibc 原样应用。
+     */
+    if (host != NULL && px_elf_needs_stub(host)) {
+        px_stub_plan *sp = (px_stub_plan *)malloc(sizeof(*sp));
+        if (sp != NULL && px_stub_prepare(sp, host, argv, envp, argv0) == 0) {
+            if (real_posix_spawn == NULL) {
+                real_posix_spawn = (int (*)(pid_t *, const char *,
+                                            const posix_spawn_file_actions_t *,
+                                            const posix_spawnattr_t *,
+                                            char *const[], char *const[]))
+                                       px_dlsym("posix_spawn");
+            }
+            rc = (real_posix_spawn != NULL)
+                 ? real_posix_spawn(pid, sp->path, fa, attr, sp->nv, sp->ne) : -1;
+            PX_LOG("proc: spawn 无 PT_INTERP 的 ELF 经 stub-loader %s rc=%d", host, rc);
+            free(sp->ne);
+            free(sp);
+            return rc == 0 ? 0 : -1;
+        }
+        if (sp != NULL) {
+            free(sp->ne);
+            free(sp);
+        }
     }
     if (preload == NULL || preload[0] == '\0') {
         preload = getenv("PROROOT_LIB_PATH");

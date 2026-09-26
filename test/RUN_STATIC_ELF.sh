@@ -16,7 +16,8 @@
 #      （证明不只是"能跑"，路径翻译也生效）
 #   B. ld.so --version 正常；`ld.so <动态程序>` 在非默认 rootfs 下翻译生效
 #   C. ldd /bin/true 输出与**官方 runtime 作内层**时逐行一致（地址归一）
-#   D. 动态程序不受影响（仍走 trampoline）
+#   D. posix_spawn（带 file_actions + attr）静态/动态程序都正常
+#   E. 动态程序不受影响（仍走 trampoline）
 # 需要外层 proroot（提供 bridge/linker/stub-loader 与注入链路）。
 # ---------------------------------------------------------------------
 set -u
@@ -57,6 +58,7 @@ P="$ROOT/test/static/probe_static_read.c"
 bld -O1 -static     -o "$RF/tmp/p_static" "$P" || { echo "⏭️  跳过：无静态 libc"; exit 2; }
 bld -O1 -static-pie -o "$RF/tmp/p_spie"   "$P" || { echo "⏭️  跳过：不支持 static-pie"; exit 2; }
 bld -O1             -o "$RF/tmp/p_dyn"    "$P" || exit 1
+bld -O1             -o "$RF/tmp/p_spawn"  "$ROOT/test/static/probe_spawn.c" || exit 1
 
 # 符号链接 /usr 在 rootfs 里指向宿主 /usr —— 外层视角即 $PROROOT_ROOTFS/usr，
 # 与 guest 的 /usr 同一目录，动态程序与 ld.so 可用。
@@ -92,7 +94,17 @@ else
     echo "  ⏭️  C 跳过：读不到官方 runtime 做对照"
 fi
 
-echo "--- D) 动态程序不受影响 ---"
+echo "--- D) posix_spawn（带 file_actions + attr）---"
+# spawn 走的是另一条 trampoline（px_trampoline_spawn），曾漏掉静态分支：
+# fork+exec 已修好时，C 程序 posix_spawn 静态程序仍 "no PT_DYNAMIC"。
+o=$(run_rf '/tmp/p_spawn /tmp/p_static' | tr '\n' ' ')
+case "$o" in "marker=INSIDE-ROOTFS spawn r=0 status=0 ") good "posix_spawn 静态程序，翻译生效" ;;
+             *) bad "posix_spawn 静态：$o" ;; esac
+o=$(run_rf '/tmp/p_spawn /tmp/p_dyn' | tr '\n' ' ')
+case "$o" in "marker=INSIDE-ROOTFS spawn r=0 status=0 ") good "posix_spawn 动态程序照常" ;;
+             *) bad "posix_spawn 动态：$o" ;; esac
+
+echo "--- E) 动态程序不受影响 ---"
 o=$(run_rf '/tmp/p_dyn')
 [ "$o" = "marker=INSIDE-ROOTFS" ] && good "动态程序照常（trampoline 路径）" || bad "动态程序：$o"
 
