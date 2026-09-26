@@ -665,6 +665,19 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# 非默认 rootfs（--rootfs <另一棵树>）：sh -c cat 0 崩溃 + 输出来自那棵树；
+# 有异 glibc rootfs（默认探测 /root/rootfs-trixie，或 BXROOT_ALT_ROOTFS）
+# 时再测 exec 重入后的 _Fork/fork/pthread_create/posix_spawn ——
+# 这是 glibc 2.41 站点表 / struct pthread 偏移（92d7355）的回归钉。
+# 同 glibc 子用例用 cp -al 现做硬链接镜像，本环境总能跑。
+# ---------------------------------------------------------------------
+if [ -f test/RUN_ALT_ROOTFS.sh ]; then
+    run_step "非默认 rootfs" sh test/RUN_ALT_ROOTFS.sh
+else
+    run_step "非默认 rootfs"
+fi
+
+# ---------------------------------------------------------------------
 # SysV 共享内存模拟（sysvshm.c）：语义对照官方 + 双向互通 + 并发
 # ---------------------------------------------------------------------
 if [ -f test/RUN_SYSVSHM.sh ]; then
