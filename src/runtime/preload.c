@@ -7105,8 +7105,25 @@ int dladdr(const void *addr, Dl_info *info) {
 
     if (addr == NULL || info == NULL)
         return 0;
-    if (!bxroot_has_ldso_service())
-        return 0;
+    if (!bxroot_has_ldso_service()) {
+        /*
+         * ★ 无 ldso 服务 → 转发给 libc 的 dladdr（2026-09-27 真机修）★
+         *
+         * 原来这里直接 `return 0`。在标准 glibc ld.so 下（Termux 真机、
+         * 无外层 proroot 的任何普通 Linux）这等于**本库的 dladdr 永远失败**，
+         * 而 proc.c 的 px_detect_self_lib 正靠 dladdr 反查自身路径：
+         *   → "无法确定自身库路径，envp 注入已禁用"
+         *   → 子进程 exec 不再带 runtime，guest 里 `sh -c /bin/echo`
+         *     报 not found（路径不翻译）。
+         * 与 dlsym / dl_iterate_phdr 的降级路径同一原则：没有服务就交给 libc。
+         */
+        static int (*fn)(const void *, Dl_info *);
+        if (fn == NULL)
+            fn = (int (*)(const void *, Dl_info *))bxroot_next_symbol("dladdr");
+        if (fn == NULL || (void *)fn == (void *)&dladdr)
+            return 0;
+        return fn(addr, info);
+    }
 
     memset(&w, 0, sizeof(w));
     w.addr = addr;

@@ -121,7 +121,8 @@ src/l2s/l2s-runtime.c
 src/launcher/launcher.c
 src/bridge/bridge.c
 src/stub-loader/stub-loader.c
-src/linker/linker.c"
+src/linker/linker.c
+src/ldr/ulx.c"
 
 # ★ 最后两项是 2026-09-19 补进来的 ★
 #

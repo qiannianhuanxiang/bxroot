@@ -15,7 +15,7 @@ SO_CFLAGS = -shared -fPIC $(COMMON_CFLAGS)
 #   调研报告 §六.2 点名缺失）。对静态 launcher 同样需要——
 #   可执行文件的加载段对齐由链接器按 max-page-size 决定。
 SO_LDFLAGS = -ldl -nostartfiles -Wl,-z,max-page-size=16384
-LAUNCH_LDFLAGS = -static -Wl,-z,max-page-size=16384
+LAUNCH_LDFLAGS = -static -Wl,-z,max-page-size=16384 -Wl,-e,bx_early_start
 
 # D4 进程管理层的源目录（proc.c / proc.h）。
 #
@@ -34,7 +34,8 @@ TARGETS = \
 	$(BUILD_DIR)/libbxroot-runtime.so \
 	$(BUILD_DIR)/libbxroot-linker.so \
 	$(BUILD_DIR)/libbxroot-bridge.so \
-	$(BUILD_DIR)/libbxroot-stub-loader.so
+	$(BUILD_DIR)/libbxroot-stub-loader.so \
+	$(BUILD_DIR)/libbxroot-ulx.so
 
 .PHONY: all clean install install-dsha debug runtime test test-quick
 
@@ -48,6 +49,11 @@ runtime:
 $(BUILD_DIR)/libbxroot.so: src/launcher/launcher.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(COMMON_CFLAGS) $(LAUNCH_LDFLAGS) -o $@ $<
+
+# === 用户态 exec 加载器（静态可执行，伪装为 .so；见 src/ldr/ulx.c） ===
+$(BUILD_DIR)/libbxroot-ulx.so: src/ldr/ulx.c src/ldr/early_sigsys.h
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(COMMON_CFLAGS) $(LAUNCH_LDFLAGS) -o $@ src/ldr/ulx.c
 
 # === Runtime (LD_PRELOAD hook + l2s 硬链接模拟 + D4 进程管理) ===
 #
@@ -110,6 +116,7 @@ INSTALL_DIR = /data/local/tmp/bxroot
 install: all
 	@mkdir -p $(INSTALL_DIR)
 	cp $(BUILD_DIR)/libbxroot.so $(INSTALL_DIR)/
+	cp $(BUILD_DIR)/libbxroot-ulx.so $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/libbxroot-runtime.so $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/libbxroot-linker.so $(INSTALL_DIR)/ 2>/dev/null || true
 	cp $(BUILD_DIR)/libbxroot-bridge.so $(INSTALL_DIR)/ 2>/dev/null || true
@@ -131,7 +138,7 @@ install-dsha: all
 
 # === 清理 ===
 clean:
-	rm -f $(BUILD_DIR)/libbxroot.so
+	rm -f $(BUILD_DIR)/libbxroot.so $(BUILD_DIR)/libbxroot-ulx.so
 	rm -f $(BUILD_DIR)/libbxroot-*.so
 	@echo "清理完成"
 

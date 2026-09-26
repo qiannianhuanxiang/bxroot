@@ -37,6 +37,14 @@
 #include <time.h>
 
 /*
+ * ★ 早期 SIGSYS 处理器（2026-09-27 真机新增）★
+ * launcher 是静态 glibc 程序：Android app 沙箱里它在 main 之前就会因
+ * set_robust_list 被 seccomp TRAP 杀掉（Termux 实测 `bxroot -V` rc=159）。
+ * 链接时须 `-Wl,-e,bx_early_start`，详见该头文件。
+ */
+#include "../ldr/early_sigsys.h"
+
+/*
  * 版本号。
  *
  * 用 `-V` / `--version` 打印。参考实现用 `-V`（大写），
@@ -139,6 +147,7 @@ static const char *const PROOT_SU_BINDS[] = {
 #define LIBBXROOT_RUNTIME "libbxroot-runtime.so"
 #define LIBBXROOT_LINKER "libbxroot-linker.so"
 #define LIBBXROOT_STUB_LOADER "libbxroot-stub-loader.so"
+#define LIBBXROOT_ULX "libbxroot-ulx.so"
 
 /* 配置结构 */
 typedef struct {
@@ -1142,6 +1151,181 @@ static void guest_to_host(char *out, size_t sz, const char *rootfs, const char *
         snprintf(out, sz, "%s", g);
 }
 
+static void explain_exec_failure(const char *exe, const char *rootfs, int err);
+
+/*
+ * 读 ELF 的 PT_INTERP（仅 64 位 LE、程序头在首 4K 内）。
+ * 返回 1 = 有解释器（写入 out），0 = 不是 ELF / 无 INTERP，-1 = 读失败。
+ */
+static int read_elf_interp(const char *path, char *out, size_t outsz)
+{
+    unsigned char buf[4096];
+    unsigned long phoff = 0;
+    unsigned phentsize, phnum, k;
+    ssize_t m;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0)
+        return -1;
+    m = read(fd, buf, sizeof(buf));
+    close(fd);
+    if (m < 64 || memcmp(buf, "\177ELF", 4) != 0 || buf[4] != 2)
+        return 0;
+    memcpy(&phoff, buf + 32, 8);
+    phentsize = buf[54] | (buf[55] << 8);
+    phnum = buf[56] | (buf[57] << 8);
+    for (k = 0; k < phnum && phentsize >= 56; k++) {
+        unsigned long off = phoff + (unsigned long)k * phentsize, poff, psz;
+        unsigned type;
+        if (off + 56 > (unsigned long)m)
+            break;
+        memcpy(&type, buf + off, 4);
+        if (type != 3 /* PT_INTERP */)
+            continue;
+        memcpy(&poff, buf + off + 8, 8);
+        memcpy(&psz, buf + off + 32, 8);
+        if (psz == 0 || psz > outsz || poff + psz > (unsigned long)m)
+            return 0;
+        memcpy(out, buf + poff, psz);
+        out[psz - 1] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * ★ 经 libbxroot-ulx.so（用户态 exec）启动 guest（2026-09-27 真机新增）★
+ *
+ * 【为什么】Android app 沙箱的 seccomp 对 set_robust_list / rseq 是 TRAP。
+ * 内核 execve 会把信号处置重置为默认，guest 的 ld.so 在 __libc_early_init
+ * 里发这两个调用时 runtime 还没加载 → 进程被 SIGSYS 杀死（Termux 实测：
+ * 所有 guest 命令 rc=159）。ulx 在本进程内装载 ld.so，处理器全程有效。
+ *
+ * 【何时走】launcher 目录里有 libbxroot-ulx.so、guest 是动态 ELF、
+ * 其 PT_INTERP 在 rootfs 内存在；且外层没有提供 PROROOT_TRAMPOLINE_PATH
+ * （嵌套在 proroot/DSHA 里时维持原路径不变）。BXROOT_NO_ULX=1 可强制关闭。
+ *
+ * 同时导出 BXROOT_ULX_PATH / BXROOT_ULX_LDSO，runtime 的 exec 钩子据此让
+ * 子进程也经 ulx（proc.c px_tramp_cfg）。
+ *
+ * 成功不返回；返回即表示不适用或失败（调用方继续走原来的 execve）。
+ */
+static void try_exec_via_ulx(const launcher_config_t *cfg, const char *lib_dir,
+                             const char *caller_guest_path)
+{
+    char ulx[PATH_MAX], interp[PATH_MAX], ldso[PATH_MAX * 2];
+    char sb_interp[PATH_MAX], sb_host[PATH_MAX * 2], sb_arg[PATH_MAX];
+    const char *exe_host = cfg->guest_exe;   /* 交给 ld.so 的程序（宿主路径） */
+    int is_script = 0, sb_has_arg = 0;
+    const char *v = getenv("BXROOT_NO_ULX");
+    char **nv;
+    int n = 0, i;
+
+    if (v != NULL && v[0] != '\0' && v[0] != '0')
+        return;
+    v = getenv("PROROOT_TRAMPOLINE_PATH");
+    if (v != NULL && v[0] != '\0')
+        return;
+    if (join_dir_name(ulx, sizeof(ulx), lib_dir, LIBBXROOT_ULX) != 0 ||
+        access(ulx, X_OK) != 0)
+        return;
+    /*
+     * shebang 脚本：内核语义是 exec 解释器、argv = [interp, (arg), 脚本, ...]。
+     * 不在这里处理的话会落到直接 execve —— 内核按宿主视角解析 `#!/bin/sh`，
+     * 在 Android 上跑起来的是**系统的** /system/bin/sh（bionic），再被
+     * LD_PRELOAD 的 glibc runtime 拖死（真机实测 "CANNOT LINK EXECUTABLE"）。
+     * 只处理一层（解释器本身是脚本时放弃，交回原路径）。
+     */
+    {
+        char line[PATH_MAX];
+        ssize_t m;
+        int fd = open(cfg->guest_exe, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            return;
+        m = read(fd, line, sizeof(line) - 1);
+        close(fd);
+        if (m >= 2 && line[0] == '#' && line[1] == '!') {
+            char *s = line + 2, *e, *a;
+            line[m] = '\0';
+            e = strchr(s, '\n');
+            if (e == NULL)
+                return;                  /* 行过长：交内核处理 */
+            *e = '\0';
+            if (e > s && e[-1] == '\r')
+                return;                  /* CRLF：交原路径，explain_exec_failure 会解释 */
+            while (*s == ' ' || *s == '\t')
+                s++;
+            a = s;
+            while (*a && *a != ' ' && *a != '\t')
+                a++;
+            if (*a) {
+                *a++ = '\0';
+                while (*a == ' ' || *a == '\t')
+                    a++;
+                /* 与 Linux 相同：解释器之后的**整段**（去尾空白）是单个参数 */
+                e = a + strlen(a);
+                while (e > a && (e[-1] == ' ' || e[-1] == '\t'))
+                    *--e = '\0';
+                if (*a) {
+                    snprintf(sb_arg, sizeof(sb_arg), "%s", a);
+                    sb_has_arg = 1;
+                }
+            }
+            if (s[0] != '/')
+                return;
+            snprintf(sb_interp, sizeof(sb_interp), "%s", s);
+            guest_to_host(sb_host, sizeof(sb_host), cfg->rootfs, sb_interp);
+            if (resolve_guest_symlinks(sb_host, cfg->rootfs) != 0)
+                return;
+            exe_host = sb_host;
+            is_script = 1;
+        }
+    }
+    if (read_elf_interp(exe_host, interp, sizeof(interp)) != 1)
+        return;
+    guest_to_host(ldso, sizeof(ldso), cfg->rootfs, interp);
+    if (access(ldso, R_OK) != 0)
+        return;
+
+    setenv("BXROOT_ULX_PATH", ulx, 1);
+    setenv("BXROOT_ULX_LDSO", ldso, 1);
+
+    nv = calloc((size_t)cfg->guest_argc + 10, sizeof(char *));
+    if (nv == NULL)
+        return;
+    nv[n++] = ulx;
+    nv[n++] = ldso;
+    nv[n++] = (char *)"--argv0";
+    if (is_script)
+        nv[n++] = sb_interp;
+    else
+        nv[n++] = cfg->guest_argv[0] != NULL ? cfg->guest_argv[0] : cfg->guest_exe;
+    nv[n++] = (char *)"--preload";
+    nv[n++] = cfg->runtime_lib;
+    nv[n++] = (char *)exe_host;
+    if (is_script) {
+        if (sb_has_arg)
+            nv[n++] = sb_arg;
+        /* 脚本路径用 guest 视角（$0 / B1 期望 "HELLO /tmp/sg"）；
+         * 解释器打开它时由 runtime 翻译 */
+        nv[n++] = (char *)(caller_guest_path != NULL && caller_guest_path[0] == '/'
+                           ? caller_guest_path : cfg->guest_exe);
+    }
+    for (i = 1; i < cfg->guest_argc && cfg->guest_argv[i] != NULL; i++)
+        nv[n++] = cfg->guest_argv[i];
+    nv[n] = NULL;
+
+    if (cfg->verbose)
+        fprintf(stderr, "[bxroot-launcher] 经 ulx 启动: %s %s\n", ulx, ldso);
+    syscall(SYS_execve, ulx, nv, environ);
+    if (cfg->verbose)
+        fprintf(stderr, "[bxroot-launcher] ulx exec 失败（%s），回退直接 execve\n",
+                strerror(errno));
+    unsetenv("BXROOT_ULX_PATH");
+    unsetenv("BXROOT_ULX_LDSO");
+    free(nv);
+}
+
 static void explain_exec_failure(const char *exe, const char *rootfs, int err)
 {
     unsigned char h[128];
@@ -1879,6 +2063,7 @@ int main(int argc, char **argv) {
      * execve 被改写，syscall(SYS_execve) 不被改写）。失败时回退到 libc
      * execve，保持原来的行为与错误信息。
      */
+    try_exec_via_ulx(&cfg, lib_dir, caller_guest_path);   /* 成功不返回 */
     syscall(SYS_execve, cfg.guest_exe, cfg.guest_argv, environ);
     execve(cfg.guest_exe, cfg.guest_argv, environ);
 

@@ -3346,17 +3346,45 @@ static long px_raw_svc5(long nr, long a, long b, long c, long d, long e)
 #define PX_RAW_EXECVE(p, a, e) \
     px_raw_svc5(SYS_execve, (long)(p), (long)(a), (long)(e), 0, 0)
 
+/*
+ * ★ trampoline 配置来源（2026-09-27 真机新增）★
+ *
+ * 优先外层 proroot/DSHA 的 PROROOT_TRAMPOLINE_PATH + PROROOT_LINKER_PATH；
+ * 没有时回落 bxroot 自带的用户态加载器 libbxroot-ulx.so：
+ *     BXROOT_ULX_PATH  = ulx 可执行路径（launcher 在本目录找到时设置）
+ *     BXROOT_ULX_LDSO  = rootfs 内 ld.so 的宿主路径
+ * ulx 的 argv 约定与 bridge 相同（<tramp> <linker> [ld.so 选项] <host> args），
+ * 所以下游构造逻辑完全不变。之所以不直接复用 PROROOT_* 名字：那些变量
+ * 是 preload.c「嵌套容器」判定的标记，借用会让独立部署被误判。
+ *
+ * 为什么独立部署也必须走 trampoline：Android app 沙箱的 seccomp 对
+ * set_robust_list / rseq 是 TRAP，内核 execve 之后信号处置被重置，
+ * guest ld.so 的 __libc_early_init 在 runtime 构造函数之前就被杀
+ * （见 src/ldr/ulx.c 文件头）。ulx 在同一进程里装载 ld.so，处理器不丢。
+ */
+static void px_tramp_cfg(const char **tramp, const char **linker)
+{
+    *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
+    *linker = getenv("PROROOT_LINKER_PATH");
+    if (*tramp == NULL || (*tramp)[0] == '\0' || *linker == NULL ||
+        (*linker)[0] == '\0') {
+        *tramp = getenv("BXROOT_ULX_PATH");
+        *linker = getenv("BXROOT_ULX_LDSO");
+    }
+}
+
 static int px_trampoline_exec(const char *host, char *const argv[],
                               char *const *envp, const char *argv0,
                               const char *preload)
 {
-    const char *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
-    const char *linker = getenv("PROROOT_LINKER_PATH");
+    const char *tramp;
+    const char *linker;
     char tramp_path[PX_PATH_MAX];
     char *nv[PX_ARGV_MAX + 8];
     size_t n = 0;
     size_t i;
 
+    px_tramp_cfg(&tramp, &linker);
     /*
      * `host` 是**翻译后的宿主可执行路径**，作为 linker 的 guest exe 参数。
      * 官方形态里这个位置放的就是宿主路径（实测 cmdline 第 7 项是
@@ -3712,14 +3740,15 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
                                const posix_spawn_file_actions_t *fa,
                                const posix_spawnattr_t *attr)
 {
-    const char *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
-    const char *linker = getenv("PROROOT_LINKER_PATH");
+    const char *tramp;
+    const char *linker;
     char tramp_path[PX_PATH_MAX];
     char *nv[PX_ARGV_MAX + 8];
     size_t n = 0;
     size_t i;
     int rc;
 
+    px_tramp_cfg(&tramp, &linker);
     if (pid == NULL || argv == NULL) {
         return -1;
     }
