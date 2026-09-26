@@ -285,6 +285,42 @@ extern int l2s_rt_resolve_fake_link(const char *path, char *out,
 extern int bxroot_absolutize(const char *path, char *out, size_t outsz)
     __attribute__((weak));
 
+/*
+ * l2s 的 unlink 语义核心（实现见 l2s-runtime.c）：递减链长，归零回收
+ * 中间层 / 数据文件 / .cnt。返回 0 = 已接管；L2S_RT_PASSTHRU = 与 l2s
+ * 无关；-errno = 失败。weak 同上：单测单独编译本文件时缺失即透传。
+ *
+ * 【为什么裸 syscall 路径也必须接（上游 #131/#28 清理行为核查，
+ *  2026-09-26 实测）】preload.c 的 unlink/unlinkat 符号钩子已经递减
+ * 计数，但 `syscall(SYS_unlinkat, …)` 不经符号 —— 只走了本文件的路径
+ * 翻译，然后把**符号链接本身**交给内核删掉。结果：
+ *
+ *     ln a b; syscall(unlinkat, a)
+ *       官方  : b nlink=1                       ← 计数递减
+ *       bxroot: b nlink=2（.cnt 仍是 2）        ← 计数漂移
+ *     再 syscall(unlinkat, b) → .cnt 读到 2 → 只减到 1，不回收
+ *       → 集中目录 / 客户目录里永久残留 .l2s.X0001 / .0002 / .cnt
+ *
+ * 与 statx / getdents64 在本文件补"缺的那一半"是同一句教训：判据是
+ * "客户会走哪条路"，Go / Rust / 静态链接程序都可能裸调 unlinkat。
+ */
+#define L2S_RT_PASSTHRU_SG (-4096)      /* 与 l2s-runtime.h 的 L2S_RT_PASSTHRU 同值 */
+#define SCG_NR_unlinkat 35
+#define SCG_AT_REMOVEDIR 0x200
+extern int l2s_rt_unlink(const char *path) __attribute__((weak));
+extern int l2s_rt_enabled(void) __attribute__((weak));
+
+/* 裸 renameat(38)/renameat2(276) 覆盖伪造链接时的记账（同上，实现与
+ * 说明见 l2s-runtime.c 的 l2s_rt_rename_replace_prepare）。 */
+#define SCG_NR_renameat  38
+#define SCG_NR_renameat2 276
+extern int l2s_rt_rename_replace_prepare(const char *oldpath, const char *newpath,
+                                         char *out_mid, size_t midsz,
+                                         char *out_final, size_t finalsz)
+    __attribute__((weak));
+extern int l2s_rt_rename_replace_commit(const char *mid, const char *final)
+    __attribute__((weak));
+
 /* ------------------------------------------------------------------ */
 /* 裸系统调用                                                          */
 /* ------------------------------------------------------------------ */
@@ -1453,6 +1489,81 @@ long syscall(long number, ...)
         }   /* 相对路径绝对化块结束 */
         }   /* for (i = 0; i < 6; i++) */
     }       /* if (pmask != 0) */
+
+    /*
+     * ================================================================
+     * 裸 unlinkat(35) 的 l2s 记账 —— 与 libc 钩子 unlink/unlinkat 同一条
+     * 语义（见文件头 SCG_NR_unlinkat 处的实测记录）
+     * ================================================================
+     *
+     * 放在翻译**之后**：a1 此时已是宿主视角路径（中间层与数据文件都在
+     * 宿主侧，l2s 层只认这种形态）；放在 svc **之前**：这是"接管"而不是
+     * "结果补丁"—— 一旦 l2s 认领，内核不再看到这次调用。
+     *
+     * 门控：
+     *   flags 带 AT_REMOVEDIR 的是 rmdir 语义，与硬链接无关，不碰；
+     *   a1 为 0 时上面的 EFAULT 分支已经返回，这里再判一次是防御。
+     * 懒启用：纯读进程（从未 link 过）里 l2s 可能尚未启用，而它删的
+     * 可能正是别的进程留下的伪造链接 —— 与 O_NOFOLLOW / statx 补丁同款。
+     */
+    if (number == SCG_NR_unlinkat && a1 != 0 &&
+        (a2 & SCG_AT_REMOVEDIR) == 0 && l2s_rt_unlink != NULL &&
+        /* 真 dirfd + 相对名：本层无法还原目录，交给内核（与修前一致） */
+        ((int)a0 == SG_AT_FDCWD ||
+         ((const char *)(uintptr_t)a1)[0] == '/')) {
+        const char *up = (const char *)(uintptr_t)a1;
+        int urc;
+
+        if (bxroot_l2s_lazy_enable != NULL &&
+            (l2s_rt_enabled == NULL || !l2s_rt_enabled()))
+            (void)bxroot_l2s_lazy_enable(up);
+        urc = l2s_rt_unlink(up);
+        if (urc == 0)
+            return 0;
+        if (urc != L2S_RT_PASSTHRU_SG) {
+            errno = -urc;
+            return -1;
+        }
+        /* PASSTHRU：普通文件，照常发 svc */
+    }
+
+    /*
+     * 裸 renameat(38) / renameat2(276) **覆盖**伪造链接：与 libc 的
+     * rename/renameat/renameat2 钩子同一条记账（prepare 在 svc 前，
+     * commit 在 svc 成功后）。renameat2 带 RENAME_NOREPLACE(1) /
+     * RENAME_EXCHANGE(2) 时不会覆盖任何东西，跳过。真 dirfd + 相对名
+     * 本层还原不了目录，保持修前行为（不记账）。
+     */
+    {
+        char rmid[SG_SLOT_SIZE], rfin[SG_SLOT_SIZE];
+        int rpre = 0;
+        long ret2;
+
+        if ((number == SCG_NR_renameat || number == SCG_NR_renameat2) &&
+            a1 != 0 && a3 != 0 &&
+            l2s_rt_rename_replace_prepare != NULL &&
+            l2s_rt_rename_replace_commit != NULL &&
+            (number == SCG_NR_renameat || (a4 & 3u) == 0) &&
+            ((int)a0 == SG_AT_FDCWD || ((const char *)(uintptr_t)a1)[0] == '/') &&
+            ((int)a2 == SG_AT_FDCWD || ((const char *)(uintptr_t)a3)[0] == '/')) {
+            const char *ro = (const char *)(uintptr_t)a1;
+            const char *rn = (const char *)(uintptr_t)a3;
+
+            if (bxroot_l2s_lazy_enable != NULL &&
+                (l2s_rt_enabled == NULL || !l2s_rt_enabled()))
+                (void)bxroot_l2s_lazy_enable(rn);
+            rpre = l2s_rt_rename_replace_prepare(ro, rn, rmid, sizeof(rmid),
+                                                 rfin, sizeof(rfin));
+            if (rpre == 2)
+                return 0;
+        }
+        if (rpre == 1) {
+            ret2 = raw_syscall6(number, a0, a1, a2, a3, a4, a5);
+            if (ret2 == 0)
+                (void)l2s_rt_rename_replace_commit(rmid, rfin);
+            return ret2;
+        }
+    }
 
     {
         /*

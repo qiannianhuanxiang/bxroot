@@ -120,6 +120,17 @@ int l2s_rt_unlink(const char *path);
  * 否则重命名后原来的客户路径会留下悬空链接。 */
 int l2s_rt_rename(const char *oldpath, const char *newpath);
 
+/*
+ * 改名**覆盖**伪造链接时的引用计数记账（两步，说明见 l2s-runtime.c）。
+ * prepare 在真实 rename 之前调用：0 = 与 l2s 无关；1 = newpath 是伪造
+ * 链接，成功后须 commit；2 = old/new 是同一条链的两个名字，调用方应
+ * 直接返回 0 且不发真实 rename。commit 对 final 递减计数，归零回收。
+ */
+int l2s_rt_rename_replace_prepare(const char *oldpath, const char *newpath,
+                                  char *out_mid, size_t midsz,
+                                  char *out_final, size_t finalsz);
+int l2s_rt_rename_replace_commit(const char *mid, const char *final);
+
 /* ------------------------------------------------------------------ */
 /* readlink 反转译                                                     */
 /* ------------------------------------------------------------------ */
