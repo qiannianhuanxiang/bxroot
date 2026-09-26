@@ -4117,6 +4117,50 @@ static int px_resolve_abs_symlink(const char *in, char *out, size_t outsz)
     return 1;
 }
 
+/*
+ * exec("/proc/self/exe") —— 自重执行（re-exec）的 guest 视角改写。
+ *
+ * 【缺陷（实测，2026-09-26）】
+ *     sh -c '/proc/self/exe -c "echo ok"'      官方: ok   bxroot: not found ❌
+ *     python: os.execv("/proc/self/exe", …)    官方: ok   bxroot: ENOENT    ❌
+ * 内核对 /proc/self/exe 的解析得到 bridge.so（bxroot 进程映像的真实来源）；
+ * px_resolve_abs_symlink 再给它套上 $ROOTFS → 不存在。busybox、多进程
+ * 服务器（nginx/uwsgi 的 re-exec）、Go 程序的 `os.Executable()` 后再
+ * exec 全都走这条路。
+ *
+ * 【修法】guest 眼里 /proc/<who>/exe 就是 BXROOT_GUEST_EXE（runtime 的
+ * readlink 钩子给的同一个答案，见 preload.c proc_magic_link_target）。
+ * 在翻译**之前**把 path 换成它，后续 shebang/符号链接/翻译逻辑全部照常。
+ * 只认 /proc/self、/proc/thread-self、/proc/<数字>/exe 这一形状；
+ * guest_exe 缺失或非绝对时不动（与 readlink 钩子的 rc=134 修复同边界）。
+ */
+static const char *px_exec_proc_exe_alias(const char *path)
+{
+    const char *rest, *q, *slash, *ge;
+
+    if (path == NULL || strncmp(path, "/proc/", 6) != 0)
+        return path;
+    rest = path + 6;
+    if (strncmp(rest, "self/", 5) == 0) {
+        slash = rest + 4;
+    } else if (strncmp(rest, "thread-self/", 12) == 0) {
+        slash = rest + 11;
+    } else {
+        q = rest;
+        while (*q >= '0' && *q <= '9')
+            q++;
+        if (q == rest || *q != '/')
+            return path;
+        slash = q;
+    }
+    if (strcmp(slash, "/exe") != 0)
+        return path;
+    ge = getenv("BXROOT_GUEST_EXE");
+    if (ge == NULL || ge[0] != '/')
+        return path;
+    return ge;
+}
+
 static int px_do_execve(const char *path, char *const argv[],
                         char *const envp[], const char *path_env,
                         int use_search)
@@ -4176,6 +4220,15 @@ static int px_do_execve(const char *path, char *const argv[],
     raw_argv0[0] = '\0';
     if (argv != NULL && argv[0] != NULL) {
         px_cfg_str(raw_argv0, sizeof(raw_argv0), argv[0]);
+    }
+
+    /* /proc/<who>/exe → guest_exe（自重执行；见 px_exec_proc_exe_alias） */
+    if (!use_search) {
+        const char *alias = px_exec_proc_exe_alias(path);
+        if (alias != path) {
+            PX_LOG("proc: execve %s → %s（/proc exe 别名）", path, alias);
+            path = alias;
+        }
     }
 
     g_rt_stats.exec_calls++;
@@ -4957,7 +5010,10 @@ static int px_do_spawn(pid_t *pid, const char *path,
         dl_name = "posix_spawnp";
         g_rt_stats.spawn_path_translated++;
     } else {
-        int tr = px_runtime_translate(path, host, sizeof(host));
+        int tr;
+        /* /proc/<who>/exe → guest_exe（与 px_do_execve 同款） */
+        path = px_exec_proc_exe_alias(path);
+        tr = px_runtime_translate(path, host, sizeof(host));
         if (tr < 0) {
             return ENAMETOOLONG;
         }
