@@ -840,6 +840,14 @@ else
     run_step "l2s 中间文件清理"
 fi
 
+# ulx 用户态 exec + 早期 SIGSYS 处理器（Android app 沙箱 seccomp TRAP，
+# 2026-09-27 Termux 真机）。端到端在 test/device/run-termux.sh。
+if [ -f test/RUN_ULX.sh ]; then
+    run_step "ulx 早期 SIGSYS" sh test/RUN_ULX.sh
+else
+    run_step "ulx 早期 SIGSYS"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================
