@@ -985,16 +985,87 @@ int l2s_rt_unlink(const char *path)
  * 我原先的实现会重建中间层，反而引入两个风险：中途失败留下悬空链接；
  * 以及 nlink 记账挂在中间层上，换名等于换账本。透传没有这些问题。
  *
- * 已知且接受的残留（参考实现 同样存在）：把一个普通文件改名**覆盖**到伪造
- * 链接上时，内核会用新文件替换掉那条符号链接，中间层与数据文件变成无人
- * 引用的孤儿，占用空间直到被清理。要修需要反向扫描整个元数据目录，代价
- * 远高于收益，且会让行为偏离参考实现，故不处理。
+ * 改名**覆盖**到伪造链接上的情形（内核用新文件替换那条符号链接）曾被
+ * 本注释记作"参考实现同样存在、接受的残留"。2026-09-26 实测**不成立**
+ * —— 见下面 l2s_rt_rename_replace_prepare/commit：不需要反向扫描，
+ * 只需在 rename 前 probe 一次 newpath，成功后对其 final 做 unlink 同款
+ * 的递减/回收。
  */
 int l2s_rt_rename(const char *oldpath, const char *newpath)
 {
     (void)oldpath;
     (void)newpath;
     return L2S_RT_PASSTHRU;
+}
+
+/*
+ * ★ 改名**覆盖**伪造链接时的记账（上游 #131/#28 清理行为核查，
+ *   2026-09-26 实测）★
+ *
+ * 上面那段注释里"已知且接受的残留"实测**不成立**：官方 runtime 导出
+ * link2symlink_pre_rename_replace / link2symlink_pre_rename_move 两个
+ * 符号，`ln a b; echo zz > c; mv c b` 之后官方 `stat a` 报 nlink=**1**，
+ * 而 bxroot 报 **2**、`.cnt` 仍是 2；随后 `rm a` 只把计数减到 1，
+ * 中间层 / 数据文件 / .cnt 三个文件**永久残留**（集中目录或客户目录）。
+ * 这正是 #131/#28 抱怨的"l2s 中间文件越积越多"的一条成因。
+ *
+ * 【为什么拆成 prepare / commit 两步而不是在 l2s_rt_rename 里做】
+ * 本层不发系统调用（文件头铁律）；而"内核是否真的覆盖成功"只有调用
+ * 方知道（RENAME_NOREPLACE 会 EEXIST，权限不足会 EACCES）。所以：
+ *   prepare（svc 前）：判定 newpath 是不是伪造链接，记下它的 mid/final；
+ *   commit （svc 成功后）：对那条 final 做与 unlink 相同的递减/回收。
+ * 客户路径本身已被内核用新文件顶掉，不必再删。
+ *
+ * prepare 返回：
+ *   0  newpath 不是伪造链接（或未启用）→ 调用方照常 rename，不必 commit
+ *   1  是伪造链接，mid/final 已填 → rename 成功后必须 commit
+ *   2  old 与 new 是**同一条链**的两个名字 → Linux 对指向同一 inode 的
+ *      两个硬链接 rename 的语义是"什么都不做并返回成功"，调用方直接
+ *      return 0，不要发 svc（否则内核会把一个名字删掉、计数漂移）
+ */
+int l2s_rt_rename_replace_prepare(const char *oldpath, const char *newpath,
+                                  char *out_mid, size_t midsz,
+                                  char *out_final, size_t finalsz)
+{
+    char omid[L2S_PATH_MAX];
+
+    if (!l2s_rt_enabled() || oldpath == NULL || newpath == NULL ||
+        out_mid == NULL || out_final == NULL)
+        return 0;
+    if (!probe_fake_link(newpath, out_mid, midsz))
+        return 0;
+    if (resolve_final(out_mid, out_final, finalsz) != 0)
+        return 0;                       /* 链已损坏：让内核照常覆盖 */
+    if (probe_fake_link(oldpath, omid, sizeof(omid)) &&
+        strcmp(omid, out_mid) == 0)
+        return 2;
+    return 1;
+}
+
+int l2s_rt_rename_replace_commit(const char *mid, const char *final)
+{
+    unsigned int count;
+
+    if (!l2s_rt_enabled() || mid == NULL || final == NULL)
+        return 0;
+    if (read_nlink(final, &count) != 0)
+        return -EINVAL;
+    if (count > 1) {
+        count--;
+        if (write_nlink(final, count) != 0)
+            return -errno;
+        g_stats.unlink_dec++;
+        return 0;
+    }
+    (void)g_ops->unlink(mid);
+    (void)g_ops->unlink(final);
+    {
+        char cnt[L2S_PATH_MAX];
+        if (l2s_refcount_path(final, cnt, sizeof(cnt)) == L2S_OK)
+            (void)g_ops->unlink(cnt);
+    }
+    g_stats.unlink_free++;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */

@@ -5209,6 +5209,26 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath) {
     return fn(target, newdirfd, pl);
 }
 
+/*
+ * rename 族共享：newpath 是伪造链接且会被覆盖时，做与 unlink 相同的
+ * 递减/回收（实测缺陷与设计说明见 l2s-runtime.c 的
+ * l2s_rt_rename_replace_prepare）。first 参数是用来懒启用的宿主路径。
+ * 返回值同 l2s_rt_rename_replace_prepare。
+ */
+static int l2s_rename_replace_pre(const char *lazy_probe,
+                                  const char *ao, const char *an,
+                                  char *mid, size_t midsz,
+                                  char *fin, size_t finsz)
+{
+    if (an == NULL || ao == NULL)
+        return 0;
+    if (!l2s_rt_enabled())
+        (void)bxroot_l2s_lazy_enable(lazy_probe);
+    if (!l2s_rt_enabled())
+        return 0;
+    return l2s_rt_rename_replace_prepare(ao, an, mid, midsz, fin, finsz);
+}
+
 int rename(const char *oldpath, const char *newpath) {
     static int (*fn)(const char *, const char *) = NULL;
     char to[MAX_PATH_LEN], tn[MAX_PATH_LEN];
@@ -5228,7 +5248,20 @@ int rename(const char *oldpath, const char *newpath) {
         if (rc == 0) return 0;
         if (rc != L2S_RT_PASSTHRU) { errno = -rc; return -1; }
     }
-    return fn(po, pn);
+    {
+        char jo[MAX_PATH_LEN], ho[MAX_PATH_LEN], jn[MAX_PATH_LEN], hn[MAX_PATH_LEN];
+        char mid[MAX_PATH_LEN], fin[MAX_PATH_LEN];
+        const char *ao = resolve_host_path(AT_FDCWD, oldpath, jo, sizeof(jo), ho, sizeof(ho));
+        const char *an = resolve_host_path(AT_FDCWD, newpath, jn, sizeof(jn), hn, sizeof(hn));
+        int pre = l2s_rename_replace_pre(an, ao, an, mid, sizeof(mid),
+                                         fin, sizeof(fin));
+        int rc;
+        if (pre == 2) return 0;
+        rc = fn(po, pn);
+        if (rc == 0 && pre == 1)
+            (void)l2s_rt_rename_replace_commit(mid, fin);
+        return rc;
+    }
 }
 
 int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
@@ -5243,7 +5276,20 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
 
     if (translate_path(oldpath, to, sizeof(to)) > 0) po = to;
     if (translate_path(newpath, tn, sizeof(tn)) > 0) pn = tn;
-    return fn(olddirfd, po, newdirfd, pn);
+    {
+        char jo[MAX_PATH_LEN], ho[MAX_PATH_LEN], jn[MAX_PATH_LEN], hn[MAX_PATH_LEN];
+        char mid[MAX_PATH_LEN], fin[MAX_PATH_LEN];
+        const char *ao = resolve_host_path(olddirfd, oldpath, jo, sizeof(jo), ho, sizeof(ho));
+        const char *an = resolve_host_path(newdirfd, newpath, jn, sizeof(jn), hn, sizeof(hn));
+        int pre = l2s_rename_replace_pre(an, ao, an, mid, sizeof(mid),
+                                         fin, sizeof(fin));
+        int rc;
+        if (pre == 2) return 0;
+        rc = fn(olddirfd, po, newdirfd, pn);
+        if (rc == 0 && pre == 1)
+            (void)l2s_rt_rename_replace_commit(mid, fin);
+        return rc;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -5924,7 +5970,22 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
 
     if (translate_path(oldpath, to, sizeof(to)) > 0) po = to;
     if (translate_path(newpath, tn, sizeof(tn)) > 0) pn = tn;
-    return fn(olddirfd, po, newdirfd, pn, flags);
+    {
+        char jo[MAX_PATH_LEN], ho[MAX_PATH_LEN], jn[MAX_PATH_LEN], hn[MAX_PATH_LEN];
+        char mid[MAX_PATH_LEN], fin[MAX_PATH_LEN];
+        const char *ao = resolve_host_path(olddirfd, oldpath, jo, sizeof(jo), ho, sizeof(ho));
+        const char *an = resolve_host_path(newdirfd, newpath, jn, sizeof(jn), hn, sizeof(hn));
+        /* RENAME_EXCHANGE(2)/NOREPLACE(1)：不覆盖任何东西，不记账 */
+        int pre = (flags & 3u) ? 0
+                : l2s_rename_replace_pre(an, ao, an, mid, sizeof(mid),
+                                         fin, sizeof(fin));
+        int rc;
+        if (pre == 2) return 0;
+        rc = fn(olddirfd, po, newdirfd, pn, flags);
+        if (rc == 0 && pre == 1)
+            (void)l2s_rt_rename_replace_commit(mid, fin);
+        return rc;
+    }
 }
 
 /* ------------------------------------------------------------------ */
