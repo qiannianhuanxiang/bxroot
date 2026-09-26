@@ -388,6 +388,24 @@ if [ ! -e "$GUEST_EXE_HOST" ]; then
     exit 2
 fi
 
+# ---------------------------------------------------------------------
+# 首进程的 BXROOT_GUEST_EXE —— 与 launcher 对齐（launcher.c:1358）
+#
+# 【为什么】runtime 用它回答"我是谁"：readlink/stat -L/open/exec 的
+# /proc/self/exe 都以它为准（内核给的是 bridge.so）。launcher 在启动首
+# 进程时会设，子进程由 proc.c 每次 exec 更新；但本脚本**直接调 bridge**，
+# 首进程此前一直没有这个值 —— 实测 `wc -c </proc/self/exe` 顶层 sh 读到
+# bridge.so 的 20200 字节，而它 fork 出的子进程都正确。
+#
+# 值是 **guest 视角**（上游语义，且非绝对会让 ld.so 断言 rc=134）。
+# 调用方显式设了就尊重（有测试要观察"没有 guest_exe"的行为）。
+# ---------------------------------------------------------------------
+if [ -z "${BXROOT_GUEST_EXE+x}" ]; then
+    case "$GUEST_EXE" in
+    /*) BXROOT_GUEST_EXE=$GUEST_EXE; export BXROOT_GUEST_EXE ;;
+    esac
+fi
+
 run_loader "$GUEST_ARGV0" "$GUEST_EXE_HOST" "$@"
 _rc=$?
 exit $_rc

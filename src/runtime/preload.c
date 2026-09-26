@@ -1455,6 +1455,296 @@ static void l2s_fix_symlink_size(struct stat *st, const char *p)
  * 而"失败一次再展开重试"的最坏情况只影响本来就会失败的那一次。
  */
 
+/*
+ * ====================================================================
+ * /proc 魔法链接（exe / cwd / root / fd/N）的 guest 视角目标
+ * ====================================================================
+ *
+ * 【缺陷（实测，2026-09-26，上游 #421 / #438 复核时发现）】
+ * 内核对 /proc/<pid>/{exe,cwd,root,fd/N} 的 readlink 返回**宿主视角**：
+ *     exe  → …/lib/arm64/libproroot-bridge.so   （bridge 加载链的产物）
+ *     cwd  → $ROOTFS/etc
+ *     root → /                                    （宿主真根）
+ * readlink 钩子已把**叶子**改写成 guest 视角（guest_exe / 剥 rootfs 前缀），
+ * 但所有把这些链接当**中间组件**走的路径、以及"跟随叶子"的调用都还在
+ * 用内核的原始目标：
+ *
+ *     cat /proc/self/root/etc/hostname   官方: localhost   bxroot: ENOENT ❌
+ *     stat -L /proc/self/exe             官方: 133488       bxroot: ENOENT ❌
+ *     /proc/self/exe -c 'echo ok'        官方: ok           bxroot: not found ❌
+ *     wc -c < /proc/self/exe             官方: 133608(dash) bxroot: 20200(bridge.so) ❌
+ *
+ * 根因：resolve_intermediate_symlinks / resolve_symlink_full 逐段
+ * real_readlink 展开，拿到 "/" 就按 translate_path 翻成 $ROOTFS（对 root
+ * 正确），但对 exe 拿到的是 bridge.so 的宿主路径 → 再套一层 $ROOTFS →
+ * 不存在；对 root 后面的 open() 又因为 /proc 透传规则从不展开
+ * 中间组件（translate_path 返回 0 → 整段解链逻辑被跳过）。
+ *
+ * 【修法】把"这个 /proc 链接在 guest 眼里指向哪"集中在一处：
+ *   - exe                 → g_config.guest_exe（与 readlink 钩子同一答案）
+ *   - root                → "/"（guest 的根就是根）
+ *   - cwd / fd/N          → 内核目标经 readlink_fixup 反向翻译
+ * 得到 guest 路径后再 translate_path 成宿主路径交给内核，这样内核看到的
+ * 不再是魔法链接，两层视角不会再打架。
+ *
+ * 只认 /proc/self、/proc/thread-self、/proc/<数字> 三种形态；其它 /proc
+ * 条目（/proc/self/fd/N 指向 socket:[…] 等非路径）返回 0 保持原样。
+ *
+ * 返回 1 = out 是 guest 视角目标；0 = 不是我们认识的 /proc 魔法链接。
+ */
+
+/*
+ * 读 /proc/<pid>/environ 里的 BXROOT_GUEST_EXE（其它 guest 进程的 exe 身份）。
+ * 只用裸 open/read（real_* 指针），不经钩子；environ 最多读 64 KiB。
+ * 返回 1 = out 已写入绝对路径；0 = 读不到/没有/非绝对。
+ */
+static int proc_other_pid_guest_exe(const char *exe_path, char *out, size_t outsz)
+{
+    char envp[128];
+    /*
+     * ★ 必须先 ensure_real_functions ★ —— 本函数会从 readlinkat /
+     * __readlink_chk 等**不**调 ensure_real_functions 的钩子进来；进程的
+     * 第一个 FS 调用若正是它（coreutils readlink 走 __readlink_chk），
+     * real_open 还是 NULL → 直接放弃 → 回退成调用者自己的 guest_exe。
+     * 表现为 `readlink /proc/$$/exe` 偶发答 /usr/bin/readlink 而非 /bin/sh
+     * （RUN_ALL 里复现、单跑不复现 —— 取决于哪条钩子先被触发）。
+     */
+    ensure_real_functions();
+    const size_t cap = 65536;           /* environ 上限（线程安全：堆分配） */
+    char *big;
+    const char *e;
+    int fd, rc = 0;
+    ssize_t n, total = 0;
+    size_t pfx = (size_t)(strrchr(exe_path, '/') - exe_path);   /* "/proc/<pid>" */
+
+    if (out == NULL || outsz == 0 || pfx + 9 >= sizeof(envp))
+        return 0;
+    memcpy(envp, exe_path, pfx);
+    memcpy(envp + pfx, "/environ", 9);
+    if (real_open == NULL)
+        return 0;
+    fd = real_open(envp, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    big = (char *)malloc(cap);
+    if (big == NULL) {
+        close(fd);
+        return 0;
+    }
+    while (total < (ssize_t)cap - 1) {
+        n = read(fd, big + total, cap - 1 - (size_t)total);
+        if (n <= 0)
+            break;
+        total += n;
+    }
+    close(fd);
+    if (total > 0) {
+        big[total] = '\0';
+        for (e = big; e < big + total; e += strlen(e) + 1) {
+            if (strncmp(e, "BXROOT_GUEST_EXE=", 17) == 0) {
+                const char *v = e + 17;
+                if (v[0] == '/' && strlen(v) < outsz) {
+                    memcpy(out, v, strlen(v) + 1);
+                    rc = 1;
+                }
+                break;
+            }
+        }
+    }
+    free(big);
+    return rc;
+}
+
+static int proc_magic_link_target(const char *hostp, char *out, size_t outsz)
+{
+    const char *rest;
+    const char *slash;
+    char raw[MAX_PATH_LEN];
+    ssize_t n;
+
+    if (hostp == NULL || out == NULL || outsz == 0)
+        return 0;
+    if (strncmp(hostp, "/proc/", 6) != 0)
+        return 0;
+    ensure_real_functions();        /* 下面要用 real_readlink / real_open（见 proc_other_pid_guest_exe） */
+    rest = hostp + 6;
+    if (strncmp(rest, "self", 4) == 0 && rest[4] == '/') {
+        slash = rest + 4;
+    } else if (strncmp(rest, "thread-self", 11) == 0 && rest[11] == '/') {
+        slash = rest + 11;
+    } else {
+        const char *q = rest;
+        if (*q < '0' || *q > '9')
+            return 0;
+        while (*q >= '0' && *q <= '9')
+            q++;
+        if (*q != '/')
+            return 0;
+        slash = q;
+    }
+
+    if (strcmp(slash, "/root") == 0) {
+        snprintf(out, outsz, "/");
+        return 1;
+    }
+    if (strcmp(slash, "/exe") == 0) {
+        /*
+         * 同 readlink 钩子：只在 guest_exe 是绝对路径时伪装。
+         *
+         * 【/proc/<其它pid>/exe】bxroot 下每个 guest 进程都经同一条 bridge
+         * 链启动，内核对任何 guest 进程的 exe 都答 bridge.so，用它必错。
+         * 但每个 guest 的 BXROOT_GUEST_EXE 就在它自己的 /proc/<pid>/environ
+         * 里（proc.c 每次 exec 都写；同 uid 可读）—— 直接去读，于是
+         *     sh -c 'readlink /proc/$$/exe'   → /usr/bin/dash（与官方一致）
+         * 而不是 readlink 进程自己的名字。读不到（非 guest 进程、已退出、
+         * 权限）时回退到本进程的 guest_exe（fork 未 exec 的子进程 environ
+         * 与父相同，回退值恰好正确）。
+         */
+        if (g_config.guest_exe != NULL && g_config.guest_exe[0] == '/') {
+            if (slash != rest + 4 && slash != rest + 11 &&
+                proc_other_pid_guest_exe(hostp, out, outsz) == 1)
+                return 1;
+            snprintf(out, outsz, "%s", g_config.guest_exe);
+            return 1;
+        }
+        return 0;
+    }
+    if (strcmp(slash, "/cwd") != 0 && strncmp(slash, "/fd/", 4) != 0)
+        return 0;
+
+    if (real_readlink == NULL)
+        return 0;
+    n = real_readlink(hostp, raw, sizeof(raw) - 1);
+    if (n <= 0)
+        return 0;
+    raw[n] = '\0';
+    if (raw[0] != '/')
+        return 0;                   /* socket:[N] / pipe:[N] / anon_inode */
+    if (readlink_fixup(raw, out, outsz) == 1)
+        return 1;
+    snprintf(out, outsz, "%s", raw);
+    return 1;
+}
+
+/*
+ * 把路径中作为**中间组件**出现的 /proc 魔法链接展开成宿主路径：
+ *
+ *   /proc/self/root/etc/hostname → $ROOTFS/etc/hostname
+ *   /proc/self/cwd/hostname      → $ROOTFS/<cwd>/hostname
+ *
+ * 叶子本身是魔法链接时**不动**（readlink/lstat/O_NOFOLLOW 语义要它保留），
+ * 叶子的跟随由 proc_magic_leaf_resolve 负责。返回 1 = out 已改写。
+ */
+static int proc_magic_intermediate_resolve(const char *hostp,
+                                           char *out, size_t outsz)
+{
+    const char *slash;
+    const char *link_end = NULL;
+    char prefix[MAX_PATH_LEN];
+    char guest[MAX_PATH_LEN];
+    char host[MAX_PATH_LEN];
+    size_t pl, gl, rl;
+
+    if (hostp == NULL || strncmp(hostp, "/proc/", 6) != 0)
+        return 0;
+
+    /* 找到 "/proc/<who>/<entry>" 的结尾：entry 是 root|cwd|exe|fd/N */
+    slash = strchr(hostp + 6, '/');
+    if (slash == NULL)
+        return 0;
+    if (strncmp(slash, "/root/", 6) == 0 || strncmp(slash, "/cwd/", 5) == 0 ||
+        strncmp(slash, "/exe/", 5) == 0) {
+        link_end = strchr(slash + 1, '/');
+    } else if (strncmp(slash, "/fd/", 4) == 0) {
+        const char *q = slash + 4;
+        while (*q >= '0' && *q <= '9')
+            q++;
+        if (q == slash + 4 || *q != '/')
+            return 0;
+        link_end = q;
+    }
+    if (link_end == NULL || link_end[1] == '\0')
+        return 0;                   /* 魔法链接是叶子 → 不在本函数职责内 */
+
+    pl = (size_t)(link_end - hostp);
+    if (pl >= sizeof(prefix))
+        return 0;
+    memcpy(prefix, hostp, pl);
+    prefix[pl] = '\0';
+
+    if (proc_magic_link_target(prefix, guest, sizeof(guest)) != 1)
+        return 0;
+
+    /* guest 目标 + rest（以 '/' 开头）→ 再翻译成宿主路径 */
+    gl = strlen(guest);
+    rl = strlen(link_end);
+    if (gl == 1 && guest[0] == '/')
+        gl = 0;                     /* 避免 "//etc" */
+    if (gl + rl + 1u > sizeof(host))
+        return 0;
+    memcpy(host, guest, gl);
+    memcpy(host + gl, link_end, rl + 1u);
+
+    if (translate_path(host, out, outsz) < 0)
+        return 0;
+    return 1;
+}
+
+/*
+ * 叶子是 /proc 魔法链接、且调用方要**跟随**它（stat/open/exec 不带
+ * NOFOLLOW）时，给出宿主视角的最终目标。返回 1 = out 已改写。
+ */
+static int proc_magic_leaf_resolve(const char *hostp, char *out, size_t outsz)
+{
+    char guest[MAX_PATH_LEN];
+
+    if (proc_magic_link_target(hostp, guest, sizeof(guest)) != 1)
+        return 0;
+    if (translate_path(guest, out, outsz) < 0)
+        return 0;
+    return 1;
+}
+
+static int resolve_intermediate_symlinks(const char *translated, char *out, size_t out_size);
+static int resolve_symlink_full(const char *translated, char *out, size_t out_size);
+
+/*
+ * realpath 族（realpath / __realpath_chk / canonicalize_file_name）在
+ * **未翻译分支**（/proc 透传）对 /proc 魔法链接的宿主路径预解析。
+ *
+ * 【缺陷（实测，2026-09-26）】
+ *     realpath("/proc/self/exe")        官方: /tmp/rp   bxroot: …/libproroot-bridge.so ❌
+ *     realpath("/proc/self/root/etc")   官方: /etc      bxroot: /system/etc（外层）     ❌
+ *     readlink -f /proc/self/exe（子目录 rootfs）        bxroot: rc=1                    ❌
+ * translate_path 对 /proc 返回 0，三个入口直接把原路径交给 libc realpath，
+ * 内核按宿主视角展开魔法链接。修法：先把魔法链接（中间组件或叶子）换成
+ * guest 目标再翻译成宿主路径，随后走与已翻译分支同款的链接解析；返回值
+ * 再由 realpath_fixup_inplace 反向翻译。返回 1 = out 是可交给 realpath 的宿主路径。
+ */
+static int proc_magic_realpath_pre(const char *p, char *out, size_t outsz)
+{
+    char pm[MAX_PATH_LEN];
+    char mid_[MAX_PATH_LEN];
+    char full_[MAX_PATH_LEN];
+    const char *pre;
+    int rr;
+
+    if (!proc_magic_intermediate_resolve(p, pm, sizeof(pm)) &&
+        !proc_magic_leaf_resolve(p, pm, sizeof(pm)))
+        return 0;
+    pre = pm;
+    if (resolve_intermediate_symlinks(pre, mid_, sizeof(mid_)))
+        pre = mid_;
+    rr = resolve_symlink_full(pre, full_, sizeof(full_));
+    if (rr == 1)
+        pre = full_;
+    /* rr == -2（环）：不改 pre，让内核给出 ELOOP */
+    if (strlen(pre) >= outsz)
+        return 0;
+    memcpy(out, pre, strlen(pre) + 1);
+    return 1;
+}
+
 /* 展开包含绝对目标的符号链接。返回 1 = 已改写 out，0 = 未变。 */
 static int resolve_abs_symlink(const char *translated,
                                char *out, size_t out_size)
@@ -1712,6 +2002,18 @@ static int resolve_symlink_full(const char *translated,
         if (real_readlink == NULL)
             return 0;
 
+        /*
+         * ★ /proc 魔法链接优先：内核给的目标是宿主视角（exe 甚至是
+         * bridge.so），不能拿去再翻译。见 proc_magic_link_target。★
+         */
+        {
+            char pm[MAX_PATH_LEN];
+            if (proc_magic_leaf_resolve(cur, pm, sizeof(pm))) {
+                memcpy(cur, pm, strlen(pm) + 1);
+                continue;               /* 目标可能还是链接，继续跟 */
+            }
+        }
+
         n = real_readlink(cur, tgt, sizeof(tgt) - 1);
         if (n <= 0)
             break;                      /* 不再是链接 → cur 是最终路径 */
@@ -1859,6 +2161,28 @@ static int resolve_intermediate_symlinks(const char *translated,
             size_t rl = strlen(rf);
             start = (rl > 0 && strncmp(cur, rf, rl) == 0 && cur[rl] == '/')
                     ? (rl + 1) : 1;
+        }
+
+        /*
+         * ★ /proc 魔法链接作中间组件（/proc/self/root/etc/x、
+         * /proc/self/cwd/x、/proc/<pid>/fd/N/x）：一步展开成宿主路径，
+         * 不能走下面的逐段 real_readlink（内核目标是宿主视角）。★
+         */
+        {
+            char pm[MAX_PATH_LEN];
+            if (proc_magic_intermediate_resolve(cur, pm, sizeof(pm))) {
+                int k, dup = 0;
+                for (k = 0; k < nseen; k++)
+                    if (strcmp(seen[k], pm) == 0) dup = 1;
+                if (dup) {
+                    errno = ELOOP;
+                    return -2;
+                }
+                memcpy(cur, pm, strlen(pm) + 1);
+                if (nseen < 16)
+                    memcpy(seen[nseen++], cur, strlen(cur) + 1);
+                continue;                       /* 重头扫下一轮 */
+            }
         }
 
         for (i = start; i < strlen(cur); i++) {
@@ -2112,6 +2436,7 @@ static int stat_pre_resolve(const char *translated, int dirfd, int flags,
 {
     struct stat lst;
     int r;
+    int changed = 0;    /* 中间组件已展开进 out（叶子可能仍需处理） */
 
     /* 调用方明确要"看链接本身"时，绝不改动语义 */
     if (flags & AT_SYMLINK_NOFOLLOW)
@@ -2128,12 +2453,44 @@ static int stat_pre_resolve(const char *translated, int dirfd, int flags,
      *     stat("/etc/passwd")                 → dev=65086（容器）
      * 同一个文件两条路给出**不同 inode**。实测由第三轮验收子代理报出。
      */
+    /*
+     * ★ 中间组件展开后**不能直接返回**，叶子还要继续判 ★
+     *
+     * 【缺陷（实测，2026-09-26）】`/proc/self/exe` 的中间组件
+     * `/proc/self` 是链接（→ <pid>），这里展开成 `/proc/<pid>/exe`
+     * 就 return 1 —— 叶子（exe 本身也是链接）从未被解析，内核随后
+     * 跟随到 bridge.so：`stat("/proc/self/exe")` 拿到 20200 字节的
+     * bridge.so 元数据，而同路径 fstatat/statx 是对的（它们的叶子
+     * 判定在别处）。修法：展开中间组件后把结果当新起点继续走叶子判定。
+     */
     {
         char mid[MAX_PATH_LEN];
         int rr = resolve_intermediate_symlinks(translated, mid, sizeof(mid));
-        if (rr) {
+        if (rr && strlen(mid) < out_size) {
             memcpy(out, mid, strlen(mid) + 1);
-            return 1;
+            translated = out;       /* 叶子判定以展开后的路径为准 */
+            changed = 1;
+        }
+    }
+
+    /*
+     * ★ /proc 魔法链接的叶子不能靠 S_ISLNK 判 ★
+     * 本容器里 libc fstatat(AT_SYMLINK_NOFOLLOW) 对 /proc/self/exe 返回
+     * islnk=0（外层加载链的干扰），按形状认：是我们认识的魔法链接就交给
+     * resolve_symlink_full（首步即 proc_magic_leaf_resolve）。
+     */
+    {
+        char pm[MAX_PATH_LEN];
+        if (proc_magic_leaf_resolve(translated, pm, sizeof(pm))) {
+            char full[MAX_PATH_LEN];
+            int rr = resolve_symlink_full(translated, full, sizeof(full));
+            if (rr == -2)
+                return -2;
+            if (rr == 1 && strlen(full) < out_size) {
+                memcpy(out, full, strlen(full) + 1);
+                return 1;
+            }
+            return changed;
         }
     }
 
@@ -2141,13 +2498,23 @@ static int stat_pre_resolve(const char *translated, int dirfd, int flags,
         ? real_newfstatat(dirfd, translated, &lst, AT_SYMLINK_NOFOLLOW)
         : -1;
     if (r != 0)
-        return 0;                   /* 取不到 → 交给原调用报错 */
+        return changed;             /* 取不到 → 交给原调用报错 */
 
     if (!S_ISLNK(lst.st_mode))
-        return 0;                   /* 不是链接：**零额外开销** */
+        return changed;             /* 不是链接：**零额外开销** */
 
     /* 是链接 → 自己解析到底（绝对目标会按 rootfs 翻译） */
-    return resolve_symlink_full(translated, out, out_size);
+    {
+        char full[MAX_PATH_LEN];
+        int rr = resolve_symlink_full(translated, full, sizeof(full));
+        if (rr == -2)
+            return -2;
+        if (rr == 1 && strlen(full) < out_size) {
+            memcpy(out, full, strlen(full) + 1);
+            return 1;
+        }
+    }
+    return changed;
 }
 
 /* open64 版本（同 open_retry_abs_symlink，只是底层函数不同）。 */
@@ -2303,6 +2670,20 @@ int open(const char *path, int flags, ...) {
         }
         return open_retry_abs_symlink(q, flags, mode);
     }
+    /*
+     * 未翻译分支（/proc /sys /dev 透传）：/proc 魔法链接仍要按 guest
+     * 视角解析 —— `cat /proc/self/root/etc/hostname`、`wc -c </proc/self/exe`
+     * 走的就是这里（实测 ENOENT / 读到 bridge.so，见 proc_magic_link_target）。
+     * O_NOFOLLOW 只作用于叶子，中间组件照常展开。
+     */
+    {
+        char pm[MAX_PATH_LEN];
+        if (proc_magic_intermediate_resolve(eff, pm, sizeof(pm)))
+            return call_real_open(pm, flags, mode); /* 已是宿主路径 */
+        if (!(flags & O_NOFOLLOW) &&
+            proc_magic_leaf_resolve(eff, pm, sizeof(pm)))
+            return call_real_open(pm, flags, mode);
+    }
     q = l2s_open_path(eff, flags, resolved, sizeof(resolved));
     return call_real_open(q, flags, mode);
 }
@@ -2392,6 +2773,15 @@ int open64(const char *path, int flags, ...) {
             return open64_retry_abs_symlink(q, flags, mode);
         }
         return open64_retry_abs_symlink(q, flags, mode);
+    }
+    /* 与 open() 同款：/proc 魔法链接按 guest 视角解析（理由见那里） */
+    {
+        char pm[MAX_PATH_LEN];
+        if (proc_magic_intermediate_resolve(eff, pm, sizeof(pm)))
+            return real_open64(pm, flags, mode);
+        if (!(flags & O_NOFOLLOW) &&
+            proc_magic_leaf_resolve(eff, pm, sizeof(pm)))
+            return real_open64(pm, flags, mode);
     }
     q = l2s_open_path(eff, flags, resolved, sizeof(resolved));
     return real_open64(q, flags, mode);
@@ -3381,6 +3771,120 @@ int fchown(int fd, uid_t uid, gid_t gid) {
 }
 
 /* Hook: readlink */
+
+/*
+ * readlink 四入口（readlink / readlinkat / __readlink_chk / __readlinkat_chk）
+ * 的**共同收尾**：反向翻译 + l2s 伪造链接判定 + 按 readlink(2) 语义截断。
+ *
+ * 【缺陷（实测，2026-09-26）】此前四个入口各自把内核结果**直接写进客户
+ * 缓冲**再做 fixup —— 客户缓冲小于宿主路径时，内核先把宿主路径截断
+ * 写入，fixup 拿到的是半截 `/data/data/com.d`，剥不掉前缀，于是**宿主
+ * 前缀原样泄漏**：
+ *
+ *     readlink("/proc/self/cwd", buf, 16)  官方: "/tmp/xxxxxxxxxxx"
+ *                                          bxroot: "/data/data/com.d" ❌
+ *
+ * 触发面很大：`readlink /proc/self/cwd` 在 cwd 超过 15 字节时**答案被
+ * 截成 15 字节**（coreutils 先试小缓冲再扩），`/tmp/xxxxxxxxxxxxxxxxxxxx`
+ * 变成 `/tmp/xxxxxxxxxxxxxxx`。另外两个 FORTIFY 入口根本没接 fixup，
+ * `ls -l /proc/self/cwd` 直接显示 $ROOTFS 前缀。
+ *
+ * 【修法】先读到足够大的内部缓冲、做完改写，**最后**才按客户给的大小
+ * 截断 —— 这正是内核对"目标 + 缓冲"的原生语义（返回值 = 写入字节数，
+ * 不补 NUL）。四个入口共用这一份逻辑，避免再次漂移。
+ *
+ * hostp：交给内核的路径（l2s 判据要宿主视角）。raw/n：内核返回的目标。
+ * 返回值即钩子返回值。
+ */
+static ssize_t readlink_finish(const char *hostp, char *raw, ssize_t n,
+                               char *buf, size_t bufsiz)
+{
+    char fixed[MAX_PATH_LEN];
+    const char *use = raw;
+    size_t ulen;
+    int lrc;
+
+    if (n <= 0)
+        return n;
+    raw[n] = '\0';
+
+    /* ① D3：/proc 泄漏反向翻译（socket:[N] 等非路径在 fixup 内原样放行） */
+    if (readlink_fixup(raw, fixed, sizeof(fixed)) == 1) {
+        use = fixed;
+    } else {
+        /* ② l2s 伪造链接：必须 EINVAL（契约见 l2s_rt_rewrite_readlink） */
+        if (!l2s_rt_enabled())
+            (void)bxroot_l2s_lazy_enable(hostp);
+        lrc = l2s_rt_rewrite_readlink(hostp, raw, fixed, sizeof(fixed));
+        if (lrc == L2S_RT_READLINK_FAKE) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (lrc == 1)
+            use = fixed;
+    }
+
+    /* ③ 截断，与 readlink(2) 语义一致：不补 NUL */
+    ulen = strlen(use);
+    if (ulen > bufsiz)
+        ulen = bufsiz;
+    memcpy(buf, use, ulen);
+    return (ssize_t)ulen;
+}
+
+/*
+ * /proc/…/exe 的伪装判定（四个入口共用）。
+ * 认 /proc/self/exe、/proc/thread-self/exe、/proc/<pid>/exe，以及
+ * dirfd 指向 /proc/<who> 目录时的裸 "exe"（readlinkat 形态）。
+ * 返回 1 = 已把 guest_exe 写入 buf（按 readlink 语义截断），0 = 不适用。
+ */
+static int readlink_fake_exe(int dirfd, const char *path,
+                             char *buf, size_t bufsiz, ssize_t *out_n)
+{
+    int is_self_exe = 0;
+    char tgt[MAX_PATH_LEN];
+
+    if (path == NULL || g_config.guest_exe == NULL ||
+        g_config.guest_exe[0] != '/')
+        return 0;
+
+    if (path[0] == '/') {
+        const char *tail = strrchr(path, '/');
+        /* 形状 /proc/<who>/exe：proc_magic_link_target 判 <who> 合法性并
+         * 给出目标（self → 本进程 guest_exe；<pid> → 该进程 environ 里的） */
+        if (tail != NULL && strcmp(tail, "/exe") == 0 &&
+            proc_magic_link_target(path, tgt, sizeof(tgt)) == 1)
+            is_self_exe = 1;
+    } else if (dirfd != AT_FDCWD && strcmp(path, "exe") == 0) {
+        /* 相对 /proc/<who> 目录 fd 的 "exe"：确认 dirfd 真是 /proc 目录，
+         * 再拼成绝对路径走同一判定（/proc/<pid> 形态能读到该进程的身份） */
+        char dir[MAX_PATH_LEN];
+        char proc[64];
+        ssize_t dn;
+
+        snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dirfd);
+        dn = real_readlink != NULL ? real_readlink(proc, dir, sizeof(dir) - 1) : -1;
+        if (dn > 0 && (size_t)dn + 5 < sizeof(dir)) {
+            dir[dn] = '\0';
+            if (strncmp(dir, "/proc/", 6) == 0 && strchr(dir + 6, '/') == NULL) {
+                memcpy(dir + dn, "/exe", 5);
+                if (proc_magic_link_target(dir, tgt, sizeof(tgt)) == 1)
+                    is_self_exe = 1;
+            }
+        }
+    }
+
+    if (!is_self_exe)
+        return 0;
+    {
+        size_t len = strlen(tgt);
+        if (len > bufsiz)
+            len = bufsiz;
+        memcpy(buf, tgt, len);
+        *out_n = (ssize_t)len;
+    }
+    return 1;
+}
 ssize_t readlink(const char *path, char *buf, size_t buf_size) {
     char mid_[MAX_PATH_LEN];    /* 函数作用域：p 会指向它 */
     ensure_real_functions();
@@ -3473,40 +3977,13 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
      *   会把它当作 readlink("/proc/self/exe") 的结果返回给 guest，而 guest
      *   ld.so 的 _dl_get_origin 断言 linkval[0]=='/' —— 于是 abort（rc=134）。
      *   非绝对时回退到正常翻译（返回真实、绝对的 exe 路径）。 */
-    if (path != NULL && g_config.guest_exe != NULL && g_config.guest_exe[0] == '/') {
-        int is_self_exe = 0;
-
-        if (strcmp(path, "/proc/self/exe") == 0 ||
-            strcmp(path, "/proc/thread-self/exe") == 0) {
-            is_self_exe = 1;
-        } else if (strncmp(path, "/proc/", 6) == 0) {
-            /* /proc/<pid>/exe —— 只认形状，不校验 pid */
-            const char *p = path + 6;
-            const char *slash = strchr(p, '/');
-            if (slash != NULL && strcmp(slash, "/exe") == 0 &&
-                slash != p) {
-                is_self_exe = 1;
-            }
-        }
-
-        if (is_self_exe) {
-            /*
-             * readlink(2) 的语义：**不补 NUL**，只写至多 buf_size 字节，
-             * 返回实际写入的字节数。这里必须严格照做。
-             *
-             * 曾经写成"截断后 memcpy 并返回 len"，看起来对，但若
-             * strlen(guest_exe) >= buf_size，客户拿到的是一个**没有终止符**
-             * 的缓冲 —— 客户随后 strlen(buf) 就越界读。
-             *
-             * （官方同样不补 NUL。契约如此，我们不能"好心"多写一个字节：
-             *   buf_size 恰为 len 时多写就是缓冲溢出。）
-             */
-            size_t len = strlen(g_config.guest_exe);
-            if (len > buf_size)
-                len = buf_size;
-            memcpy(buf, g_config.guest_exe, len);
-            return (ssize_t)len;
-        }
+    /*
+     *   （判定与写入现集中在 readlink_fake_exe，四个入口共用。）
+     */
+    if (path != NULL) {
+        ssize_t fn_;
+        if (readlink_fake_exe(AT_FDCWD, path, buf, buf_size, &fn_))
+            return fn_;
     }
 
     /*
@@ -3518,95 +3995,28 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
      *
      * 这与 stat/lstat 钩子处的做法一致（那里传的也是 p）。
      */
-    if (translate_path(path, translated, sizeof(translated)) > 0) {
+    if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
-        /*
-         * ★ 只解析**中间组件**，绝不碰叶子 ★
-         *
-         * readlink 的契约是"读这个链接**本身**"。叶子若被跟随，
-         * `readlink` 就废了；但**中间**目录若是链接，内核会按真实根
-         * 展开它，于是 `/tmp/rly/dirlink/leaf` 在 guest 里 ENOENT，
-         * 而宿主正确返回 `/tmp/acc-d/f`（实测 2026-09-20）。
-         */
-        if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
-            p = mid_;
-        n = real_readlink(p, buf, buf_size);
-    } else {
-        n = real_readlink(path, buf, buf_size);
-    }
-    if (n <= 0)
-        return n;
-
     /*
-     * ★ D3 修复：/proc 泄漏的反向翻译，必须在 l2s 重写**之前**做 ★
+     * ★ 只解析**中间组件**，绝不碰叶子 ★
      *
-     * 内核对 /proc/self/fd/N、/proc/self/cwd、/proc/self/root 返回的
-     * 是宿主路径；客户期望 guest 视角。不剥的话，客户把它再喂回
-     * open()/stat() 会双重翻译或 ENOENT（实测：内核真值 n=61 带
-     * $ROOTFS 前缀）。socket:[N]/pipe:[N] 等非路径形态在 fixup 内部
-     * 被规则 1 原样放行。
+     * readlink 的契约是"读这个链接**本身**"。叶子若被跟随，
+     * `readlink` 就废了；但**中间**目录若是链接，内核会按真实根
+     * 展开它，于是 `/tmp/rly/dirlink/leaf` 在 guest 里 ENOENT，
+     * 而宿主正确返回 `/tmp/acc-d/f`（实测 2026-09-20）。
+     * /proc 透传路径同样要过一遍（/proc/self/root/tmp/lnk 的中间组件）。
      */
-    {
-        char fixedp[MAX_PATH_LEN];
-        if (n < (ssize_t)sizeof(fixedp)) {
-            char rawp[MAX_PATH_LEN];
-            memcpy(rawp, buf, (size_t)n);
-            rawp[n] = '\0';
-            if (readlink_fixup(rawp, fixedp, sizeof(fixedp)) == 1) {
-                size_t flen = strlen(fixedp);
-                if (flen > buf_size)
-                    flen = buf_size;      /* 截断，与 readlink(2) 语义一致 */
-                memcpy(buf, fixedp, flen);
-                return (ssize_t)flen;
-            }
-        }
-    }
+    if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+        p = mid_;
 
     /*
-     * 伪造链接的 readlink 必须失败（EINVAL）—— 见 l2s_rt_rewrite_readlink
-     * 的长注释。判据在 l2s 层，这里只负责把哨兵转成 errno 语义。
+     * ★ 先读进大缓冲，改写完再截断 ★ —— 理由见 readlink_finish 头注。
      */
     {
         char raw[MAX_PATH_LEN];
-        char fixed[MAX_PATH_LEN];
-        size_t copy = (size_t)n < sizeof(raw) - 1 ? (size_t)n : sizeof(raw) - 1;
-        int lrc;
-
-        memcpy(raw, buf, copy);
-        raw[copy] = '\0';
-
-        /*
-         * ★ readlink 也要懒启用 ★
-         *
-         * 【为什么】`ls -l` 在 stat 之前会先 `readlinkat` 判断"这是不是
-         * 符号链接"。新进程里 l2s 未启用 → 本层返回 PASSTHRU → 内核
-         * 如实施报出中间层目标 → **`ls` 认定它是符号链接**并打印
-         * `.l2s.f10001` 这种内部名字给客户看。
-         *
-         * 实测（2026-09-20）：C 探针的 stat/lstat 已正确（nlink=2），
-         * 而 `ls -l` 仍显示 `f1 -> .l2s.f10001` —— 差异就在这条 readlink。
-         *
-         * 懒启用后本层能识别伪造链接 → 返回 L2S_RT_READLINK_FAKE →
-         * 下面转成 EINVAL → `ls` 认定普通文件，与 stat 的伪装自洽
-         * （这正是 l2s 的契约：mode 与 readlink 必须一致）。
-         */
-        if (!l2s_rt_enabled())
-            (void)bxroot_l2s_lazy_enable(p);
-
-        lrc = l2s_rt_rewrite_readlink(p, raw, fixed, sizeof(fixed));
-        if (lrc == L2S_RT_READLINK_FAKE) {
-            errno = EINVAL;
-            return -1;
-        }
-        if (lrc == 1) {
-            size_t flen = strlen(fixed);
-            if (flen > buf_size)
-                flen = buf_size;          /* 截断，与 readlink(2) 语义一致 */
-            memcpy(buf, fixed, flen);
-            return (ssize_t)flen;
-        }
+        n = real_readlink(p, raw, sizeof(raw) - 1);
+        return readlink_finish(p, raw, n, buf, buf_size);
     }
-    return n;
 }
 
 /*
@@ -3728,7 +4138,12 @@ char *realpath(const char *path, char *resolved) {
         if (pre == NULL && resolved != NULL)
             resolved[0] = '\0';
     } else {
-        r = real_realpath(path, resolved);
+        char pm_[MAX_PATH_LEN];
+        /* /proc 透传分支：魔法链接按 guest 视角预解析（见 proc_magic_realpath_pre） */
+        if (proc_magic_realpath_pre(eff, pm_, sizeof(pm_)))
+            r = real_realpath(pm_, resolved);
+        else
+            r = real_realpath(path, resolved);
     }
     }   /* 绝对化块结束 */
 
@@ -4085,6 +4500,34 @@ ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen) {
              bxroot_next_symbol("__readlink_chk");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    /*
+     * FORTIFY 语义：len > buflen 是编译期缓冲溢出，glibc 会 abort。
+     * 我们改为自己读进大缓冲，所以这个检查要在这里补上，不能丢。
+     */
+    if (len > buflen) {
+        errno = EINVAL;   /* glibc 实际是 __chk_fail() abort；不主动崩溃 */
+        return -1;
+    }
+
+    /*
+     * ★ 与 readlink() 完全同构 ★
+     *
+     * 【缺陷（实测，2026-09-26）】此前本入口**没接** /proc/self/exe 伪装
+     * 与 D3 反向翻译 —— 而 `ls -l` 走的就是 __readlink_chk（-O2 +
+     * FORTIFY）。于是：
+     *     ls -l /proc/self/exe   官方: -> /usr/bin/ls
+     *                            bxroot: -> …/libproroot-bridge.so ❌
+     *     ls -l /proc/self/cwd   官方: -> /etc
+     *                            bxroot: -> $ROOTFS/etc ❌（宿主前缀泄漏）
+     * readlink() 钩子修了两年，ls 却始终看不到 —— 同类缺陷本项目已踩过
+     * （realpath vs __realpath_chk），这里是同一根因的又一处。
+     */
+    if (path != NULL) {
+        ssize_t fn_;
+        if (readlink_fake_exe(AT_FDCWD, path, buf, len, &fn_))
+            return fn_;
+    }
+
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
     /*
@@ -4102,58 +4545,18 @@ ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen) {
     if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
         p = mid_;
 
-    n = fn(p, buf, len, buflen);
-    if (n <= 0)
-        return n;
-
-    /* 与 readlink 一致：伪造链接必须 EINVAL（理由见 readlink 钩子） */
     {
         char raw[MAX_PATH_LEN];
-        char fixed[MAX_PATH_LEN];
-        size_t copy = (size_t)n < sizeof(raw) - 1 ? (size_t)n : sizeof(raw) - 1;
-        int lrc;
-
-        memcpy(raw, buf, copy);
-        raw[copy] = '\0';
-
-        /*
-         * ★ readlink 也要懒启用 ★
-         *
-         * 【为什么】`ls -l` 在 stat 之前会先 `readlinkat` 判断"这是不是
-         * 符号链接"。新进程里 l2s 未启用 → 本层返回 PASSTHRU → 内核
-         * 如实施报出中间层目标 → **`ls` 认定它是符号链接**并打印
-         * `.l2s.f10001` 这种内部名字给客户看。
-         *
-         * 实测（2026-09-20）：C 探针的 stat/lstat 已正确（nlink=2），
-         * 而 `ls -l` 仍显示 `f1 -> .l2s.f10001` —— 差异就在这条 readlink。
-         *
-         * 懒启用后本层能识别伪造链接 → 返回 L2S_RT_READLINK_FAKE →
-         * 下面转成 EINVAL → `ls` 认定普通文件，与 stat 的伪装自洽
-         * （这正是 l2s 的契约：mode 与 readlink 必须一致）。
-         */
-        if (!l2s_rt_enabled())
-            (void)bxroot_l2s_lazy_enable(p);
-
-        lrc = l2s_rt_rewrite_readlink(p, raw, fixed, sizeof(fixed));
-        if (lrc == L2S_RT_READLINK_FAKE) {
-            errno = EINVAL;
-            return -1;
-        }
-        if (lrc == 1) {
-            size_t flen = strlen(fixed);
-            if (flen > len)
-                flen = len;
-            memcpy(buf, fixed, flen);
-            return (ssize_t)flen;
-        }
+        n = fn(p, raw, sizeof(raw) - 1, sizeof(raw));
+        return readlink_finish(p, raw, n, buf, len);
     }
-    return n;
 }
 
 ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
                          size_t buflen) {
     static ssize_t (*fn)(int, const char *, char *, size_t, size_t) = NULL;
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     char mid_[MAX_PATH_LEN];    /* 函数作用域：p 会指向它 */
     const char *p = path;
     ssize_t n;
@@ -4163,67 +4566,38 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
              bxroot_next_symbol("__readlinkat_chk");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    if (len > buflen) {
+        errno = EINVAL;   /* 见 __readlink_chk */
+        return -1;
+    }
+
+    /* 与 readlinkat() 同构：exe 伪装（含 dirfd + 裸 "exe"）+ 反向翻译 */
+    if (path != NULL) {
+        ssize_t fn_;
+        if (readlink_fake_exe(dirfd, path, buf, len, &fn_))
+            return fn_;
+    }
+
+    /*
+     * ★ 判据要用**绝对宿主路径** ★
+     * 相对名（tar 的 openat+readlinkat 组合）下 p 还是 "a"，
+     * l2s 层拿它 probe 不到任何东西 —— 这正是此前漏改写的根因。
+     * 拼成绝对后交给内核也是等价的（dirfd 对绝对路径被忽略）。
+     */
+    if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1)
+        p = joined;
+    if (translate_path(p, translated, sizeof(translated)) > 0)
         p = translated;
 
     /* ★ 中间组件解析（叶子不动）——理由见 __readlink_chk */
     if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
         p = mid_;
 
-    n = fn(dirfd, p, buf, len, buflen);
-    if (n <= 0)
-        return n;
-
     {
-        char joined[MAX_PATH_LEN];
         char raw[MAX_PATH_LEN];
-        char fixed[MAX_PATH_LEN];
-        size_t copy = (size_t)n < sizeof(raw) - 1 ? (size_t)n : sizeof(raw) - 1;
-        int lrc;
-
-        /* 与 readlinkat 一致：相对名要靠 dirfd 拼成绝对路径（见那里的注释） */
-        if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1) {
-            if (translate_path(joined, translated, sizeof(translated)) > 0)
-                p = translated;
-            else
-                p = joined;
-        }
-
-        memcpy(raw, buf, copy);
-        raw[copy] = '\0';
-
-        /*
-         * ★ readlink 也要懒启用 ★
-         *
-         * 【为什么】`ls -l` 在 stat 之前会先 `readlinkat` 判断"这是不是
-         * 符号链接"。新进程里 l2s 未启用 → 本层返回 PASSTHRU → 内核
-         * 如实施报出中间层目标 → **`ls` 认定它是符号链接**并打印
-         * `.l2s.f10001` 这种内部名字给客户看。
-         *
-         * 实测（2026-09-20）：C 探针的 stat/lstat 已正确（nlink=2），
-         * 而 `ls -l` 仍显示 `f1 -> .l2s.f10001` —— 差异就在这条 readlink。
-         *
-         * 懒启用后本层能识别伪造链接 → 返回 L2S_RT_READLINK_FAKE →
-         * 下面转成 EINVAL → `ls` 认定普通文件，与 stat 的伪装自洽
-         * （这正是 l2s 的契约：mode 与 readlink 必须一致）。
-         */
-        if (!l2s_rt_enabled())
-            (void)bxroot_l2s_lazy_enable(p);
-
-        lrc = l2s_rt_rewrite_readlink(p, raw, fixed, sizeof(fixed));
-        if (lrc == L2S_RT_READLINK_FAKE) {
-            errno = EINVAL;
-            return -1;
-        }
-        if (lrc == 1) {
-            size_t flen = strlen(fixed);
-            if (flen > len)
-                flen = len;
-            memcpy(buf, fixed, flen);
-            return (ssize_t)flen;
-        }
+        n = fn(dirfd, p, raw, sizeof(raw) - 1, sizeof(raw));
+        return readlink_finish(p, raw, n, buf, len);
     }
-    return n;
 }
 
 /*
@@ -4281,7 +4655,12 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
         p = pre;
     }
 
-    r = fn(p, resolved, resolvedlen);
+    {
+        char pm_[MAX_PATH_LEN];
+        if (p == path && proc_magic_realpath_pre(p, pm_, sizeof(pm_)))
+            p = pm_;      /* /proc 透传分支：同 realpath() */
+        r = fn(p, resolved, resolvedlen);
+    }
     if (r == NULL)
         return NULL;   /* 失败路径：不动 */
 
@@ -4883,7 +5262,12 @@ char *canonicalize_file_name(const char *path) {
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
 
-    r = fn(p);
+    {
+        char pm_[MAX_PATH_LEN];
+        if (p == path && proc_magic_realpath_pre(p, pm_, sizeof(pm_)))
+            p = pm_;      /* /proc 透传分支：同 realpath() */
+        r = fn(p);
+    }
     if (r == NULL)
         return NULL;   /* 失败路径：不动 */
 
@@ -5418,6 +5802,7 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     char mid_[MAX_PATH_LEN];    /* 函数作用域：p 会指向它 */
     static ssize_t (*fn)(int, const char *, char *, size_t) = NULL;
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *p = path;
     ssize_t n;
 
@@ -5431,44 +5816,31 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
      *
      * 这里额外要处理**相对路径 + dirfd** 的形态：客户可能先 open 了
      * /proc/self 目录，再 readlinkat(fd, "exe", ...)。所以既要认
-     * 绝对路径，也要认 dirfd != AT_FDCWD 时的裸 "exe"。
+     * 绝对路径，也要认 dirfd 指向 /proc/<who> 目录时的裸 "exe"
+     * （readlink_fake_exe 会核对 dirfd 真是 /proc 下的进程目录，
+     * 不再像从前那样对任何 dirfd 的 "exe" 都伪装）。
      */
-    /* ★ 同 readlink()：仅当 guest_exe 为绝对路径时才伪装 /proc/self/exe ★
-     *   非绝对值会让 guest ld.so 的 _dl_get_origin 断言失败 → rc=134。 */
-    if (path != NULL && g_config.guest_exe != NULL && g_config.guest_exe[0] == '/') {
-        int is_self_exe = 0;
-
-        if (strcmp(path, "/proc/self/exe") == 0 ||
-            strcmp(path, "/proc/thread-self/exe") == 0) {
-            is_self_exe = 1;
-        } else if (strncmp(path, "/proc/", 6) == 0) {
-            const char *q = path + 6;
-            const char *slash = strchr(q, '/');
-            if (slash != NULL && strcmp(slash, "/exe") == 0 && slash != q)
-                is_self_exe = 1;
-        } else if (dirfd != AT_FDCWD && strcmp(path, "exe") == 0) {
-            /* 相对 /proc/self 目录 fd 的 "exe" */
-            is_self_exe = 1;
-        }
-
-        if (is_self_exe) {
-            /* 与 readlink() 同一语义：不补 NUL，见那里的详细说明。 */
-            size_t len = strlen(g_config.guest_exe);
-            if (len > bufsiz)
-                len = bufsiz;
-            memcpy(buf, g_config.guest_exe, len);
-            return (ssize_t)len;
-        }
+    if (path != NULL) {
+        ssize_t fn_;
+        if (readlink_fake_exe(dirfd, path, buf, bufsiz, &fn_))
+            return fn_;
     }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
+    /*
+     * ★ 判据要用**绝对宿主路径** ★
+     *
+     * 相对名（tar 的 openat+readlinkat 组合）下 p 还是 "a"，
+     * l2s 层拿它 probe 不到任何东西 —— 这正是此前漏改写的根因。
+     * 拼成绝对后交给内核等价（dirfd 对绝对路径被忽略），且
+     * /proc/<who>/fd/N 这类 dirfd 形态的中间组件也能被展开。
+     */
+    if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1)
+        p = joined;
+    if (translate_path(p, translated, sizeof(translated)) > 0)
         p = translated;
 
-    /* ★ 中间组件解析（叶子不动）——理由见 __readlink_chk */
-    if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
-        p = mid_;
     /*
-     * ★ 中间组件的符号链接必须解析 ★
+     * ★ 中间组件的符号链接必须解析（叶子不动）★
      *
      * readlink 的契约是"**读叶子链接本身**，不跟随"——所以**叶子**
      * 绝不能动。但**中间**组件若是链接，内核会按真实根展开它，
@@ -5482,85 +5854,17 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
         p = mid_;
 
-    n = fn(dirfd, p, buf, bufsiz);
-    if (n <= 0)
-        return n;
-
     /*
-     * ★ D3 修复：与 readlink() 同一处理 —— /proc 泄漏反向翻译 ★
-     * 必须在 l2s 重写之前：l2s 判据用的是宿主路径 p，改写 buf 会
-     * 破坏它的 probe；而且 /proc/self/fd/N 的返回值要 guest 视角。
+     * ★ D3 反向翻译 + l2s 伪造链接判定 + 截断，全部在 readlink_finish ★
+     * 必须在 l2s 重写之前做反向翻译：l2s 判据用的是宿主路径 p；而且
+     * /proc/self/fd/N 的返回值要 guest 视角。先读大缓冲再截断的理由
+     * 见 readlink_finish 头注（小缓冲截断会泄漏宿主前缀）。
      */
     {
-        char fixedp[MAX_PATH_LEN];
-        if (n < (ssize_t)sizeof(fixedp)) {
-            char rawp[MAX_PATH_LEN];
-            memcpy(rawp, buf, (size_t)n);
-            rawp[n] = '\0';
-            if (readlink_fixup(rawp, fixedp, sizeof(fixedp)) == 1) {
-                size_t flen = strlen(fixedp);
-                if (flen > bufsiz)
-                    flen = bufsiz;        /* 截断，与 readlinkat(2) 语义一致 */
-                memcpy(buf, fixedp, flen);
-                return (ssize_t)flen;
-            }
-        }
-    }
-
-    {
-        char joined[MAX_PATH_LEN];
         char raw[MAX_PATH_LEN];
-        char fixed[MAX_PATH_LEN];
-        size_t copy = (size_t)n < sizeof(raw) - 1 ? (size_t)n : sizeof(raw) - 1;
-        int lrc;
-
-        /*
-         * ★ 判据要用**绝对宿主路径** ★
-         *
-         * 相对名（tar 的 openat+readlinkat 组合）下 p 还是 "a"，
-         * l2s 层拿它 probe 不到任何东西 —— 这正是此前漏改写的根因。
-         */
-        if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1) {
-            if (translate_path(joined, translated, sizeof(translated)) > 0)
-                p = translated;
-            else
-                p = joined;
-        }
-
-        memcpy(raw, buf, copy);
-        raw[copy] = '\0';
-        /*
-         * ★ readlink 也要懒启用 ★
-         *
-         * 【为什么】`ls -l` 在 stat 之前会先 `readlinkat` 判断"这是不是
-         * 符号链接"。新进程里 l2s 未启用 → 本层返回 PASSTHRU → 内核
-         * 如实施报出中间层目标 → **`ls` 认定它是符号链接**并打印
-         * `.l2s.f10001` 这种内部名字给客户看。
-         *
-         * 实测（2026-09-20）：C 探针的 stat/lstat 已正确（nlink=2），
-         * 而 `ls -l` 仍显示 `f1 -> .l2s.f10001` —— 差异就在这条 readlink。
-         *
-         * 懒启用后本层能识别伪造链接 → 返回 L2S_RT_READLINK_FAKE →
-         * 下面转成 EINVAL → `ls` 认定普通文件，与 stat 的伪装自洽
-         * （这正是 l2s 的契约：mode 与 readlink 必须一致）。
-         */
-        if (!l2s_rt_enabled())
-            (void)bxroot_l2s_lazy_enable(p);
-
-        lrc = l2s_rt_rewrite_readlink(p, raw, fixed, sizeof(fixed));
-        if (lrc == L2S_RT_READLINK_FAKE) {
-            errno = EINVAL;
-            return -1;
-        }
-        if (lrc == 1) {
-            size_t flen = strlen(fixed);
-            if (flen > bufsiz)
-                flen = bufsiz;
-            memcpy(buf, fixed, flen);
-            return (ssize_t)flen;
-        }
+        n = fn(dirfd, p, raw, sizeof(raw) - 1);
+        return readlink_finish(p, raw, n, buf, bufsiz);
     }
-    return n;
 }
 
 int chdir(const char *path);   /* 已在前文定义 */
