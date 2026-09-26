@@ -60,17 +60,29 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* 子进程：切到 /etc，打开 /etc/hostname 为 fd 3，挂起等待 */
-    c = fork();
-    if (c == 0) {
-        int fd;
-        if (chdir("/etc") != 0) _exit(3);
-        fd = open("/etc/hostname", O_RDONLY);
-        if (fd != 3) { dup2(fd, 3); }
-        pause();
-        _exit(0);
+    /* 子进程：切到 /etc，打开 /etc/hostname 为 fd 3，挂起等待。
+     * 用管道同步"子进程已就位"—— 固定 usleep 在 RUN_ALL 的负载下会
+     * 抢在子进程 chdir/open 之前读 /proc/<pid>/cwd（实测偶发 1 项红）。 */
+    {
+        int pfd[2];
+        char sync_ch;
+        if (pipe(pfd) != 0) { printf("pipe=ERR%d\n", errno); return 1; }
+        c = fork();
+        if (c == 0) {
+            int fd;
+            close(pfd[0]);
+            if (chdir("/etc") != 0) _exit(3);
+            fd = open("/etc/hostname", O_RDONLY);
+            if (fd != 3) { dup2(fd, 3); }
+            if (write(pfd[1], "R", 1) != 1) _exit(4);
+            close(pfd[1]);
+            pause();
+            _exit(0);
+        }
+        close(pfd[1]);
+        if (read(pfd[0], &sync_ch, 1) != 1) { printf("child_sync=ERR\n"); }
+        close(pfd[0]);
     }
-    usleep(300000);
 
     /* --- 自身 --- */
     rl("self_exe", "/proc/self/exe");

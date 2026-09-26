@@ -34,7 +34,9 @@ grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || {
 W=$(mktemp -d /tmp/bxroot-procview-XXXXXX)
 trap 'rm -rf "$W"' EXIT
 FAIL=0
-bad()  { FAIL=$((FAIL + 1)); echo "  ❌ $*"; }
+# 失败明细另存一份（RUN_ALL 只保留摘要行，偶发红时需要现场）
+FAIL_LOG=${BXROOT_PROCVIEW_FAIL_LOG:-/tmp/bxroot-procview-last-fail.log}
+bad()  { FAIL=$((FAIL + 1)); echo "  ❌ $*"; echo "$(date +%T) ❌ $*" >>"$FAIL_LOG"; }
 good() { echo "  ✅ $*"; }
 
 # 子目录 rootfs（宿主 cwd 放在 rootfs 之外，更能暴露泄漏）：复用宿主 /usr
