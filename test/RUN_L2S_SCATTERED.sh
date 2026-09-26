@@ -19,6 +19,22 @@ set -u
 # ★ 不能硬编码 /root/bxroot：换个克隆位置就是 rc=127「找不到 bxroot-run」，
 #   而且会被误读成 l2s 缺陷（2026-09-25 在 /root/work/bxroot 克隆里实测）。
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+#
+# ★ 产物守卫（2026-09-26 在干净克隆里实测发现）★
+#
+# 本脚本经 tools/bxroot-run 跑 guest，而 bxroot-run 需要
+# build/libbxroot-runtime.so。干净克隆（构建产物不入版本控制）里没有它，
+# bxroot-run 会以自己的错误码 125 退出，而下面把**任何**非 0 都读成
+# "硬链接契约被破坏" —— 把"环境不满足"误报成"产品缺陷"。
+# 与 RUN_STATIC_ELF.sh 等既有测试同口径：缺产物按 rc=2 上报。
+#
+[ -f "$ROOT/build/libbxroot-runtime.so" ] || {
+    echo "⏭️  跳过：没有 build/libbxroot-runtime.so（先 sh BUILD_RUNTIME.sh）"
+    exit 2
+}
+[ -x "$ROOT/tools/bxroot-run" ] || { echo "⏭️  跳过：缺 tools/bxroot-run"; exit 2; }
+
 PROBE_C=${TMPDIR:-/tmp}/l2s_scatter_probe.c
 PROBE=${TMPDIR:-/tmp}/l2s_scatter_probe
 WORK=${TMPDIR:-/tmp}/l2s_scatter_work
