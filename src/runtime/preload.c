@@ -11154,12 +11154,62 @@ static void constructor(void) {
         /* 使用 syscall 直接调用 chdir（ctor 中 dlsym 不可用） */
         long ret = syscall(SYS_chdir, target);
         if (ret < 0) {
-            LOG("workdir chdir failed: %s", strerror(errno));
+            /*
+             * ============================================================
+             * chdir 失败 → 回退到 rootfs 的 "/"（上游 proot #307/#66 语义）
+             * ============================================================
+             *
+             * 【缺陷（实测，2026-09-26，tools/bxroot-run 链路）】
+             * 原先失败只 LOG 一句就放行，且**不打标记**。后果有三：
+             *   1. cwd 仍是**宿主启动目录**（内核视角）。当 rootfs 是宿主
+             *      的子目录（--rootfs /root/rootfs-copy）时，那个目录在
+             *      rootfs 之外：`/bin/pwd`、`$PWD` 直接回显
+             *      `/data/data/.../ubuntu/root/work` —— **宿主路径泄漏**；
+             *      `ls -d .` 报 ENOENT（"." 翻译后不存在）。
+             *      官方 runtime 同场景：PWD=/root/work、ls 正常。
+             *   2. launcher 已把 $PWD 设成 workdir（launcher.c setenv PWD），
+             *      与实际 cwd 不一致；shell 的 stat($PWD) 校验失败后回退
+             *      getcwd，拿到的又是第 1 条的泄漏值。
+             *   3. 不打标记 → 每个 exec 出来的子进程都再试一次 chdir，
+             *      一旦目录后来被建出来，子进程 cwd 会被**悄悄重置**，
+             *      正是上面那段长注释要杜绝的"父进程 cd 丢失"。
+             *
+             * 【上游语义】cli/cli.c initialize_cwd()：workdir 在 guest 里
+             * 不可用（ENOENT/ENOTDIR/EACCES…）→
+             *     notice(WARNING, "can't chdir to <dir>, falling back to /")
+             *   → chdir("/") → setenv("PWD", "/")。
+             * 这里照做：warning 走 stderr（不受 VERBOSE 控制，用户必须看到
+             * 自己的 -w 没生效），回退目标是**翻译后**的 "/"（即 rootfs
+             * 根），PWD 同步为 "/"，然后**照样打 DONE 标记** —— 回退也是
+             * 一次已完成的"设置工作目录"。
+             */
+            int saved_errno = errno;
+            char root_translated[MAX_PATH_LEN];
+            const char *root_target = "/";
+
+            if (translate_path("/", root_translated, sizeof(root_translated)) > 0)
+                root_target = root_translated;
+            else if (g_config.rootfs && g_config.rootfs[0])
+                root_target = g_config.rootfs;
+
+            fprintf(stderr, "bxroot warning: can't chdir to %s (%s), falling back to /\n",
+                    g_config.workdir, strerror(saved_errno));
+            LOG("workdir chdir failed: %s; fallback chdir(%s)",
+                strerror(saved_errno), root_target);
+
+            if (syscall(SYS_chdir, root_target) < 0) {
+                /* rootfs 根都进不去：环境本身坏了，只能报告，不再假装成功 */
+                fprintf(stderr, "bxroot warning: can't chdir to / either (%s)\n",
+                        strerror(errno));
+            } else {
+                setenv("PWD", "/", 1);
+            }
+            setenv(BXROOT_WORKDIR_DONE_ENV, "1", 1);
         } else {
             LOG("workdir chdir OK");
             /*
-             * 打标记。放在成功之后：若 chdir 失败（workdir 不存在），
-             * 下次 exec 仍会再试一次 —— 那时目录可能已经建好了。
+             * 打标记：首进程已设过工作目录，后续 exec 出来的子进程不再动
+             * cwd（继承父进程的）。失败分支同样打标记（见上）。
              * 注意 libc 的 setenv 在本阶段可用（它不依赖 dlsym）。
              */
             setenv(BXROOT_WORKDIR_DONE_ENV, "1", 1);

@@ -766,6 +766,18 @@ else
     run_step "降权族 chage"
 fi
 
+# ---------------------------------------------------------------------
+# 9g. workdir 不可用时回退到 "/"（上游 #307/#66）
+# ---------------------------------------------------------------------
+# 修前 BXROOT_WORKDIR 指向不存在/非目录时 chdir 失败只 LOG 就放行：cwd 留在
+# **宿主启动目录**，rootfs 为子目录时 `/bin/pwd`/$PWD 泄漏 /data/data/... 路径、
+# `cd .` ENOENT。修后：stderr 警告 + chdir(rootfs 根) + PWD=/ + 打 DONE 标记。
+if [ -f test/RUN_WORKDIR_FALLBACK.sh ]; then
+    run_step "workdir 回退" sh test/RUN_WORKDIR_FALLBACK.sh
+else
+    run_step "workdir 回退"
+fi
+
 # =====================================================================
 # 10. 可选端到端
 # =====================================================================
