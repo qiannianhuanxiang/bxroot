@@ -155,10 +155,11 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * 站点表声明所针对的 glibc 版本。**改站点表就必须同时改这里** ——
- * 两者是同一条信息的两个副本，版本断言靠它们对齐。
+ * 站点表覆盖的 glibc 版本清单（供告警文案与访问器用）。
+ * **增删表就必须同时改这里** —— 两者是同一条信息的两个副本。
+ * 真正的选表逻辑看 g_tables（按 gnu_get_libc_version() 精确匹配）。
  */
-#define LP_SITE_LIBC_VERSION "2.39"
+#define LP_SITE_LIBC_VERSION "2.39/2.41"
 
 /*
  * 强制跳过开关。值语义与 BXROOT_FAKEROOT / BXROOT_VERBOSE 一致：
@@ -242,8 +243,46 @@ typedef struct {
  * glibc 对"调用成功"与"根本没这个调用"都能工作）；
  * 对 rseq 则必须返回 ENOSYS。
  */
-static const lp_site g_sites[] = {
+/*
+ * ★ 站点表按 glibc 版本分表（2026-09-26）★
+ *
+ * 【起因】Debian 13 rootfs（glibc 2.41）下，任何经 bxroot exec 钩子
+ * 重入的进程，其 `fork()`/`_Fork()` 出的子进程 100% 死于 SIGSYS(159)：
+ *
+ *     bxroot-run --rootfs <trixie> -- /bin/sh -c '/bin/sh -c "/bin/true"'
+ *     → Bad system call（第二层 sh 的每个子进程）
+ *
+ * 逐条系统调用用内联 svc 复刻 _Fork 子进程的动作后定位到：
+ * **在全信号屏蔽状态下发出 set_robust_list(99)**。宿主 seccomp 对 99
+ * 是 TRAP；SIGSYS 被屏蔽时内核不投递而直接杀进程（159）。
+ *
+ *     child: rawblock + raw99  → sig=31     ← 屏蔽 + 99 = 死
+ *     child: rawblock only     → 正常       ← 只屏蔽不死
+ *     parent unblocked  raw99  → -38 ENOSYS ← 不屏蔽时由处理器兜住
+ *
+ * 而 glibc 2.41 的 `_Fork` 正是这个形态：它先调 `__abort_lock_rdlock`
+ * 用**内部** rt_sigprocmask 屏蔽全部信号（不经任何导出符号，bxroot 的
+ * sigprocmask 钩子与裸 syscall() 钩子都拦不到），再在子进程里内联 svc
+ * 发 set_robust_list。2.39 的 `_Fork` 没有那一步屏蔽，所以同一个站点
+ * 漏补在 2.39 上只表现为"多进一次 SIGSYS 处理器"，看不出来。
+ *
+ * 所以两件事都得做：
+ *   1. 站点表必须覆盖 `_Fork` 里的 99 站点（此前只补了 pthread_create
+ *      路径那一个，两个版本都漏了它）；
+ *   2. 版本门不再是"不是 2.39 就整体跳过"，而是按当前版本**选表**；
+ *      没有表的版本才跳过 + 告警（语义不变：不打错位置、要出声）。
+ *
+ * 偏移由 `objdump -d libc.so.6` 逐条核对（`mov x8,#nr` 后 12 条内的
+ * `svc #0`），打补丁前仍逐字节校验 svc，换小版本最坏是不生效。
+ *
+ * 【为什么第一层进程在 2.41 下没事、第二层才死】bxroot-run 直接启动
+ * 的首进程由外层 proroot 的 linker 加载**容器自己的** glibc 2.39
+ * （见 /proc/self/maps）；只有经 exec 钩子重入 trampoline 的进程才
+ * 真正加载 --rootfs 里的 2.41。这也是为什么这个缺陷藏在"两层 sh"后面。
+ */
+static const lp_site g_sites_2_39[] = {
     { 0x855c4UL, MOV_X0_0,      "set_robust_list", 99  },
+    { 0xbd3d0UL, MOV_X0_0,      "_Fork set_robust_list", 99 },
     { 0x85850UL, MOV_X0_0,      "rseq",            293 },
     /*
      * ★ `__spawni` 里的身份内联 svc（新增，2026-09-20）★
@@ -302,7 +341,33 @@ static const lp_site g_sites[] = {
     { 0xd7160UL, MOV_X0_0,      "__spawni setresgid", 149 },
 };
 
-#define NSITES (sizeof(g_sites) / sizeof(g_sites[0]))
+/* Debian 13 (trixie) glibc 2.41-12+deb13u4，aarch64。同一套站点，偏移不同。 */
+static const lp_site g_sites_2_41[] = {
+    { 0x85f6cUL, MOV_X0_0,      "set_robust_list", 99  },
+    { 0xbfc08UL, MOV_X0_0,      "_Fork set_robust_list", 99 },
+    { 0x86224UL, MOV_X0_0,      "rseq",            293 },
+    { 0xda1e0UL, MOV_X0_0,      "__spawni setresuid", 147 },
+    { 0xda3a0UL, MOV_X0_0,      "__spawni setresgid", 149 },
+};
+
+typedef struct {
+    const char    *version;   /* gnu_get_libc_version() 的精确值 */
+    const lp_site *sites;
+    size_t         n;
+} lp_table;
+
+#define LP_TBL(v, arr) { v, arr, sizeof(arr) / sizeof((arr)[0]) }
+static const lp_table g_tables[] = {
+    LP_TBL("2.39", g_sites_2_39),
+    LP_TBL("2.41", g_sites_2_41),
+};
+#define NTABLES (sizeof(g_tables) / sizeof(g_tables[0]))
+
+/* 门控选中的表；LP_SKIP_NONE 之后才有效。 */
+static const lp_site *g_sites;
+static size_t         g_nsites;
+
+#define NSITES g_nsites
 
 static int       g_applied;
 static int       g_hits;
@@ -426,19 +491,31 @@ static int lp_gate(void)
     if (ver == NULL) {
         /* 版本读不出来 —— 与"版本不符"同等危险（偏移不可信），告警并跳过。
          * ★ 只有走到这里（= 有 seccomp，真机场景）才会报，见门顺序说明。 */
-        lp_say("[bxroot] WARN: livepatch: 站点表是给 glibc "
-               LP_SITE_LIBC_VERSION " 写的，但读不到当前 glibc 版本"
+        lp_say("[bxroot] WARN: livepatch: 站点表只覆盖 glibc "
+               LP_SITE_LIBC_VERSION "，但读不到当前 glibc 版本"
                "（gnu_get_libc_version 返回空）→ livepatch 已跳过\n");
         return LP_SKIP_LIBC_VERSION;
     }
-    if (strcmp(ver, LP_SITE_LIBC_VERSION) != 0) {
+    {
+        size_t t;
+        g_sites = NULL;
+        g_nsites = 0;
+        for (t = 0; t < NTABLES; t++) {
+            if (strcmp(ver, g_tables[t].version) == 0) {
+                g_sites = g_tables[t].sites;
+                g_nsites = g_tables[t].n;
+                break;
+            }
+        }
+    }
+    if (g_sites == NULL) {
         /*
-         * 版本不匹配 = 站点偏移不可信。**必须出声** —— 否则就是
+         * 没有这个版本的表 = 站点偏移不可信。**必须出声** —— 否则就是
          * P2-4.1 那条"静默失效"：进程照跑，只是补丁一条没打，
-         * 真机上表现为 pthread_create 死 159，离原因极远。
+         * 真机上表现为 pthread_create / fork 子进程死 159，离原因极远。
          */
-        lp_say("[bxroot] WARN: livepatch: 站点表是给 glibc "
-               LP_SITE_LIBC_VERSION " 写的，当前是 glibc ");
+        lp_say("[bxroot] WARN: livepatch: 站点表只覆盖 glibc "
+               LP_SITE_LIBC_VERSION "，当前是 glibc ");
         lp_say(ver);
         lp_say("，偏移不可信 → livepatch 已跳过\n");
         return LP_SKIP_LIBC_VERSION;
