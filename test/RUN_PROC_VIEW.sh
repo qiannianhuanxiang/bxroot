@@ -69,10 +69,10 @@ o=$(run_rf 'cd /etc && readlink /proc/self/cwd'); [ "$o" = "/etc" ] && good "rea
 o=$(run_rf 'readlink /proc/self/root'); [ "$o" = "/" ] && good "readlink self/root = /" || bad "self/root: $o"
 o=$(run_rf 'readlink /proc/thread-self/exe'); [ "$o" = "/usr/bin/readlink" ] && good "readlink thread-self/exe = $o" || bad "thread-self/exe: $o"
 o=$(run_rf 'cd /etc; readlink /proc/$$/exe; readlink /proc/$$/cwd; readlink /proc/$$/root' | tr '\n' ' ')
-# 已知边界（bxroot 与官方一致）：/proc/<其它pid>/exe 回答的是**调用进程**的 guest_exe
-# （内核对所有 guest 进程都答 bridge.so，别的进程的 guest_exe 在它自己的 env 里拿不到），
-# 所以 sh 里 `readlink /proc/$$/exe` 得到的是 readlink 自己而不是 dash。cwd/root 精确。
-[ "$o" = "/usr/bin/readlink /etc / " ] && good "readlink /proc/<pid>/{exe,cwd,root} = $o（exe=调用者，同官方）" || bad "/proc/<pid>: $o"
+# /proc/<其它pid>/exe：内核对所有 guest 进程都答 bridge.so；bxroot 从目标进程 environ 取
+# BXROOT_GUEST_EXE（proc_other_pid_guest_exe）→ 精确到 /bin/sh；官方 runtime 此处答调用者自身。
+case "$o" in "/bin/sh /etc / "|"/usr/bin/dash /etc / ") good "readlink /proc/<pid>/{exe,cwd,root} = $o" ;;
+     *) bad "/proc/<pid>: $o" ;; esac
 # #438：readlink 顶层 /proc 不是链接 → rc=1、EINVAL，不得崩溃/hang
 o=$(run_rf 'readlink /proc; echo rc=$?'); [ "$o" = "rc=1" ] && good "readlink /proc → rc=1（不崩溃）" || bad "readlink /proc: $o"
 o=$(run_rf 'ls -al /proc 2>/dev/null | head -30; echo rc=$?' ); r=${o##*rc=}
@@ -92,7 +92,11 @@ o=$(run_rf 'wc -c </proc/self/exe; stat -c %s /usr/bin/dash' | tr '\n' ' ')
 set -- $o; [ -n "${1:-}" ] && [ "${1:-a}" = "${2:-b}" ] && good "wc -c </proc/self/exe = dash 大小（$1）" || bad "wc exe: $o（读到宿主映像？）"
 o=$(run_rf '/proc/self/exe -c "echo reexec-ok"'); [ "$o" = "reexec-ok" ] && good "exec /proc/self/exe 自重执行" || bad "exec exe: $o"
 # realpath 族（readlink -f 走 realpath/canonicalize）：#421 的验证命令
-o=$(run_rf 'readlink -f /proc/self/exe; echo rc=$?' | tr '\n' ' '); [ "$o" = "/usr/bin/readlink rc=0 " ] && good "readlink -f /proc/self/exe = /usr/bin/readlink" || bad "readlink -f exe: $o"
+# 注：本测试 rootfs 的 /usr 是逃出 rootfs 的相对链接（复用宿主 /usr），coreutils 自身的
+# exe 反向翻译不到 guest 路径属布局所致；用 rootfs 内的探针 /tmp/rp 验 realpath("/proc/self/exe")。
+bld -O1 -o "$RF/tmp/rp" "$ROOT/test/probe_proc_realpath.c" || exit 1
+o=$(run_rf 'cd /etc; /tmp/rp /proc/self/exe /proc/self/cwd /proc/self/root/etc' | tr '\n' ' ')
+[ "$o" = "/tmp/rp /etc /etc " ] && good "realpath(/proc/self/{exe,cwd,root/etc}) = $o" || bad "realpath 魔法链接: $o"
 o=$(run_rf 'readlink -f /proc/self/root/etc/hostname'); [ "$o" = "/etc/hostname" ] && good "readlink -f /proc/self/root/etc/hostname = $o" || bad "readlink -f root/etc: $o"
 # 顶层首进程（bxroot-run 直接启动的进程）也要有 guest_exe
 o=$(timeout 30 "$BX" --no-check --rootfs "$RF" -- /usr/bin/readlink /proc/self/exe 2>&1); [ "$o" = "/usr/bin/readlink" ] && good "首进程 readlink self/exe = $o" || bad "首进程 self/exe: $o"
