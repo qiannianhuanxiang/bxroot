@@ -876,6 +876,14 @@ else
     run_step "livepatch 指令扫描"
 fi
 
+# livepatch 真实 seccomp 端到端（A: 2.41 rootfs 派生族 + B: 容器内自装 TRAP 隔离）
+# 判别力：BXROOT_NO_LIVEPATCH=1 变红、默认绿。环境不满足按 rc=2 跳过。
+if [ -f test/RUN_LIVEPATCH_E2E.sh ]; then
+    run_step "livepatch seccomp 端到端" sh test/RUN_LIVEPATCH_E2E.sh
+else
+    run_step "livepatch seccomp 端到端"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================
