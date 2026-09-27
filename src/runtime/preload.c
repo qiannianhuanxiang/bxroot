@@ -3919,6 +3919,42 @@ int euidaccess(const char *path, int mode)
  * **但非权限类错误必须透传** —— 文件不存在时假装 chown 成功，
  * 会让客户以为改好了，之后一读才发现没有，错误点离现场很远。
  */
+/*
+ * ★ 路径 chown 同时按 inode 记账（BXR-FR-1，2026-09-27 爆破测试）★
+ *
+ * 【缺陷】chown/lchown 只记 by_path，而 stat 家族打补丁时只按 dev+ino 查
+ * （fakeroot_patch_stat → fakeroot_lookup(p=NULL, dev, ino)）—— 两张表对不上：
+ *     chown("/tmp/x", 1000, 2000) → 0；stat("/tmp/x") → 0:0   （修前）
+ * 只有 fchown（记 by_inode）是对的。dpkg/tar/cp -p 全走路径 chown，
+ * 于是 fakeroot 下"改属主后读回"全部失效（与上游 proot fake_id0 语义不符）。
+ * 修法：chown 成功（或伪装成功）后 lstat/stat 一次拿 dev+ino，两张表都写。
+ */
+static void fr_record_owner_path_inode(const char *p, uid_t uid, gid_t gid, int nofollow)
+{
+    struct stat st;
+    int saved = errno;
+
+    (void)fakeroot_record_owner_path(&g_fakeroot_state, p, uid, gid);
+    if (real_newfstatat != NULL &&
+        real_newfstatat(AT_FDCWD, p, &st, nofollow ? AT_SYMLINK_NOFOLLOW : 0) == 0)
+        (void)fakeroot_record_owner_inode(&g_fakeroot_state, st.st_dev, st.st_ino,
+                                          uid, gid);
+    errno = saved;
+}
+
+/* fchown 同理：fd 键之外再按 inode 记，stat(路径) 才查得到（BXR-FR-1） */
+static void fr_record_owner_fd_inode(int fd, uid_t uid, gid_t gid)
+{
+    struct stat st;
+    int saved = errno;
+
+    (void)fakeroot_record_owner_fd(&g_fakeroot_state, fd, uid, gid);
+    if (syscall(SYS_fstat, fd, &st) == 0)
+        (void)fakeroot_record_owner_inode(&g_fakeroot_state, st.st_dev, st.st_ino,
+                                          uid, gid);
+    errno = saved;
+}
+
 static int fr_do_chown(const char *p, uid_t uid, gid_t gid, int which)
 {
     static int (*fn_chown)(const char *, uid_t, gid_t) = NULL;
@@ -3940,7 +3976,7 @@ static int fr_do_chown(const char *p, uid_t uid, gid_t gid, int which)
     if (rc == 0) {
         /* 真实成功（比如伪装身份下确有权限）：如实记账，不改写返回值。 */
         if (g_fakeroot_on)
-            (void)fakeroot_record_owner_path(&g_fakeroot_state, p, uid, gid);
+            fr_record_owner_path_inode(p, uid, gid, which);
         return 0;
     }
 
@@ -3956,7 +3992,7 @@ static int fr_do_chown(const char *p, uid_t uid, gid_t gid, int which)
         fr_chown_action act = fakeroot_chown_action(rc, saved, gate);
 
         if (act == FR_CHOWN_FAKE_OK) {
-            (void)fakeroot_record_owner_path(&g_fakeroot_state, p, uid, gid);
+            fr_record_owner_path_inode(p, uid, gid, which);
             return 0;   /* 吞掉 EPERM/EACCES */
         }
         errno = saved;  /* 透传真实错误 */
@@ -3995,7 +4031,7 @@ int fchown(int fd, uid_t uid, gid_t gid) {
         return rc;
 
     if (rc == 0) {
-        (void)fakeroot_record_owner_fd(&g_fakeroot_state, fd, uid, gid);
+        fr_record_owner_fd_inode(fd, uid, gid);
         return 0;
     }
     {
@@ -4007,7 +4043,8 @@ int fchown(int fd, uid_t uid, gid_t gid) {
         fr_chown_action act = fakeroot_chown_action(rc, saved, gate);
 
         if (act == FR_CHOWN_FAKE_OK) {
-            (void)fakeroot_record_owner_fd(&g_fakeroot_state, fd, uid, gid);
+            fr_record_owner_fd_inode(fd, uid, gid);
+            errno = saved;
             return 0;
         }
         errno = saved;
@@ -6277,15 +6314,27 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
              bxroot_next_symbol("fchownat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (path != NULL && translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /* BXR-ESC-3：跟随型（flags 无 NOFOLLOW）要按 guest 视角解析链接；
+     * 相对路径 + dirfd 先拼成绝对再翻译（与 openat 同策略）。 */
+    if (path != NULL && path[0] != '\0') {
+        char joined[MAX_PATH_LEN];
+        const char *src = path;
+        if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1)
+            src = joined;
+        if (translate_follow(src, translated, sizeof(translated),
+                             (flags & AT_SYMLINK_NOFOLLOW) != 0) > 0) {
+            p = translated;
+            if (p[0] == '/')
+                dirfd = AT_FDCWD;
+        }
+    }
 
     rc = fn(dirfd, p, uid, gid, flags);
     if (!g_fakeroot_on)
         return rc;
 
     if (rc == 0) {
-        (void)fakeroot_record_owner_path(&g_fakeroot_state, p, uid, gid);
+        if (p != NULL && p[0] == '/') fr_record_owner_path_inode(p, uid, gid, (flags & AT_SYMLINK_NOFOLLOW) != 0);
         return 0;
     }
     /* 与 chown 同策略：吞掉 EPERM/EACCES 并记账，其余如实上抛 */
@@ -6296,7 +6345,7 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
         int gate = fakeroot_gate_chown(&g_fakeroot_state, NULL, uid, gid,
                                        &out_uid, &out_gid);
         if (fakeroot_chown_action(rc, saved, gate) == FR_CHOWN_FAKE_OK) {
-            (void)fakeroot_record_owner_path(&g_fakeroot_state, p, uid, gid);
+            if (p != NULL && p[0] == '/') fr_record_owner_path_inode(p, uid, gid, (flags & AT_SYMLINK_NOFOLLOW) != 0);
             return 0;
         }
         errno = saved;

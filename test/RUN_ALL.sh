@@ -862,6 +862,13 @@ else
     run_step "exec 参数边界"
 fi
 
+# fakeroot chown 读回（BXR-FR-1）
+if [ -f test/RUN_FR_CHOWN_READBACK.sh ]; then
+    run_step "fakeroot chown 读回" sh test/RUN_FR_CHOWN_READBACK.sh
+else
+    run_step "fakeroot chown 读回"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================
