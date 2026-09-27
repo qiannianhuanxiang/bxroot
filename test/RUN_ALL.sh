@@ -883,6 +883,13 @@ else
     run_step "livepatch 审计"
 fi
 
+# livepatch 真实 seccomp 端到端（A: 2.41 rootfs 派生族 + B: 容器内自装 TRAP 隔离）
+if [ -f test/RUN_LIVEPATCH_E2E.sh ]; then
+    run_step "livepatch seccomp 端到端" sh test/RUN_LIVEPATCH_E2E.sh
+else
+    run_step "livepatch seccomp 端到端"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================
