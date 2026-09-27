@@ -146,6 +146,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <limits.h>
 #include <gnu/libc-version.h>
 
 #include "livepatch.h"
@@ -168,6 +169,13 @@
  * 父进程环境里的 `=1`（删不掉，只能改值）。
  */
 #define LP_ENV_OFF "BXROOT_NO_LIVEPATCH"
+
+/*
+ * ★ path-relay 的独立硬开关（2026-09-28，DNS 缺口修复）★
+ * 与 LP_ENV_OFF 分开：seccomp 中和（robust_list/rseq）与 path-relay 是两件
+ * 事，排障时可能只想关其中一个。值语义同 LP_ENV_OFF（atoi()!=0 生效）。
+ */
+#define LP_ENV_OFF_PATHRELAY "BXROOT_NO_PATHRELAY"
 
 /*
  * 本模块只对 aarch64 有意义：站点表里是 aarch64 的指令编码
@@ -810,6 +818,341 @@ static int lp_scan_and_patch(uintptr_t lo, uintptr_t hi)
     return total;
 }
 
+/* ================================================================== */
+/* path-relay：libc 内联 svc 的路径翻译腿（DNS 缺口的根因修复）        */
+/* ================================================================== */
+/*
+ * ★ 为什么必须做（实测证据链，2026-09-28）★
+ *
+ * 症状：bxroot 下 `getaddrinfo`/`gethostbyname` 恒返回
+ *   `gaierror -3 (Temporary failure in name resolution)`；官方 proroot
+ *   runtime 下同样调用正常返回。
+ *
+ * 分层定位（每层都有对照实测，见 test/RUN_DNS.sh 与提交信息）：
+ *   1. 底层 socket 全通（connect/send/recv/sendmmsg 都能收到 DNS 应答）；
+ *      /etc/resolv.conf 与 /etc/nsswitch.conf 读得到、内容对。
+ *   2. 但 glibc resolver 的 `res_ninit` 拿到 **nscount=1、ns[0]=127.0.0.1**
+ *      （这是 res_vinit 读不到任何 nameserver 时的 loopback 默认值），
+ *      官方是 nscount=2、8.8.8.8/223.5.5.5。
+ *   3. 关键：`res_ninit` 经
+ *          _IO_fopen（bl，libc 内部直跳）
+ *        → _IO_file_open（bl）
+ *        → __open/__open64_nocancel
+ *        → **内联 svc openat(56)**
+ *      发出的是**未翻译的 guest 路径** "/etc/resolv.conf"。内核按真实根
+ *      解析，而真实根 /etc 里没有 resolv.conf（那份文件只在 rootfs）→
+ *      ENOENT → resolver 认为"没有 resolv.conf" → 无 nameserver → TEMP_FAIL。
+ *   4. 同源连带故障：getservbyname/getprotobyname 也全 NULL
+ *      （/etc/services、/etc/protocols 同样只在 rootfs、真实根没有）。
+ *
+ * ★ 为什么符号钩子救不了（这就是本层存在的全部理由）★
+ * libc 内部用 `bl` **直跳**自己的 _IO_fopen/__open（库内直接分支，
+ * 不过 PLT/GOT），符号 interposition 对库内直跳无效；那条链最终落到
+ * **内联 svc**，同样不经任何导出符号。preload.c 的 open/openat/fopen
+ * 钩子、syscall_guard 的 syscall() 钩子都拦不到这条路径。唯一能拦的
+ * 位置就是**改写 libc 里那些内联 svc 指令本身** —— 与 99/293 的
+ * seccomp 中和是同一类手段（见本文件上半部分）。
+ *
+ * 官方 off-rt.so 正是这么做的：对照两个 runtime 下的活体 libc r-x 段
+ * 逐字比对，官方把 openat/newfstatat/statx/faccessat/renameat… 这些
+ * **带路径参数**的内联 svc 站点改成了 `bl <relay 桩>`（105 个站点，
+ * 桩里做路径翻译再发真 svc）。其 rodata 里也有
+ * "[proroot-hook] patched %d seccomp + %d path (%d relay) + %d brk"。
+ *
+ * ★ 本实现的克制范围 ★
+ * 官方补了 105 个站点（几乎所有带路径的号）。本层**只补 openat(56)**：
+ *   - openat 是 stdio/fopen 唯一的最终内核入口（_IO_file_open→__open→
+ *     内联 svc openat），resolver/getservbyname/NSS files 全部经它 —— 补
+ *     它就修好了 DNS 与 /etc 下配置查询这一整类，命中本任务的功能目标；
+ *   - stat 家族（newfstatat/statx）的**符号入口**已被 preload.c 钩子覆盖，
+ *     裸 syscall 入口被 syscall_guard 覆盖，两条腿都在；resolver 不依赖
+ *     它们读文件内容（它只 openat+read+fstat(fd)，fstat 用 fd 不带路径）。
+ *     所以不补 stat 家族不影响本缺陷，也把"改写热路径"的面收到最小。
+ *   - 少补的代价：静态链接程序若走 libc 内联 svc 的 newfstatat 读**文件
+ *     内容**才可能踩到——但那类路径 preload/guard 已覆盖绝大多数，且
+ *     不属于本缺陷。留作后续按需扩站点，不在本轮扩大爆炸半径。
+ *
+ * ★ 安全边界（改写所有 open 热路径，必须字字较真）★
+ *   a) 站点识别与 99/293 同框架：`mov x8,#56` 后 ≤LP_SCAN_WINDOW 条内跟
+ *      `svc #0`，中途遇 lp_is_scan_barrier 即放弃 —— 复用已审计的判据。
+ *   b) 打补丁前逐字节校验 `svc #0`（换 glibc 最坏是不生效，不会打错位置）。
+ *   c) relay 桩里**重入守卫**：桩内调用 translate_path，而 translate_path
+ *      是纯字符串处理（不 open/stat/readlink，见 preload.c），但为绝对
+ *      安全仍加线程局部 depth 守卫——嵌套进入直接原样发 svc。
+ *   d) **fail-open**：路径为 NULL、非绝对、或翻译返回 ≤0，一律原样发
+ *      原始 svc，绝不让 open 崩或改变语义。
+ *   e) relay 桩用**裸 svc**（raw_svc6）发真实调用，绝不回到 libc 的 open。
+ *   f) bl 可达性：libc r-x 段与 runtime r-x 段实测相距 ~20MB，远小于
+ *      bl 的 ±128MB 半径（本容器 /proc/self/maps 实测）。超界则跳过该点
+ *      （fail-open），不硬跳。
+ */
+
+/*
+ * translate_path 的导出入口（实现在 preload.c，同一 .so 内）。
+ * weak：单独编 livepatch.c 的离线测试里没有它 → 解析为 NULL，
+ * relay 桩判空后原样发 svc（那些测试也不测 path-relay）。
+ */
+__attribute__((weak))
+int bxroot_translate_path(const char *path, char *out, size_t out_size);
+
+/* mov x8,#56 的编码（openat）。集中一处，避免魔数散落。 */
+#define LP_MOV_X8_OPENAT  0xd2800708u   /* movz x8, #56 */
+
+/*
+ * relay 桩里翻译缓冲的大小。与 config.h 的 MAX_PATH_LEN (PATH_MAX*2)
+ * 等值，但本文件刻意不 #include config.h（它拖入 bxroot_config_t 等一
+ * 大堆声明，而离线单测只需独立编译本文件）—— 直接按 PATH_MAX 定义。
+ */
+#define LP_PATH_BUF_LEN   (PATH_MAX * 2)
+
+/* AArch64 unconditional BL 的编码：0x94000000 | (imm26)，imm26 = off/4。 */
+#define LP_BL_OPCODE      0x94000000u
+#define LP_BL_RANGE       (1L << 27)    /* ±128 MB（字节） */
+
+/*
+ * 裸 6 参 svc —— relay 桩发真实系统调用用。**不经 libc**（否则又回到
+ * 被补的 open，成环）。返回内核原始约定（负 errno 即错误，不设 errno）。
+ * 与 syscall_guard.c 的 raw_syscall6 同形，但本文件独立编译，各带一份。
+ */
+static long lp_raw_svc6(long nr, long a0, long a1, long a2,
+                        long a3, long a4, long a5)
+{
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+
+    __asm__ __volatile__("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+        : "memory", "cc");
+    return x0;
+}
+
+/*
+ * relay 桩的 C 主体。由汇编 trampoline（lp_pathrelay_tramp）调用，
+ * 约定：a0..a5 = 原始系统调用的 6 个参数，nr = 系统调用号（由 x8 传入）。
+ *
+ * 返回**内核原始约定**（负 errno = 错误），trampoline 直接把它当 svc
+ * 的返回值交回 libc —— libc 的站点后续代码本来就是按内核约定处理
+ * （`cmn x0,#1,lsl#12 ; b.hi <err>`），所以约定必须是"内核原始"，
+ * 不能用 -1/errno 的 libc 约定。
+ *
+ * 只对 openat(56) 且 a1 是绝对路径时翻译；其余原样透传。
+ */
+static __thread int lp_relay_depth;   /* 重入守卫（见桩注释 c/e） */
+
+long bxroot_pathrelay_dispatch(long a0, long a1, long a2,
+                               long a3, long a4, long a5, long nr)
+{
+    /*
+     * ★ 重入守卫 + fail-open ★
+     * 正常情况下 translate_path 是纯字符串处理，不会再发 openat；但
+     * 若将来它内部逻辑变化（或被其它站点间接触发），depth>0 时一律
+     * 原样发 svc，杜绝 relay↔open 成环。
+     */
+    if (nr == 56 /* openat */ && lp_relay_depth == 0 &&
+        bxroot_translate_path != NULL) {
+        const char *p = (const char *)(uintptr_t)a1;
+        if (p != NULL && p[0] == '/') {
+            /* 翻译缓冲：线程局部，避免并发互踩；不 malloc（桩里不该分配）。 */
+            static __thread char tbuf[LP_PATH_BUF_LEN];
+            int r;
+
+            lp_relay_depth++;
+            r = bxroot_translate_path(p, tbuf, sizeof(tbuf));
+            lp_relay_depth--;
+
+            /* r>0 = 真的翻译了（加了 rootfs 前缀）；≤0 = 不翻/失败 → 原样。 */
+            if (r > 0)
+                a1 = (long)(uintptr_t)tbuf;
+        }
+    }
+
+    return lp_raw_svc6(nr, a0, a1, a2, a3, a4, a5);
+}
+
+/*
+ * 汇编 trampoline：站点的 `bl` 落到这里。
+ *
+ * 职责：把 svc 的入参（x0..x5）与号（x8）整理成
+ * bxroot_pathrelay_dispatch(a0..a5, nr) 的 C 调用约定，调用它，再把
+ * 返回值（x0，内核原始约定）原样带回站点的下一条指令。
+ *
+ * 站点形态回顾（__open 的 openat 站点）：
+ *     mov  x8, #56          ← 号已在 x8
+ *     bl   lp_pathrelay_tramp   ← 原为 svc #0，被我们改写
+ *     cmn  x0, #1, lsl #12   ← 站点后续：按内核约定判错
+ * 因此桩必须：① 保存/恢复 x30（bl 会覆盖它）；② 把 x8 挪到第 7 个参数
+ * 位置（x6）；③ 不破坏 x0..x5（它们就是要传的实参，dispatch 的形参
+ * 顺序与之一致）；④ dispatch 返回后 x0 已是结果，ldp 恢复 x29/x30 后
+ * ret 回到站点下一条。
+ *
+ * 只用 x6 传 nr、只动 x29/x30 与 sp —— dispatch 是标准 AAPCS 函数，
+ * 会自己保存它用到的 callee-saved 寄存器，桩无需代劳。
+ */
+extern void lp_pathrelay_tramp(void);
+__asm__(
+    ".text\n"
+    ".globl lp_pathrelay_tramp\n"
+    ".type  lp_pathrelay_tramp,%function\n"
+    "lp_pathrelay_tramp:\n"
+    "    stp x29, x30, [sp, #-16]!\n"   /* 保存帧（bl 会写 x30） */
+    "    mov x29, sp\n"
+    "    mov x6, x8\n"                   /* 第 7 参 = 系统调用号 */
+    "    bl  bxroot_pathrelay_dispatch\n"/* x0 = 内核原始约定返回值 */
+    "    ldp x29, x30, [sp], #16\n"
+    "    ret\n"                          /* 回站点下一条（cmn x0,...） */
+    ".size lp_pathrelay_tramp, .-lp_pathrelay_tramp\n"
+);
+
+/*
+ * 扫描 [lo,hi)，把 openat(56) 的内联 svc 站点改成 `bl lp_pathrelay_tramp`。
+ * 返回改写的站点数。形态/中断判据与 lp_scan_and_patch 完全一致
+ * （复用 lp_is_scan_barrier），只是补丁指令不同（bl 而非 mov x0,#0）。
+ *
+ * 逐点安全：① 只认 mov x8,#56 近距离跟 svc#0；② 打补丁前校验 svc；
+ * ③ bl 偏移超 ±128MB 则跳过该点（fail-open，不硬跳）。
+ */
+static int lp_pathrelay_patch(uintptr_t lo, uintptr_t hi)
+{
+    uint32_t *code = (uint32_t *)lo;
+    size_t n = (hi - lo) / 4;
+    size_t j;
+    int total = 0;
+    uintptr_t tramp = (uintptr_t)(void *)&lp_pathrelay_tramp;
+
+    for (j = 0; j < n; j++) {
+        size_t s;
+
+        if (code[j] != LP_MOV_X8_OPENAT)
+            continue;
+
+        for (s = 1; s <= LP_SCAN_WINDOW && j + s < n; s++) {
+            uint32_t ins = code[j + s];
+
+            if (ins == SVC_INSN) {
+                uint32_t *p = &code[j + s];
+                long off = (long)((intptr_t)tramp - (intptr_t)(uintptr_t)p);
+
+                /* bl 可达性（±128MB）。超界 → fail-open，跳过本点。 */
+                if (off < -LP_BL_RANGE || off >= LP_BL_RANGE)
+                    break;
+                if (*p != SVC_INSN)         /* 再校验一次（幂等/防漂移） */
+                    break;
+
+                *p = LP_BL_OPCODE |
+                     ((uint32_t)((off >> 2) & 0x03ffffff));
+                __builtin___clear_cache((char *)p, (char *)p + 4);
+                total++;
+                break;
+            }
+            if (lp_is_scan_barrier(ins))
+                break;
+        }
+    }
+    return total;
+}
+
+static int g_pathrelay_hits;
+
+/*
+ * 对所有 libc.so.6 的 r-x 段跑 path-relay 扫描（openat 站点分散在多个
+ * r-x 段里 —— 实测本机 libc 有两段 r-x：0x0.. 与 0xd8000..，openat 的
+ * 内联 svc 恰在**第二段** 0xe0xxx，而 find_libc_exec_range 只返回第一
+ * 段。所以这里必须遍历全部 r-x 段，不能只取第一段）。
+ *
+ * mode: 'l' = 匹配 libc.so.6 的 r-x 段；'m' = 匹配含锚点的主映像 r-x 段
+ * （静态链接 guest，glibc 代码在主 .text）。返回累计改写站点数。
+ * 每段各自 mprotect RWX → 扫描 → 复位 r-x，窗口尽量小。
+ */
+static int lp_pathrelay_scan_libc_segments(void)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[1024];
+    int have_libc = 0;
+    int total = 0;
+    uintptr_t anchor = (uintptr_t)(void *)&lp_pathrelay_scan_libc_segments;
+
+    if (f == NULL)
+        return 0;
+
+    /* 先判断是否为动态链接（有独立 libc.so.6 r-x 段）。 */
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char perms[8];
+        unsigned long long a, b;
+        if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) < 3)
+            continue;
+        if (perms[2] == 'x' && strstr(line, "libc.so.6") != NULL) {
+            have_libc = 1;
+            break;
+        }
+    }
+    rewind(f);
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        unsigned long long a, b;
+        char perms[8];
+        int match;
+
+        if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) < 3)
+            continue;
+        if (perms[2] != 'x')
+            continue;
+
+        if (have_libc) {
+            /* 动态：只碰 libc.so.6 的 r-x 段。 */
+            match = (strstr(line, "libc.so.6") != NULL);
+        } else {
+            /* 静态 guest：只碰含本函数锚点的主映像 r-x 段（glibc 代码在此）。 */
+            match = (anchor >= (uintptr_t)a && anchor < (uintptr_t)b);
+        }
+        if (!match)
+            continue;
+
+        if ((uintptr_t)b > (uintptr_t)a &&
+            mprotect((void *)(uintptr_t)a, (size_t)(b - a),
+                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            total += lp_pathrelay_patch((uintptr_t)a, (uintptr_t)b);
+            (void)mprotect((void *)(uintptr_t)a, (size_t)(b - a),
+                           PROT_READ | PROT_EXEC);
+        }
+    }
+    fclose(f);
+    return total;
+}
+
+#ifdef LP_TEST_HOOK
+/*
+ * 测试专用：对合成缓冲跑 path-relay 扫描（不碰 /proc、不 mprotect）。
+ * 断言"哪些 openat svc 被改成 bl、哪些没被碰"。仅 -DLP_TEST_HOOK 编入。
+ * 注意：合成缓冲远离 tramp，bl 偏移几乎必然超界 → 本钩子改用
+ * bxroot_livepatch_pathrelay_count_for_test 只**计数命中站点**（不实际
+ * 改写），把"识别"与"可达性"两件事分开测。
+ */
+int bxroot_livepatch_pathrelay_count_for_test(uint32_t *buf, size_t words)
+{
+    uint32_t *code = buf;
+    size_t n = words, j;
+    int total = 0;
+
+    for (j = 0; j < n; j++) {
+        size_t s;
+        if (code[j] != LP_MOV_X8_OPENAT)
+            continue;
+        for (s = 1; s <= LP_SCAN_WINDOW && j + s < n; s++) {
+            uint32_t ins = code[j + s];
+            if (ins == SVC_INSN) { total++; break; }
+            if (lp_is_scan_barrier(ins)) break;
+        }
+    }
+    return total;
+}
+#endif
+
 #ifdef LP_TEST_HOOK
 /*
  * 测试专用：对一段调用方提供的机器码缓冲跑扫描逻辑（不碰 /proc、不
@@ -933,6 +1276,29 @@ int bxroot_livepatch_apply(void)
     }
 
     /*
+     * ★ 第四部分：path-relay —— 把 libc 的 openat 内联 svc 改成 bl 桩 ★
+     *
+     * 这是 DNS 缺口的根因修复（见本文件 path-relay 段的证据链）。与前
+     * 三部分**分开的开关** BXROOT_NO_PATHRELAY，且只在门控（seccomp +
+     * 架构）通过后才走到这里（本函数开头 lp_gate 已把关）。
+     *
+     * ★ 必须遍历全部 libc r-x 段 ★ openat 内联 svc 分散在 libc 的多个
+     * r-x 段（实测本机 libc 有两段 r-x，openat 站点在第二段），而
+     * find_libc_exec_range 只返回第一段。lp_pathrelay_scan_libc_segments
+     * 遍历 /proc/self/maps 里 libc.so.6 的所有 r-x 段（静态 guest 则扫含
+     * 锚点的主映像段），逐段 RWX→扫描→复位 r-x。
+     */
+    {
+        const char *e = getenv(LP_ENV_OFF_PATHRELAY);
+        int pr_off = (e != NULL && atoi(e) != 0);
+
+        if (!pr_off) {
+            g_pathrelay_hits = lp_pathrelay_scan_libc_segments();
+            g_hits += g_pathrelay_hits;
+        }
+    }
+
+    /*
      * ★ g_applied 只在**真的改写了至少一个站点**时才置位 ★
      * 原实现无条件置 1，于是"一条都没打上"也会对外报 applied=1 ——
      * 那是"看起来干了活"的假象，正是本项目反复吃过亏的静默失效形态。
@@ -942,8 +1308,10 @@ int bxroot_livepatch_apply(void)
         g_applied = 1;
         if (lp_verbose())
             fprintf(stderr, "[bxroot] livepatch: 已中和 %d 个站点"
-                    "（扫描 %d + 版本表 %d）\n",
-                    g_hits, g_scan_hits, g_hits - g_scan_hits);
+                    "（扫描 %d + 版本表 %d + path-relay %d）\n",
+                    g_hits, g_scan_hits,
+                    g_hits - g_scan_hits - g_pathrelay_hits,
+                    g_pathrelay_hits);
         return 0;
     }
     return -5;
@@ -962,6 +1330,12 @@ int bxroot_livepatch_hits(void)
 int bxroot_livepatch_scan_hits(void)
 {
     return g_scan_hits;
+}
+
+/* path-relay 改写的 openat 站点数（诊断/回归判别力用）。 */
+int bxroot_livepatch_pathrelay_hits(void)
+{
+    return g_pathrelay_hits;
 }
 
 int bxroot_livepatch_skip_reason(void)

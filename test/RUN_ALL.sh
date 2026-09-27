@@ -904,6 +904,13 @@ else
     run_step "livepatch 静态主映像"
 fi
 
+# DNS/NSS 解析（path-relay：libc openat 内联 svc 接路径翻译，修 getaddrinfo TEMP_FAIL）
+if [ -f test/RUN_DNS.sh ]; then
+    run_step "DNS 解析" sh test/RUN_DNS.sh
+else
+    run_step "DNS 解析"
+fi
+
 # 路径翻译沙箱边界爆破（BXR-ESC-4：相对 `..` / *at dirfd `..` 夹紧）
 if [ -f test/RUN_FUZZ_PATH.sh ]; then
     run_step "路径爆破边界" sh test/RUN_FUZZ_PATH.sh
