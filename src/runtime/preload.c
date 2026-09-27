@@ -47,6 +47,8 @@
 #include <pthread.h>
 #include <sys/mman.h>       /* POSIX shm / sem 后备文件的 mmap（shm_open/sem_open 重实现）*/
 #include <semaphore.h>      /* sem_t / sem_init（命名信号量重实现）*/
+#include <utime.h>          /* struct utimbuf：utime() 钩子 */
+#include <sys/time.h>       /* struct timeval：utimes()/futimes() 钩子 */
 
 #include "config.h"
 #include "l2s-runtime.h"
@@ -1179,6 +1181,64 @@ static int ro_guard_at(int dirfd, const char *path) {
     }
     return ro_guard_path(g);
 }
+
+/*
+ * 只读 bind 写意图守卫（**fd 版**）：把已打开的 fd 反解成 guest 绝对
+ * 路径后判定。命中只读 bind → 置 errno=EROFS 返回 1；否则 0（放行）。
+ *
+ * ★ 为什么必须单独有 fd 版 ★（实测缺陷，2026-09-28 压测子代理 B 报出）
+ * 路径版 open(O_RDWR)/truncate/chmod 都正确 EROFS，但 **fd 版**
+ * fchmod(fd)/fchown(fd)/futimens(fd)/ftruncate(fd) 此前完全不判 ——
+ * 程序先 open(O_RDONLY) 拿到只读 fd（读打开被放行），再用 fchmod(fd)
+ * 改权限，就**绕过只读 bind 并真写穿宿主 backing file**（644→700、
+ * mtime 被改）。fd 已经指向宿主真文件，内核照做。
+ *
+ * 反解链路与 realpath_fixup / getcwd_fixup 同源：readlink /proc/self/fd/N
+ * 拿到内核视角的宿主路径 → strip_rootfs 前缀 → detranslate_binds 反 bind
+ * → 得到 guest 视角路径 → bind_is_readonly_target 前缀匹配。
+ *
+ * 失败（fd 非普通文件、readlink 失败、反解不出 guest 路径）一律**放行**
+ * （返回 0）：只读语义宁可漏判也不能误锁一个本不在只读 bind 内的 fd。
+ * 命中只读 bind 才拦，代价是每次 fd 版写钩子多一次 readlink——只读
+ * bind 场景本就少见，可接受。
+ */
+static int ro_guard_fd(int fd) {
+    if (fd < 0)
+        return 0;
+    if (g_config.bind_count <= 0 || g_config.bind_readonly == NULL)
+        return 0;
+
+    char proc[64];
+    char host[MAX_PATH_LEN];
+    ssize_t n;
+
+    snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
+    n = real_readlink != NULL ? real_readlink(proc, host, sizeof(host) - 1)
+                              : readlink(proc, host, sizeof(host) - 1);
+    if (n <= 0)
+        return 0;                       /* 拿不到路径：放行 */
+    host[n] = '\0';
+    if (host[0] != '/')
+        return 0;                       /* socket:[N]/pipe:[N]/anon_inode: 等 */
+
+    /* 宿主视角 → guest 视角。两种 bind：
+     *   ① source 在 rootfs **外**（如 -b /dev:/dev）：raw 路径不带 rootfs
+     *      前缀，需先 detranslate 反 bind；
+     *   ② source 在 rootfs **内**（如 -b <rootfs>/x:/mnt）：raw 路径 =
+     *      <rootfs>/x/...，bind source 也是 <rootfs>/x，直接反 bind 即命中；
+     *      若先剥 rootfs 前缀会把 source 需要的段吃掉，反 bind 就永远 miss。
+     * 所以**先对 raw 原样反 bind**；不中再剥 rootfs 前缀后重试。 */
+    {
+        char guest[MAX_PATH_LEN];
+        if (detranslate_binds(host, guest, sizeof(guest)) == 1)
+            return ro_guard_path(guest);
+        (void)strip_rootfs_prefix_inplace(host);   /* 原地：host 变 rootfs 内路径 */
+        if (detranslate_binds(host, guest, sizeof(guest)) == 1)
+            return ro_guard_path(guest);
+        return ro_guard_path(host);
+    }
+}
+
 
 /*
  * open(2) 族的写意图判定。
@@ -4286,6 +4346,8 @@ int fchown(int fd, uid_t uid, gid_t gid) {
         fn = (int (*)(int, uid_t, gid_t))bxroot_next_symbol("fchown");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (ro_guard_fd(fd)) return -1;     /* 只读 bind：fd 版写意图 → EROFS */
+
     rc = fn(fd, uid, gid);
     if (!g_fakeroot_on)
         return rc;
@@ -6501,6 +6563,8 @@ int fchmod(int fd, mode_t mode) {
         fn = (int (*)(int, mode_t))bxroot_next_symbol("fchmod");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (ro_guard_fd(fd)) return -1;     /* 只读 bind：fd 版写意图 → EROFS */
+
     rc = fn(fd, mode);
     if (rc == 0 && g_fakeroot_on)
         (void)fakeroot_record_mode_fd(&g_fakeroot_state, fd, mode);
@@ -6901,6 +6965,21 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
     char absbuf[MAX_PATH_LEN];   /* 相对路径绝对化（见 bxroot_absolutize） */
     char rs_[MAX_PATH_LEN];     /* 函数作用域：p 会指向它 */
     char mid_[MAX_PATH_LEN];    /* 同上 */
+
+    /*
+     * ★ 洗掉 glibc 的 __nonnull 假设（实测崩溃修复）★
+     * <bits/statx-generic.h> 把 statx 声明成 `__nonnull((2, 5))`。gcc 据此
+     * **在本函数体内**认定 path 恒非空，于是把我们后面所有 `path != NULL`
+     * 的判断整段消除（objdump 可见：无 NULL 分支就直接 `ldrb [path]`）。
+     * 结果 `statx(fd, NULL, AT_EMPTY_PATH, …)`（合法用法：作用于 fd 自身）
+     * 在 runtime 内解空指针 → 整进程 SIGSEGV；官方 glibc 对 NULL 返回 EFAULT。
+     * `-fno-delete-null-pointer-checks` 挡不住这个基于 attribute 的假设。
+     * 用 volatile 过一遍让编译器无法证明其非空，NULL 守卫即恢复有效。
+     */
+    const char *path_v;
+    { const char *volatile _pv = path; path_v = _pv; }
+    path = path_v;
+
     const char *p = path;
 
     if (fn == NULL)
@@ -7080,6 +7159,222 @@ int truncate(const char *path, off_t length) {
     if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, length);
+}
+
+/*
+ * ftruncate —— **fd 版** truncate。只读 bind 守卫的 fd 版（同 fchmod/
+ * fchown：路径版 truncate 已判，fd 版此前漏判 → 只读 bind 被写穿）。
+ */
+int ftruncate(int fd, off_t length) {
+    static int (*fn)(int, off_t) = NULL;
+
+    if (fn == NULL)
+        fn = (int (*)(int, off_t))bxroot_next_symbol("ftruncate");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_fd(fd)) return -1;
+    return fn(fd, length);
+}
+
+/*
+ * mkfifo / mkfifoat —— 创建 FIFO。此前**完全未 hook**（实测缺陷，
+ * 2026-09-28 压测子代理 B）：rootfs 内任何路径都因走未翻译的字面
+ * guest 路径而 ENOENT，基线正常创建。补上路径翻译 + 只读 bind 守卫。
+ */
+int mkfifo(const char *path, mode_t mode) {
+    static int (*fn)(const char *, mode_t) = NULL;
+    char translated[MAX_PATH_LEN];
+    const char *p = path;
+
+    if (fn == NULL)
+        fn = (int (*)(const char *, mode_t))bxroot_next_symbol("mkfifo");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
+        p = translated;
+    return fn(p, mode);
+}
+
+int mkfifoat(int dirfd, const char *path, mode_t mode) {
+    static int (*fn)(int, const char *, mode_t) = NULL;
+    char joined[MAX_PATH_LEN];
+    char translated[MAX_PATH_LEN];
+    const char *p = path;
+
+    if (fn == NULL)
+        fn = (int (*)(int, const char *, mode_t))bxroot_next_symbol("mkfifoat");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_at(dirfd, path)) return -1;
+
+    if (path != NULL && path[0] == '/') {
+        if (translate_path(path, translated, sizeof(translated)) > 0)
+            p = translated;
+    } else if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1) {
+        if (translate_path(joined, translated, sizeof(translated)) > 0)
+            p = translated;
+        else
+            p = joined;
+    }
+    return fn(dirfd, p, mode);
+}
+
+/*
+ * mknod / mknodat —— 创建设备节点/FIFO/普通文件。此前**未 hook**：
+ * 走未翻译字面路径 → ENOENT。补路径翻译 + 只读 bind 守卫。
+ *
+ * ★ errno 归一化（实测缺陷，压测子代理 E）★ 非特权用户建字符/块设备
+ * 节点，POSIX 与官方基线恒为 EPERM(1)。bxroot 若照透翻译后落点的内核
+ * errno，会返回 EACCES/ENOENT/EROFS —— 尤其父目录明明存在却报 ENOENT，
+ * 误导 `errno==EPERM ? skip` 的程序（dpkg postinst/mkdev）。因此：对
+ * S_IFCHR/S_IFBLK，非 root（且未开 fakeroot 顶包）时统一归一化成 EPERM。
+ */
+static int mknod_common(const char *p, mode_t mode, dev_t dev,
+                        int (*fn)(const char *, mode_t, dev_t)) {
+    int rc = fn(p, mode, dev);
+    if (rc == 0)
+        return 0;
+    /* 设备节点在非特权下的 errno 归一化。fakeroot 顶包时保持内核结果。 */
+    if ((S_ISCHR(mode) || S_ISBLK(mode)) && !g_fakeroot_on) {
+        int saved = errno;
+        if (saved == EACCES || saved == ENOENT || saved == EROFS ||
+            saved == ENOTDIR)
+            errno = EPERM;
+    }
+    return rc;
+}
+
+int mknod(const char *path, mode_t mode, dev_t dev) {
+    static int (*fn)(const char *, mode_t, dev_t) = NULL;
+    char translated[MAX_PATH_LEN];
+    const char *p = path;
+
+    if (fn == NULL)
+        fn = (int (*)(const char *, mode_t, dev_t))bxroot_next_symbol("mknod");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
+        p = translated;
+    return mknod_common(p, mode, dev, fn);
+}
+
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
+    static int (*fn)(int, const char *, mode_t, dev_t) = NULL;
+    char joined[MAX_PATH_LEN];
+    char translated[MAX_PATH_LEN];
+    const char *p = path;
+    int rc;
+
+    if (fn == NULL)
+        fn = (int (*)(int, const char *, mode_t, dev_t))
+             bxroot_next_symbol("mknodat");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_at(dirfd, path)) return -1;
+
+    if (path != NULL && path[0] == '/') {
+        if (translate_path(path, translated, sizeof(translated)) > 0)
+            p = translated;
+    } else if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1) {
+        if (translate_path(joined, translated, sizeof(translated)) > 0)
+            p = translated;
+        else
+            p = joined;
+    }
+    rc = fn(dirfd, p, mode, dev);
+    if (rc != 0 && (S_ISCHR(mode) || S_ISBLK(mode)) && !g_fakeroot_on) {
+        int saved = errno;
+        if (saved == EACCES || saved == ENOENT || saved == EROFS ||
+            saved == ENOTDIR)
+            errno = EPERM;
+    }
+    return rc;
+}
+
+/*
+ * utime / utimes / lutimes —— 旧式时间戳设置的**路径版**。此前未 hook：
+ * 走未翻译字面路径 → ENOENT（utimensat 已 hook，故 touch 不受影响，
+ * 仅直调这些旧符号的程序受害：dpkg/tar 保留 mtime 会踩）。补翻译 +
+ * 只读 bind 守卫。
+ */
+int utime(const char *path, const struct utimbuf *times) {
+    static int (*fn)(const char *, const struct utimbuf *) = NULL;
+    char translated[MAX_PATH_LEN];
+    const char *p = path;
+
+    if (fn == NULL)
+        fn = (int (*)(const char *, const struct utimbuf *))
+             bxroot_next_symbol("utime");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
+        p = translated;
+    return fn(p, times);
+}
+
+int utimes(const char *path, const struct timeval times[2]) {
+    static int (*fn)(const char *, const struct timeval[2]) = NULL;
+    char translated[MAX_PATH_LEN];
+    const char *p = path;
+
+    if (fn == NULL)
+        fn = (int (*)(const char *, const struct timeval[2]))
+             bxroot_next_symbol("utimes");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
+    if (translate_follow(path, translated, sizeof(translated), 0) > 0)
+        p = translated;
+    return fn(p, times);
+}
+
+int lutimes(const char *path, const struct timeval times[2]) {
+    static int (*fn)(const char *, const struct timeval[2]) = NULL;
+    char translated[MAX_PATH_LEN];
+    const char *p = path;
+
+    if (fn == NULL)
+        fn = (int (*)(const char *, const struct timeval[2]))
+             bxroot_next_symbol("lutimes");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
+    /* lutimes 不跟随符号链接：translate_follow 末段 nofollow=1 */
+    if (translate_follow(path, translated, sizeof(translated), 1) > 0)
+        p = translated;
+    return fn(p, times);
+}
+
+/*
+ * futimes / futimens —— **fd 版**时间戳设置。只读 bind 的 fd 版守卫
+ * （同 fchmod/fchown/ftruncate：此前 futimens 被用来写穿只读 bind，
+ * mtime 被真实改写）。
+ */
+int futimes(int fd, const struct timeval times[2]) {
+    static int (*fn)(int, const struct timeval[2]) = NULL;
+
+    if (fn == NULL)
+        fn = (int (*)(int, const struct timeval[2]))
+             bxroot_next_symbol("futimes");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_fd(fd)) return -1;
+    return fn(fd, times);
+}
+
+int futimens(int fd, const struct timespec times[2]) {
+    static int (*fn)(int, const struct timespec[2]) = NULL;
+
+    if (fn == NULL)
+        fn = (int (*)(int, const struct timespec[2]))
+             bxroot_next_symbol("futimens");
+    if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_fd(fd)) return -1;
+    return fn(fd, times);
 }
 
 int creat(const char *path, mode_t mode) {

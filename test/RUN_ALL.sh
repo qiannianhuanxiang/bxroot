@@ -946,6 +946,28 @@ else
     run_step "statx 空路径"
 fi
 
+# statx(fd,NULL,AT_EMPTY_PATH)：glibc __nonnull 让编译器删掉 NULL 守卫，
+# 合法的 NULL 调用曾致整进程 SIGSEGV；此项守护"不崩溃"。
+if [ -f test/RUN_STATX_NULL.sh ]; then
+    run_step "statx NULL 不崩" sh test/RUN_STATX_NULL.sh
+else
+    run_step "statx NULL 不崩"
+fi
+
+# mkfifo/mknod/utime/utimes 路径翻译 + mknod 设备节点 errno 归一化为 EPERM
+if [ -f test/RUN_MKNOD_UTIME.sh ]; then
+    run_step "mkfifo/mknod/utime" sh test/RUN_MKNOD_UTIME.sh
+else
+    run_step "mkfifo/mknod/utime"
+fi
+
+# execve 家族保留调用方 argv[0]（trampoline --argv0 用 raw_argv0）
+if [ -f test/RUN_EXEC_ARGV0.sh ]; then
+    run_step "execve argv0" sh test/RUN_EXEC_ARGV0.sh
+else
+    run_step "execve argv0"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================

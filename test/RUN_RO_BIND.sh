@@ -120,6 +120,59 @@ case "$out" in
 *) bad "只读文件疑似被改动：$out" ;;
 esac
 
+# --- a2c) fd 版写钩子也必须被只读 bind 拦（此前漏判会写穿宿主）---
+#     判别力：程序先 open(O_RDONLY) 拿到只读 bind 内文件的 fd（读打开放行），
+#     再用 fchmod/fchown/ftruncate/futimens 这些 **fd 版** 写系统调用改它。
+#     修复前 fd 版完全不判 ro_guard → rc=0 且真写穿宿主 backing file。
+#     修复后应全部 EROFS。这里用一个自带 C 探针（编译进 rootfs 内）验证。
+echo "--- a2c) fd 版写钩子（fchmod/fchown/ftruncate/futimens）→ EROFS ---"
+FDPROBE_SRC="$W/rofd.c"
+cat > "$FDPROBE_SRC" <<'CEOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+/* 只 open(O_RDONLY)（读打开在只读 bind 上是允许的），随后用 fd 版写钩子。
+ * 每个都应返回 -1/EROFS。任何一个 rc==0 = 只读语义被 fd 版击穿。 */
+int main(int argc, char **argv) {
+    int fd = open(argv[1], O_RDONLY);
+    if (fd < 0) { printf("OPEN-FAIL errno=%d\n", errno); return 3; }
+    int bad = 0;
+    if (fchmod(fd, 0700) == 0)                 { printf("FCHMOD-WROTE\n");   bad = 1; }
+    else if (errno != EROFS)                   { printf("FCHMOD-ERR=%d\n", errno); bad = 1; }
+    if (fchown(fd, 0, 0) == 0)                 { printf("FCHOWN-WROTE\n");   bad = 1; }
+    else if (errno != EROFS)                   { printf("FCHOWN-ERR=%d\n", errno); bad = 1; }
+    if (ftruncate(fd, 0) == 0)                 { printf("FTRUNCATE-WROTE\n"); bad = 1; }
+    else if (errno != EROFS)                   { printf("FTRUNCATE-ERR=%d\n", errno); bad = 1; }
+    struct timespec ts[2] = {{1000000000,0},{1000000000,0}};
+    if (futimens(fd, ts) == 0)                 { printf("FUTIMENS-WROTE\n"); bad = 1; }
+    else if (errno != EROFS)                   { printf("FUTIMENS-ERR=%d\n", errno); bad = 1; }
+    close(fd);
+    printf(bad ? "FD-RO-BREACH\n" : "FD-RO-OK\n");
+    return bad ? 1 : 0;
+}
+CEOF
+# 探针二进制放进只读 bind 之外的 rootfs 内（/tmp 下），guest 可 exec。
+FDPROBE_C="$W/rofd"
+i=1
+while [ "$i" -le 15 ]; do
+    gcc -O1 -w -o "$FDPROBE_C" "$FDPROBE_SRC" 2>"$W/cc2.err" && break
+    grep -q 'internal compiler error' "$W/cc2.err" || { bad "rofd 探针无法编译"; break; }
+    i=$((i + 1))
+done
+if [ -x "$FDPROBE_C" ]; then
+    # 探针在容器 /tmp（=rootfs 内），guest 视角同路径可执行。
+    out=$(BXROOT_BINDS="$BINDS" timeout 40 "$BX" --no-check -- "$FDPROBE_C" /mnt/ro/f 2>&1)
+    case "$out" in
+    *FD-RO-OK*)     good "fd 版写钩子全部被只读 bind 拦成 EROFS" ;;
+    *FD-RO-BREACH*) bad "fd 版写钩子击穿只读 bind：$(echo "$out" | tr '\n' ' ')" ;;
+    *)              bad "fd 版探针输出异常：$(echo "$out" | tr '\n' ' ')" ;;
+    esac
+fi
+
 echo "--- a3) 非只读 bind 仍可写 ---"
 out=$(runbx 'echo RW-NEW > /mnt/rw/h && cat /mnt/rw/h')
 case "$out" in

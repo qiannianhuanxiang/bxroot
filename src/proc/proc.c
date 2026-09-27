@@ -4750,7 +4750,8 @@ static int px_do_execve(const char *path, char *const argv[],
         } else if (px_elf_needs_stub(host) &&
                    px_stub_exec(host, final_argv, final_env, guest) == 0) {
             PX_LOG("proc: stub-loader exec 失败，回退 %s", host);
-        } else if (px_trampoline_exec(host, final_argv, final_env, guest,
+        } else if (px_trampoline_exec(host, final_argv, final_env,
+                                      raw_argv0[0] != '\0' ? raw_argv0 : guest,
                                       getenv("BXROOT_LD_PRELOAD")) == 0) {
             /* 走到这里说明 trampoline exec 失败（成功则永不返回），
              * 落到下面回退到直接 execve —— 保持普通环境的行为不变。 */
