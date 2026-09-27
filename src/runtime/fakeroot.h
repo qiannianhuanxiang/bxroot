@@ -550,6 +550,10 @@ void fakeroot_state_set_enabled(fakeroot_state *fs, bool enabled);
  */
 int fakeroot_setuid(fakeroot_state *fs, uid_t uid);
 int fakeroot_setgid(fakeroot_state *fs, gid_t gid);
+/* seteuid/setegid：只改 euid/egid（与官方基线一致，见 fakeroot.c 的降权族
+ * 长注释）。桥接/符号层新增 op 10/11 路由到这两个。 */
+int fakeroot_seteuid(fakeroot_state *fs, uid_t euid);
+int fakeroot_setegid(fakeroot_state *fs, gid_t egid);
 int fakeroot_setreuid(fakeroot_state *fs, uid_t r, uid_t e);
 int fakeroot_setregid(fakeroot_state *fs, gid_t r, gid_t e);
 int fakeroot_setresuid(fakeroot_state *fs, uid_t r, uid_t e, uid_t s);

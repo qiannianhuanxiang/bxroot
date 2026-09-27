@@ -1657,177 +1657,110 @@ void fakeroot_state_set_enabled(fakeroot_state *fs, bool enabled)
     }
 }
 
-/* fake_id0.c:92-97 的 MAYBE_DROP_CAPS。 */
-static void fr_maybe_drop_caps(fakeroot_state *fs, bool prev_root)
-{
-    if (prev_root && !fs->keep_caps &&
-        fs->ruid != (uid_t)0 && fs->euid != (uid_t)0 && fs->suid != (uid_t)0) {
-        fs->caps_active = false;
-    }
-}
-
-static bool fr_any_uid_is_root(const fakeroot_state *fs)
-{
-    return fs->ruid == (uid_t)0 || fs->euid == (uid_t)0 || fs->suid == (uid_t)0;
-}
-
-static bool fr_any_gid_is_root(const fakeroot_state *fs)
-{
-    return fs->rgid == (gid_t)0 || fs->egid == (gid_t)0 || fs->sgid == (gid_t)0;
-}
-
+/*
+ * ★★ 降权族语义：与官方基线（/tmp/off-rt.so）实测对齐，而非 fake_id0.c ★★
+ *
+ * 【为什么推翻原先的 fake_id0.c 权限状态机】
+ * 原实现照抄了 upstream fake_id0.c 的 EPERM 闸门（"非特权且 uid 不匹配
+ * r/e/s 则拒绝"）与 MAYBE_DROP_CAPS（r/e/s 全非 0 时清 caps）。爆破测试
+ * （test/RUN_FUZZ_ID.sh，146 组 setter 序列）逐条对照官方 runtime 后发现
+ * 这套模型与官方**可观测行为不一致**，共 3 类偏差：
+ *
+ *   ① 降权后无法回 root：官方下 `setuid(1000)` 后 `setuid(0)` 仍 rc=0
+ *      并回到 0/0/0；旧实现清了 caps_active → 回 root 报 EPERM，
+ *      且此后任意 set*id 全 EPERM（守护进程"临时降权再恢复"的经典模式
+ *      直接崩）。官方 fakeroot 里 **root 特权是永久的**。
+ *   ② setreuid/setregid 误改 suid/sgid：官方 `setreuid(5,6)` 从 0/0/0
+ *      → r=5 e=6 **s 不变=0**；旧实现按内核"euid 变化连带改 suid"的规则
+ *      把 suid 也改成 6 → 5,6,6。官方对 saved-id **完全不联动**。
+ *   ③ setresuid/setresgid 的越权：官方一律 rc=0，旧实现在降权后按
+ *      EQUALS_ANY 闸门拒绝任意新值。
+ *
+ * 【官方实测模型（RUN_FUZZ_ID.sh 的对照证据即判据）】
+ *   - 所有 set*id **永远成功**（rc=0），fakeroot 下不存在"权限不足"；
+ *   - setuid(u)  : r=e=s=u（三者同置）；
+ *   - setgid(g)  : r=e=s=g；
+ *   - seteuid(e) : 仅 euid=e（r/s 不动）；setegid 同理仅 egid；
+ *   - setreuid(r,e): r!=-1 则 ruid=r，e!=-1 则 euid=e，**suid 恒不动**；
+ *   - setregid 同构；
+ *   - setresuid(r,e,s): 三者各自 !=-1 才改，互不联动；setresgid 同构。
+ *
+ * fsuid/fsgid 跟随 euid/egid（供将来的 fs 身份查询用；官方不暴露 fsuid
+ * 读回，跟不跟随都不可观测，这里跟随以保持内部自洽）。
+ * caps_active 恒为真（root 特权永久），不再有 MAYBE_DROP_CAPS。
+ */
 int fakeroot_setuid(fakeroot_state *fs, uid_t uid)
 {
-    bool prev_root;
-    bool allowed;
-
     if (fs == NULL) {
         return FR_EINVAL;
     }
-
-    prev_root = fr_any_uid_is_root(fs);
-
-    /* fake_id0.c:112-115 —— 「EPERM: The user is not privileged and uid
-     * does not match the real UID or saved set-user-ID」 */
-    allowed = (fs->euid == (uid_t)0 || fs->caps_active ||
-               uid == fs->ruid || uid == fs->euid || uid == fs->suid);
-    if (!allowed) {
-        return FR_EPERM;
-    }
-
-    /* fake_id0.c:122-125 —— euid 是 root 时，ruid 与 suid 一起被设置。 */
-    if (fs->euid == (uid_t)0 || fs->caps_active) {
-        fs->ruid = uid;
-        fs->suid = uid;
-    }
-    /* fake_id0.c:130-131 —— 改 euid 时 fsuid 跟随。 */
-    fs->euid  = uid;
-    fs->fsuid = uid;
-
-    fr_maybe_drop_caps(fs, prev_root);
+    fs->ruid = fs->euid = fs->suid = fs->fsuid = uid;
     return FR_OK;
 }
 
 int fakeroot_setgid(fakeroot_state *fs, gid_t gid)
 {
-    bool prev_root;
-    bool allowed;
-
     if (fs == NULL) {
         return FR_EINVAL;
     }
-
-    prev_root = fr_any_gid_is_root(fs);
-
-    allowed = (fs->egid == (gid_t)0 || fs->caps_active ||
-               gid == fs->rgid || gid == fs->egid || gid == fs->sgid);
-    if (!allowed) {
-        return FR_EPERM;
-    }
-
-    if (fs->egid == (gid_t)0 || fs->caps_active) {
-        fs->rgid = gid;
-        fs->sgid = gid;
-    }
-    fs->egid  = gid;
-    fs->fsgid = gid;
-
-    fr_maybe_drop_caps(fs, prev_root);
+    fs->rgid = fs->egid = fs->sgid = fs->fsgid = gid;
     return FR_OK;
 }
 
-/* fake_id0.c:147 的 UNCHANGED_ID / UNSET_ID */
-static bool fr_uid_unchanged(const fakeroot_state *fs, uid_t u)
+/* seteuid/setegid：仅改 euid/egid（内部实现，符号/桥接层经 setres* 复用
+ * 也可，但独立实现更贴合官方"只动一个字段"的观测）。 */
+int fakeroot_seteuid(fakeroot_state *fs, uid_t euid)
 {
-    return !fr_uid_is_set(u) || u == fs->ruid;
+    if (fs == NULL) {
+        return FR_EINVAL;
+    }
+    fs->euid  = euid;
+    fs->fsuid = euid;
+    return FR_OK;
 }
-static bool fr_gid_unchanged(const fakeroot_state *fs, gid_t g)
+
+int fakeroot_setegid(fakeroot_state *fs, gid_t egid)
 {
-    return !fr_gid_is_set(g) || g == fs->rgid;
+    if (fs == NULL) {
+        return FR_EINVAL;
+    }
+    fs->egid  = egid;
+    fs->fsgid = egid;
+    return FR_OK;
 }
 
 int fakeroot_setreuid(fakeroot_state *fs, uid_t r, uid_t e)
 {
-    bool prev_root;
-    bool allowed;
-
     if (fs == NULL) {
         return FR_EINVAL;
     }
-
-    /* fake_id0.c:155 */
-    prev_root = fr_any_uid_is_root(fs);
-
-    /* fake_id0.c:177-181 */
-    allowed = (fs->euid == (uid_t)0 || fs->caps_active ||
-               (fr_uid_unchanged(fs, e) && fr_uid_unchanged(fs, r)) ||
-               (r == fs->euid && (e == fs->ruid || !fr_uid_is_set(e))) ||
-               (e == fs->ruid && (r == fs->euid || !fr_uid_is_set(r))) ||
-               (e == fs->suid && fr_uid_unchanged(fs, r)));
-    if (!allowed) {
-        return FR_EPERM;
+    /* suid 恒不动 —— 官方对 saved-uid 不做任何联动。 */
+    if (fr_uid_is_set(r)) {
+        fs->ruid = r;
     }
-
-    /* fake_id0.c:191-197：先处理 euid（suid 的更新依赖旧的 ruid 比较）。 */
     if (fr_uid_is_set(e)) {
-        if (e != fs->ruid) {
-            fs->suid = e;
-        }
         fs->euid  = e;
         fs->fsuid = e;
     }
-
-    /* fake_id0.c:201-205：再处理 ruid。 */
-    if (fr_uid_is_set(r)) {
-        if (fr_uid_is_set(e)) {
-            fs->suid = e;
-        }
-        fs->ruid = r;
-    }
-
-    fr_maybe_drop_caps(fs, prev_root);
     return FR_OK;
 }
 
 int fakeroot_setregid(fakeroot_state *fs, gid_t r, gid_t e)
 {
-    bool prev_root;
-    bool allowed;
-
     if (fs == NULL) {
         return FR_EINVAL;
     }
-
-    prev_root = fr_any_gid_is_root(fs);
-
-    allowed = (fs->egid == (gid_t)0 || fs->caps_active ||
-               (fr_gid_unchanged(fs, e) && fr_gid_unchanged(fs, r)) ||
-               (r == fs->egid && (e == fs->rgid || !fr_gid_is_set(e))) ||
-               (e == fs->rgid && (r == fs->egid || !fr_gid_is_set(r))) ||
-               (e == fs->sgid && fr_gid_unchanged(fs, r)));
-    if (!allowed) {
-        return FR_EPERM;
+    if (fr_gid_is_set(r)) {
+        fs->rgid = r;
     }
-
     if (fr_gid_is_set(e)) {
-        if (e != fs->rgid) {
-            fs->sgid = e;
-        }
         fs->egid  = e;
         fs->fsgid = e;
     }
-    if (fr_gid_is_set(r)) {
-        if (fr_gid_is_set(e)) {
-            fs->sgid = e;
-        }
-        fs->rgid = r;
-    }
-
-    fr_maybe_drop_caps(fs, prev_root);
     return FR_OK;
 }
 
-/* fake_id0.c:216-218 的 EQUALS_ANY_ID */
+/* fake_id0.c:216-218 的 EQUALS_ANY_ID（setfsuid/setfsgid 的闸门仍用它） */
 static bool fr_uid_equals_any(const fakeroot_state *fs, uid_t u)
 {
     return u == fs->ruid || u == fs->euid || u == fs->suid;
@@ -1839,26 +1772,10 @@ static bool fr_gid_equals_any(const fakeroot_state *fs, gid_t g)
 
 int fakeroot_setresuid(fakeroot_state *fs, uid_t r, uid_t e, uid_t s)
 {
-    bool prev_root;
-    bool allowed;
-
     if (fs == NULL) {
         return FR_EINVAL;
     }
-
-    prev_root = fr_any_uid_is_root(fs);
-
-    /* fake_id0.c:239-242 */
-    allowed = (fs->euid == (uid_t)0 || fs->caps_active ||
-               ((!fr_uid_is_set(r) || fr_uid_equals_any(fs, r)) &&
-                (!fr_uid_is_set(e) || fr_uid_equals_any(fs, e)) &&
-                (!fr_uid_is_set(s) || fr_uid_equals_any(fs, s))));
-    if (!allowed) {
-        return FR_EPERM;
-    }
-
-    /* 「If one of the arguments equals -1, the corresponding value is
-     *  not changed.」 */
+    /* 「若某参数为 -1，对应值不变」；三者互不联动，一律成功。 */
     if (fr_uid_is_set(r)) {
         fs->ruid = r;
     }
@@ -1869,30 +1786,14 @@ int fakeroot_setresuid(fakeroot_state *fs, uid_t r, uid_t e, uid_t s)
     if (fr_uid_is_set(s)) {
         fs->suid = s;
     }
-
-    fr_maybe_drop_caps(fs, prev_root);
     return FR_OK;
 }
 
 int fakeroot_setresgid(fakeroot_state *fs, gid_t r, gid_t e, gid_t s)
 {
-    bool prev_root;
-    bool allowed;
-
     if (fs == NULL) {
         return FR_EINVAL;
     }
-
-    prev_root = fr_any_gid_is_root(fs);
-
-    allowed = (fs->egid == (gid_t)0 || fs->caps_active ||
-               ((!fr_gid_is_set(r) || fr_gid_equals_any(fs, r)) &&
-                (!fr_gid_is_set(e) || fr_gid_equals_any(fs, e)) &&
-                (!fr_gid_is_set(s) || fr_gid_equals_any(fs, s))));
-    if (!allowed) {
-        return FR_EPERM;
-    }
-
     if (fr_gid_is_set(r)) {
         fs->rgid = r;
     }
@@ -1903,8 +1804,6 @@ int fakeroot_setresgid(fakeroot_state *fs, gid_t r, gid_t e, gid_t s)
     if (fr_gid_is_set(s)) {
         fs->sgid = s;
     }
-
-    fr_maybe_drop_caps(fs, prev_root);
     return FR_OK;
 }
 

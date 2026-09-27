@@ -1896,7 +1896,6 @@ long syscall(long number, ...)
              * aarch64 上一致（本机 gcc 打印 SYS_getuid..SYS_getegid 核对过）。
              */
             case 174:   /* getuid  */
-            case 175:   /* geteuid */
                 /*
                  * ★ 这两条仍要求 `ret >= 0` ★
                  * 与 148/150 不同：这里没有"客户缓冲区"要填，纯粹是改写
@@ -1914,14 +1913,51 @@ long syscall(long number, ...)
                     ret = (long)fuid;
                 }
                 break;
+            case 175:   /* geteuid */
+                /*
+                 * ★ geteuid 必须回 **euid**，不是 ruid ★
+                 * 【实测缺陷（RUN_FUZZ_ID.sh 爆破）】原先 174/175 共用
+                 * bxroot_fakeroot_ids（只给 ruid），于是 `seteuid(1234)`
+                 * 后裸 syscall(175) 仍回 0，而官方回 1234 —— 裸 syscall
+                 * 层与 libc geteuid 钩子自相矛盾。改用 res_ids 取真正的 euid。
+                 */
+                if (bxroot_fakeroot_res_ids == NULL)
+                    break;
+                {
+                    unsigned int feuid = 0;
+                    if (ret >= 0 &&
+                        bxroot_fakeroot_res_ids(NULL, &feuid, NULL,
+                                                NULL, NULL, NULL)) {
+                        if (g_trace)
+                            log_num("[bxroot] syscall_guard: 伪装 euid ",
+                                    number, " ");
+                        ret = (long)feuid;
+                    }
+                }
+                break;
             case 176:   /* getgid  */
-            case 177:   /* getegid */
                 if (bxroot_fakeroot_ids == NULL)
                     break;
                 if (ret >= 0 && bxroot_fakeroot_ids(NULL, &fgid)) {
                     if (g_trace)
                         log_num("[bxroot] syscall_guard: 伪装 gid ", number, " ");
                     ret = (long)fgid;
+                }
+                break;
+            case 177:   /* getegid */
+                /* getegid 必须回 egid，与 175/geteuid 同理。 */
+                if (bxroot_fakeroot_res_ids == NULL)
+                    break;
+                {
+                    unsigned int fegid = 0;
+                    if (ret >= 0 &&
+                        bxroot_fakeroot_res_ids(NULL, NULL, NULL,
+                                                NULL, &fegid, NULL)) {
+                        if (g_trace)
+                            log_num("[bxroot] syscall_guard: 伪装 egid ",
+                                    number, " ");
+                        ret = (long)fegid;
+                    }
                 }
                 break;
 
