@@ -640,6 +640,79 @@ static int find_libc_exec_range(uintptr_t *lo_out, uintptr_t *hi_out)
 }
 
 /*
+ * ====================================================================
+ * ★ 静态链接 guest 的主映像扫描（2026-09-28）★
+ * ====================================================================
+ *
+ * 【为什么必须补】静态链接（gcc -static）的 guest 里，glibc 的代码在
+ * **主可执行映像自己的 .text**，而不是独立的 libc.so.6 段。于是：
+ *   - find_libc_base() 找不到 libc.so.6 → g_base=0 → apply() 早退 -1；
+ *   - find_libc_exec_range() 也找不到 libc.so.6 的 r-x → 扫描一条不扫。
+ * 结果静态 guest 的 set_robust_list(99)/rseq(293) 内联 svc 一个都没中和。
+ *
+ * 【实测残余的真实性（本容器 vs 真机）】
+ * 本容器嵌套在外层 proroot 上，外层会把静态主映像里**紧凑形态**
+ * （mov x8,#99|#293 后≤2 条即 svc）的站点预打成 mov x0,#0，所以看起来
+ * 静态多线程也活 —— 那是外层的功劳，不是 bxroot。实测：
+ *   - 直接跑静态线程程序（含 BXROOT_NO_LIVEPATCH=1）站点已 PATCHED；
+ *   - 但**带栈 spill 的间隔站点**（mov x8,#99 → str/ldr x8 → svc）外层
+ *     漏补，UNPATCHED；masked set_robust_list 实测 DIED sig=31（SIGSYS
+ *     KILL_PROCESS，处理器投递不了）。
+ * 真机（Termux）没有外层 proroot，这些站点**全部**要 bxroot 自己补，
+ * 否则 pthread_create 的新线程在 clone 前掩全信号、start_thread 内联发
+ * set_robust_list → 被杀（159）。这正是 docs/真机验证清单.md 记的残余。
+ *
+ * 【安全边界（与 libc 扫描同款，且更克制）】
+ *   - **只在没有独立 libc.so.6 r-x 段时**（= 静态链接特征）才扫主映像，
+ *     动态 guest 一律不碰主映像（它的 99/293 在 libc.so.6 里，已被覆盖），
+ *     把误配/性能面限制到"确实是静态"这一种情形；
+ *   - 扫描逻辑复用 lp_scan_and_patch：只认 mov x8,#99|#293 近距离跟 svc#0
+ *     的确定形态，打补丁前逐字节校验 svc，中途遇到再写 x8 或分支即放弃；
+ *   - 99/293 中和成"该内核不支持"（rseq 走回退、robust list 降级）对任何
+ *     调用方安全 —— 这是本模块既定前提（见 g_scan_nrs 处说明），落在主
+ *     程序 .text 还是 libc .text 不改变这一点。
+ *
+ * 【主映像段如何认定 —— 用代码地址锚点，不用路径匹配】
+ * 不能拿 /proc/self/exe 的路径去 maps 里比：proroot 类路径翻译下
+ * /proc/self/exe 是 **guest 视角**（如 /tmp/prog），而 maps 里是**内核
+ * 视角**（如 <rootfs>/tmp/prog），两者前缀不同，字符串比会漏。
+ * 而本函数只在静态链接情形被调用 —— 静态链接把本模块的代码也编进主
+ * 映像，所以**本函数自己的地址**必落在主映像的 r-x 段内。用它当锚点
+ * 找"包含该地址的 r-x 段"，与路径无关、与视角无关。
+ * 返回 0 = 没找到（读不到 maps / 无匹配段 → 不扫，退化为原行为）。
+ */
+static int find_main_exec_range(uintptr_t *lo_out, uintptr_t *hi_out)
+{
+    /* 锚点：本函数自身的地址。静态链接时它就在主可执行映像的 .text。 */
+    uintptr_t anchor = (uintptr_t)(void *)&find_main_exec_range;
+    FILE *f;
+    char line[1024];
+    int found = 0;
+
+    f = fopen("/proc/self/maps", "r");
+    if (f == NULL)
+        return 0;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        unsigned long long a, b, off;
+        char perms[8];
+
+        if (sscanf(line, "%llx-%llx %7s %llx", &a, &b, perms, &off) < 4)
+            continue;
+        if (perms[2] != 'x')                 /* 只要可执行段 */
+            continue;
+        if (anchor < (uintptr_t)a || anchor >= (uintptr_t)b)
+            continue;                        /* 锚点不在本段 → 不是主映像段 */
+        *lo_out = (uintptr_t)a;
+        *hi_out = (uintptr_t)b;
+        found = 1;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
+/*
  * 扫描 [lo,hi) 内的指令，把 g_scan_nrs 里的号对应的内联 svc 中和为
  * `mov x0,#0`。返回改写的站点数。已在 g_sites 版本表里出现过的偏移
  * 会被后续 apply 再校验一次 svc（幂等，patch_one 只认 svc），不会重打。
@@ -732,20 +805,26 @@ int bxroot_livepatch_apply(void)
     if (skip != LP_SKIP_NONE)
         return skip;            /* 正数 = 跳过，调用方不该当失败 */
 
+    /*
+     * ★ g_base==0 不再早退 ★
+     * 静态链接 guest 没有独立 libc.so.6 段，find_libc_base() 必然返回 0。
+     * 早先在这里 return -1 会让静态 guest 一条都不补 —— 而它的 99/293
+     * 内联 svc 恰恰在主可执行映像自己的 .text 里（见下面第三部分）。
+     * 所以 g_base==0 只意味着"版本精确表那部分不做"（它依赖 libc 基址），
+     * 不代表"整个 livepatch 无事可做"。
+     */
     g_base = find_libc_base();
-    if (g_base == 0)
-        return -1;
 
     pg = sysconf(_SC_PAGESIZE);
     if (pg <= 0)
         return -2;
 
     /*
-     * 第一部分：版本精确表（仅当命中已登记版本）。覆盖 147/149 这类
-     * 扫描不能安全全补的号；99/293 若在表里也会被打，与扫描重叠但幂等
-     * （patch_one 只认 svc，已被扫描改写的就不是 svc 了）。
+     * 第一部分：版本精确表（仅当命中已登记版本 **且**找到了 libc 基址）。
+     * 覆盖 147/149 这类扫描不能安全全补的号；99/293 若在表里也会被打，
+     * 与扫描重叠但幂等（patch_one 只认 svc，已被扫描改写的就不是 svc 了）。
      */
-    if (g_sites != NULL && NSITES > 0) {
+    if (g_base != 0 && g_sites != NULL && NSITES > 0) {
         for (i = 0; i < NSITES; i++) {
             uintptr_t a = (g_base + g_sites[i].off) & ~(uintptr_t)(pg - 1);
             uintptr_t b = (g_base + g_sites[i].off + 4 + (uintptr_t)pg - 1)
@@ -770,7 +849,9 @@ int bxroot_livepatch_apply(void)
      */
     {
         uintptr_t elo = 0, ehi = 0;
-        if (find_libc_exec_range(&elo, &ehi) && ehi > elo) {
+        int have_libc_exec = find_libc_exec_range(&elo, &ehi);
+
+        if (have_libc_exec && ehi > elo) {
             if (mprotect((void *)elo, (size_t)(ehi - elo),
                          PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
                 g_scan_hits = lp_scan_and_patch(elo, ehi);
@@ -778,6 +859,25 @@ int bxroot_livepatch_apply(void)
                 /* 复位为 r-x，缩小可写代码页窗口（失败不致命，已改完）。 */
                 (void)mprotect((void *)elo, (size_t)(ehi - elo),
                                PROT_READ | PROT_EXEC);
+            }
+        } else if (!have_libc_exec) {
+            /*
+             * ★ 第三部分：静态链接 guest —— 扫主可执行映像 r-x 段 ★
+             * 没有独立 libc.so.6 r-x 段 = 静态链接特征（glibc 代码在主
+             * 映像自己的 .text）。这时 99/293 站点在主程序里，第二部分
+             * 扫不到，必须扫主映像。**只在这种情形**扫主映像，动态 guest
+             * （有 libc.so.6 段）一律不碰主程序，把误配/性能面限制到确
+             * 实是静态的场景。安全性同第二部分：形态识别 + 逐字节校验 svc。
+             */
+            uintptr_t mlo = 0, mhi = 0;
+            if (find_main_exec_range(&mlo, &mhi) && mhi > mlo) {
+                if (mprotect((void *)mlo, (size_t)(mhi - mlo),
+                             PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                    g_scan_hits = lp_scan_and_patch(mlo, mhi);
+                    g_hits += g_scan_hits;
+                    (void)mprotect((void *)mlo, (size_t)(mhi - mlo),
+                                   PROT_READ | PROT_EXEC);
+                }
             }
         }
     }
