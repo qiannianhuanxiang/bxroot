@@ -86,7 +86,10 @@ out=$(bxw -r "$RF" -w /etc /bin/sh -c 'readlink /proc/self/cwd' 2>&1)
 out=$(bxw -r "$RF" /bin/sh -c 'readlink /proc/self/exe' 2>&1)
 # 上游 test-99999999：子进程 readlink 读的是它自己 → /usr/bin/readlink
 [ "$out" = "/usr/bin/readlink" ] && pass B2c "exe -> $out" || fail B2c "exe -> [$out]"
-out=$(bxw -r "$RF" /bin/sh -c 'read x </proc/self/cmdline 2>/dev/null; ls -l /proc/$$/exe | sed "s/.*-> //"' 2>&1)
+out=$(bxw -r "$RF" /bin/sh -c ': ; p=$$; readlink /proc/$p/exe' 2>&1)
+# `:` 占位阻止 dash 对"单命令 sh -c"的尾调用 exec 优化（优化下 shell 原地 exec
+# 成目标程序，$$ 的 exe 就指向目标 —— 属正确行为，但会让这条断言误红）。
+# 用 readlink 而非 ls（rootfs 里 ls 缺 libcap 会另报错）。
 case "$out" in /bin/sh|/usr/bin/dash|/bin/dash) pass B2f "shell 自身 exe -> $out";; *) fail B2f "shell exe -> [$out]";; esac
 out=$(bxw -r "$RF" /bin/sh -c 'cat /proc/self/root/etc/hostname' 2>&1)
 [ "$out" = "bxroot-guest" ] && pass B2d "/proc/self/root/ 穿透 -> $out" || fail B2d "[$out]"
