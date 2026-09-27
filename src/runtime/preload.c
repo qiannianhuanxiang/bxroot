@@ -45,6 +45,8 @@
  * （-Wall -Wextra -Wformat=2 -D_GNU_SOURCE=）下**零告警**。
  */
 #include <pthread.h>
+#include <sys/mman.h>       /* POSIX shm / sem 后备文件的 mmap（shm_open/sem_open 重实现）*/
+#include <semaphore.h>      /* sem_t / sem_init（命名信号量重实现）*/
 
 #include "config.h"
 #include "l2s-runtime.h"
@@ -780,6 +782,54 @@ static int translate_path(const char *path, char *out, size_t out_size) {
             }
             LOG("translate (bind): %s -> %s", path, out);
             return 1;
+        }
+    }
+
+    /*
+     * ★ /dev/shm 重定向（POSIX 共享内存后备目录）★
+     *
+     * 【为什么必须在特殊路径透传之前】Android 内核**没有 /dev/shm**
+     * （真机 Termux 直接确认不存在；本开发容器经 bxroot runtime 透传后
+     * 亦然——inline svc openat("/dev/shm") 返回 ENOENT）。而下面的
+     * `special[]` 会把 `/dev` 前缀整体透传给内核，于是 `/dev/shm` 及其子路径
+     * 落到一个不存在的内核目录 → 所有 POSIX shm / 命名信号量的**直接
+     * open**（如 `open("/dev/shm/x")`）报 ENOENT。官方 proroot 在容器里
+     * 提供了一个可写 /dev/shm（与 /tmp 同设备），所以官方下直接 open 正常。
+     *
+     * 修法：把 `/dev/shm` 精确路径或 `/dev/shm/` 子路径重定向到 rootfs 内
+     * 一个真实可写目录（`<rootfs>/tmp/.bxroot-shm`，构造函数里以 1777 建好），
+     * 其余 /dev 下路径仍照常透传。等价于 tmpfs /dev/shm 的可见性语义：
+     * 同一后备目录 → 跨进程文件可见；stat 该目录像普通目录。
+     *
+     * 【与 bind 的关系】bind 匹配在本函数更靠前（上面那段），且优先级
+     * 高于此处：用户若显式 `-b X:/dev/shm`，那条 bind 先命中，这里的
+     * 兜底不会执行。只有在**无对应 bind** 时才走这条重定向。
+     *
+     * 【重要局限】此重定向只修复对 `/dev/shm` 路径的**直接** open/stat/
+     * unlink/mkdir。glibc 的 `shm_open()` / `sem_open()` 在内部用**直接
+     * 分支**（非 PLT）调 `__open`/`__open64_nocancel`，那条调用**不经过
+     * 本翻译层**，所以 shm_open/sem_open 另由本文件末尾导出的公共符号
+     * 钩子（shm_open/sem_open 等）重实现来覆盖。二者互补：路径重定向管
+     * “直接把 /dev/shm 当普通目录用”的程序，符号钩子管 glibc 的 POSIX
+     * shm/信号量 API。
+     */
+    {
+        static const char *const SHM_GUEST = "/dev/shm";
+        size_t sl = strlen(SHM_GUEST);   /* 8 */
+        if (strncmp(path, SHM_GUEST, sl) == 0 &&
+            (path[sl] == '\0' || path[sl] == '/')) {
+            /* 后备目录（guest 视角）→ 交回本函数做常规 rootfs 前缀翻译 */
+            char redirect[MAX_PATH_LEN];
+            int w = snprintf(redirect, sizeof(redirect),
+                             "%s/.bxroot-shm%s",
+                             g_config.tmp_dir ? g_config.tmp_dir : "/tmp",
+                             path + sl);
+            if (w < 0 || (size_t)w >= sizeof(redirect)) {
+                LOG("path too long (/dev/shm redirect): %s", path);
+                return -1;
+            }
+            LOG("translate (/dev/shm redirect): %s -> %s", path, redirect);
+            return translate_path(redirect, out, out_size);
         }
     }
 
@@ -5931,6 +5981,190 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath) {
         newdirfd = AT_FDCWD;
     return fn(target, newdirfd, pl);
 }
+
+/* ================================================================== */
+/* POSIX 共享内存 / 命名信号量（shm_open / sem_open 家族）             */
+/* ================================================================== */
+/*
+ * ★ 为什么必须导出这些公共符号，而不能只靠 translate_path ★
+ *
+ * Android / bxroot 下 /dev/shm 不存在（见 translate_path 里的 /dev/shm
+ * 重定向注释）。translate_path 重定向能修“程序直接 open("/dev/shm/x")”，
+ * 但**修不了 glibc 自己的 shm_open()/sem_open()**：反汇编 aarch64 glibc
+ * 证实它们在内部用**直接分支 bl**（非 PLT）调 `__open` / `__open64_nocancel`：
+ *     shm_open  → bl __open64_nocancel@0xe2220   （.text 内，直接调）
+ *     sem_open  → bl __open@0xe0680              （.text 内，直接调）
+ * 直接分支不经过动态符号解析，LD_PRELOAD/bxroot 的 __open 钩子都拦不到，
+ * 于是 shm_open/sem_open 内部拿到的仍是内核真实 /dev/shm（不存在）→ 失败。
+ * 实测（bxroot-run，双基线对照）：
+ *     bxroot：shm_open → ENOENT；sem_open → ENOENT；python mp.Lock() → FileNotFoundError
+ *     官方：  shm_open → ok（官方容器有可写 /dev/shm）
+ *
+ * 唯一能拦住 glibc 内部调用的入口，是**外部调用者绑定的公共符号**
+ * shm_open/sem_open 本身（_multiprocessing.so / 用户程序经 PLT 调它们）。
+ * 实证：把 shm_open 作为 runtime 导出符号后，guest 的 PLT 调用确实落到
+ * 这里（[MINI] 探针命中），python mp.Lock() 成功。
+ *
+ * 【落地位置】统一到 translate_path 的同一后备目录
+ * `<tmp_dir>/.bxroot-shm`（guest 视角），经 translate_path 得到宿主路径。
+ * 这样“直接 open /dev/shm/x”与“shm_open("/x")”落到**同一个目录**，
+ * 跨进程、跨两种入口都互相可见。命名信号量额外加 `sem.` 前缀，避免与
+ * 共享内存对象重名（与 glibc /dev/shm/sem.NAME 布局一致）。
+ *
+ * 【信号量实现】命名信号量 = 后备文件 + mmap(MAP_SHARED) + sem_init(pshared=1)。
+ * 底层的 futex 语义在 bxroot 下已验证可用（匿名 MAP_SHARED + sem_init +
+ * sem_wait/post 实测 OK），所以只需把“命名”落到共享文件即可。
+ * sem_wait/sem_post/sem_getvalue/sem_timedwait/sem_trywait 直接用 glibc 的
+ * （它们只操作 sem_t 内存，不碰文件名），无需在此重实现。
+ */
+
+/* POSIX 名字 → guest 视角后备路径。name 形如 "/foo"（可无前导 /）。 */
+static void posix_shm_backing(char *out, size_t out_size,
+                              const char *name, const char *prefix)
+{
+    const char *base = g_config.tmp_dir ? g_config.tmp_dir : "/tmp";
+    while (*name == '/')
+        name++;
+    snprintf(out, out_size, "%s/.bxroot-shm/%s%s", base, prefix, name);
+}
+
+/*
+ * 后备目录（guest 视角 <tmp_dir>/.bxroot-shm）在**首次使用时**惰性建好。
+ * 构造函数里也会建一次（bxroot_devshm_init）；这里兜底并发/顺序问题。
+ * 用导出的 mkdir 钩子（会做 translate），1777 与 tmpfs /dev/shm 权限一致；
+ * EEXIST 视为成功。
+ */
+static void posix_shm_ensure_dir(void)
+{
+    char dir[MAX_PATH_LEN];
+    const char *base = g_config.tmp_dir ? g_config.tmp_dir : "/tmp";
+    int saved = errno;              /* 别让 mkdir 的 EEXIST 污染调用方 errno */
+    int w = snprintf(dir, sizeof(dir), "%s/.bxroot-shm", base);
+    if (w < 0 || (size_t)w >= sizeof(dir)) {
+        errno = saved;
+        return;
+    }
+    /* mkdir 钩子内部会 translate 到宿主路径 */
+    (void)mkdir(dir, 01777);
+    errno = saved;
+}
+
+int shm_open(const char *name, int oflag, mode_t mode)
+{
+    char guest[MAX_PATH_LEN];
+    if (name == NULL) { errno = EINVAL; return -1; }
+    posix_shm_ensure_dir();
+    posix_shm_backing(guest, sizeof(guest), name, "");
+    /* 走本库导出的 open 钩子（O_CLOEXEC 与 glibc shm_open 语义一致） */
+    return open(guest, oflag | O_CLOEXEC, mode);
+}
+
+int shm_unlink(const char *name)
+{
+    char guest[MAX_PATH_LEN];
+    if (name == NULL) { errno = EINVAL; return -1; }
+    posix_shm_backing(guest, sizeof(guest), name, "");
+    return unlink(guest);
+}
+
+sem_t *sem_open(const char *name, int oflag, ...)
+{
+    char guest[MAX_PATH_LEN];
+    mode_t mode = 0;
+    unsigned int value = 0;
+    int created = 0;
+    int fd;
+
+    if (name == NULL || name[0] == '\0') { errno = EINVAL; return SEM_FAILED; }
+
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode  = (mode_t)va_arg(ap, unsigned int);
+        value = va_arg(ap, unsigned int);
+        va_end(ap);
+        if (value > SEM_VALUE_MAX) { errno = EINVAL; return SEM_FAILED; }
+    }
+
+    posix_shm_ensure_dir();
+    posix_shm_backing(guest, sizeof(guest), name, "sem.");
+
+    /* 先按调用方的 O_CREAT/O_EXCL 语义尝试创建 */
+    {
+        int cflags = O_RDWR | O_CLOEXEC | (oflag & (O_CREAT | O_EXCL));
+        fd = open(guest, cflags, mode);
+        if (fd >= 0) {
+            created = 1;
+        } else if ((oflag & O_EXCL) && (oflag & O_CREAT)) {
+            /* O_CREAT|O_EXCL 且已存在 → 保留 EEXIST 语义 */
+            return SEM_FAILED;
+        } else {
+            /* 复用已存在的信号量 */
+            fd = open(guest, O_RDWR | O_CLOEXEC);
+            if (fd < 0)
+                return SEM_FAILED;
+            created = 0;
+        }
+    }
+
+    if (created) {
+        if (ftruncate(fd, (off_t)sizeof(sem_t)) < 0) {
+            int saved = errno;
+            close(fd);
+            unlink(guest);
+            errno = saved;
+            return SEM_FAILED;
+        }
+    }
+
+    {
+        void *m = mmap(NULL, sizeof(sem_t), PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0);
+        int saved = errno;
+        close(fd);
+        if (m == MAP_FAILED) {
+            if (created) unlink(guest);
+            errno = saved;
+            return SEM_FAILED;
+        }
+        if (created) {
+            /* pshared=1：初值 value；sem_init 只写内存，无文件依赖 */
+            if (sem_init((sem_t *)m, 1, value) < 0) {
+                saved = errno;
+                munmap(m, sizeof(sem_t));
+                unlink(guest);
+                errno = saved;
+                return SEM_FAILED;
+            }
+        }
+        return (sem_t *)m;
+    }
+}
+
+int sem_close(sem_t *sem)
+{
+    if (sem == NULL || sem == SEM_FAILED) { errno = EINVAL; return -1; }
+    /* 命名信号量：解除映射即可（内容留在后备文件，供其它进程/后续打开） */
+    return munmap((void *)sem, sizeof(sem_t));
+}
+
+int sem_unlink(const char *name)
+{
+    char guest[MAX_PATH_LEN];
+    if (name == NULL || name[0] == '\0') { errno = EINVAL; return -1; }
+    posix_shm_backing(guest, sizeof(guest), name, "sem.");
+    return unlink(guest);
+}
+
+/*
+ * 构造函数调用：确保后备目录 <tmp_dir>/.bxroot-shm 以 1777 存在。
+ * 与 SysV shm 的 bxroot_sysvshm_init 相邻调用（见构造函数）。
+ */
+void bxroot_devshm_init(void)
+{
+    posix_shm_ensure_dir();
+}
+
 
 /*
  * rename 族共享：newpath 是伪造链接且会被覆盖时，做与 unlink 相同的
@@ -11802,6 +12036,14 @@ static void constructor(void) {
         if (translate_path("/tmp/.proroot-shm", shm_dir, sizeof(shm_dir)) >= 0)
             bxroot_sysvshm_init(shm_dir);
     }
+
+    /*
+     * POSIX 共享内存 / 命名信号量后备目录：guest 视角 <tmp_dir>/.bxroot-shm，
+     * 以 1777 建好（像 tmpfs /dev/shm）。translate_path 把 /dev/shm 重定向到
+     * 这里，导出的 shm_open/sem_open 家族也落到这里。见本文件 POSIX shm 段
+     * 与 translate_path 的 /dev/shm 重定向注释。
+     */
+    bxroot_devshm_init();
 
     /*
      * 运行时指令补丁（seccomp 中和）—— 本轮实测定位的关键一层。

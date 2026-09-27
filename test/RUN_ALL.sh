@@ -904,6 +904,13 @@ else
     run_step "路径爆破边界"
 fi
 
+# POSIX 共享内存 / 命名信号量（/dev/shm 缺口修复：shm_open/sem_open + multiprocessing）
+if [ -f test/RUN_DEVSHM.sh ]; then
+    run_step "POSIX /dev/shm" sh test/RUN_DEVSHM.sh
+else
+    run_step "POSIX /dev/shm"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================
