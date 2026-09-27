@@ -869,6 +869,13 @@ else
     run_step "fakeroot chown 读回"
 fi
 
+# 身份/权限层降权族爆破（BXR-FR-2）
+if [ -f test/RUN_FUZZ_ID.sh ]; then
+    run_step "身份权限爆破" sh test/RUN_FUZZ_ID.sh
+else
+    run_step "身份权限爆破"
+fi
+
 # livepatch 运行期指令扫描（99/293 覆盖任意 glibc 版本）
 if [ -f test/RUN_LIVEPATCH_SCAN.sh ]; then
     run_step "livepatch 指令扫描" sh test/RUN_LIVEPATCH_SCAN.sh

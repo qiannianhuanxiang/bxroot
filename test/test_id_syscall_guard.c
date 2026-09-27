@@ -545,16 +545,23 @@ int main(void)
         check("getuid 被改写为伪造 uid", a == (long)FAKE_UID, buf);
 
         b = syscall(175);
-        snprintf(buf, sizeof buf, "syscall(175)=%ld 期望 %u", b, FAKE_UID);
-        check("geteuid 被改写为伪造 uid", b == (long)FAKE_UID, buf);
+        snprintf(buf, sizeof buf, "syscall(175)=%ld 期望 %u", b, FAKE_RES_UID);
+        /* ★ geteuid 走 res_ids（euid），不是 ids（ruid）★
+         * 实测缺陷（RUN_FUZZ_ID.sh）：seteuid(1234) 后 euid!=ruid，
+         * 175 必须回 euid。桩里 res_ids 给 FAKE_RES_UID，与 ids 的
+         * FAKE_UID 不同值 —— 若 175 误接回 ids，这里立刻变红。 */
+        check("geteuid 被改写为伪造 euid（res_ids 路径）",
+              b == (long)FAKE_RES_UID, buf);
 
         c = syscall(176);
         snprintf(buf, sizeof buf, "syscall(176)=%ld 期望 %u", c, FAKE_GID);
         check("getgid 被改写为伪造 gid", c == (long)FAKE_GID, buf);
 
         d = syscall(177);
-        snprintf(buf, sizeof buf, "syscall(177)=%ld 期望 %u", d, FAKE_GID);
-        check("getegid 被改写为伪造 gid", d == (long)FAKE_GID, buf);
+        snprintf(buf, sizeof buf, "syscall(177)=%ld 期望 %u", d, FAKE_RES_GID);
+        /* getegid 走 res_ids（egid），与 175 同理。 */
+        check("getegid 被改写为伪造 egid（res_ids 路径）",
+              d == (long)FAKE_RES_GID, buf);
 
         check("改写路径不动 errno", errno == 0, "");
     }
@@ -653,7 +660,7 @@ int main(void)
         int i, ok = 1;
         for (i = 0; i < 64; i++) {
             if (syscall(174) != (long)FAKE_UID) { ok = 0; break; }
-            if (syscall(177) != (long)FAKE_GID) { ok = 0; break; }
+            if (syscall(177) != (long)FAKE_RES_GID) { ok = 0; break; }
         }
         check("连续 64 轮改写稳定", ok, "");
     }

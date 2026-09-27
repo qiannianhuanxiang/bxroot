@@ -10812,6 +10812,43 @@ int setgid(gid_t gid) {
     return -1;
 }
 
+/*
+ * ★ seteuid / setegid：必须自带符号钩子 ★
+ *
+ * 【实测缺陷（RUN_FUZZ_ID.sh 爆破，bxroot -0 vs 官方 /tmp/off-rt.so）】
+ * glibc 的 seteuid()/setegid() 包装函数直接内联发 svc(147 setresuid /
+ * 149 setresgid)（`objdump -d libc | grep -A3 '<seteuid'` 可见 x8=0x93、
+ * svc #0），既不经 libc 的 `syscall()` 符号（syscall_guard 那层），也不
+ * 走 setresuid/setresgid 符号（那两个我们钩了）。而 bxroot 从前**根本
+ * 没导出 seteuid/setegid 符号**，于是客户程序里的 `seteuid(5)` 落到
+ * 内核 → 真实进程无 CAP → EPERM。官方基线下 `seteuid(5)` 成功。
+ *
+ * 现象：任何"setuid 降权后再用 seteuid 临时改 euid"的守护进程（sshd、
+ * cron、chsh 等）在 bxroot -0 下崩，而官方正常。
+ *
+ * 修法：导出 seteuid/setegid 符号，路由到桥接 op 10/11 → 只改 euid/egid，
+ * 与官方"只动一个字段、永远成功"一致。op 10/11 见 bxroot_fakeroot_setter。
+ */
+int seteuid(uid_t euid) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(10, (unsigned long)euid, 0, 0, &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int setegid(gid_t egid) {
+    long r; int e;
+    if (bxroot_fakeroot_setter(11, (unsigned long)egid, 0, 0, &r, &e) == 1) {
+        errno = e;
+        return (int)r;
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
 int setreuid(uid_t r_, uid_t e_) {
     long r; int e;
     if (bxroot_fakeroot_setter(3, (unsigned long)r_, (unsigned long)e_, 0,
@@ -12076,6 +12113,12 @@ int bxroot_fakeroot_setter(int op, unsigned long a0, unsigned long a1,
                                      (uid_t)a2);                             break;
     case 6:  rc = fakeroot_setresgid(&g_fakeroot_state, (gid_t)a0, (gid_t)a1,
                                      (gid_t)a2);                             break;
+    /* op 10/11：seteuid/setegid —— 只改 euid/egid。官方基线下这两个符号
+     * 走内联 svc(147/149)，既不经 syscall() 钩子也不经 setres* 符号钩子；
+     * bxroot 从前**根本没导出这两个符号** → 客户程序调 seteuid 直落内核
+     * → fakeroot 下 EPERM。新增符号钩子（见 preload.c）路由到这里。 */
+    case 10: rc = fakeroot_seteuid(&g_fakeroot_state, (uid_t)a0);            break;
+    case 11: rc = fakeroot_setegid(&g_fakeroot_state, (gid_t)a0);            break;
     case 7:
         /*
          * setgroups(n, list)：n == 0 且 list == NULL 表示清空。
