@@ -408,6 +408,52 @@ static uint32_t lp_mov_x8_imm(int nr)
     return 0xd2800008u | ((uint32_t)(nr & 0xffff) << 5);
 }
 
+/*
+ * 扫描窗口的“中断”判据：遇到它就说明 mov x8,#nr 与后续 svc 之间的关系
+ * 已经不能保证成立，必须放弃本窗口，避免把不相关的 svc 误配给前面的
+ * mov x8,#99|#293。
+ *
+ * ★ 加固（2026-09-28，对抗性审计）★ 原实现只挡两类：
+ *     ① movz x8,#imm（hw=0）    ② B / BL
+ * 这在 2.39/2.41 的真实 libc 上恰好够用（审计确认三个命中站点的 svc 都在
+ * mov x8 后 2~3 条内、且中间无任何控制流），但形态判据本身有两个洞：
+ *
+ *   洞一（movk / 带移位的 movz 漏判）：`mov x8,#nr` 后跟
+ *       `movk x8,#hi,lsl#16`（拼大立即数）或 `movz x8,#imm,lsl#16`
+ *   都会改写 x8，但旧掩码 0xffe0001f 只认 hw=0 的 movz，识别不到，于是
+ *   会把后面那个**属于别的系统调用**的 svc 误当成 99/293 中和掉。
+ *   合成反例已证实旧逻辑在此序列下误改（见 test/RUN_LIVEPATCH_AUDIT.sh）。
+ *
+ *   洞二（条件分支 / 间接跳转 / 返回漏判）：窗口内若出现
+ *       B.cond / CBZ/CBNZ / TBZ/TBNZ / BR/BLR/RET
+ *   控制流已经可能离开当前基本块，后面的 svc 未必再由这条 mov x8 支配，
+ *   旧逻辑不中断 → 有跨基本块误配的风险。
+ *
+ * 修复方向是**只增不减的收紧**：把这些形态都纳入中断条件。收紧只会让
+ * 扫描更早放弃、绝不会多补，因此对真实 libc 的三个合法命中零影响
+ * （审计脚本对两个 libc 断言：加固前后命中集合完全一致）。
+ *
+ * aarch64 编码要点（掩码都掩掉可变位后比较固定位）：
+ *   movz x8（任意 hw）  (ins & 0xff80001f) == 0xd2800008
+ *   movk x8（任意 hw）  (ins & 0xff80001f) == 0xf2800008
+ *   B / BL             (ins>>26) == 0x05 / 0x25
+ *   B.cond             (ins>>24) == 0x54
+ *   CBZ/CBNZ           (ins & 0x7e000000) == 0x34000000
+ *   TBZ/TBNZ           (ins & 0x7e000000) == 0x36000000
+ *   BR/BLR/RET         (ins & 0xfe000000) == 0xd6000000
+ */
+static int lp_is_scan_barrier(uint32_t ins)
+{
+    if ((ins & 0xff80001fu) == 0xd2800008u) return 1;   /* movz x8, 任意 hw */
+    if ((ins & 0xff80001fu) == 0xf2800008u) return 1;   /* movk x8, 任意 hw */
+    if ((ins >> 26) == 0x05u || (ins >> 26) == 0x25u) return 1; /* B / BL */
+    if ((ins >> 24) == 0x54u) return 1;                 /* B.cond */
+    if ((ins & 0x7e000000u) == 0x34000000u) return 1;   /* CBZ/CBNZ */
+    if ((ins & 0x7e000000u) == 0x36000000u) return 1;   /* TBZ/TBNZ */
+    if ((ins & 0xfe000000u) == 0xd6000000u) return 1;   /* BR/BLR/RET */
+    return 0;
+}
+
 static int       g_applied;
 static int       g_hits;
 static int       g_scan_hits;
@@ -681,12 +727,10 @@ static int lp_scan_and_patch(uintptr_t lo, uintptr_t hi)
                 }
                 break;
             }
-            /* 又一次写 x8（movz x8,#..）或任何分支 → 放弃本窗口，避免误配。
-             * movz x8,#imm16 编码：0xd2800008 | (imm<<5)，imm 占 bit5..20，
-             * 故掩掉 imm 位后比较；B/BL：bit31..26 = 000101/100101。 */
-            if ((ins & 0xffe0001fu) == 0xd2800008u)
-                break;
-            if ((ins >> 26) == 0x05u || (ins >> 26) == 0x25u)
+            /* 遇到会改写 x8 或改变控制流的指令 → 放弃本窗口，避免误配。
+             * 判据集中在 lp_is_scan_barrier（movz/movk x8 任意 hw、
+             * B/BL、B.cond、CBZ/CBNZ、TBZ/TBNZ、BR/BLR/RET）。 */
+            if (lp_is_scan_barrier(ins))
                 break;
         }
     }
@@ -702,6 +746,12 @@ static int lp_scan_and_patch(uintptr_t lo, uintptr_t hi)
 int bxroot_livepatch_scan_buffer_for_test(uint32_t *buf, size_t words)
 {
     return lp_scan_and_patch((uintptr_t)buf, (uintptr_t)(buf + words));
+}
+
+/* 测试专用：暴露窗口中断判据，便于对 movk/条件分支等形态单独断言。 */
+int bxroot_livepatch_is_scan_barrier_for_test(uint32_t ins)
+{
+    return lp_is_scan_barrier(ins);
 }
 #endif
 
