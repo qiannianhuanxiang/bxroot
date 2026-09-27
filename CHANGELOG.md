@@ -2,6 +2,67 @@
 
 本项目遵循语义化版本。日期为 UTC。
 
+## v0.1.4
+
+**主题：爆破压测驱动的一轮缺陷收敛（7 类真缺陷）+ 真实项目端到端验证**
+
+以"基于 bxroot 做项目、直接爆破玩到崩"为目标，5 路子代理在 bxroot 运行时里
+对照官方基线（`/tmp/off-rt.so`）压测（编译型负载 / 文件系统折磨 / 进程·exec
+风暴 / 真实应用端到端 / 网络·DNS），逐条以基线区分"bxroot 缺陷"与"环境限制"，
+共修复 7 类"bxroot 错、基线对"的缺陷，全部附带判别力回归并接入 RUN_ALL。
+
+### 修复
+- **statx(fd, NULL, AT_EMPTY_PATH) 整进程 SIGSEGV**：glibc `<bits/statx-generic.h>`
+  的 `__nonnull((2,5))` 让编译器认定钩子体内 `path` 恒非空、删掉所有 `path!=NULL`
+  守卫（`-fno-delete-null-pointer-checks` 也挡不住这个基于 attribute 的假设），
+  合法的 NULL 调用（作用于 fd 自身）在 runtime 内解空指针。修：钩子入口用
+  `volatile` 洗掉 nonnull 假设，NULL 守卫恢复 → 返回 EFAULT。官方基线本就返回
+  EFAULT。回归 `RUN_STATX_NULL.sh`。
+- **只读 bind 被 fd 版写钩子击穿并真写穿宿主**：路径版 `open`/`truncate`/`chmod`
+  正确 EROFS，但 `fchmod`/`fchown`/`ftruncate`/`futimes`/`futimens` 这些 **fd 版**
+  完全不判只读——先 `open(O_RDONLY)`（读打开放行）再 `fchmod(fd)` 即可改宿主
+  backing file（权限 644→700、mtime 被改）。新增 `ro_guard_fd()`（readlink
+  `/proc/self/fd` → 剥 rootfs → 反 bind → 前缀匹配只读 bind），5 个 fd 钩子接入。
+  回归 `RUN_RO_BIND.sh` 新增 a2c。
+- **DNS：绝对符号链接布局的 resolv.conf 导致全部解析静默失败**：guest 的
+  `/etc/resolv.conf` 是指向绝对路径的符号链接（**systemd-resolved 默认布局**
+  `→ /run/systemd/resolve/stub-resolv.conf`）时，resolver 经库内内联 svc openat
+  走 path-relay，而 relay 只做前缀拼接、缺 exported open 钩子的
+  `resolve_abs_symlink` 重定向腿 → 符号链接的绝对目标从外层内核根解析、落不进
+  rootfs → ENOENT → `res_init` 退化成 `nscount=1/127.0.0.1` → `getaddrinfo`/
+  `getent` 恒 gaierror -3。最阴险的是 `cat` 读文件看着正常、唯独 resolver 挂。
+  修：把 `resolve_abs_symlink` 经导出桥暴露给 livepatch，relay 在 openat 返回
+  -ENOENT 时重定向重发。回归 `RUN_DNS.sh` 新增 G 项（res_init 探针 +
+  `BXROOT_NO_ABSSYM` 判别力）。
+- **execve 家族丢失调用方 argv[0]**：`px_do_execve` 保存了 `raw_argv0`（注释写明
+  trampoline `--argv0` 用它），但调用点传的是解析后的 guest 路径 → guest 的 `$0`
+  变成路径。posix_spawn 路径（传 raw_argv0）正确、同 runtime 内不一致。影响
+  busybox 多调用分派、登录 shell（-bash/-sh）、按 argv[0] 改行为的程序。修：
+  调用点改传 `raw_argv0`（空时回退 guest）。回归 `RUN_EXEC_ARGV0.sh`。
+- **mkfifo/mkfifoat/mknod/mknodat/utime/utimes/lutimes 未 hook**：走未翻译字面
+  guest 路径 → rootfs 内路径 ENOENT（基线正常）。补齐这些路径版钩子（路径翻译
+  + 只读 bind 守卫），`futimes`/`futimens` 为 fd 版守卫。
+- **mknod 设备节点非特权 errno 不是 EPERM**：非特权建字符/块设备，POSIX/基线恒为
+  EPERM(1)，bxroot 照透翻译落点的内核 errno 返回 EACCES/ENOENT/EROFS，父目录明明
+  存在却报 ENOENT，误导 `errno==EPERM ? skip` 的程序（dpkg mkdev）。修：设备节点
+  非特权失败归一化为 EPERM。mkfifo/mknod/utime 合并回归 `RUN_MKNOD_UTIME.sh`。
+- **裸 syscall stat 的 nlink 与属主伪装缺失**：node/libuv、静态程序绕过 libc 的
+  stat 符号钩子直接发 `syscall(newfstatat=79)/statx(291)`，只经 syscall_guard，
+  而 guard 此前只翻译路径、不补结果（且只给 statx 补了 l2s nlink 一半、
+  newfstatat 完全没补）。结果 l2s 模拟硬链接的 `nlink` 停在 1、文件属主停在磁盘
+  真实 Android app uid（如 10665）。node `fs.statSync`、tar、find、ls 全中招。修：
+  guard 给 79 补 l2s nlink + fakeroot 属主、给 291 补属主、statx 冷进程 lazy_enable
+  改用 leaf_pre，带 `__thread` 重入守卫防 probe 递归打穿。真实硬链接 vs l2s 模拟
+  链接由现有 `probe_fake_link()` 区分、不误伤。回归 `RUN_RAW_STAT.sh`。
+
+### 验证
+- 容器内 `RUN_ALL --quick` 59/0 全绿，`WARN_GATE` 零告警（14 编译单元）。
+- 端到端：一个 DSHA 风格的 TypeScript/Express 设备桥接 harness（DSHA-mini）在
+  bxroot 运行时里跑通完整生命周期——`npm install`（192 包，含 esbuild native
+  postinstall）、`tsc` 构建、`vitest` 12/12、启动服务 + 8 类 `/app/*` 端点 curl
+  全通，全程无 bxroot 缺陷（原担心的 native postinstall / 大量小文件 IO / node
+  多层子进程链 / 网络装包 / http self-fetch 均扛住）。
+
 ## v0.1.3
 
 **主题：Android app 沙箱打通 + DNS/网络可用 + 功能扩展**
