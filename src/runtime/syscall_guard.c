@@ -105,8 +105,47 @@ void l2s_rt_patch_statx_buf(void *sx, unsigned int statx_nlink_bit,
 __attribute__((weak))
 int l2s_rt_patch_dents64(const char *host_dir, void *buf, long len);
 
+/*
+ * l2s 的 struct stat 缓冲补丁桥（实现体在 src/l2s/l2s-runtime.c）。
+ * 与上面 statx 那条同源：node/静态链接程序走裸 syscall(newfstatat=79)，
+ * 不经 libc 的 fstatat 符号钩子，所以 l2s 的硬链接 nlink 补丁在裸 79
+ * 入口从未发生（早前只补了 291）。收 void* 是因为本文件不含 <sys/stat.h>。
+ * weak：单测单独编译本文件时解析为 NULL，调用点判空跳过。
+ */
+__attribute__((weak))
+void l2s_rt_patch_stat_buf(void *st, const char *path);
+
+/*
+ * fakeroot 的 struct stat / struct statx 结果补丁桥（实现体在 preload.c）。
+ *
+ * 【为什么裸 syscall 路径必须单独接】
+ * fakeroot 的属主伪装此前只在 libc 的 stat/statx/fstatat 符号钩子里做
+ * （preload.c 的 fakeroot_patch_stat/statx 调用点）。而绕过 libc 直接发
+ * syscall(newfstatat=79) / syscall(statx=291) 的程序（node/libuv、静态
+ * 链接 Go/Rust）只走本文件这条路 —— 于是 st_uid/st_gid 停在**内核真实
+ * 属主**（本容器实测 10665 = Android app uid u0_a665），而 libc 符号入口
+ * 报 0。同一进程两个入口自相矛盾。这与身份查询（getuid 那一组）在裸
+ * syscall 层补齐是同一句教训：判据是"客户会走哪条路"。
+ *
+ * 收 void* 是因为本文件刻意不含 <sys/stat.h>/<linux/stat.h>；判据（记账
+ * 查询 + OWNER 启发式）全在 fakeroot 层，guard 只搬运。
+ * weak：单测单独编译本文件时解析为 NULL，调用点判空跳过。
+ */
+__attribute__((weak))
+void bxroot_fakeroot_patch_stat_buf(void *st);
+__attribute__((weak))
+void bxroot_fakeroot_patch_statx_buf(void *stx);
+
 /* __NR_getdents64（asm-generic / aarch64 均为 61，已按本机实测核对）。 */
 #define SCG_NR_getdents64 61
+
+/*
+ * ★ stat 结果补丁重入守卫（跨编译单元共享，定义在此，preload.c extern）★
+ * 由发起 l2s probe 的一方（l2s_real_lstat）在 probe 前后置位/清零。
+ * 置位期间本函数对 79/291 只翻译路径、不做结果补丁 —— 见 syscall() 里
+ * 的长注释。默认 0；__thread 保证并发线程各自独立、零锁。
+ */
+__thread int bxroot_scg_in_stat_probe;
 
 /*
  * SIGSYS 防屏蔽所需的常量（本文件刻意不含 <signal.h>，与不含 <stdio.h>
@@ -930,10 +969,36 @@ long syscall(long number, ...)
     int i;
 
     /*
+     * ★ stat 结果补丁的**重入守卫**（跨编译单元共享）★
+     *
+     * 【为什么必须有，且必须共享】l2s / fakeroot 的结果补丁内部要 probe
+     * 磁盘：l2s 的 lstat ops（preload.c 的 l2s_real_lstat）**正是**
+     * `syscall(SYS_newfstatat, …)`（aarch64 无 SYS_lstat）。补 79 结果后：
+     *
+     *   ① 本函数自身补 79 时内部 probe 会重入本函数 → 若不挡则无限递归
+     *      栈溢出 SIGSEGV（实测 /tmp/sameproc，fp 链每 4 帧循环）。
+     *   ② 更隐蔽：**符号层**的 stat 钩子（preload.c 的 newfstatat/statx）
+     *      也会调 l2s_rt_patch_stat → l2s_real_lstat → syscall(79)。这条
+     *      进入本函数时 TLS 标志是 0，于是本函数**把 probe 自己的 lstat
+     *      结果也补了** —— probe_fake_link 靠 S_ISLNK 识别伪造链接，被抹掉
+     *      S_IFLNK 后 probe 失败，符号层 l2s 随之失效（实测：stat 命令
+     *      nlink 从 3 掉回 1）。这就是"补 79 反而打穿了 79 补丁依赖的探测"。
+     *
+     * 因此守卫必须由**发起 probe 的一方**（l2s_real_lstat）设置，覆盖无论
+     * 从符号层还是裸 syscall 层进入的 probe。这里定义为非 static 的
+     * __thread 变量，preload.c 的 l2s_real_lstat extern 引用它并在 probe
+     * 前后置位/清零。置位期间本函数对 79/291 只做路径翻译（probe 传的已是
+     * 宿主绝对路径，翻译对其幂等无副作用），**不做结果补丁** —— 正是
+     * probe 需要的"内核真值"。__thread 保证并发线程各自独立、零锁。
+     */
+
+    /*
      * ★ 需要"叶子解析"的路径槽位（补丁段末尾用；说明见 pmask 循环内
      *   "顺序约束"的注释）。-1 = 不需要。
      */
     const char *leaf_pre = NULL;   /* 叶子解析前的路径（l2s 补丁 probe 用） */
+
+
 
     /*
      * ★ 翻译槽位池：提升到函数作用域 ★
@@ -1678,6 +1743,7 @@ long syscall(long number, ...)
          *     bxroot(修前): mode=0120777 nlink=1 islnk=1
          */
         if (ret == 0 && number == SCG_NR_statx && a4 != 0 && a1 != 0 &&
+            !bxroot_scg_in_stat_probe &&
             l2s_rt_patch_statx_buf != NULL) {
             /*
              * ★ 懒启用必须在补丁**之前** ★
@@ -1702,7 +1768,8 @@ long syscall(long number, ...)
              * 不是"我在哪条路上修过"。
              */
             if (bxroot_l2s_lazy_enable != NULL)
-                (void)bxroot_l2s_lazy_enable((const char *)(uintptr_t)a1);
+                (void)bxroot_l2s_lazy_enable((leaf_pre != NULL) ? leaf_pre
+                                             : (const char *)(uintptr_t)a1);
             /*
              * ★ 用 `_buf` 版本（传整个结构体指针）★
              *
@@ -1730,6 +1797,70 @@ long syscall(long number, ...)
                                    SCG_STATX_NLINK,
                                    (leaf_pre != NULL) ? leaf_pre
                                        : (const char *)(uintptr_t)a1);
+
+            /*
+             * ★ fakeroot 属主伪装 —— 裸 statx 路径上缺失的那一半 ★
+             *
+             * 必须在 l2s 之后：l2s 会回填 stx_ino/size/blocks（伪造链接
+             * 指向数据文件），但**不动 uid/gid**（它注释里明说保留属主给
+             * fakeroot）；fakeroot 只改 uid/gid/mode 属主，二者互不覆盖，
+             * 顺序与 preload.c 的 statx 符号钩子一致（先 fakeroot 后 l2s
+             * 也可，因为 l2s 不碰属主 —— 这里放最后，语义等价且清晰）。
+             *
+             * 【为什么补这里】libc 的 statx 符号钩子（preload.c:7076）会把
+             * stx_uid/gid 改成伪造身份，但 node/libuv 的裸 syscall(291)
+             * 不经符号钩子，于是属主停在内核真值（实测 10665 = Android
+             * app uid），与 libc 入口自相矛盾。判据全在 fakeroot 层。
+             */
+            if (bxroot_fakeroot_patch_statx_buf != NULL)
+                bxroot_fakeroot_patch_statx_buf((void *)(uintptr_t)a4);
+        }
+
+        /*
+         * ============================================================
+         * newfstatat(79) 的**结果补丁** —— 裸 syscall 路径上缺失的那一半
+         * ============================================================
+         *
+         * 【与 statx(291) 完全同构，只是结构体是 struct stat、buf 在 a2】
+         * node/libuv、静态链接程序也会走 syscall(SYS_newfstatat=79) 直接
+         * 发起，不经 libc 的 fstatat 符号钩子。于是两件伪装都没发生：
+         *   ① l2s 硬链接：st_nlink 停在内核值 1（伪造链接磁盘上是 symlink）
+         *   ② fakeroot 属主：st_uid/st_gid 停在内核真值（实测 10665）
+         * preload.c 的 newfstatat 符号钩子（:3840/:3843）两件都做了，
+         * 裸 79 这条是最后一个没补的入口 —— 与 statx 同一句教训。
+         *
+         * 【buf 在 a2，flags 在 a3】newfstatat(dfd, path, buf, flags)。
+         * 这与 statx(dfd, path, flags, mask, buf) 的 buf=a4 **不同**，
+         * 别照抄（本文件"号码表/参数位置"出过两次事故，见 case 260）。
+         *
+         * 【probe 路径与 statx 同款】flags==0（跟随叶子）时 svc 前已把
+         * a1 展开成数据文件路径，probe 需要解析前的原始 symlink 形态，
+         * 所以优先用 leaf_pre；NOFOLLOW 时 a1 未被展开，直接用 a1。
+         *
+         * 【门控，一条不少】
+         *   ret == 0   失败时内核没写 buf
+         *   number==79 只碰 newfstatat
+         *   a2 != 0    buf 空指针（内核回 EFAULT）不可解引用
+         *   a1 != 0    路径空指针时 l2s 无从 probe
+         *
+         * 【l2s 懒启用必须在补丁之前】与 statx 同款：纯读进程里 l2s
+         * 可能尚未启用，patch 内部第一行会 return。但注意 flags==0 时
+         * a1 已是数据文件（非 symlink），lazy_enable(a1) 认不出 l2s
+         * 产物 —— 所以用 leaf_pre（原始 symlink）触发懒启用，与 probe
+         * 用同一路径。
+         */
+        if (ret == 0 && number == 79 && a2 != 0 && a1 != 0 &&
+            !bxroot_scg_in_stat_probe) {
+            const char *probe_path = (leaf_pre != NULL)
+                ? leaf_pre : (const char *)(uintptr_t)a1;
+
+            if (bxroot_l2s_lazy_enable != NULL)
+                (void)bxroot_l2s_lazy_enable(probe_path);
+            if (l2s_rt_patch_stat_buf != NULL)
+                l2s_rt_patch_stat_buf((void *)(uintptr_t)a2, probe_path);
+            /* fakeroot 属主：与 statx 同理，放在 l2s 之后（l2s 不碰属主）。 */
+            if (bxroot_fakeroot_patch_stat_buf != NULL)
+                bxroot_fakeroot_patch_stat_buf((void *)(uintptr_t)a2);
         }
 
 

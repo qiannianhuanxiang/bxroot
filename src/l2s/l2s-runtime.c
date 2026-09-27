@@ -1357,6 +1357,23 @@ void l2s_rt_patch_stat(struct stat *st, const char *path)
         g_stats.nlink_patched++;
 }
 
+/*
+ * ★ 裸 syscall(newfstatat=79) 专用的 struct stat 缓冲补丁桥 ★
+ *
+ * 与 l2s_rt_patch_statx_buf 完全同源同理由：syscall_guard.c 是独立编译
+ * 单元、刻意不含 <sys/stat.h>，无法构造 struct stat 形参。这里提供一个
+ * 只收 void* 的入口，内部转回 struct stat* 再复用 l2s_rt_patch_stat ——
+ * 判据（probe_fake_link / read_nlink / S_IFLNK 抹除）只在一处，guard 不
+ * 复制任何规则。
+ *
+ * node/静态链接程序的 uv__fs 走 syscall(79)，完全不经 libc 的 fstatat
+ * 符号钩子 —— 与 statx(291) 是同一个原因，早前只补了 291，79 漏了。
+ */
+void l2s_rt_patch_stat_buf(void *st, const char *path)
+{
+    l2s_rt_patch_stat((struct stat *)st, path);
+}
+
 /* 公共实现：stx_mode 为 NULL 时只补 nlink（历史行为，向后兼容）。 */
 static void patch_statx_impl(unsigned int *stx_nlink, unsigned int *stx_mask,
                              uint16_t *stx_mode,

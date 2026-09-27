@@ -175,6 +175,10 @@ int bxroot_absolutize(const char *path, char *out, size_t outsz)
 }
 
 static int l2s_real_lstat(const char *p, struct stat *st);
+/* stat 结果补丁重入守卫（定义在 syscall_guard.c）：l2s probe 的裸
+ * newfstatat 会进 syscall_guard 的接管层，那里对 79/291 做结果补丁；
+ * probe 前置位让 guard 只翻译不补丁，拿到内核真值。见 l2s_real_lstat。 */
+extern __thread int bxroot_scg_in_stat_probe;
 static int l2s_real_symlink(const char *t, const char *l);
 static int l2s_real_rename(const char *o, const char *n);
 static int l2s_real_unlink(const char *p);
@@ -1619,10 +1623,20 @@ static int l2s_real_lstat(const char *p, struct stat *st)
      * 与 l2s_real_readlink 改裸 readlinkat 是同一个道理：l2s 内部
      * 的 FS 探测一律不经任何符号层，内核给什么就是什么。
      * aarch64 没有 SYS_lstat，用 newfstatat + AT_SYMLINK_NOFOLLOW。
-     */
-    if (syscall(SYS_newfstatat, AT_FDCWD, p, st, AT_SYMLINK_NOFOLLOW) == 0)
-        return 0;
-    return -1;
+     *
+     * ★ 重入守卫：这条裸 syscall(79) 会进入 syscall_guard.c 的 syscall()
+     *   接管层，而那里现在对 79 做**结果补丁**（补 l2s nlink + fakeroot
+     *   属主）。若不挡，本 probe 拿到的就是**被补过的** stat（S_IFLNK
+     *   被抹成 S_IFREG）→ 下面的 S_ISLNK 判定失败 → probe_fake_link
+     *   认不出伪造链接 → 整个 l2s 伪装（含符号层与裸 79 两条路）失效。
+     *   置位 bxroot_scg_in_stat_probe 让 guard 对本次 79 只翻译、不补丁，
+     *   probe 因此拿到内核真值。清零必须在 syscall 返回后立即执行。 */
+    int rc;
+    bxroot_scg_in_stat_probe = 1;
+    rc = (syscall(SYS_newfstatat, AT_FDCWD, p, st, AT_SYMLINK_NOFOLLOW) == 0)
+             ? 0 : -1;
+    bxroot_scg_in_stat_probe = 0;
+    return rc;
 }
 
 static int l2s_real_symlink(const char *t, const char *l)
@@ -13006,6 +13020,47 @@ int bxroot_fakeroot_groups(unsigned int *groups, int cap, int *count)
             groups[k] = (unsigned int)g_fakeroot_state.groups[k];
     }
     return 1;
+}
+
+/*
+ * ==================================================================
+ * 裸 syscall 层的 stat / statx **属主结果补丁**桥
+ * ==================================================================
+ *
+ * 【为什么需要它】
+ * fakeroot 的属主伪装此前只在 libc 的 stat/statx/fstatat 符号钩子里做
+ * （上面 newfstatat/statx 钩子里的 fakeroot_patch_stat/statx 调用）。而
+ * 绕过 libc 直接发 syscall(newfstatat=79) / syscall(statx=291) 的程序
+ * （node/libuv、静态链接 Go/Rust）只走 syscall_guard.c 那条路 —— 于是
+ * st_uid/st_gid 停在**内核真实属主**（本容器实测 10665 = Android app
+ * uid u0_a665），而 libc 符号入口报 0。同一进程两个入口自相矛盾。
+ *
+ * 这与身份查询桥（bxroot_fakeroot_ids 等）是同一类补丁：符号层做了、
+ * 裸 syscall 层漏了。收 void* 是因为 syscall_guard.c 刻意不含
+ * <sys/stat.h>/<linux/stat.h>；判据（记账查询 + OWNER 启发式）全在
+ * fakeroot 层，guard 只搬运，不复制任何规则。
+ *
+ * ★ 与符号钩子读同一份 g_fakeroot_state、走同一个 fakeroot_patch_*，
+ *   保证"同一程序两种方式问出同一答案"。★
+ *
+ * 门控用 g_fakeroot_on（与 bxroot_fakeroot_ids 同款，不是
+ * g_config.fakeroot）：init_fakeroot 记账表建不起来时会整体关掉，
+ * 若这里改用别的判据就会出现"符号层不伪装、裸层伪装"的新矛盾。
+ */
+void bxroot_fakeroot_patch_stat_buf(void *st)
+{
+    if (!g_fakeroot_on || st == NULL)
+        return;
+    /* 无 fd、无预取记录：由 fakeroot_patch_stat 内部按 dev+ino 查表，
+     * 未命中则走 OWNER 启发式（属主==真实用户 → 伪造 euid）。 */
+    fakeroot_patch_stat((struct stat *)st, &g_fakeroot_state);
+}
+
+void bxroot_fakeroot_patch_statx_buf(void *stx)
+{
+    if (!g_fakeroot_on || stx == NULL)
+        return;
+    fakeroot_patch_statx((struct statx *)stx, &g_fakeroot_state);
 }
 
 /*

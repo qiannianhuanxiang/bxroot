@@ -968,6 +968,14 @@ else
     run_step "execve argv0"
 fi
 
+# 裸 syscall(newfstatat/statx) 的 l2s nlink + fakeroot 属主伪装
+# （node/libuv/静态程序绕过 libc 符号钩子，syscall_guard 需补齐结果补丁）
+if [ -f test/RUN_RAW_STAT.sh ]; then
+    run_step "裸 syscall stat 伪装" sh test/RUN_RAW_STAT.sh
+else
+    run_step "裸 syscall stat 伪装"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================

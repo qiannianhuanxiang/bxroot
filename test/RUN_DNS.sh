@@ -106,8 +106,12 @@ fi
 
 echo "--- D) files 分支不回归（localhost 仍走 /etc/hosts）---"
 d_out=$("$BX" -- /usr/bin/getent hosts localhost 2>&1)
+# 判据：命中 localhost 的**任一环回地址**即算 files 分支正常。
+# 不写死 127.0.0.1 —— getent 按 /etc/hosts 与 gai.conf 的顺序，可能先返回
+# IPv6 ::1（容器裸环境、官方基线、bxroot 三方一致如此），那不是回归。
 case "$d_out" in
-*127.0.0.1*) good "getent hosts localhost → 127.0.0.1（files 分支正常）" ;;
+*127.0.0.1*|*::1*localhost*|*localhost*)
+    good "getent hosts localhost → $(echo "$d_out" | tr '\n' ' ')（files 分支正常）" ;;
 *) bad "getent hosts localhost 回归：[$d_out]" ;;
 esac
 

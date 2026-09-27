@@ -274,6 +274,13 @@ void l2s_rt_patch_statx_full(unsigned int *stx_nlink, unsigned int *stx_mask,
 void l2s_rt_patch_statx_buf(void *sx, unsigned int statx_nlink_bit,
                             const char *path);
 
+/*
+ * 裸 syscall(newfstatat=79) 用的 struct stat 缓冲补丁桥。
+ * 收 void* 是为了让 syscall_guard.c（不含 <sys/stat.h>）也能调用；
+ * 内部转回 struct stat* 复用 l2s_rt_patch_stat，判据只在一处。
+ */
+void l2s_rt_patch_stat_buf(void *st, const char *path);
+
 /* 默认 1（客户不该看出这是符号链接）。置 0 便于诊断。 */
 void l2s_rt_set_hide_symlink(int on);
 
