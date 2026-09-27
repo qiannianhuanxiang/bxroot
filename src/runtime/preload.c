@@ -683,8 +683,22 @@ static int translate_path(const char *path, char *out, size_t out_size) {
         return 1;
     }
 
-    /* 相对路径，不翻译 */
+    /* 相对路径，不翻译 —— **除非**含 `..`。
+     *
+     * ★ BXR-ESC-4（2026-09-28 更狠的爆破发现）★
+     * 相对名不含 `..` 时透传是对的（内核按已翻译的 cwd 解析，落在
+     * rootfs 内）。但相对名含 `..`（`../x`、`a/../../x`）透传给内核，
+     * 会从**宿主 cwd** 往上走出 rootfs。所以这类先按 guest cwd 绝对化，
+     * 再回到本函数走 `..` 夹紧。绝对化失败（无 getcwd）时退回透传，
+     * 与修前一致（fail open 仅限拿不到 cwd 的极端情况）。
+     * 注意：*at 钩子已在各自入口用 resolve_host_path 按 dirfd 绝对化，
+     * 走到这里的相对名都是 AT_FDCWD 语义，用 cwd 绝对化正确。 */
     if (path[0] != '/') {
+        if (path_has_dotdot(path)) {
+            char ab[MAX_PATH_LEN];
+            if (bxroot_absolutize(path, ab, sizeof(ab)) > 0)
+                return translate_path(ab, out, out_size);
+        }
         strncpy(out, path, out_size - 1);
         out[out_size - 1] = '\0';
         return 0;
@@ -2636,8 +2650,31 @@ static int translate_follow(const char *path, char *out, size_t out_size, int no
 {
     char tr[MAX_PATH_LEN];
     char res[MAX_PATH_LEN];
-    int t = translate_path(path, tr, sizeof(tr));
+    char absbuf[MAX_PATH_LEN];      /* 相对路径先绝对化，见下 */
+    const char *eff = path;
+    int t;
     int rr;
+
+    /*
+     * ★ BXR-ESC-4（2026-09-28 更狠的爆破发现）★
+     *
+     * 相对路径含 `..` 时**必须先按 cwd 绝对化再翻译**，否则
+     * translate_path 对相对路径直接返回 0（"不翻译"），内核就按
+     * **宿主 cwd** 解析 `../canary` —— 直接走出 rootfs。实测
+     * （容器内，rootfs=子目录，canary 放 rootfs 之上一层）：
+     *     access("../canary")   → 命中外部 canary（修前）
+     *     chmod/chown/unlink/mkdir/rmdir/truncate("../x") 同样逃逸
+     * open()/stat()/realpath() 早已在各自钩子里做了 bxroot_absolutize，
+     * 所以它们不受影响；漏的正是走 translate_follow 的这一批
+     * （access/chmod/chown/lchown/creat/statfs/statvfs/truncate/
+     *   canonicalize_file_name/mkdir/rmdir）。
+     * 绝对化失败（getcwd 不可用）时 eff 退回原串，行为与修前一致。
+     */
+    if (path != NULL && path[0] != '\0' && path[0] != '/' &&
+        bxroot_absolutize(path, absbuf, sizeof(absbuf)) > 0)
+        eff = absbuf;
+
+    t = translate_path(eff, tr, sizeof(tr));
 
     if (t <= 0)
         return t;
@@ -4516,11 +4553,17 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
            int flags) {
     static int (*fn)(int, const char *, int, const char *, int) = NULL;
     char told[MAX_PATH_LEN], tnew[MAX_PATH_LEN];
+    char jo[MAX_PATH_LEN], jn[MAX_PATH_LEN];
     const char *po = oldpath, *pn = newpath;
     int rc;
 
-    if (translate_path(oldpath, told, sizeof(told)) > 0) po = told;
-    if (translate_path(newpath, tnew, sizeof(tnew)) > 0) pn = tnew;
+    /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），否则相对名
+     * `../x` 会被内核按 dirfd 解析出 rootfs 之外（实测新路径侧可逃逸）。
+     * AT_SYMLINK_FOLLOW 等标志不影响路径归属。 */
+    po = resolve_host_path(olddirfd, oldpath, jo, sizeof(jo), told, sizeof(told));
+    pn = resolve_host_path(newdirfd, newpath, jn, sizeof(jn), tnew, sizeof(tnew));
+    if (po != NULL && po[0] == '/') olddirfd = AT_FDCWD;
+    if (pn != NULL && pn[0] == '/') newdirfd = AT_FDCWD;
 
     if (l2s_rt_enabled()) {
         rc = l2s_rt_link(po, pn);
@@ -5775,6 +5818,7 @@ int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
 int unlinkat(int dirfd, const char *path, int flags) {
     static int (*fn)(int, const char *, int) = NULL;
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *p = path;
     int rc;
 
@@ -5782,8 +5826,11 @@ int unlinkat(int dirfd, const char *path, int flags) {
         fn = (int (*)(int, const char *, int))bxroot_next_symbol("unlinkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），理由见 faccessat */
+    p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
+    if (p != NULL && p[0] == '/')
+        dirfd = AT_FDCWD;
 
     /* 只在"删除文件"时走 l2s（AT_REMOVEDIR 删的是目录，与硬链接无关） */
     if (l2s_rt_enabled() && (flags & AT_REMOVEDIR) == 0) {
@@ -5815,14 +5862,18 @@ int mkdir(const char *path, mode_t mode) {
 int mkdirat(int dirfd, const char *path, mode_t mode) {
     static int (*fn)(int, const char *, mode_t) = NULL;
     char translated[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *p = path;
 
     if (fn == NULL)
         fn = (int (*)(int, const char *, mode_t))bxroot_next_symbol("mkdirat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），理由见 faccessat */
+    p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                          translated, sizeof(translated));
+    if (p != NULL && p[0] == '/')
+        dirfd = AT_FDCWD;
     return fn(dirfd, p, mode);
 }
 
@@ -5864,14 +5915,20 @@ int symlink(const char *target, const char *linkpath) {
 int symlinkat(const char *target, int newdirfd, const char *linkpath) {
     static int (*fn)(const char *, int, const char *) = NULL;
     char tl[MAX_PATH_LEN];
+    char joined[MAX_PATH_LEN];
     const char *pl = linkpath;
 
     if (fn == NULL)
         fn = (int (*)(const char *, int, const char *))bxroot_next_symbol("symlinkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
-    if (translate_path(linkpath, tl, sizeof(tl)) > 0)
-        pl = tl;
+    /* ★ BXR-ESC-4：linkpath 是被创建的路径，先按 dirfd 拼绝对再翻译
+     * （`..` 夹紧），否则 newdirfd 指向 rootfs 根时 `../x` 建到 rootfs 外。
+     * target 是链接内容，绝不翻译（客户 readlink 要看到 guest 视角）。 */
+    pl = resolve_host_path(newdirfd, linkpath, joined, sizeof(joined),
+                           tl, sizeof(tl));
+    if (pl != NULL && pl[0] == '/')
+        newdirfd = AT_FDCWD;
     return fn(target, newdirfd, pl);
 }
 
@@ -5950,6 +6007,11 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
         int pre = l2s_rename_replace_pre(an, ao, an, mid, sizeof(mid),
                                          fin, sizeof(fin));
         int rc;
+        /* ★ BXR-ESC-4：用 dirfd 解析出的绝对宿主路径（`..` 已夹紧）作为
+         * 真正 rename 的入参，否则相对名 `../x` 会被内核按 dirfd 解析出
+         * rootfs 之外。ao/an 绝对 → 内核忽略 dirfd。 */
+        if (ao != NULL && ao[0] == '/') { po = ao; olddirfd = AT_FDCWD; }
+        if (an != NULL && an[0] == '/') { pn = an; newdirfd = AT_FDCWD; }
         if (pre == 2) return 0;
         rc = fn(olddirfd, po, newdirfd, pn);
         if (rc == 0 && pre == 1)
@@ -6015,8 +6077,14 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
         return rc;
     }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），理由见 faccessat */
+    {
+        char joined[MAX_PATH_LEN];
+        p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                              translated, sizeof(translated));
+        if (p != NULL && p[0] == '/')
+            dirfd = AT_FDCWD;
+    }
 
     rc = fn(dirfd, p, mode, flags);
     if (rc == 0 && g_fakeroot_on)
@@ -6045,8 +6113,20 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
         return rc;
     }
 
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    /*
+     * ★ BXR-ESC-4：先按 dirfd 拼绝对（含 `..` 夹紧），再翻译 ★
+     * 只 translate_path(相对名) 会返回 0（不翻译），内核按 dirfd 解析
+     * `../x` —— dirfd 指向 rootfs 根时直接走出 rootfs（实测逃逸）。
+     * resolve_host_path 会把 (dirfd, 相对名) 拼成绝对宿主路径并经
+     * translate_path 的 `..` 夹紧，结果绝对 → 内核忽略 dirfd。
+     */
+    {
+        char joined[MAX_PATH_LEN];
+        p = resolve_host_path(dirfd, path, joined, sizeof(joined),
+                              translated, sizeof(translated));
+        if (p != NULL && p[0] == '/')
+            dirfd = AT_FDCWD;
+    }
     /* 中间组件解析（理由见 access() 处的完整说明） */
     if (resolve_intermediate_symlinks(p, mid2_, sizeof(mid2_)))
         p = mid2_;
@@ -6578,6 +6658,9 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
                 : l2s_rename_replace_pre(an, ao, an, mid, sizeof(mid),
                                          fin, sizeof(fin));
         int rc;
+        /* ★ BXR-ESC-4：用夹紧后的绝对宿主路径，理由见 renameat */
+        if (ao != NULL && ao[0] == '/') { po = ao; olddirfd = AT_FDCWD; }
+        if (an != NULL && an[0] == '/') { pn = an; newdirfd = AT_FDCWD; }
         if (pre == 2) return 0;
         rc = fn(olddirfd, po, newdirfd, pn, flags);
         if (rc == 0 && pre == 1)
