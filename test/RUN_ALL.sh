@@ -925,6 +925,13 @@ else
     run_step "任意 -i uid:gid 映射"
 fi
 
+# 只读 bind（-b host:guest:ro）：读放行 + 各写入入口 EROFS + 非只读 bind 不受影响
+if [ -f test/RUN_RO_BIND.sh ]; then
+    run_step "只读 bind" sh test/RUN_RO_BIND.sh
+else
+    run_step "只读 bind"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================

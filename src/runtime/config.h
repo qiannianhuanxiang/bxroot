@@ -41,6 +41,7 @@ typedef struct {
     /* bind mount 列表 */
     char **bind_sources;    /* host 路径 */
     char **bind_targets;    /* guest 路径 */
+    int *bind_readonly;     /* 平行数组：该 bind 是否只读（1=只读，写返回 EROFS） */
     int bind_count;
 } bxroot_config_t;
 
