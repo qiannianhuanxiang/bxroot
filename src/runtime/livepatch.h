@@ -69,6 +69,14 @@ int bxroot_livepatch_hits(void);
 /* 其中由运行期指令扫描改写的站点数（99/293，覆盖任意 glibc 版本）。 */
 int bxroot_livepatch_scan_hits(void);
 
+/*
+ * path-relay 改写的 openat 内联 svc 站点数（DNS 缺口修复，2026-09-28）。
+ * >0 表示 libc 的 openat 内联 svc 已被接到路径翻译桩（getaddrinfo/
+ * getservbyname/NSS files 读 /etc 下配置因此拿到 rootfs 内文件）。
+ * 被 BXROOT_NO_PATHRELAY=1 关闭时为 0。
+ */
+int bxroot_livepatch_pathrelay_hits(void);
+
 /* 被跳过时的原因（LP_SKIP_*）；未跳过为 LP_SKIP_NONE。 */
 int bxroot_livepatch_skip_reason(void);
 
