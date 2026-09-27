@@ -125,6 +125,15 @@ echo; echo "=== K kill-on-exit / 内核版本伪装 ==="
 out=$(bxw -k 4.19.0-bx -r "$RF" /usr/bin/uname -r 2>&1)
 [ "$out" = "4.19.0-bx" ] && pass K1 "uname -r 伪装 -> $out" || fail K1 "[$out]"
 
+echo; echo "=== G 参数 / 环境 / 嵌套 shebang 边界 ==="
+out=$(bxw -r "$RF" /bin/sh -c '/bin/echo $(seq 1 9000) | wc -w' 2>&1)
+[ "$out" = "9000" ] && pass G1 "9000 个参数全部送达" || fail G1 "[$out]（期望 9000）"
+out=$(bxw -r "$RF" /bin/sh -c 'x=$(head -c 100000 /dev/zero | tr "\0" a); X=$x /bin/sh -c "echo \${#X}"' 2>&1)
+[ "$out" = "100000" ] && pass G2 "100 KB 环境变量保留" || fail G2 "[$out]"
+printf '#!/bin/sh\necho S1 "$0" "$1" "$2" "$3"\n' > "$RF/tmp/gs1"; printf '#!/tmp/gs1 A1\n' > "$RF/tmp/gs2"; chmod +x "$RF/tmp/gs1" "$RF/tmp/gs2"
+out=$(bxw -r "$RF" /bin/sh -c '/tmp/gs2 X' 2>&1)
+[ "$out" = "S1 /tmp/gs1 A1 /tmp/gs2 X" ] && pass G3 "两层 shebang" || fail G3 "[$out]"
+
 echo; echo "=== X 沙箱逃逸（需先把 test/probe_escape_*.c 编译为 rootfs/tmp/esc 与 esc2）==="
 echo CANARY > "$HERE/canary"; mkdir -p "$HERE/hd"; echo CANARY > "$HERE/hd/canary"
 if [ -x "$RF/tmp/esc" ]; then

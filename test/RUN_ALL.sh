@@ -855,6 +855,13 @@ else
     run_step "沙箱逃逸"
 fi
 
+# exec 参数条数 / 长环境变量 / 嵌套 shebang（BXR-ARG-1 / ENV-1 / SB-1）
+if [ -f test/RUN_ARG_LIMITS.sh ]; then
+    run_step "exec 参数边界" sh test/RUN_ARG_LIMITS.sh
+else
+    run_step "exec 参数边界"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================

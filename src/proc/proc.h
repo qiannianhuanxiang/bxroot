@@ -140,6 +140,19 @@ extern "C" {
 #define PX_ENV_ENTRY_MAX ((PX_PRELOAD_MAX) + (PX_ENV_NAME_MAX))
 
 /*
+ * 调用方原有（非强制）环境条目的单条上限 = 内核 MAX_ARG_STRLEN（32 页，
+ * 4K 页下 128 KiB）。
+ *
+ * ★ BXR-ENV-1（2026-09-27 爆破测试）★ 原来透传条目也用 PX_ENV_ENTRY_MAX
+ * （约 16 KiB）封顶，超过就**静默丢弃** —— guest 里
+ *     X=<60 KB> sh -c 'echo ${#X}'   → 0（Linux 与官方：60000）
+ * 这类变量并不罕见（大 JSON 配置、CI 的长 PATH/证书、node 的
+ * NODE_OPTIONS）。透传条目我们不解析也不改写，没理由比内核更严。
+ * PX_ENV_ENTRY_MAX 仍用于**我们自己写的**强制条目（见 P2 的说明）。
+ */
+#define PX_ENV_PASSTHRU_MAX (32u * 4096u)
+
+/*
  * envp 累计字节上限（含所有条目的 NUL）。对齐内核 `ARG_MAX`（2 MiB）——
  * 超过它内核会 E2BIG，还不如我们在本地就截断掉。
  */
@@ -160,7 +173,9 @@ extern "C" {
     typedef char px_limit_check_entry_le_budget[                          \
         ((PX_ENV_ENTRY_MAX) <= (PX_ENV_BUDGET_DEFAULT)) ? 1 : -1];        \
     typedef char px_limit_check_budget_le_argmax[                         \
-        ((PX_ENV_BUDGET_DEFAULT) <= (2u * 1024u * 1024u)) ? 1 : -1]
+        ((PX_ENV_BUDGET_DEFAULT) <= (2u * 1024u * 1024u)) ? 1 : -1];      \
+    typedef char px_limit_check_passthru_ge_entry[                        \
+        ((PX_ENV_PASSTHRU_MAX) >= (PX_ENV_ENTRY_MAX)) ? 1 : -1]
 
 PX_LIMITS_MUST_BE_CONSISTENT;
 

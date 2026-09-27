@@ -1012,7 +1012,7 @@ int px_env_build(const char *const *in_envp, const px_envpolicy *pol,
              * 没有 fakeroot、没有 l2s，且**没有任何报错**。
              * 丢弃一条超长变量只影响那一条，代价远小于丢掉全部钩子。
              */
-            if (len > (size_t)PX_ENV_ENTRY_MAX) {
+            if (len > (size_t)PX_ENV_PASSTHRU_MAX) {   /* BXR-ENV-1 */
                 n_skipped_long++;
                 continue;
             }
@@ -1458,7 +1458,7 @@ int px_plan_argv_ex(char *const argv[], const char *rootfs,
                                       ? plan->policy : &PX_ARGPOLICY_DEFAULT;
         int prev_is_path_opt = 0;
 
-    for (i = 0; i < (size_t)PX_ARGV_MAX && argv[i] != NULL; i++) {
+    for (i = 0; argv[i] != NULL; i++) {
         /*
          * ★ 默认策略只翻 argv[0] ★
          *
@@ -1559,7 +1559,7 @@ int px_apply_argv(char *const argv[], const px_argv_plan *plan,
         return PX_EINVAL;
     }
 
-    while (count < (size_t)PX_ARGV_MAX && argv[count] != NULL) {
+    while (argv[count] != NULL) {
         count++;
     }
 
@@ -3362,6 +3362,16 @@ static long px_raw_svc5(long nr, long a, long b, long c, long d, long e)
  * guest ld.so 的 __libc_early_init 在 runtime 构造函数之前就被杀
  * （见 src/ldr/ulx.c 文件头）。ulx 在同一进程里装载 ld.so，处理器不丢。
  */
+/* argv 条数（不含 NULL）；NULL 视为 0。BXR-ARG-1：数组一律按它分配。 */
+static size_t px_argv_len(char *const argv[])
+{
+    size_t n = 0;
+    if (argv != NULL)
+        while (argv[n] != NULL)
+            n++;
+    return n;
+}
+
 static void px_tramp_cfg(const char **tramp, const char **linker)
 {
     *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
@@ -3380,7 +3390,7 @@ static int px_trampoline_exec(const char *host, char *const argv[],
     const char *tramp;
     const char *linker;
     char tramp_path[PX_PATH_MAX];
-    char *nv[PX_ARGV_MAX + 8];
+    char **nv;
     size_t n = 0;
     size_t i;
 
@@ -3440,6 +3450,16 @@ static int px_trampoline_exec(const char *host, char *const argv[],
         return -1;
     }
 
+    /*
+     * ★ argv 数组按实际 argc 分配（BXR-ARG-1，2026-09-27 爆破测试）★
+     * 原来是栈上 `char *nv[PX_ARGV_MAX + 8]`，循环到 PX_ARGV_MAX 就停 ——
+     * `echo $(seq 1 5000)` 在 guest 里只输出 4095 个词，**静默截断**。
+     * Linux 只限 ARG_MAX 字节，不限条数。
+     */
+    nv = (char **)malloc((px_argv_len(argv) + 8u) * sizeof(char *));
+    if (nv == NULL) {
+        return -1;
+    }
     nv[n++] = tramp_path;
     nv[n++] = (char *)(uintptr_t)linker;
 
@@ -3458,6 +3478,7 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * 装不上就没必要进 bridge。
      */
     if (preload == NULL || preload[0] == '\0') {
+        free(nv);
         return -1;
     }
     if (argv0 != NULL && argv0[0] != '\0') {
@@ -3481,7 +3502,7 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * `sh <name> -c ...`）。所以从 1 开始。
      */
     if (argv != NULL) {
-        for (i = 1; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 7; i++) {
+        for (i = 1; argv[i] != NULL; i++) {
             nv[n++] = argv[i];
         }
     }
@@ -3494,6 +3515,7 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * （bridge 在 /data/app 下，翻译后必然不存在）。
      */
     (void)PX_RAW_EXECVE(tramp_path, nv, (char *const *)envp);
+    free(nv);
     return 0;   /* 能返回就是失败了 */
 }
 
@@ -3586,7 +3608,7 @@ typedef struct {
     char path[PX_PATH_MAX];
     char genv[PX_PATH_MAX + 32];
     char renv[PX_PATH_MAX + 32];
-    char *nv[PX_ARGV_MAX + 4];
+    char **nv;          /* 按实际 argc 分配（BXR-ARG-1） */
     char **ne;
 } px_stub_plan;
 
@@ -3600,6 +3622,7 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
     int tracing = 0;
 
     sp->ne = NULL;
+    sp->nv = NULL;
     /*
      * 优先 bxroot 自己的变量，回落官方的 PROROOT_STUB_LOADER（DSHA 与外层
      * proroot 都提供它）。bxroot 自己的 libbxroot-stub-loader.so **不能**
@@ -3619,10 +3642,13 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
         return -1;
     }
 
+    sp->nv = (char **)malloc((px_argv_len(argv) + 4u) * sizeof(char *));
+    if (sp->nv == NULL)
+        return -1;
     sp->nv[n++] = sp->path;
     sp->nv[n++] = (char *)(uintptr_t)host;
     if (argv != NULL)
-        for (i = 1; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 2; i++)
+        for (i = 1; argv[i] != NULL; i++)
             sp->nv[n++] = argv[i];
     sp->nv[n] = NULL;
 
@@ -3677,12 +3703,15 @@ static int px_stub_exec(const char *host, char *const argv[],
     if (sp == NULL)
         return -1;
     if (px_stub_prepare(sp, host, argv, envp, guest) != 0) {
+        free(sp->ne);
+        free(sp->nv);
         free(sp);
         return -1;
     }
     PX_LOG("proc: 无 PT_INTERP 的 ELF，经 stub-loader 执行 %s", host);
     (void)PX_RAW_EXECVE(sp->path, sp->nv, sp->ne);
     free(sp->ne);
+    free(sp->nv);
     free(sp);
     return 0;
 }
@@ -3743,7 +3772,7 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
     const char *tramp;
     const char *linker;
     char tramp_path[PX_PATH_MAX];
-    char *nv[PX_ARGV_MAX + 8];
+    char **nv;
     size_t n = 0;
     size_t i;
     int rc;
@@ -3777,11 +3806,13 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
                  ? real_posix_spawn(pid, sp->path, fa, attr, sp->nv, sp->ne) : -1;
             PX_LOG("proc: spawn 无 PT_INTERP 的 ELF 经 stub-loader %s rc=%d", host, rc);
             free(sp->ne);
+            free(sp->nv);
             free(sp);
             return rc == 0 ? 0 : -1;
         }
         if (sp != NULL) {
             free(sp->ne);
+            free(sp->nv);
             free(sp);
         }
     }
@@ -3814,6 +3845,10 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
      *     [bridge, linker, --argv0 <name>, --preload <rt>, <host>, argv[1..]]
      * 两条路径共用同一约定，避免"exec 能跑、spawn 不行"这类漂移。
      */
+    nv = (char **)malloc((px_argv_len(argv) + 8u) * sizeof(char *));  /* BXR-ARG-1 */
+    if (nv == NULL) {
+        return -1;
+    }
     nv[n++] = tramp_path;
     nv[n++] = (char *)(uintptr_t)linker;
     if (argv0 != NULL && argv0[0] != '\0') {
@@ -3825,7 +3860,7 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
     if (host != NULL && host[0] != '\0') {
         nv[n++] = (char *)(uintptr_t)host;
     }
-    for (i = 1; argv[i] != NULL && n < (size_t)PX_ARGV_MAX + 7; i++) {
+    for (i = 1; argv[i] != NULL; i++) {
         nv[n++] = argv[i];
     }
     nv[n] = NULL;
@@ -3838,6 +3873,7 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
                                px_dlsym("posix_spawn");
     }
     if (real_posix_spawn == NULL) {
+        free(nv);
         return -1;
     }
 
@@ -3874,6 +3910,7 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
      * 作为"排查路径已收束"的路标，避免后来者重走。
      */
 rc = real_posix_spawn(pid, tramp_path, fa, attr, nv, (char *const *)envp);
+    free(nv);
     if (rc != 0) {
         /*
          * spawn 失败了 —— 回 -1 让调用方走原路径。
@@ -4224,6 +4261,92 @@ static const char *px_exec_proc_exe_alias(const char *path)
     return ge;
 }
 
+
+/*
+ * ★ 嵌套 shebang（BXR-SB-1，2026-09-27 真机爆破）★
+ *
+ * 【缺陷】`#!/tmp/s1`（s1 本身又是 `#!/bin/sh` 脚本）只改写一层：解释器
+ * s1 被当成 ELF 交给 ld.so → "file too short"，rc=127。Linux 允许解释器
+ * 本身是脚本，最多嵌套 BINPRM_MAX_RECURSION(4) 层之后报 ELOOP。
+ *
+ * 【修法】循环改写，直到目标不再是 shebang 脚本；每层的缓冲放在一个
+ * 堆上的链节点里（argv 各项指向它们，须活到 exec 之后）。
+ * 返回：1 = 至少改写了一层（*out_argv / host / guest 已更新）；0 = 不是脚本；
+ *       -1 = 畸形 / 超过 4 层（errno = ENOEXEC / ELOOP）/ 内存不足。
+ */
+typedef struct px_sb_level {
+    struct px_sb_level *next;
+    char host[PX_PATH_MAX];
+    char guest[PX_PATH_MAX];
+    char arg1[PX_PATH_MAX];
+    char script[PX_PATH_MAX];
+    char **argv;
+} px_sb_level;
+
+static void px_sb_chain_free(px_sb_level *l)
+{
+    while (l != NULL) {
+        px_sb_level *n = l->next;
+        free(l->argv);
+        free(l);
+        l = n;
+    }
+}
+
+static int px_rewrite_shebang_chain(char *host, size_t host_cap,
+                                    char *guest, size_t guest_cap,
+                                    char *const **argv_io, px_sb_level **chain)
+{
+    int depth;
+    int changed = 0;
+
+    for (depth = 0; depth <= 4; depth++) {
+        px_sb_level *l;
+        size_t cap = px_argv_len(*argv_io) + 4u;
+        int rc;
+
+        l = (px_sb_level *)calloc(1, sizeof(*l));
+        if (l == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+        l->argv = (char **)malloc(cap * sizeof(char *));
+        if (l->argv == NULL) {
+            free(l);
+            errno = ENOMEM;
+            return -1;
+        }
+        rc = px_rewrite_shebang(host, guest, *argv_io,
+                                l->host, sizeof(l->host),
+                                l->guest, sizeof(l->guest),
+                                l->arg1, sizeof(l->arg1),
+                                l->script, sizeof(l->script),
+                                l->argv, cap);
+        if (rc <= 0) {
+            free(l->argv);
+            free(l);
+            if (rc < 0) {
+                errno = ENOEXEC;
+                return -1;
+            }
+            return changed;
+        }
+        if (depth == 4) {                   /* 第 5 层仍是脚本：与内核一致 */
+            free(l->argv);
+            free(l);
+            errno = ELOOP;
+            return -1;
+        }
+        l->next = *chain;
+        *chain = l;
+        px_cfg_str(host, host_cap, l->host);
+        px_cfg_str(guest, guest_cap, l->guest);
+        *argv_io = l->argv;
+        changed = 1;
+    }
+    return changed;
+}
+
 static int px_do_execve(const char *path, char *const argv[],
                         char *const envp[], const char *path_env,
                         int use_search)
@@ -4232,7 +4355,7 @@ static int px_do_execve(const char *path, char *const argv[],
     char guest[PX_PATH_MAX];
     px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     px_argv_plan plan;
-    char *vec[PX_ARGV_MAX + 1];
+    char **vec = NULL;      /* BXR-ARG-1：按实际 argc 堆分配（原栈上 PX_ARGV_MAX+1） */
     size_t need = 0;
     const char *final_env_use = NULL;
     char *const *final_env;
@@ -4249,10 +4372,7 @@ static int px_do_execve(const char *path, char *const argv[],
      * 可能还没被覆盖，症状是"大多数时候正常、偶发读到垃圾 argv"）。
      * 这类缺陷极难定位，所以显式放到函数作用域并注释原因。
      */
-    char *sb_argv[PX_ARGV_MAX + 1];
-    char sb_host[PX_PATH_MAX];
-    char sb_guest[PX_PATH_MAX];
-    char sb_arg1[PX_PATH_MAX];
+    px_sb_level *sb_chain = NULL;   /* BXR-SB-1：嵌套 shebang 各层缓冲（堆） */
     /*
      * ★ 脚本路径必须**单独一份**，不能复用 `guest` ★
      *
@@ -4268,7 +4388,6 @@ static int px_do_execve(const char *path, char *const argv[],
      * 看起来像"python 把 ELF 当源码读"，实际是 argv[1] 指错了地方。
      * 用一个独立缓冲把脚本路径**拷一份**，与解释器缓冲互不干扰。
      */
-    char sb_script[PX_PATH_MAX];
     /*
      * raw user path（shebang 重写前）：用于 BXROOT_ORIG_COMM /
      * /proc/self/comm 的上游语义（见赋值处注释）。
@@ -4434,21 +4553,13 @@ static int px_do_execve(const char *path, char *const argv[],
          */
         px_cfg_str(raw_guest, sizeof(raw_guest), guest);
 
-        sb_rc = px_rewrite_shebang(host, guest, argv,
-                                   sb_host, sizeof(sb_host),
-                                   sb_guest, sizeof(sb_guest),
-                                   sb_arg1, sizeof(sb_arg1),
-                                   sb_script, sizeof(sb_script),
-                                   sb_argv, PX_ARGV_MAX + 1);
+        sb_rc = px_rewrite_shebang_chain(host, sizeof(host), guest, sizeof(guest),
+                                         &argv, &sb_chain);
         if (sb_rc < 0) {
-            errno = ENOEXEC;   /* 与内核对畸形 shebang 的答复一致 */
+            int e_ = errno;         /* ENOEXEC（畸形）/ ELOOP（嵌套过深）/ ENOMEM */
+            px_sb_chain_free(sb_chain);
+            errno = e_;
             return -1;
-        }
-        if (sb_rc > 0) {
-            /* 命中 shebang：目标改成解释器，argv 换成改写后的 */
-            px_cfg_str(host, sizeof(host), sb_host);
-            px_cfg_str(guest, sizeof(guest), sb_guest);
-            argv = sb_argv;
         }
     }
 
@@ -4461,7 +4572,9 @@ static int px_do_execve(const char *path, char *const argv[],
         PX_LOG("proc: argv 计划失败 rc=%d，跳过 argv 翻译", rc);
         final_argv = argv;
     } else if (px_plan_needs_rebuild(&plan)) {
-        rc = px_apply_argv(argv, &plan, vec, PX_ARGV_MAX + 1, &need);
+        size_t vcap = px_argv_len(argv) + 1u;
+        vec = (char **)malloc(vcap * sizeof(char *));
+        rc = (vec != NULL) ? px_apply_argv(argv, &plan, vec, vcap, &need) : PX_ENOMEM;
         final_argv = (rc == PX_OK) ? vec : argv;
     } else {
         final_argv = argv;
@@ -4668,6 +4781,12 @@ static int px_do_execve(const char *path, char *const argv[],
     if (env.v != NULL) {
         px_env_dispose(&env);
     }
+    {
+        int e_ = errno;
+        free(vec);
+        px_sb_chain_free(sb_chain);
+        errno = e_;
+    }
     return rc;
 }
 
@@ -4691,96 +4810,95 @@ int execvpe(const char *file, char *const argv[], char *const envp[])
     return px_do_execve(file, argv, envp, getenv("PATH"), 1);
 }
 
+/*
+ * execl 家族：变参收成 argv 数组。
+ *
+ * ★ BXR-ARG-1（2026-09-27 爆破测试）★ 原来是栈上 `char *vec[PX_ARGV_MAX+1]`，
+ * 收满 4096 条就截断 —— 与 execve/spawn 同一缺陷（guest 里
+ * `echo $(seq 1 5000)` 只剩 4095 个词）。Linux 只按 ARG_MAX **字节**限制。
+ * 改为先用 va_copy 数条数，再按实际条数堆分配。
+ * 分配失败回 ENOMEM（内核对放不下的参数表同样拒绝，而不是截断）。
+ */
+static char **px_collect_varargs(const char *arg, va_list ap, char *const **envp_out)
+{
+    va_list cp;
+    size_t n = 1, i;
+    char **vec;
+
+    if (px_is_null(arg)) {
+        vec = (char **)malloc(sizeof(char *));
+        if (vec != NULL)
+            vec[0] = NULL;
+        if (envp_out != NULL)
+            *envp_out = va_arg(ap, char *const *);
+        return vec;
+    }
+    va_copy(cp, ap);
+    while (va_arg(cp, char *) != NULL)
+        n++;
+    va_end(cp);
+    vec = (char **)malloc((n + 1u) * sizeof(char *));
+    if (vec == NULL)
+        return NULL;
+    vec[0] = (char *)(uintptr_t)arg;
+    for (i = 1; i < n; i++)
+        vec[i] = va_arg(ap, char *);
+    (void)va_arg(ap, char *);              /* 跳过结尾 NULL */
+    vec[n] = NULL;
+    /* execle 的 envp 紧跟在 argv 的 NULL 之后 */
+    if (envp_out != NULL)
+        *envp_out = va_arg(ap, char *const *);
+    return vec;
+}
+
+static int px_execl_common(const char *path, char **vec, char *const *envp,
+                           const char *path_env, int use_search)
+{
+    int rc, e;
+
+    if (vec == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+    rc = px_do_execve(path, vec, envp, path_env, use_search);
+    e = errno;
+    free(vec);                             /* 只有失败才会走到这里 */
+    errno = e;
+    return rc;
+}
+
 int execl(const char *path, const char *arg, ...)
 {
-    /*
-     * execl 家族是变参，必须先把变参收成 argv 数组。
-     *
-     * 边界：最多收 PX_ARGV_MAX 条，超过就截断 —— 截断而不是失败，
-     * 因为返回值语义不允许我们在「还没调用真实函数」时报错。
-     * 实际中 argv 超过 4096 条的程序不存在（ARG_MAX 限制的是字节数，
-     * 而 4096 条 × 最小长度已超过常见 ARG_MAX）。
-     */
-    char *vec[PX_ARGV_MAX + 1];
-    size_t n = 0;
     va_list ap;
+    char **vec;
 
-    if (!px_is_null(arg)) {
-        vec[n++] = (char *)(uintptr_t)arg;
-        va_start(ap, arg);
-        while (n < (size_t)PX_ARGV_MAX) {
-            char *a = va_arg(ap, char *);
-            vec[n++] = a;
-            if (a == NULL) {
-                break;
-            }
-        }
-        va_end(ap);
-        vec[PX_ARGV_MAX] = NULL;
-        if (n > 0 && vec[n - 1] != NULL) {
-            vec[n] = NULL;   /* 溢出保护：保证 NULL 结尾 */
-        }
-    } else {
-        vec[0] = NULL;
-    }
-    return px_do_execve(path, vec, NULL, NULL, 0);
+    va_start(ap, arg);
+    vec = px_collect_varargs(arg, ap, NULL);
+    va_end(ap);
+    return px_execl_common(path, vec, NULL, NULL, 0);
 }
 
 int execlp(const char *file, const char *arg, ...)
 {
-    char *vec[PX_ARGV_MAX + 1];
-    size_t n = 0;
     va_list ap;
+    char **vec;
 
-    if (!px_is_null(arg)) {
-        vec[n++] = (char *)(uintptr_t)arg;
-        va_start(ap, arg);
-        while (n < (size_t)PX_ARGV_MAX) {
-            char *a = va_arg(ap, char *);
-            vec[n++] = a;
-            if (a == NULL) {
-                break;
-            }
-        }
-        va_end(ap);
-        vec[PX_ARGV_MAX] = NULL;
-        if (n > 0 && vec[n - 1] != NULL) {
-            vec[n] = NULL;
-        }
-    } else {
-        vec[0] = NULL;
-    }
-    return px_do_execve(file, vec, NULL, getenv("PATH"), 1);
+    va_start(ap, arg);
+    vec = px_collect_varargs(arg, ap, NULL);
+    va_end(ap);
+    return px_execl_common(file, vec, NULL, getenv("PATH"), 1);
 }
 
 int execle(const char *path, const char *arg, ...)
 {
-    char *vec[PX_ARGV_MAX + 1];
-    char *const *envp = NULL;
-    size_t n = 0;
     va_list ap;
+    char **vec;
+    char *const *envp = NULL;
 
-    if (!px_is_null(arg)) {
-        vec[n++] = (char *)(uintptr_t)arg;
-        va_start(ap, arg);
-        while (n < (size_t)PX_ARGV_MAX) {
-            char *a = va_arg(ap, char *);
-            vec[n++] = a;
-            if (a == NULL) {
-                break;
-            }
-        }
-        /* execle 的 envp 紧跟在 argv 的 NULL 之后 */
-        envp = va_arg(ap, char *const *);
-        va_end(ap);
-        vec[PX_ARGV_MAX] = NULL;
-        if (n > 0 && vec[n - 1] != NULL) {
-            vec[n] = NULL;
-        }
-    } else {
-        vec[0] = NULL;
-    }
-    return px_do_execve(path, vec, (char *const *)envp, NULL, 0);
+    va_start(ap, arg);
+    vec = px_collect_varargs(arg, ap, &envp);
+    va_end(ap);
+    return px_execl_common(path, vec, envp, NULL, 0);
 }
 
 /*
@@ -5005,7 +5123,7 @@ static int px_do_spawn(pid_t *pid, const char *path,
     }
     px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     px_argv_plan plan;
-    char *vec[PX_ARGV_MAX + 1];
+    char **vec = NULL;      /* BXR-ARG-1 */
     char *const *final_env = envp;
     char *const *final_argv = argv;
     size_t need = 0;
@@ -5023,11 +5141,8 @@ static int px_do_spawn(pid_t *pid, const char *path,
      * 这与 px_do_execve 里同名变量的注释是同一个教训（那里已经踩过一次）。
      * gcc 的 -Wdangling-pointer 正是抓这个的，本项目告警门禁零容忍。
      */
-    char sb_host[PX_PATH_MAX];
     char sb_guest[PX_PATH_MAX];
-    char sb_arg1[PX_PATH_MAX];
-    char sb_script[PX_PATH_MAX];
-    char *sb_argv[PX_ARGV_MAX + 1];
+    px_sb_level *sb_chain = NULL;   /* BXR-SB-1 */
 
     g_rt_stats.spawn_calls++;
 
@@ -5134,28 +5249,25 @@ static int px_do_spawn(pid_t *pid, const char *path,
     {
         int sb_rc;
 
-        sb_rc = px_rewrite_shebang(host, path, argv,
-                                   sb_host, sizeof(sb_host),
-                                   sb_guest, sizeof(sb_guest),
-                                   sb_arg1, sizeof(sb_arg1),
-                                   sb_script, sizeof(sb_script),
-                                   sb_argv, PX_ARGV_MAX + 1);
+        px_cfg_str(sb_guest, sizeof(sb_guest), path);
+        sb_rc = px_rewrite_shebang_chain(host, sizeof(host), sb_guest, sizeof(sb_guest),
+                                         &argv, &sb_chain);
         if (sb_rc < 0) {
-            return ENOEXEC;
+            int e_ = errno;
+            px_sb_chain_free(sb_chain);
+            return e_ ? e_ : ENOEXEC;
         }
-        if (sb_rc > 0) {
-            /* 命中 shebang：目标改成解释器，argv 换成改写后的 */
-            px_cfg_str(host, sizeof(host), sb_host);
-            argv = sb_argv;
-            PX_LOG("spawn: shebang 重写 %s -> %s", path, sb_host);
-        }
+        if (sb_rc > 0)
+            PX_LOG("spawn: shebang 重写 %s -> %s", path, host);
     }
 
     /* 2) argv 翻译 */
     rc = px_plan_argv(argv, g_rt_cfg.have_rootfs ? g_rt_cfg.rootfs : NULL,
                       px_xlate_trampoline, NULL, &plan);
     if (rc == PX_OK && px_plan_needs_rebuild(&plan)) {
-        if (px_apply_argv(argv, &plan, vec, PX_ARGV_MAX + 1, &need) == PX_OK) {
+        size_t vcap = px_argv_len(argv) + 1u;
+        vec = (char **)malloc(vcap * sizeof(char *));
+        if (vec != NULL && px_apply_argv(argv, &plan, vec, vcap, &need) == PX_OK) {
             final_argv = vec;
         }
     }
@@ -5241,6 +5353,12 @@ out:
     px_plan_dispose(&plan);
     if (env.v != NULL) {
         px_env_dispose(&env);
+    }
+    {
+        int e_ = errno;
+        free(vec);
+        px_sb_chain_free(sb_chain);
+        errno = e_;
     }
     return rc;
 }

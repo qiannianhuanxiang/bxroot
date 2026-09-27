@@ -846,7 +846,7 @@ static void test_env_build(void)
          * 断言：畸长变量被丢掉、被计入 skipped_long，
          *       而强制条目 LD_PRELOAD 与其它正常条目都还在。
          */
-        static char huge[PX_ENV_ENTRY_MAX + 512];
+        static char huge[PX_ENV_PASSTHRU_MAX + 512];   /* BXR-ENV-1：透传上限 = MAX_ARG_STRLEN */
         px_env_kv fm[1];
         px_envpolicy pm;
         const char *in[3];
@@ -854,7 +854,7 @@ static void test_env_build(void)
         memset(huge, 'x', sizeof(huge) - 1u);
         huge[0] = 'H';
         huge[1] = '=';
-        huge[sizeof(huge) - 1u] = '\0';       /* 远长于 PX_ENV_ENTRY_MAX */
+        huge[sizeof(huge) - 1u] = '\0';       /* 长于 PX_ENV_PASSTHRU_MAX */
 
         fm[0].name = "LD_PRELOAD";
         fm[0].value = "/ours.so";
@@ -873,6 +873,35 @@ static void test_env_build(void)
         CHECK_STR(px_env_lookup((const char *const *)out.v, "KEEP"), "1");
         CHECK_STR(px_env_lookup((const char *const *)out.v, "LD_PRELOAD"),
                   "/ours.so");
+        px_env_dispose(&out);
+    }
+
+    CASE("C18b ★BXR-ENV-1★：60 KB 的透传变量必须保留（原 16 KB 封顶静默丢弃）");
+    {
+        static char big[60000 + 3];
+        px_env_kv fm[1];
+        px_envpolicy pm;
+        const char *in[2];
+
+        memset(big, 'y', sizeof(big) - 1u);
+        big[0] = 'B';
+        big[1] = '=';
+        big[sizeof(big) - 1u] = '\0';
+        fm[0].name = "LD_PRELOAD";
+        fm[0].value = "/ours.so";
+        fm[0].mode = PX_ENV_SET;
+        memset(&pm, 0, sizeof(pm));
+        pm.forced = fm;
+        pm.forced_n = 1;
+        in[0] = big;
+        in[1] = NULL;
+        CHECK_EQ(px_env_build(in, &pm, &out, NULL), PX_OK);
+        CHECK_EQ(out.skipped_long, 0u);
+        {
+            const char *v = px_env_lookup((const char *const *)out.v, "B");
+            CHECK(v != NULL);
+            CHECK_EQ(v != NULL ? (int)strlen(v) : -1, 60000);
+        }
         px_env_dispose(&out);
     }
 
