@@ -890,6 +890,13 @@ else
     run_step "livepatch seccomp 端到端"
 fi
 
+# livepatch 静态链接 guest 主映像扫描（静态多线程在 seccomp 下存活）
+if [ -f test/RUN_STATIC_THREAD.sh ]; then
+    run_step "livepatch 静态主映像" sh test/RUN_STATIC_THREAD.sh
+else
+    run_step "livepatch 静态主映像"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================
