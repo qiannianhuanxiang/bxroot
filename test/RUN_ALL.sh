@@ -869,6 +869,13 @@ else
     run_step "fakeroot chown 读回"
 fi
 
+# livepatch 运行期指令扫描（99/293 覆盖任意 glibc 版本）
+if [ -f test/RUN_LIVEPATCH_SCAN.sh ]; then
+    run_step "livepatch 指令扫描" sh test/RUN_LIVEPATCH_SCAN.sh
+else
+    run_step "livepatch 指令扫描"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================

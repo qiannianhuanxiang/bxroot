@@ -66,6 +66,9 @@ int bxroot_livepatch_applied(void);
 /* 成功改写的站点数。 */
 int bxroot_livepatch_hits(void);
 
+/* 其中由运行期指令扫描改写的站点数（99/293，覆盖任意 glibc 版本）。 */
+int bxroot_livepatch_scan_hits(void);
+
 /* 被跳过时的原因（LP_SKIP_*）；未跳过为 LP_SKIP_NONE。 */
 int bxroot_livepatch_skip_reason(void);
 

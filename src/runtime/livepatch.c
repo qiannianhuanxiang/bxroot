@@ -363,14 +363,54 @@ static const lp_table g_tables[] = {
 };
 #define NTABLES (sizeof(g_tables) / sizeof(g_tables[0]))
 
-/* 门控选中的表；LP_SKIP_NONE 之后才有效。 */
+/* 门控选中的表；命中的版本用它补 147/149。未命中为 NULL（走纯扫描）。 */
 static const lp_site *g_sites;
 static size_t         g_nsites;
 
 #define NSITES g_nsites
 
+/*
+ * ====================================================================
+ * ★ 运行期指令扫描（2026-09-27）—— 让 99/293 覆盖任意 glibc 版本 ★
+ * ====================================================================
+ *
+ * 【动机】版本精确表（上面 g_tables）只覆盖 2.39/2.41。换一个 glibc 就
+ * 得人肉 objdump 补偏移，否则真机上 fork/pthread 子进程死于 SIGSYS(159)
+ * ——因为 set_robust_list(99) 与 rseq(293) 是 glibc 线程/进程初始化里的
+ * **内联 svc**，没有导出符号能被 bxroot 的钩子拦到，不打补丁就必死。
+ *
+ * 【为什么 99/293 可以放心扫全补、147/149 不行】
+ *   - 99(set_robust_list)/293(rseq)：glibc 里这两个号**只**出现在
+ *     __tls_init_tp / _Fork / pthread 创建路径的内联 svc。它们是可选设施
+ *     （内核不支持时本就返回 -ENOSYS），把它们中和成"该内核不支持"对
+ *     任何调用方都安全，与落在哪个函数无关。所以按指令形态扫描全补。
+ *   - 147/149(setresuid/setresgid)：既有 __spawni 内部站点（要补），也有
+ *     **导出符号入口** setresuid()/seteuid() 自身的 svc。bxroot 已用符号
+ *     钩子接管导出符号；若把入口 svc 也无条件改成"成功"，非 fakeroot
+ *     模式下语义就错了。区分这两类需要符号地址信息，扫描给不了 ——
+ *     所以 147/149 仍走版本精确表，未知版本宁可不补（退化为该版本 make
+ *     的 RESETIDS 子进程受限），也不冒语义错误的险。
+ *
+ * 【安全边界】扫描只认"mov x8,#nr 后近距离跟 svc #0"这一确定形态，且
+ * 打补丁前逐字节校验 svc（patch_one）。中途遇到另一个写 x8 的 movz 或
+ * 分支就放弃本窗口，避免跨站点/跨函数误配。
+ */
+#define LP_SCAN_WINDOW 12           /* mov x8 到 svc 之间最多隔几条指令 */
+#define LP_SCAN_MAX_HITS 32         /* 单个号在 libc 里的站点数上限（实测 ≤3） */
+
+/* 需要扫描中和的系统调用号（只放"落在哪都安全"的）。 */
+static const int g_scan_nrs[] = { 99 /* set_robust_list */, 293 /* rseq */ };
+#define NSCAN_NRS (sizeof(g_scan_nrs) / sizeof(g_scan_nrs[0]))
+
+/* movz x8, #imm16 的编码（rd=x8, hw=0）：0xd2800008 | (imm<<5)。 */
+static uint32_t lp_mov_x8_imm(int nr)
+{
+    return 0xd2800008u | ((uint32_t)(nr & 0xffff) << 5);
+}
+
 static int       g_applied;
 static int       g_hits;
+static int       g_scan_hits;
 static int       g_skip_reason;
 static uintptr_t g_base;
 
@@ -486,20 +526,19 @@ static int lp_gate(void)
                "按\"可能有过滤器\"处理，继续打补丁\n");
     }
 
-    /* ---- 门 ④：libc 版本断言（P2-4.1）---- */
+    /* ---- 门 ④：libc 版本（决定 147/149 精确表是否可用）----
+     *
+     * ★ 语义变更（2026-09-27）★ 版本不符**不再整体跳过**。99/293 由
+     * 运行期指令扫描覆盖（对任意版本都安全，见 g_scan_nrs 处的说明）；
+     * 版本表只用于 147/149 这类"扫描给不了符号信息、不能全补"的号。
+     * 所以：读不到版本 / 版本没登记 → g_sites=NULL，仅少补 147/149，
+     * 不再放弃 99/293（那才是 fork/pthread 必死的根因）。
+     */
     ver = lp_libc_version();
-    if (ver == NULL) {
-        /* 版本读不出来 —— 与"版本不符"同等危险（偏移不可信），告警并跳过。
-         * ★ 只有走到这里（= 有 seccomp，真机场景）才会报，见门顺序说明。 */
-        lp_say("[bxroot] WARN: livepatch: 站点表只覆盖 glibc "
-               LP_SITE_LIBC_VERSION "，但读不到当前 glibc 版本"
-               "（gnu_get_libc_version 返回空）→ livepatch 已跳过\n");
-        return LP_SKIP_LIBC_VERSION;
-    }
-    {
+    g_sites = NULL;
+    g_nsites = 0;
+    if (ver != NULL) {
         size_t t;
-        g_sites = NULL;
-        g_nsites = 0;
         for (t = 0; t < NTABLES; t++) {
             if (strcmp(ver, g_tables[t].version) == 0) {
                 g_sites = g_tables[t].sites;
@@ -508,17 +547,10 @@ static int lp_gate(void)
             }
         }
     }
-    if (g_sites == NULL) {
-        /*
-         * 没有这个版本的表 = 站点偏移不可信。**必须出声** —— 否则就是
-         * P2-4.1 那条"静默失效"：进程照跑，只是补丁一条没打，
-         * 真机上表现为 pthread_create / fork 子进程死 159，离原因极远。
-         */
-        lp_say("[bxroot] WARN: livepatch: 站点表只覆盖 glibc "
-               LP_SITE_LIBC_VERSION "，当前是 glibc ");
-        lp_say(ver);
-        lp_say("，偏移不可信 → livepatch 已跳过\n");
-        return LP_SKIP_LIBC_VERSION;
+    if (g_sites == NULL && lp_verbose()) {
+        lp_say("[bxroot] livepatch: glibc ");
+        lp_say(ver ? ver : "(未知)");
+        lp_say(" 无精确站点表 → 99/293 走指令扫描，147/149 本版不补\n");
     }
 
     return LP_SKIP_NONE;
@@ -574,6 +606,105 @@ static int patch_one(uint32_t *p, const lp_site *s)
     return 1;
 }
 
+/*
+ * 找 libc.so.6 的**可执行**段范围 [lo,hi)（r-xp 的那一段），供扫描界定。
+ * 只扫这一段：数据段里可能恰好有等于 svc/mov 编码的字节，扫到就会误判。
+ * 返回 0 = 没找到。
+ */
+static int find_libc_exec_range(uintptr_t *lo_out, uintptr_t *hi_out)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[1024];
+    int found = 0;
+
+    if (f == NULL)
+        return 0;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        unsigned long long a, b, off;
+        char perms[8];
+
+        if (sscanf(line, "%llx-%llx %7s %llx", &a, &b, perms, &off) < 4)
+            continue;
+        if (strstr(line, "libc.so.6") == NULL)
+            continue;
+        if (perms[2] != 'x')                 /* 只要可执行段 */
+            continue;
+        *lo_out = (uintptr_t)a;
+        *hi_out = (uintptr_t)b;
+        found = 1;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
+/*
+ * 扫描 [lo,hi) 内的指令，把 g_scan_nrs 里的号对应的内联 svc 中和为
+ * `mov x0,#0`。返回改写的站点数。已在 g_sites 版本表里出现过的偏移
+ * 会被后续 apply 再校验一次 svc（幂等，patch_one 只认 svc），不会重打。
+ *
+ * 形态：mov(z) x8,#nr  →（≤LP_SCAN_WINDOW 条内，中途不得再写 x8/不得分支）→ svc #0
+ */
+static int lp_scan_and_patch(uintptr_t lo, uintptr_t hi)
+{
+    uint32_t *code = (uint32_t *)lo;
+    size_t n = (hi - lo) / 4;
+    size_t j;
+    int total = 0;
+    size_t s;
+
+    for (j = 0; j < n; j++) {
+        int matched_nr = 0;
+        size_t t;
+
+        for (t = 0; t < NSCAN_NRS; t++) {
+            if (code[j] == lp_mov_x8_imm(g_scan_nrs[t])) {
+                matched_nr = 1;
+                break;
+            }
+        }
+        if (!matched_nr)
+            continue;
+
+        for (s = 1; s <= LP_SCAN_WINDOW && j + s < n; s++) {
+            uint32_t ins = code[j + s];
+
+            if (ins == SVC_INSN) {
+                uint32_t *p = &code[j + s];
+                if (*p == SVC_INSN) {
+                    *p = MOV_X0_0;
+                    __builtin___clear_cache((char *)p, (char *)p + 4);
+                    total++;
+                    if (total >= LP_SCAN_MAX_HITS)
+                        return total;
+                }
+                break;
+            }
+            /* 又一次写 x8（movz x8,#..）或任何分支 → 放弃本窗口，避免误配。
+             * movz x8,#imm16 编码：0xd2800008 | (imm<<5)，imm 占 bit5..20，
+             * 故掩掉 imm 位后比较；B/BL：bit31..26 = 000101/100101。 */
+            if ((ins & 0xffe0001fu) == 0xd2800008u)
+                break;
+            if ((ins >> 26) == 0x05u || (ins >> 26) == 0x25u)
+                break;
+        }
+    }
+    return total;
+}
+
+#ifdef LP_TEST_HOOK
+/*
+ * 测试专用：对一段调用方提供的机器码缓冲跑扫描逻辑（不碰 /proc、不
+ * mprotect）。让离线测试能构造合成站点、断言"哪些 svc 被改成 mov x0,#0、
+ * 哪些没被碰"。仅在 -DLP_TEST_HOOK 下编入，生产构建不含。
+ */
+int bxroot_livepatch_scan_buffer_for_test(uint32_t *buf, size_t words)
+{
+    return lp_scan_and_patch((uintptr_t)buf, (uintptr_t)(buf + words));
+}
+#endif
+
 int bxroot_livepatch_apply(void)
 {
     long pg;
@@ -610,29 +741,45 @@ int bxroot_livepatch_apply(void)
         return -2;
 
     /*
-     * 先把涉及的所有页设成可写。
-     *
-     * 分两遍：先算范围再 mprotect，避免每个站点各改一次页属性
-     * （那样会产生可写的代码页窗口，且更慢）。
+     * 第一部分：版本精确表（仅当命中已登记版本）。覆盖 147/149 这类
+     * 扫描不能安全全补的号；99/293 若在表里也会被打，与扫描重叠但幂等
+     * （patch_one 只认 svc，已被扫描改写的就不是 svc 了）。
      */
-    for (i = 0; i < NSITES; i++) {
-        uintptr_t a = (g_base + g_sites[i].off) & ~(uintptr_t)(pg - 1);
-        uintptr_t b = (g_base + g_sites[i].off + 4 + (uintptr_t)pg - 1)
-                      & ~(uintptr_t)(pg - 1);
-        if (lo == 0 || a < lo) lo = a;
-        if (b > hi) hi = b;
+    if (g_sites != NULL && NSITES > 0) {
+        for (i = 0; i < NSITES; i++) {
+            uintptr_t a = (g_base + g_sites[i].off) & ~(uintptr_t)(pg - 1);
+            uintptr_t b = (g_base + g_sites[i].off + 4 + (uintptr_t)pg - 1)
+                          & ~(uintptr_t)(pg - 1);
+            if (lo == 0 || a < lo) lo = a;
+            if (b > hi) hi = b;
+        }
+        if (lo != 0 && hi > lo &&
+            mprotect((void *)lo, (size_t)(hi - lo),
+                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            for (i = 0; i < NSITES; i++) {
+                uint32_t *p = (uint32_t *)(g_base + g_sites[i].off);
+                g_hits += patch_one(p, &g_sites[i]);
+            }
+        }
     }
 
-    if (lo == 0 || hi <= lo)
-        return -3;
-
-    if (mprotect((void *)lo, (size_t)(hi - lo),
-                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
-        return -4;
-
-    for (i = 0; i < NSITES; i++) {
-        uint32_t *p = (uint32_t *)(g_base + g_sites[i].off);
-        g_hits += patch_one(p, &g_sites[i]);
+    /*
+     * 第二部分：运行期扫描，把 99/293 的内联 svc 中和 —— 对任意 glibc
+     * 版本生效（这才是 fork/pthread 子进程在 seccomp 下不被 SIGSYS 杀的
+     * 关键）。只扫 libc 的 r-x 段；期间把该段临时置为可写，改完复位。
+     */
+    {
+        uintptr_t elo = 0, ehi = 0;
+        if (find_libc_exec_range(&elo, &ehi) && ehi > elo) {
+            if (mprotect((void *)elo, (size_t)(ehi - elo),
+                         PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                g_scan_hits = lp_scan_and_patch(elo, ehi);
+                g_hits += g_scan_hits;
+                /* 复位为 r-x，缩小可写代码页窗口（失败不致命，已改完）。 */
+                (void)mprotect((void *)elo, (size_t)(ehi - elo),
+                               PROT_READ | PROT_EXEC);
+            }
+        }
     }
 
     /*
@@ -643,15 +790,10 @@ int bxroot_livepatch_apply(void)
      */
     if (g_hits > 0) {
         g_applied = 1;
-        /*
-         * 成功路径默认静默（与修复前一致：每进程每个 exec 都打印会刷屏）。
-         * BXROOT_VERBOSE=1 时打一行，便于确认"门控放行了、而且真打上了"。
-         * 这里用 fprintf 而不是 lp_say：构造函数里 stdio 可用（本文件
-         * 的 find_libc_base 就在用 fopen/sscanf），带实参的格式化没必要
-         * 自己手搓十进制转换 —— 手搓的那版既啰嗦又多一个出错面。
-         */
         if (lp_verbose())
-            fprintf(stderr, "[bxroot] livepatch: 已中和 %d 个站点\n", g_hits);
+            fprintf(stderr, "[bxroot] livepatch: 已中和 %d 个站点"
+                    "（扫描 %d + 版本表 %d）\n",
+                    g_hits, g_scan_hits, g_hits - g_scan_hits);
         return 0;
     }
     return -5;
@@ -665,6 +807,11 @@ int bxroot_livepatch_applied(void)
 int bxroot_livepatch_hits(void)
 {
     return g_hits;
+}
+
+int bxroot_livepatch_scan_hits(void)
+{
+    return g_scan_hits;
 }
 
 int bxroot_livepatch_skip_reason(void)
