@@ -11583,6 +11583,40 @@ static void init_fakeroot(void) {
 
     fakeroot_state_set_enabled(&g_fakeroot_state, true);
 
+    /*
+     * -i <uid>:<gid> 的身份映射（launcher setenv BXROOT_FAKE_UID/GID）。
+     *
+     * ★ 必须在 set_enabled 之后 ★
+     * set_enabled 把假身份初始化为 uid=gid=0（默认 fakeroot 即 root），
+     * 若在它之前覆盖会被抹掉。这里读环境变量把 r/e/s/fs 四个 uid 与
+     * 四个 gid、以及补充组主项统一改成 A:B —— 让 getuid/geteuid/
+     * getresuid/getgroups、裸 syscall、/proc/self/status、id/whoami
+     * 全部自洽地报告 A:B（proot -i 的语义就是"改看到的身份"）。
+     *
+     * 只覆盖显式给出的段：BXROOT_FAKE_UID 缺省保持 0，BXROOT_FAKE_GID
+     * 同理。非法/空值按缺省 0 处理（launcher 已做严格校验，这里是纵深
+     * 防御）。
+     */
+    {
+        const char *eu = getenv("BXROOT_FAKE_UID");
+        const char *eg = getenv("BXROOT_FAKE_GID");
+        if (eu != NULL && eu[0] != '\0') {
+            uid_t u = (uid_t)strtoul(eu, NULL, 10);
+            g_fakeroot_state.ruid = g_fakeroot_state.euid =
+                g_fakeroot_state.suid = g_fakeroot_state.fsuid = u;
+        }
+        if (eg != NULL && eg[0] != '\0') {
+            gid_t g = (gid_t)strtoul(eg, NULL, 10);
+            g_fakeroot_state.rgid = g_fakeroot_state.egid =
+                g_fakeroot_state.sgid = g_fakeroot_state.fsgid = g;
+            /* 补充组主项与主 gid 对齐（set_enabled 设的是 [0]）。 */
+            g_fakeroot_state.groups[0] = g;
+            if (g_fakeroot_state.ngroups < 1) {
+                g_fakeroot_state.ngroups = 1;
+            }
+        }
+    }
+
     /* 记账表：有界，避免 dpkg 解包上万文件时吃爆内存。
      * 容量取 1024 槽（FR_MAP_DEFAULT_SLOTS），装载率超阈值自动淘汰最久未用。 */
     g_fakeroot_state.by_path  = fakeroot_map_create(FR_MAP_DEFAULT_SLOTS);
@@ -11602,8 +11636,9 @@ static void init_fakeroot(void) {
     }
 
     g_fakeroot_on = 1;
-    LOG("fakeroot enabled: real=%ld/%ld fake=0/0",
-        (long)g_fakeroot_state.real_uid, (long)g_fakeroot_state.real_gid);
+    LOG("fakeroot enabled: real=%ld/%ld fake=%ld/%ld",
+        (long)g_fakeroot_state.real_uid, (long)g_fakeroot_state.real_gid,
+        (long)g_fakeroot_state.euid, (long)g_fakeroot_state.egid);
 }
 
 /* ------------------------------------------------------------------ */

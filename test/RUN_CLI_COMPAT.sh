@@ -182,15 +182,29 @@ for opt in -q --qemu; do
 done
 
 # ---------------------------------------------------------------------
-# D. -i 的取值边界：只有 0:0 被接受
+# D. -i 的取值边界：任意合法 uid:gid 被接受，格式错误被拒
 # ---------------------------------------------------------------------
+#
+# ★ 2026-09-27 语义变更 ★
+# -i/--change-id 从「只接受 0:0」升级为「接受任意合法 <uid>:<gid>」
+# （对齐上游 proot：伪装 guest 内看到的 uid/gid）。实现见
+# src/launcher/launcher.c 的解析 + src/runtime/preload.c 的采纳，
+# runtime 侧身份映射由 test/RUN_IDMAP.sh 钉住。这里只钉 launcher 的
+# CLI 解析：合法值接受、格式错误拒绝。
 echo
 echo "--- D) -i/--change-id 取值 ---"
 cls=$(classify "-i 0:0" -r /tmp -i 0:0 /bin/true)
 [ "$cls" = "supported" ] && ok "-i 0:0" "已支持" || bad "-i 0:0" "被拒绝"
 cls=$(classify "-i 1000:1000" -r /tmp -i 1000:1000 /bin/true)
-[ "$cls" = "refused" ] && ok "-i 1000:1000" "明确拒绝" \
-                       || bad "-i 1000:1000" "★ 静默接受了不支持的映射"
+[ "$cls" = "supported" ] && ok "-i 1000:1000" "已支持（任意映射）" \
+                         || bad "-i 1000:1000" "★ 合法映射被拒"
+# 格式错误必须报错（不能静默吞成垃圾身份）
+cls=$(classify "-i abc" -r /tmp -i abc /bin/true)
+[ "$cls" = "refused" ] && ok "-i abc" "明确拒绝（格式错误）" \
+                       || bad "-i abc" "★ 非法取值未报错"
+cls=$(classify "-i 1000:" -r /tmp -i 1000: /bin/true)
+[ "$cls" = "refused" ] && ok "-i 1000:" "明确拒绝（缺 gid 段）" \
+                       || bad "-i 1000:" "★ 半截取值未报错"
 
 # ---------------------------------------------------------------------
 # E. 未知选项：必须报"未知选项"，不能当 guest 命令

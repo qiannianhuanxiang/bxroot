@@ -185,6 +185,14 @@ typedef struct {
      */
     int fix_symlink_size;
     int change_id_set;      /* -i/--change-id 是否被显式指定 */
+    /*
+     * `-i <uid>:<gid>` 解析出的目标身份。仅当 change_id_set 为真时有意义。
+     * 交给 runtime 的 BXROOT_FAKE_UID/BXROOT_FAKE_GID —— runtime 的
+     * fakeroot 层据此伪装 guest 内看到的 uid/gid（见 preload.c 的
+     * init_fakeroot 读取处）。0:0 时与 -0 完全等价（fakeroot 默认身份即 0）。
+     */
+    unsigned long fake_uid;
+    unsigned long fake_gid;
     char *runtime_lib;  /* 从 BXROOT_LIB_PATH 或自动探测 */
     char *linker_lib;
     char *stub_loader;
@@ -206,7 +214,7 @@ static void usage(const char *prog) {
         "proot 兼容别名:\n"
         "  -R <path>             -r <path> + 一组推荐 bind\n"
         "  -S <path>             -0 -r <path> + 精简推荐 bind\n"
-        "  -i, --change-id 0:0   等价于 -0（其它取值未实现）\n"
+        "  -i, --change-id <uid>:<gid>  伪装 guest 内的 uid/gid（0:0 等价 -0）\n"
         "  -k, --kernel-release <r>  伪造内核版本（uname 的 release 字段）\n"
         "      --kill-on-exit    退出时结束容器内进程（清理 pid 账本）\n"
         "  -L                    修正 lstat 对符号链接返回的 size"
@@ -618,28 +626,72 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
             cfg->kill_on_exit = 1;
         } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--change-id") == 0) {
             /*
-             * `-i <id>:<id>` —— proot 改 guest 内看到的 uid/gid。
+             * `-i <uid>:<gid>` —— proot 改 guest 内看到的 uid/gid。
              *
-             * 本实现只支持 `0:0`（即 fakeroot）。其他取值**明确报错**，
-             * 不静默忽略：用户传 `-i 1000:1000` 是想要那个身份，
-             * 我们做不到却装作接受，会让后续所有权限判断都错。
+             * 语义（对齐上游 proot 的 -i）：让 guest 内的身份查询
+             * （getuid/geteuid/getresuid/getgroups、裸 syscall、
+             * /proc/self/status 的 Uid/Gid 行、id/whoami）都看到指定的
+             * A:B，而不是宿主内核给的真实 uid/gid。
+             *
+             * 实现分两半：
+             *   launcher（本处）：解析 A、B 两个整数，记进 cfg，稍后
+             *     setenv BXROOT_FAKE_UID=A / BXROOT_FAKE_GID=B，并同时
+             *     开启 fakeroot 记账机制（cfg->fakeroot=1）—— runtime 的
+             *     身份伪装总开关是 BXROOT_FAKEROOT，非 0:0 的映射也必须
+             *     经它进入伪装模式，只是伪装成 A:B 而非默认的 0:0。
+             *   runtime（src/runtime/preload.c 的 init_fakeroot）：读
+             *     BXROOT_FAKE_UID/GID 覆盖假身份，身份查询钩子统一取该值。
+             *
+             * "0:0" 与 -0 完全等价（fakeroot 默认身份即 uid=gid=0，
+             * 此时不必 setenv FAKE_UID/GID，留给 runtime 用默认 0）。
              */
             if (i + 1 >= argc) {
-                fprintf(stderr, "错误: -i/--change-id 需要 <id>:<id> 参数\n");
+                fprintf(stderr, "错误: -i/--change-id 需要 <uid>:<gid> 参数\n");
                 return -1;
             }
             const char *spec = argv[++i];
-            if (strcmp(spec, "0:0") == 0) {
-                cfg->fakeroot = 1;
+            {
+                /*
+                 * 解析 "A:B"：两段都必须是非空的十进制无符号整数，
+                 * 中间恰好一个冒号。严格校验而非 atoi 静默吞错 ——
+                 * `-i abc`、`-i 1000`、`-i 1000:`、`-i :1000`、
+                 * `-i 1000:1000:0` 一律报错，否则用户以为映射生效了
+                 * 而实际落到一个垃圾身份，后续所有权限判断都错。
+                 */
+                const char *colon = strchr(spec, ':');
+                char *end_u = NULL;
+                char *end_g = NULL;
+                unsigned long uid_v;
+                unsigned long gid_v;
+
+                if (colon == NULL || colon == spec || colon[1] == '\0' ||
+                    strchr(colon + 1, ':') != NULL) {
+                    fprintf(stderr,
+                            "错误: -i/--change-id 需要 <uid>:<gid> 形式的"
+                            "两个非负整数，收到 \"%s\"。\n", spec);
+                    return -1;
+                }
+                errno = 0;
+                uid_v = strtoul(spec, &end_u, 10);
+                if (errno != 0 || end_u != colon) {
+                    fprintf(stderr,
+                            "错误: -i/--change-id 的 uid 段不是合法整数："
+                            "\"%s\"。\n", spec);
+                    return -1;
+                }
+                errno = 0;
+                gid_v = strtoul(colon + 1, &end_g, 10);
+                if (errno != 0 || end_g == colon + 1 || *end_g != '\0') {
+                    fprintf(stderr,
+                            "错误: -i/--change-id 的 gid 段不是合法整数："
+                            "\"%s\"。\n", spec);
+                    return -1;
+                }
+
+                cfg->fakeroot = 1;          /* 任意映射都启用身份伪装 */
                 cfg->change_id_set = 1;
-            } else {
-                fprintf(stderr,
-                        "错误: -i/--change-id 只支持 \"0:0\"（等价于 -0）。"
-                        "收到 \"%s\"。\n"
-                        "      本实现不做任意 uid/gid 映射 —— 那需要完整的\n"
-                        "      setuid/getuid 语义拦截，当前没有实现，\n"
-                        "      与其静默忽略不如明确拒绝。\n", spec);
-                return -1;
+                cfg->fake_uid = uid_v;
+                cfg->fake_gid = gid_v;
             }
         } else if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--kernel-release") == 0) {
             /*
@@ -1681,6 +1733,25 @@ int main(int argc, char **argv) {
         setenv("BXROOT_FAKEROOT", "1", 1);
     else
         unsetenv("BXROOT_FAKEROOT");
+
+    /*
+     * -i <uid>:<gid> 的身份映射交给 runtime 的 fakeroot 层。
+     *
+     * ★ 必须成对 setenv/unsetenv（与 BXROOT_KERNEL_RELEASE 同一约定）★
+     * 这两个值一律由 launcher 从 argv 派生：只有用户显式传了非 0:0 的
+     * -i 才 setenv；否则显式 unset，避免 DSHA 环境残留的旧值让容器出现
+     * 用户从未要求过的身份。0:0（含 -0）不设，runtime 用默认假身份 0。
+     */
+    if (cfg.change_id_set && (cfg.fake_uid != 0 || cfg.fake_gid != 0)) {
+        char idbuf[32];
+        snprintf(idbuf, sizeof(idbuf), "%lu", cfg.fake_uid);
+        setenv("BXROOT_FAKE_UID", idbuf, 1);
+        snprintf(idbuf, sizeof(idbuf), "%lu", cfg.fake_gid);
+        setenv("BXROOT_FAKE_GID", idbuf, 1);
+    } else {
+        unsetenv("BXROOT_FAKE_UID");
+        unsetenv("BXROOT_FAKE_GID");
+    }
 
     /* quiet 优先级高于 verbose：上游 -v <负数> 就是"压低输出"，
      * 此时绝不能同时把 verbose 打开（那会自相矛盾）。 */

@@ -918,6 +918,13 @@ else
     run_step "POSIX /dev/shm"
 fi
 
+# 任意 -i <uid>:<gid> 身份映射（runtime 采纳 BXROOT_FAKE_UID/GID + launcher 解析）
+if [ -f test/RUN_IDMAP.sh ]; then
+    run_step "任意 -i uid:gid 映射" sh test/RUN_IDMAP.sh
+else
+    run_step "任意 -i uid:gid 映射"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================
