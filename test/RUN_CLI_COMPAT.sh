@@ -51,7 +51,7 @@ LAUNCHER="$WORK/libbxroot-cli"
 
 # 静态链接：launcher 在 Android 上是静态二进制（见 Makefile 的 -static）
 i=1
-while [ "$i" -le 6 ]; do
+while [ "$i" -le 15 ]; do
     if "$CC" -static -O1 -Wall -Wextra -Wformat=2 \
         -Wno-nonnull-compare -Wno-unused-parameter \
         -o "$LAUNCHER" src/launcher/launcher.c 2>"$WORK/cc.err"; then

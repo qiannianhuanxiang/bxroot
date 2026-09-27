@@ -28,7 +28,7 @@ bad() { F=$((F+1)); echo "  ❌ $*"; }
 
 build() {   # 带 ICE 重试
     i=0
-    while [ $i -lt 4 ]; do
+    while [ $i -lt 12 ]; do
         "$CC" "$@" 2>"$W/cc.err" && return 0
         grep -q "internal compiler error" "$W/cc.err" || { cat "$W/cc.err"; return 1; }
         i=$((i+1))
