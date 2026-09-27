@@ -92,3 +92,8 @@ work/
 # 增用例脱节（本项目已发生过一次），残留的就是一个非空目录，
 # `git add -A` 会把它提交进去。
 .bxroot-scg-audit-*
+
+# 竞品调研抓取的一手资料原文（proot manual / proot-distro README /
+# fakechroot / fakeroot / pseudo / bubblewrap）。它们是 docs/竞品对标分析.md
+# 的取证来源缓存，属外部文档、体量大，不进仓库；报告本体已提交。
+raw/
