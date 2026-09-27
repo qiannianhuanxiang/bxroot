@@ -6913,14 +6913,21 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
      *
      * 与 stat()/open() 同款：`translate_path()` 对相对路径返回 0，
      * 于是下面的展开全被跳过，内核按真实根解析绝对目标 → 外层。
+     *
+     * ★ 空路径必须原样透传（AT_EMPTY_PATH）★
+     * `statx(fd, "", AT_EMPTY_PATH, …)` 作用于 fd 自身，path 是空串。
+     * 若不特判，`path[0] != '/'` 对空串为真 → bxroot_absolutize("")
+     * 产出 "cwd/" → 把对 fd 的 stat 误导到 CWD（实测缺陷）。空串既
+     * 不需绝对化也不需翻译，直接让 fn(dirfd, "", …) 按 fd 语义走。
      */
-    if (path != NULL && path[0] != '/' &&
+    if (path != NULL && path[0] != '\0' && path[0] != '/' &&
         bxroot_absolutize(path, absbuf, sizeof(absbuf)) > 0)
         p = absbuf;
     else
         p = path;
 
-    if (p != NULL && translate_path(p, translated, sizeof(translated)) > 0)
+    if (p != NULL && p[0] != '\0' &&
+        translate_path(p, translated, sizeof(translated)) > 0)
         p = translated;
 
     /*
@@ -6944,10 +6951,12 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
      *   ② 再看**最后一段**是不是链接，是则解析到底
      * 注意 flags 里若带 AT_SYMLINK_NOFOLLOW 则完全不动（看链接本身）。
      */
-    /* ① 中间组件 ② 最后一段（缓冲必须在函数作用域：p 会指向它们） */
-    if (p != NULL && resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    /* ① 中间组件 ② 最后一段（缓冲必须在函数作用域：p 会指向它们）
+     * 空路径（AT_EMPTY_PATH，作用于 fd 自身）不做链接解析。 */
+    if (p != NULL && p[0] != '\0' &&
+        resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
         p = mid_;
-    if (p != NULL && !(flags & AT_SYMLINK_NOFOLLOW)) {
+    if (p != NULL && p[0] != '\0' && !(flags & AT_SYMLINK_NOFOLLOW)) {
         int rr = stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_));
         if (rr == -2)
             return -1;      /* 链接环：errno 已是 ELOOP，不得再重试 */

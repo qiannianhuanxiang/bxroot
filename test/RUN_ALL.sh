@@ -932,6 +932,13 @@ else
     run_step "只读 bind"
 fi
 
+# statx AT_EMPTY_PATH 空路径：statx(fd,"",AT_EMPTY_PATH) 不得被误导到 CWD
+if [ -f test/RUN_STATX_EMPTY.sh ]; then
+    run_step "statx 空路径" sh test/RUN_STATX_EMPTY.sh
+else
+    run_step "statx 空路径"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================

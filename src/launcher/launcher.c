@@ -175,7 +175,8 @@ typedef struct {
      * `kill_on_exit`：`--kill-on-exit`，退出时杀光容器内进程。
      *   语义：`killall_on_exit = true`。
      * `kernel_release`：`-k/--kernel-release`，伪造 uname 的
-     *   release 字段。**本实现只记录不生效** —— 见解析处的诚实标注。
+     *   release 字段。经 BXROOT_KERNEL_RELEASE 交给运行时 uname 钩子
+     *   改写 buf->release（见 preload.c 的 uname 钩子）。
      */
     int kill_on_exit;
     char *kernel_release;
