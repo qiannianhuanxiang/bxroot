@@ -876,6 +876,13 @@ else
     run_step "livepatch 指令扫描"
 fi
 
+# livepatch 对抗性审计（对两个真实 libc 交叉核对命中，无误伤）
+if [ -f test/RUN_LIVEPATCH_AUDIT.sh ]; then
+    run_step "livepatch 审计" sh test/RUN_LIVEPATCH_AUDIT.sh
+else
+    run_step "livepatch 审计"
+fi
+
 # =====================================================================
 # 汇总
 # =====================================================================
