@@ -895,6 +895,17 @@ static int lp_scan_and_patch(uintptr_t lo, uintptr_t hi)
 __attribute__((weak))
 int bxroot_translate_path(const char *path, char *out, size_t out_size);
 
+/*
+ * ★ 绝对符号链接重试腿（BUG-D1）★ 见 preload.c bxroot_resolve_abs_symlink
+ * 的详细注释。relay 对 openat 只做前缀拼接，缺了 exported open 钩子的
+ * abs-symlink 重定向；resolver 读 systemd 布局的 /etc/resolv.conf（绝对
+ * 符号链接）时因此恒 ENOENT → DNS 全挂。openat 返回 -ENOENT 时调它把
+ * 绝对目标重定向进 rootfs 再重发一次 svc。weak：单测/无 preload 时为 NULL。
+ */
+__attribute__((weak))
+int bxroot_resolve_abs_symlink(const char *translated,
+                               char *out, size_t out_size);
+
 /* mov x8,#56 的编码（openat）。集中一处，避免魔数散落。 */
 #define LP_MOV_X8_OPENAT  0xd2800708u   /* movz x8, #56 */
 
@@ -904,6 +915,9 @@ int bxroot_translate_path(const char *path, char *out, size_t out_size);
  * 大堆声明，而离线单测只需独立编译本文件）—— 直接按 PATH_MAX 定义。
  */
 #define LP_PATH_BUF_LEN   (PATH_MAX * 2)
+#ifndef AT_FDCWD_VAL
+#define AT_FDCWD_VAL      (-100)        /* AT_FDCWD 的内核约定值（aarch64） */
+#endif
 
 /* AArch64 unconditional BL 的编码：0x94000000 | (imm26)，imm26 = off/4。 */
 #define LP_BL_OPCODE      0x94000000u
@@ -969,6 +983,37 @@ long bxroot_pathrelay_dispatch(long a0, long a1, long a2,
             /* r>0 = 真的翻译了（加了 rootfs 前缀）；≤0 = 不翻/失败 → 原样。 */
             if (r > 0)
                 a1 = (long)(uintptr_t)tbuf;
+
+            /*
+             * ★ 绝对符号链接重试腿（BUG-D1）★
+             * 先按翻译后路径发一次 svc；若 -ENOENT 且该路径是"指向绝对
+             * 目标的符号链接"（systemd 的 /etc/resolv.conf 布局），把目标
+             * 重定向进 rootfs 后重发。与 exported openat_retry_abs_symlink
+             * 同构 —— 补上 relay 缺的那条腿，让 resolver 能读到 guest 配置。
+             */
+            if (bxroot_resolve_abs_symlink != NULL) {
+                long fd = lp_raw_svc6(nr, a0, a1, a2, a3, a4, a5);
+                if (fd != -ENOENT)
+                    return fd;              /* 成功或非 ENOENT 错误：直接交回 */
+
+                {
+                    static __thread char sbuf[LP_PATH_BUF_LEN];
+                    int changed;
+
+                    lp_relay_depth++;
+                    changed = bxroot_resolve_abs_symlink(
+                        (const char *)(uintptr_t)a1, sbuf, sizeof(sbuf));
+                    lp_relay_depth--;
+
+                    if (changed) {
+                        /* 绝对目标已重定向进 rootfs → dirfd 用 AT_FDCWD(-100)。 */
+                        return lp_raw_svc6(nr, (long)(int)AT_FDCWD_VAL,
+                                           (long)(uintptr_t)sbuf,
+                                           a2, a3, a4, a5);
+                    }
+                }
+                return fd;                  /* 无改写：交回原 -ENOENT */
+            }
         }
     }
 

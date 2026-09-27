@@ -139,6 +139,65 @@ else
     bad "关闭 path-relay 后仍成功（rc=0）—— 判别力不足，绿可能来自别处"
 fi
 
+# --- G) 绝对符号链接布局的 resolv.conf（BUG-D1，systemd-resolved 默认）---
+#   /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf（绝对目标）时，
+#   resolver 经库内内联 svc openat 走 path-relay。修前 path-relay 只做前缀
+#   拼接、不重定向绝对符号链接目标 → 读到的 link 目标从外层内核根解析 →
+#   ENOENT → res_init 退化成 127.0.0.1 → DNS 全挂。修后 relay 在 -ENOENT
+#   时调 abs-symlink 重定向腿。这里用一棵**专属子 rootfs**，把 resolv.conf
+#   做成绝对符号链接，用 res_init 探针读 nscount/ns[0]。
+#
+#   判别力：把探针读到的 nameserver 和 loopback 默认区分开——绝对符号链接
+#   若没修，res_init 只会拿到 127.0.0.1（读空），拿不到我们埋的 198.18.x。
+echo "--- G) 绝对符号链接 resolv.conf（systemd 布局，res_init 判据）---"
+# 用 res_init 探针（走 resolver 的库内内联 svc openat，正是 BUG-D1 命中的
+# 那条路；cat/open 走 exported 钩子有重试腿，测不出来）。探针需 -lresolv。
+GW=$(mktemp -d /tmp/bxroot-dns-abssym-XXXXXX)
+RESPROBE="$GW/resinit"
+gcc_ok=0
+i=1
+while [ $i -le 10 ]; do
+    if gcc -O1 -w -o "$RESPROBE" "$ROOT/test/probe_resinit.c" -lresolv \
+        2>"$GW/cc.err"; then gcc_ok=1; break; fi
+    grep -q 'internal compiler error' "$GW/cc.err" || break
+    i=$((i + 1))
+done
+if [ "$gcc_ok" = 1 ]; then
+    mkdir -p "$GW/etc" "$GW/run/systemd/resolve" "$GW/root" "$GW/tmp"
+    for d in usr bin lib lib64 sbin; do
+        [ -e "/$d" ] && ln -s "/$d" "$GW/$d" 2>/dev/null
+    done
+    printf 'hosts: files dns\n' > "$GW/etc/nsswitch.conf"
+    printf '127.0.0.1 localhost\n' > "$GW/etc/hosts"
+    printf 'nameserver 198.18.0.246\nsearch guestonly.internal\n' \
+        > "$GW/run/systemd/resolve/stub-resolv.conf"
+    cp "$RESPROBE" "$GW/root/resinit"
+    # 绝对符号链接布局（systemd-resolved 默认）
+    ln -s /run/systemd/resolve/stub-resolv.conf "$GW/etc/resolv.conf"
+
+    g_out=$(BXROOT_RUN_ROOTFS="$GW" "$BX" --rootfs "$GW" --no-check -- \
+        /root/resinit 2>&1 | grep -E 'ns0=|nscount=')
+    case "$g_out" in
+    *"ns0=198.18.0.246"*)
+        good "绝对符号链接 resolv.conf 被 resolver 读到（$(echo "$g_out"|tr '\n' ' ')）" ;;
+    *"ns0=127.0.0.1"*)
+        bad "res_init 退化成 127.0.0.1（BUG-D1 回归：绝对符号链接未重定向）" ;;
+    *)
+        bad "res_init 探针输出异常：[$(echo "$g_out"|tr '\n' ' ')]" ;;
+    esac
+
+    # 判别力：BXROOT_NO_ABSSYM=1 精准关掉"绝对符号链接展开"这条腿，应回退。
+    g2_out=$(BXROOT_NO_ABSSYM=1 BXROOT_RUN_ROOTFS="$GW" "$BX" --rootfs "$GW" \
+        --no-check -- /root/resinit 2>&1 | grep -E 'ns0=')
+    case "$g2_out" in
+    *"ns0=198.18.0.246"*) echo "  ⚠️  关 abs-symlink 后仍读到（该布局或不依赖此腿）" ;;
+    *) good "关闭 abs-symlink 展开后 res_init 拿不到 guest ns（判别力成立）" ;;
+    esac
+else
+    echo "  ⏭️  跳过 G（probe_resinit 无法编译，可能缺 libresolv-dev）"
+fi
+rm -rf "$GW"
+
 echo
 if [ "$FAIL" -gt 0 ]; then echo "RESULT: FAIL（$FAIL 项）"; exit 1; fi
 echo "RESULT: PASS"

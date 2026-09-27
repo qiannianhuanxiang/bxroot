@@ -1080,6 +1080,34 @@ int bxroot_translate_path(const char *path, char *out, size_t out_size) {
     return translate_path(path, out, out_size);
 }
 
+/*
+ * ★ path-relay 的绝对符号链接重试腿（BUG-D1 修复，2026-09-28）★
+ *
+ * 【问题】glibc resolver（res_ninit）用**库内内联 svc openat** 读
+ * /etc/resolv.conf。这条路走 livepatch 的 path-relay，而 relay 此前只做
+ * translate_path（纯前缀拼接），**缺**了 exported open 钩子里的
+ * resolve_abs_symlink 重试腿。当 /etc/resolv.conf 是**指向绝对路径**的
+ * 符号链接（systemd-resolved 默认布局 → /run/systemd/resolve/stub-resolv.conf）
+ * 时，内核读到 link 的绝对目标后从**外层内核根**解析 → guest rootfs 里的
+ * /run/... 不在那儿 → ENOENT → res_init 退化成 nscount=1/127.0.0.1 →
+ * 容器内**全部** DNS 解析静默失败。而 cat/exported open 有重试腿，看起来
+ * 正常，排障极其误导。
+ *
+ * 【修法】把 preload.c 里 static 的 resolve_abs_symlink 经这个导出桥暴露
+ * 给 livepatch。relay dispatch 在 openat 返回 -ENOENT 时调它，把绝对目标
+ * 重定向进 rootfs 后重发一次 svc —— 与 exported openat_retry_abs_symlink
+ * 完全同构。返回 1=out 已改写（可重试），0=无改写。
+ *
+ * 前置声明 resolve_abs_symlink（定义在下方），此桥薄封装转发。
+ */
+static int resolve_abs_symlink(const char *translated,
+                               char *out, size_t out_size);
+
+int bxroot_resolve_abs_symlink(const char *translated,
+                               char *out, size_t out_size) {
+    return resolve_abs_symlink(translated, out, out_size);
+}
+
 
 /*
  * ==================================================================
