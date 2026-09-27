@@ -144,24 +144,29 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 
 ## 当前状态
 
-**v0.1.2 可用**（已在 Android 真机容器内对照官方 proroot 实测）：
+**v0.1.3 可用**（已在 Android 真机容器内对照官方 proroot 实测，并在 vivo Android 16 / kernel 6.1 / app seccomp 沙箱上用 launcher+LD_PRELOAD 真机验证）：
 
-> v0.1.1 → v0.1.2：**符号链接解析族收敛**。第 13-17 轮迭代验收（每轮由独立
-> 子代理从零构建真实 C 项目做验收）把"绝对目标符号链接"从已知限制修成了
-> 全链路覆盖，最终验收结论 **ZERO ERRORS**。要点：
+> v0.1.2 → v0.1.3：**Android app 沙箱打通 + DNS/网络可用 + 功能扩展**。真机
+> 爆破测试（Termux）驱动的一轮收敛，31 项真机用例全绿：
 >
-> - **裸 syscall 层**（node/libuv 的 `syscall(291)` 等）：前缀翻译 + 中间组件
->   + 末端叶子三层解析补齐，且与 l2s 结果补丁正确排序
->   （[`docs/缺陷-裸syscall-statx末端符号链接逃逸.md`](docs/缺陷-裸syscall-statx末端符号链接逃逸.md)）
-> - **相对路径**：绝对化移出 guest 门（此前相对名整体跳过翻译）
-> - **open64**：dash 重定向（`cmd < link`）不再读外层
-> - **O_NOFOLLOW 双语义**：用户链接 → ELOOP；l2s 伪链接 → 成功
->   （aarch64 的 O_NOFOLLOW 是 `0100000`，不是 asm-generic 的 `00400000`）
-> - **l2s 内部探测改裸 syscall**：readlink/lstat 不再被符号解析层污染
-> - **errno 契约**：open 家族与 `raw_syscall6` 成功路径清 errno
-> - **16KB 页对齐**：五件套 LOAD 段 0x4000（Android 15+ 16KB 内核设备要求）
+> - **DNS/网络解析修复**（path-relay）：glibc resolver 经 `_IO_fopen→__open`
+>   最终**内联 svc openat** 发出未翻译的 guest 路径 `/etc/resolv.conf`，符号钩子
+>   与 syscall 钩子都拦不到。新增 livepatch 第四部分，把 libc 里 openat 的内联
+>   svc 改写成 `bl` 到翻译桩（重入守卫 + fail-open + 独立开关 `BXROOT_NO_PATHRELAY`）。
+>   `getaddrinfo`/`gethostbyname`/`getent -s dns` 现全部可用，`apt`/`pip` 联网通。
+> - **Android app 沙箱启动链**：用户态 exec 加载器 `ulx` + 早期 SIGSYS 处理器，
+>   在 app seccomp（TRAP set_robust_list/rseq）下打通 launcher+LD_PRELOAD 启动。
+> - **livepatch 运行期指令扫描**：中和 set_robust_list(99)/rseq(293)，覆盖任意
+>   glibc 版本（不再依赖版本表），含静态链接 guest 主映像扫描 + 对抗性审计。
+> - **/dev/shm POSIX 共享内存**：shm_open/sem_open/named-sem，Python `multiprocessing` 可用。
+> - **fakeroot 收敛**：chown 按 inode 记账（stat 家族读得回属主，BXR-FR-1）；
+>   降权族语义对齐官方基线（BXR-FR-2，146 组 setter 序列，51→0 mismatch）。
+> - **沙箱逃逸修复**：相对 `..` 与 `*at` dirfd 相对 `..`（BXR-ESC-4）逐组件夹紧。
+> - **新特性**：任意 `-i <uid>:<gid>` 身份映射；只读 bind `-b host:guest:ro`（写入 EROFS）。
+> - **statx 修复**：`AT_EMPTY_PATH` 空路径不再被误导到 CWD。
 > - 已作为**第三运行时接入 [DSHA](https://github.com/DSH-APP/DSHA)**
 >   （契约见 [`docs/DSHA-适配说明.md`](docs/DSHA-适配说明.md)）
+> - 竞品对标见 [`docs/竞品对标分析.md`](docs/竞品对标分析.md)。
 
 | 能力 | 状态 |
 |---|---|
