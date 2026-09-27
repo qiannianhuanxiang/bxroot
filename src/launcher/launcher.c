@@ -157,6 +157,7 @@ typedef struct {
     char **guest_argv;
     int guest_argc;
     char *binds[2 * MAX_BINDS]; /* [src, dst, src, dst, ...] */
+    int bind_readonly[MAX_BINDS]; /* 平行数组：该 bind 是否只读（-b h:g:ro） */
     int bind_count;
     int fakeroot;
     int verbose;
@@ -240,6 +241,8 @@ static void free_config(launcher_config_t *cfg) {
 /* 前向声明：辅助函数定义在 parse_args 之后（那里的注释更连贯，
  * 且它们依赖 PATH_MAX 等已就位的头文件）。 */
 static int add_bind(launcher_config_t *cfg, const char *host, const char *guest);
+static int add_bind_ro(launcher_config_t *cfg, const char *host,
+                       const char *guest, int readonly);
 static int expand_bind_list(launcher_config_t *cfg,
                             const char *const *list,
                             const char *rootfs,
@@ -446,7 +449,23 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                 }
             } else {
                 *colon = '\0';
-                if (add_bind(cfg, spec, colon + 1) != 0) {
+                /*
+                 * 只读 bind：第三段显式 `:ro` 表示该挂载点在 guest 内
+                 * 只读（写返回 EROFS）。语法 `-b host:guest:ro`。
+                 * 只有字面量 "ro" 才置只读；无第三段或其它值 = 可写
+                 * （向后兼容旧的两段格式）。
+                 *
+                 * ★ 只切第三段的冒号，不影响 guest 路径 ★ 在 guest
+                 * 部分再找一个冒号；找到且尾段为 "ro" 才截断并置标志。
+                 */
+                int ro = 0;
+                char *guest = colon + 1;
+                char *colon2 = strchr(guest, ':');
+                if (colon2 != NULL && strcmp(colon2 + 1, "ro") == 0) {
+                    *colon2 = '\0';
+                    ro = 1;
+                }
+                if (add_bind_ro(cfg, spec, guest, ro) != 0) {
                     fprintf(stderr, "错误: bind 数量已达上限 %d\n", MAX_BINDS);
                     free(spec);
                     return -1;
@@ -782,6 +801,16 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
  */
 static int add_bind(launcher_config_t *cfg, const char *host, const char *guest)
 {
+    return add_bind_ro(cfg, host, guest, 0);
+}
+
+/*
+ * add_bind 的带只读标志版本。readonly!=0 时该 bind 的 guest 挂载点在
+ * 容器内只读（编码进 BXROOT_BINDS 的第三段 `:ro`，runtime 强制 EROFS）。
+ */
+static int add_bind_ro(launcher_config_t *cfg, const char *host,
+                       const char *guest, int readonly)
+{
     if (cfg->bind_count >= MAX_BINDS) {
         return -1;
     }
@@ -791,6 +820,7 @@ static int add_bind(launcher_config_t *cfg, const char *host, const char *guest)
         cfg->binds[cfg->bind_count * 2 + 1] == NULL) {
         return -1;
     }
+    cfg->bind_readonly[cfg->bind_count] = readonly ? 1 : 0;
     cfg->bind_count++;
     return 0;
 }
@@ -1728,6 +1758,8 @@ int main(int argc, char **argv) {
             if (a == NULL || b == NULL)
                 continue;
             need += strlen(a) + 1 + strlen(b);   /* +1 是中间的 ':' */
+            if (cfg.bind_readonly[i])
+                need += 3;                        /* ":ro" */
             if (i > 0)
                 need += 1;                        /* 分隔符 ';' */
             if (need > (size_t)1 << 20) {         /* 1 MiB 上限，防御性 */
@@ -1756,6 +1788,8 @@ int main(int argc, char **argv) {
                 w = stpcpy(w, a);
                 *w++ = ':';
                 w = stpcpy(w, b);
+                if (cfg.bind_readonly[i])
+                    w = stpcpy(w, ":ro");
             }
             *w = '\0';
         }

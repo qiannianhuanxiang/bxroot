@@ -293,14 +293,28 @@ static void parse_binds(void) {
     const char *env = getenv("BXROOT_BINDS");
     if (!env || !env[0]) return;
 
-    /* 格式: src1:dst1;src2:dst2;... */
+    /*
+     * 格式: src1:dst1[:ro];src2:dst2[:ro];...
+     *
+     * 第三段是可选的**只读标志**：显式的 `:ro` 表示该 bind 挂载点在
+     * guest 内只读（任何写意图返回 EROFS）。无第三段 = 可写（旧格式，
+     * 向后兼容）。只有字面量 "ro" 才置只读；其它第三段值一律忽略并
+     * 视为可写（宽松，避免因未来扩展而误锁）。
+     *
+     * ★ 为什么只切前两个冒号 ★ source/target 里理论上不含冒号
+     * （Unix 路径合法但极罕见），本项目历史格式也从未支持路径含冒号，
+     * 所以按前两个冒号切分：第一个分 src|rest，在 rest 里再找一个冒号
+     * 分 dst|flag。
+     */
     char *copy = strdup(env);
     if (!copy) return;
 
     g_config.bind_count = 0;
     g_config.bind_sources = calloc(MAX_BINDS, sizeof(char *));
     g_config.bind_targets = calloc(MAX_BINDS, sizeof(char *));
-    if (!g_config.bind_sources || !g_config.bind_targets) {
+    g_config.bind_readonly = calloc(MAX_BINDS, sizeof(int));
+    if (!g_config.bind_sources || !g_config.bind_targets ||
+        !g_config.bind_readonly) {
         free(copy);
         return;
     }
@@ -312,16 +326,27 @@ static void parse_binds(void) {
         if (colon) {
             *colon = '\0';
 
+            char *rest = colon + 1;
+            int ro = 0;
+            /* 第三段（只读标志）：在 target 部分再找一个冒号 */
+            char *colon2 = strchr(rest, ':');
+            if (colon2) {
+                *colon2 = '\0';
+                if (strcmp(colon2 + 1, "ro") == 0)
+                    ro = 1;
+                /* 其它第三段值（含空串）→ 忽略，按可写处理 */
+            }
+
             /* 空 source 或空 target 是无效条目：留着会让匹配逻辑把
              * 空前缀当成"匹配一切"，把整棵树都翻译错。 */
-            if (entry[0] == '\0' || colon[1] == '\0') {
+            if (entry[0] == '\0' || rest[0] == '\0') {
                 LOG("bind: 跳过空条目");
                 entry = strtok_r(NULL, ";", &saveptr);
                 continue;
             }
 
             char *src = strdup(entry);
-            char *tgt = strdup(colon + 1);
+            char *tgt = strdup(rest);
             if (src == NULL || tgt == NULL) {
                 free(src); free(tgt);
                 entry = strtok_r(NULL, ";", &saveptr);
@@ -332,8 +357,9 @@ static void parse_binds(void) {
 
             g_config.bind_sources[g_config.bind_count] = src;
             g_config.bind_targets[g_config.bind_count] = tgt;
+            g_config.bind_readonly[g_config.bind_count] = ro;
             g_config.bind_count++;
-            LOG("bind: %s -> %s", src, tgt);
+            LOG("bind: %s -> %s%s", src, tgt, ro ? " (ro)" : "");
         }
         entry = strtok_r(NULL, ";", &saveptr);
     }
@@ -1052,6 +1078,133 @@ int bxroot_translate_path(const char *path, char *out, size_t out_size) {
     return translate_path(path, out, out_size);
 }
 
+
+/*
+ * ==================================================================
+ * 只读 bind（`-b host:guest:ro`）强制层
+ * ==================================================================
+ *
+ * 语义：某条 bind 标了 :ro（g_config.bind_readonly[i]==1）时，其
+ * **guest 挂载点**及所有子路径在容器内只读 —— 任何写意图返回 EROFS，
+ * 读操作正常放行。
+ *
+ * 判定必须用**与 translate_path 一致的最长匹配**：一个 guest 路径可能
+ * 同时落在多条 bind 的 target 前缀下（如 `-b A:/mnt` 与
+ * `-b B:/mnt/sub:ro`），命中哪条由"最具体（最长）target"决定，
+ * 只读性也随之取自那一条 —— 否则会出现"父可写子只读却被父盖过"的错判。
+ *
+ * 入参是 **guest 视角**的路径（钩子拿到的原始 path，或按 dirfd/cwd
+ * 绝对化后的 guest 绝对路径），不是已翻译的宿主路径。集中在这一处
+ * 判定，所有写钩子只调它。
+ */
+static int bind_match_index(const char *guest_path) {
+    if (guest_path == NULL || guest_path[0] != '/')
+        return -1;
+    if (g_config.bind_count <= 0)
+        return -1;
+
+    int best = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < g_config.bind_count; i++) {
+        const char *target = g_config.bind_targets ?
+                             g_config.bind_targets[i] : NULL;
+        if (!target) continue;
+        size_t tl = strlen(target);
+        if (tl == 0) continue;
+        /* 精确匹配 target 本身，或以 target + '/' 作为子路径（组件边界） */
+        if (strncmp(guest_path, target, tl) == 0 &&
+            (guest_path[tl] == '\0' || guest_path[tl] == '/')) {
+            if (best < 0 || tl > best_len) {
+                best = i;
+                best_len = tl;
+            }
+        }
+    }
+    return best;
+}
+
+/*
+ * guest 路径是否落在某条**只读** bind 内。
+ *
+ * 命中只读 bind → 1；命中非只读 bind、未命中任何 bind、或入参非法 → 0。
+ * 相对路径先按 cwd 绝对化后再判（与各写钩子的翻译前处理保持一致）。
+ */
+static int bind_is_readonly_target(const char *guest_path) {
+    if (guest_path == NULL)
+        return 0;
+
+    char absbuf[MAX_PATH_LEN];
+    const char *g = guest_path;
+    if (g[0] != '/') {
+        if (bxroot_absolutize(g, absbuf, sizeof(absbuf)) > 0)
+            g = absbuf;
+        else
+            return 0;   /* 无法绝对化：保守放行（不误锁） */
+    }
+
+    int idx = bind_match_index(g);
+    if (idx < 0)
+        return 0;
+    return g_config.bind_readonly ? g_config.bind_readonly[idx] : 0;
+}
+
+/*
+ * 只读 bind 写意图守卫（*at 版）：把 (dirfd, path) 解析成 guest 绝对
+ * 路径后判定。命中只读 bind → 置 errno=EROFS 返回 1（调用方应立即
+ * `return -1`）；否则返回 0（放行）。
+ *
+ * ★ 为什么单独写一个 *at 版 ★ *at 钩子的相对路径要按 dirfd 解析，
+ * 不能只靠 cwd。这里复用 resolve_dirfd_path 拿到 guest 绝对路径
+ * （resolve_dirfd_path 产出的是 guest 视角：它 readlink /proc/self/fd
+ *  再经 getcwd_fixup 修整过 —— 但为稳妥这里对结果只做前缀匹配，
+ *  匹配的是 guest target，天然是 guest 视角）。
+ */
+static int ro_guard_path(const char *guest_path) {
+    if (bind_is_readonly_target(guest_path)) {
+        errno = EROFS;
+        return 1;
+    }
+    return 0;
+}
+
+static int ro_guard_at(int dirfd, const char *path) {
+    if (path == NULL)
+        return 0;
+    char joined[MAX_PATH_LEN];
+    const char *g = path;
+    if (path[0] != '/') {
+        if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1)
+            g = joined;
+        /* 否则 g 仍是相对名，bind_is_readonly_target 会用 cwd 绝对化 */
+    }
+    return ro_guard_path(g);
+}
+
+/*
+ * open(2) 族的写意图判定。
+ *
+ * O_WRONLY / O_RDWR 显然是写；O_CREAT / O_TRUNC 即便与 O_RDONLY 组合
+ * 也会改变文件系统（创建 / 截断），同样算写意图。O_RDONLY 单独打开
+ * 只读 bind 内文件必须放行。
+ */
+static int open_flags_write_intent(int flags) {
+    if ((flags & O_ACCMODE) == O_WRONLY || (flags & O_ACCMODE) == O_RDWR)
+        return 1;
+    if (flags & (O_CREAT | O_TRUNC))
+        return 1;
+    return 0;
+}
+
+/* fopen/freopen 的 mode 串写意图判定：含 w/a/+ 即为写。 */
+static int fopen_mode_write_intent(const char *mode) {
+    if (mode == NULL)
+        return 0;
+    for (const char *m = mode; *m; m++) {
+        if (*m == 'w' || *m == 'a' || *m == '+')
+            return 1;
+    }
+    return 0;
+}
 
 /*
  * 日志桥。
@@ -2910,6 +3063,10 @@ int open(const char *path, int flags, ...) {
         va_end(args);
     }
 
+    /* 只读 bind：写意图打开 → EROFS（读打开正常放行） */
+    if (open_flags_write_intent(flags) && ro_guard_path(path))
+        return -1;
+
     char translated[MAX_PATH_LEN];
     char resolved[MAX_PATH_LEN];
     char absbuf[MAX_PATH_LEN];      /* 函数作用域：q 会指向它 */
@@ -3028,6 +3185,10 @@ int open64(const char *path, int flags, ...) {
         mode = va_arg(args, mode_t);
         va_end(args);
     }
+
+    /* 只读 bind：写意图打开 → EROFS */
+    if (open_flags_write_intent(flags) && ro_guard_path(path))
+        return -1;
 
     char translated[MAX_PATH_LEN];
         char resolved[MAX_PATH_LEN];
@@ -3241,6 +3402,10 @@ int openat(int dirfd, const char *path, int flags, ...) {
         va_end(args);
     }
 
+    /* 只读 bind：写意图打开 → EROFS（按 dirfd 解析后判定） */
+    if (open_flags_write_intent(flags) && ro_guard_at(dirfd, path))
+        return -1;
+
     char translated[MAX_PATH_LEN];
     char joined[MAX_PATH_LEN];
     char resolved[MAX_PATH_LEN];
@@ -3322,6 +3487,10 @@ int openat64(int dirfd, const char *path, int flags, ...) {
         mode = va_arg(args, mode_t);
         va_end(args);
     }
+
+    /* 只读 bind：写意图打开 → EROFS */
+    if (open_flags_write_intent(flags) && ro_guard_at(dirfd, path))
+        return -1;
 
     char translated[MAX_PATH_LEN];
     char joined[MAX_PATH_LEN];
@@ -4091,6 +4260,8 @@ int chown(const char *path, uid_t uid, gid_t gid) {
     char translated[MAX_PATH_LEN];
     const char *p = path;
 
+    if (ro_guard_path(path)) return -1;
+
     if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fr_do_chown(p, uid, gid, 0);
@@ -4099,6 +4270,8 @@ int chown(const char *path, uid_t uid, gid_t gid) {
 int lchown(const char *path, uid_t uid, gid_t gid) {
     char translated[MAX_PATH_LEN];
     const char *p = path;
+
+    if (ro_guard_path(path)) return -1;
 
     if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
@@ -4560,6 +4733,9 @@ int link(const char *oldpath, const char *newpath) {
     const char *po = oldpath, *pn = newpath;
     int rc;
 
+    /* 只读 bind：新建链接是写意图，判 newpath 落点 */
+    if (ro_guard_path(newpath)) return -1;
+
     if (translate_path(oldpath, told, sizeof(told)) > 0) po = told;
     if (translate_path(newpath, tnew, sizeof(tnew)) > 0) pn = tnew;
 
@@ -4607,6 +4783,9 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
     const char *po = oldpath, *pn = newpath;
     int rc;
 
+    /* 只读 bind：新建链接写意图，判 newpath 落点（按 newdirfd 解析） */
+    if (ro_guard_at(newdirfd, newpath)) return -1;
+
     /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），否则相对名
      * `../x` 会被内核按 dirfd 解析出 rootfs 之外（实测新路径侧可逃逸）。
      * AT_SYMLINK_FOLLOW 等标志不影响路径归属。 */
@@ -4651,6 +4830,8 @@ int unlink(const char *path) {
     char translated[MAX_PATH_LEN];
     const char *p = path;
     int rc;
+
+    if (ro_guard_path(path)) return -1;
 
     if (translate_path(path, translated, sizeof(translated)) > 0) p = translated;
 
@@ -4762,6 +4943,9 @@ int __open_2(const char *path, int flags) {
         fn = (int (*)(const char *, int))bxroot_next_symbol("__open_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (open_flags_write_intent(flags) && ro_guard_path(path))
+        return -1;
+
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
     /*
@@ -4811,6 +4995,9 @@ int __open64_2(const char *path, int flags) {
         fn = (int (*)(const char *, int))bxroot_next_symbol("__open64_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (open_flags_write_intent(flags) && ro_guard_path(path))
+        return -1;
+
     if (translate_path(path, translated, sizeof(translated)) > 0)
         p = translated;
     /* 与 __open_2 同理：fortify 变体绕过 open64，也要解链 */
@@ -4828,6 +5015,9 @@ int __openat_2(int dirfd, const char *path, int flags) {
     if (fn == NULL)
         fn = (int (*)(int, const char *, int))bxroot_next_symbol("__openat_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (open_flags_write_intent(flags) && ro_guard_at(dirfd, path))
+        return -1;
 
     /* 与 __open_2 同理：fortify 变体绕过 openat，必须自己解链。
      * 且相对名要先按 dirfd 拼成绝对路径，否则 O_NOFOLLOW 撞上
@@ -4848,6 +5038,9 @@ int __openat64_2(int dirfd, const char *path, int flags) {
     if (fn == NULL)
         fn = (int (*)(int, const char *, int))bxroot_next_symbol("__openat64_2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (open_flags_write_intent(flags) && ro_guard_at(dirfd, path))
+        return -1;
 
     /* 与 __openat_2 同理：dirfd 拼绝对路径 + l2s 解链 */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
@@ -5876,6 +6069,8 @@ int unlinkat(int dirfd, const char *path, int flags) {
         fn = (int (*)(int, const char *, int))bxroot_next_symbol("unlinkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (ro_guard_at(dirfd, path)) return -1;
+
     /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），理由见 faccessat */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
@@ -5904,6 +6099,8 @@ int mkdir(const char *path, mode_t mode) {
         fn = (int (*)(const char *, mode_t))bxroot_next_symbol("mkdir");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (ro_guard_path(path)) return -1;
+
     if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fn(p, mode);
@@ -5918,6 +6115,8 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
     if (fn == NULL)
         fn = (int (*)(int, const char *, mode_t))bxroot_next_symbol("mkdirat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_at(dirfd, path)) return -1;
 
     /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），理由见 faccessat */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
@@ -5936,6 +6135,8 @@ int rmdir(const char *path) {
         fn = (int (*)(const char *))bxroot_next_symbol("rmdir");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (ro_guard_path(path)) return -1;
+
     if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
     return fn(p);
@@ -5949,6 +6150,9 @@ int symlink(const char *target, const char *linkpath) {
     if (fn == NULL)
         fn = (int (*)(const char *, const char *))bxroot_next_symbol("symlink");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    /* 只读 bind：创建符号链接是写意图（判 linkpath 落点） */
+    if (ro_guard_path(linkpath)) return -1;
 
     /*
      * 两个参数都要翻译 —— 这是最容易漏的：target 是**链接内容**，
@@ -5971,6 +6175,9 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath) {
     if (fn == NULL)
         fn = (int (*)(const char *, int, const char *))bxroot_next_symbol("symlinkat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    /* 只读 bind：linkpath 落点判定 */
+    if (ro_guard_at(newdirfd, linkpath)) return -1;
 
     /* ★ BXR-ESC-4：linkpath 是被创建的路径，先按 dirfd 拼绝对再翻译
      * （`..` 夹紧），否则 newdirfd 指向 rootfs 根时 `../x` 建到 rootfs 外。
@@ -6195,6 +6402,10 @@ int rename(const char *oldpath, const char *newpath) {
         fn = (int (*)(const char *, const char *))bxroot_next_symbol("rename");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    /* 只读 bind：rename 同时改动源目录（删项）与目标目录（增项），
+     * 任一端落在只读 bind 内即 EROFS。 */
+    if (ro_guard_path(oldpath) || ro_guard_path(newpath)) return -1;
+
     if (translate_path(oldpath, to, sizeof(to)) > 0) po = to;
     if (translate_path(newpath, tn, sizeof(tn)) > 0) pn = tn;
 
@@ -6230,6 +6441,9 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
         fn = (int (*)(int, const char *, int, const char *))
              bxroot_next_symbol("renameat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_at(olddirfd, oldpath) || ro_guard_at(newdirfd, newpath))
+        return -1;
 
     if (translate_path(oldpath, to, sizeof(to)) > 0) po = to;
     if (translate_path(newpath, tn, sizeof(tn)) > 0) pn = tn;
@@ -6267,6 +6481,8 @@ int chmod(const char *path, mode_t mode) {
     if (fn == NULL)
         fn = (int (*)(const char *, mode_t))bxroot_next_symbol("chmod");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
 
     if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
@@ -6310,6 +6526,8 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
         rc = fn(dirfd, NULL, mode, flags);
         return rc;
     }
+
+    if (ro_guard_at(dirfd, path)) return -1;
 
     /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），理由见 faccessat */
     {
@@ -6553,6 +6771,9 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
              bxroot_next_symbol("utimensat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    /* 只读 bind：改时间戳是写意图（path==NULL 时是对 dirfd 本身操作，不判） */
+    if (path != NULL && ro_guard_at(dirfd, path)) return -1;
+
     /*
      * ★ dirfd + 相对路径的解析（2026-09-17 补，由 dpkg -i 暴露）★
      *
@@ -6627,6 +6848,8 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
         fn = (int (*)(int, const char *, uid_t, gid_t, int))
              bxroot_next_symbol("fchownat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (path != NULL && ro_guard_at(dirfd, path)) return -1;
 
     /* BXR-ESC-3：跟随型（flags 无 NOFOLLOW）要按 guest 视角解析链接；
      * 相对路径 + dirfd 先拼成绝对再翻译（与 openat 同策略）。 */
@@ -6843,6 +7066,8 @@ int truncate(const char *path, off_t length) {
         fn = (int (*)(const char *, off_t))bxroot_next_symbol("truncate");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (ro_guard_path(path)) return -1;
+
     if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, length);
@@ -6856,6 +7081,8 @@ int creat(const char *path, mode_t mode) {
     if (fn == NULL)
         fn = (int (*)(const char *, mode_t))bxroot_next_symbol("creat");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
 
     if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
@@ -6879,6 +7106,9 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
         fn = (int (*)(int, const char *, int, const char *, unsigned int))
              bxroot_next_symbol("renameat2");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_at(olddirfd, oldpath) || ro_guard_at(newdirfd, newpath))
+        return -1;
 
     if (translate_path(oldpath, to, sizeof(to)) > 0) po = to;
     if (translate_path(newpath, tn, sizeof(tn)) > 0) pn = tn;
@@ -7899,6 +8129,9 @@ int __open_nocancel(const char *path, int flags, mode_t mode) {
         fn = (int (*)(const char *, int, mode_t))bxroot_next_symbol("__open_nocancel");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (open_flags_write_intent(flags) && ro_guard_path(path))
+        return -1;
+
     if (translate_follow(path, translated, sizeof(translated),
                          (flags & (O_NOFOLLOW | O_CREAT)) != 0) > 0)
         p = translated;
@@ -7913,6 +8146,9 @@ int __open64_nocancel(const char *path, int flags, mode_t mode) {
     if (fn == NULL)
         fn = (int (*)(const char *, int, mode_t))bxroot_next_symbol("__open64_nocancel");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (open_flags_write_intent(flags) && ro_guard_path(path))
+        return -1;
 
     if (translate_follow(path, translated, sizeof(translated),
                          (flags & (O_NOFOLLOW | O_CREAT)) != 0) > 0)
@@ -8177,6 +8413,8 @@ int setxattr(const char *path, const char *name, const void *value,
              bxroot_next_symbol("setxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (ro_guard_path(path)) return -1;
+
     if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, name, value, size, flags);
@@ -8192,6 +8430,8 @@ int lsetxattr(const char *path, const char *name, const void *value,
         fn = (int (*)(const char *, const char *, const void *, size_t, int))
              bxroot_next_symbol("lsetxattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
 
     if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
@@ -8237,6 +8477,8 @@ int removexattr(const char *path, const char *name) {
         fn = (int (*)(const char *, const char *))bxroot_next_symbol("removexattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    if (ro_guard_path(path)) return -1;
+
     if (translate_follow(path, translated, sizeof(translated), 0) > 0)
         p = translated;
     return fn(p, name);
@@ -8250,6 +8492,8 @@ int lremovexattr(const char *path, const char *name) {
     if (fn == NULL)
         fn = (int (*)(const char *, const char *))bxroot_next_symbol("lremovexattr");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+
+    if (ro_guard_path(path)) return -1;
 
     if (translate_follow(path, translated, sizeof(translated), 1) > 0)
         p = translated;
@@ -10845,6 +11089,12 @@ DIR *opendir(const char *path) {
 FILE *fopen(const char *path, const char *mode) {
     ensure_real_functions();
 
+    /* 只读 bind：写模式（w/a/+）打开 → EROFS */
+    if (fopen_mode_write_intent(mode) && bind_is_readonly_target(path)) {
+        errno = EROFS;
+        return NULL;
+    }
+
     char translated[MAX_PATH_LEN];
     if (translate_follow(path, translated, sizeof(translated), 0) > 0) {
         LOG("fopen: %s -> %s", path, translated);
@@ -10856,6 +11106,11 @@ FILE *fopen(const char *path, const char *mode) {
 /* Hook: fopen64 */
 FILE *fopen64(const char *path, const char *mode) {
     ensure_real_functions();
+
+    if (fopen_mode_write_intent(mode) && bind_is_readonly_target(path)) {
+        errno = EROFS;
+        return NULL;
+    }
 
     char translated[MAX_PATH_LEN];
     if (translate_follow(path, translated, sizeof(translated), 0) > 0) {
@@ -10906,6 +11161,13 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
              bxroot_next_symbol("freopen");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
 
+    /* 只读 bind：写模式 freopen 到只读 bind → EROFS */
+    if (path != NULL && fopen_mode_write_intent(mode) &&
+        bind_is_readonly_target(path)) {
+        errno = EROFS;
+        return NULL;
+    }
+
     /* path == NULL 时 freopen 用于"改 mode"，没有路径可翻译 */
     if (path != NULL) {
         char translated[MAX_PATH_LEN];
@@ -10925,6 +11187,12 @@ FILE *freopen64(const char *path, const char *mode, FILE *stream) {
         fn = (FILE *(*)(const char *, const char *, FILE *))
              bxroot_next_symbol("freopen64");
     if (fn == NULL) { errno = ENOSYS; return NULL; }
+
+    if (path != NULL && fopen_mode_write_intent(mode) &&
+        bind_is_readonly_target(path)) {
+        errno = EROFS;
+        return NULL;
+    }
 
     if (path != NULL) {
         char translated[MAX_PATH_LEN];
