@@ -501,7 +501,7 @@ rc=0
 ```
 $ sh rundsh.sh build/libbxroot-runtime.so web --no-open --port 44992
 node[1]: pthread_create: Invalid argument
-dsh web: http://127.0.0.1:44992/?token=IA2oxQlToY0gVdgCMEwhfoxGZwTbFU_ISE73sEtM4Vg
+dsh web: http://127.0.0.1:44992/?token=<redacted>
 
 --- curl 根路径 HTTP 状态 ---
 http_code=303 size=0

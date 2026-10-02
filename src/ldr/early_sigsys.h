@@ -40,7 +40,11 @@
 static void bx_early_sigsys(int s, void *si, void *uc) __attribute__((used));
 static void bx_early_sigsys(int s, void *si, void *uc)
 {
-    (void)s; (void)si;
+    (void)s;
+    /* 只处理 seccomp 产生的 SIGSYS（si_code==SYS_SECCOMP=1）：
+     * kill 等用户发来的 SIGSYS 不得改写被中断点的 x0（审计 F-ESS-1） */
+    if (si == (void *)0 || ((int *)si)[2] != 1)
+        return;
     ((unsigned long *)((char *)uc + 184))[0] = (unsigned long)-38; /* -ENOSYS */
 }
 __asm__(

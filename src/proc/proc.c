@@ -3502,7 +3502,8 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * `sh <name> -c ...`）。所以从 1 开始。
      */
     if (argv != NULL) {
-        for (i = 1; argv[i] != NULL; i++) {
+        /* argv[0]==NULL（空 argv）时 argv[1] 已越过终止符，不得读取 */
+        for (i = 1; argv[0] != NULL && argv[i] != NULL; i++) {
             nv[n++] = argv[i];
         }
     }
@@ -3648,7 +3649,7 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
     sp->nv[n++] = sp->path;
     sp->nv[n++] = (char *)(uintptr_t)host;
     if (argv != NULL)
-        for (i = 1; argv[i] != NULL; i++)
+        for (i = 1; argv[0] != NULL && argv[i] != NULL; i++)   /* 空 argv 不越界 */
             sp->nv[n++] = argv[i];
     sp->nv[n] = NULL;
 
@@ -3860,7 +3861,7 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
     if (host != NULL && host[0] != '\0') {
         nv[n++] = (char *)(uintptr_t)host;
     }
-    for (i = 1; argv[i] != NULL; i++) {
+    for (i = 1; argv != NULL && argv[0] != NULL && argv[i] != NULL; i++) {   /* 空 argv 不越界 */
         nv[n++] = argv[i];
     }
     nv[n] = NULL;
@@ -4117,7 +4118,7 @@ static int px_rewrite_shebang(const char *host, const char *guest,
         return -1;
     }
     out_argv[n++] = out_script;         /* 脚本路径（独立副本） */
-    for (i = 1; argv != NULL && argv[i] != NULL; i++) {
+    for (i = 1; argv != NULL && argv[0] != NULL && argv[i] != NULL; i++) {   /* 空 argv 不越界 */
         if (n + 1 >= out_argv_cap) {
             return -1;                  /* 参数过多 */
         }

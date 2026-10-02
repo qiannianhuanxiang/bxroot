@@ -127,6 +127,31 @@ int main(void) {
     check_inplace("cap 充足走 bind 反查", "/data/rootfs-test/h/xyz",
                   "/sdcard-very-long-target-name/xyz", SIZE_MAX, RF);
 
+    printf("=== D. 堆缓冲（realpath(x,NULL)/getcwd(NULL,0)，审计 A3-1）===\n");
+    /*
+     * glibc 按结果长度精确分配。反向 bind 后变长时，旧实现以 SIZE_MAX
+     * 为容量原地 memcpy → 写出堆块。realpath_fixup_heap 必须 realloc。
+     * 用 strdup 模拟精确分配，校验结果内容（配 ASan 时越界会直接报错）。
+     */
+    {
+        static const struct { const char *in, *want, *name; } T[] = {
+            { "/data/rootfs-test/h/xyz", "/sdcard-very-long-target-name/xyz", "堆缓冲 bind 变长 → realloc" },
+            { "/data/rootfs-test/tmp/x.txt", "/tmp/x.txt", "堆缓冲只剥前缀" },
+            { "/data/rootfs-test", "/", "堆缓冲 rootfs 根 → /" },
+        };
+        for (size_t k = 0; k < sizeof(T) / sizeof(T[0]); k++) {
+            char *r = realpath_fixup_heap(strdup(T[k].in));
+            if (r != NULL && strcmp(r, T[k].want) == 0) {
+                g_ok++;
+                printf("  ✅ %s\n", T[k].name);
+            } else {
+                g_fail++;
+                printf("  ❌ %s：got=%s\n", T[k].name, r ? r : "(null)");
+            }
+            free(r);
+        }
+    }
+
     printf("\n=== 结果: %d 通过 / %d 失败 ===\n", g_ok, g_fail);
     return g_fail ? 1 : 0;
 }

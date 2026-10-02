@@ -16,11 +16,12 @@ import sys
 import json
 import urllib.request
 
-# --- LLM 端点（自建中转，OpenAI 兼容）------------------------------------
-# TODO: 上线前把 key 挪到环境变量，别硬编码
-OPENAI_BASE_URL = "https://dry-basically-imaging-packets.trycloudflare.com/v1"
-OPENAI_API_KEY = "sk-proj-Xb7Qw9RtY2mKp4Ld8Vn3FhZ6Js1Ec0Aa5Uf7Gg9Hh2Ii4Jj6Kk8Ll0Mm"
-MODEL = "claude-opus-5.5"   # 中转支持的最新模型，见 /v1/models
+# --- LLM 端点（OpenAI 兼容）----------------------------------------------
+# 端点与 key 一律从环境变量读取，不入库（审计：原先硬编码 key 与临时隧道地址）。
+# 回归日志会发往该端点 —— 只配置你信任的服务。
+OPENAI_BASE_URL = os.environ.get("TRIAGE_LLM_BASE_URL", "")
+OPENAI_API_KEY = os.environ.get("TRIAGE_LLM_API_KEY", "")
+MODEL = os.environ.get("TRIAGE_LLM_MODEL", "")
 
 
 def ask_llm(prompt):
@@ -51,6 +52,11 @@ def main():
     fails = [ln for ln in text.splitlines() if "❌" in ln or "FAIL" in ln]
     if not fails:
         print("没有失败项，跳过归类。")
+        return
+    if not (OPENAI_BASE_URL and OPENAI_API_KEY and MODEL):
+        print("[triage] 未设置 TRIAGE_LLM_BASE_URL / TRIAGE_LLM_API_KEY / "
+              "TRIAGE_LLM_MODEL，跳过 LLM 归类。失败项：")
+        print("\n".join(fails))
         return
     prompt = "把下面这些 bxroot 回归失败按子系统归类，并给出最可能的根因方向：\n\n" + "\n".join(fails)
     try:

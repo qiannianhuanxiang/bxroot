@@ -174,6 +174,71 @@ int bxroot_absolutize(const char *path, char *out, size_t outsz)
     return 1;
 }
 
+/*
+ * (dirfd, 相对路径) → **客户视角**绝对路径（审计 SG-1）。
+ *
+ * 裸 syscall 层原先对一切相对路径按 cwd 绝对化：真 dirfd 时作用到
+ * 错误文件；若直接透传，`openat(fd_of_root, "../x")` 又会被内核从宿主
+ * rootfs 目录往上走出去。正确做法是取 dirfd 的宿主路径
+ * （/proc/self/fd/N），反向翻译成客户视角，再拼上 path —— 之后的
+ * translate_path 会对 `..` 做夹紧。
+ *
+ * 返回 >0 已改写 / 0 不适用（AT_FDCWD、绝对、空串、dirfd 不在 rootfs
+ * 或 bind 视图内）/ <0 失败。
+ */
+static int resolve_dirfd_path(int dirfd, const char *path,
+                              char *out, size_t outsz);
+static int realpath_fixup_inplace(char *buf, size_t cap);
+static ssize_t (*real_readlink)(const char *, char *, size_t);  /* 暂定定义，初始化见下文 */
+int bxroot_absolutize_at(int dirfd, const char *path, char *out, size_t outsz)
+{
+    char host[MAX_PATH_LEN];
+    char dir[MAX_PATH_LEN];
+    char proc[64];
+    ssize_t n;
+    size_t dl, pl;
+    int saved = errno;
+
+    if (path == NULL || out == NULL || outsz == 0)
+        return -1;
+    if (dirfd == AT_FDCWD)
+        return bxroot_absolutize(path, out, outsz);
+    if (path[0] == '/' || path[0] == '\0')
+        return 0;
+
+    snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dirfd);
+    /* 与 resolve_dirfd_path 一致：优先 libc 真身，拿内核给的宿主真值 */
+    n = real_readlink != NULL ? real_readlink(proc, host, sizeof(host) - 1)
+                              : readlink(proc, host, sizeof(host) - 1);
+    if (n <= 0) {
+        errno = saved;
+        return 0;
+    }
+    host[n] = '\0';
+    if (host[0] != '/') {           /* pipe:/socket: 等非路径 fd */
+        errno = saved;
+        return 0;
+    }
+    memcpy(dir, host, (size_t)n + 1);
+    /* 剥 rootfs 前缀 / 反 bind；都不命中说明 dirfd 不在客户视图内 */
+    if (realpath_fixup_inplace(dir, sizeof(dir)) == 0) {
+        errno = saved;
+        return 0;
+    }
+    dl = strlen(dir);
+    pl = strlen(path);
+    if (dl + 1 + pl + 1 > outsz) {
+        errno = saved;
+        return -1;
+    }
+    memcpy(out, dir, dl);
+    if (dl == 0 || dir[dl - 1] != '/')
+        out[dl++] = '/';
+    memcpy(out + dl, path, pl + 1);
+    errno = saved;
+    return 1;
+}
+
 static int l2s_real_lstat(const char *p, struct stat *st);
 /* stat 结果补丁重入守卫（定义在 syscall_guard.c）：l2s probe 的裸
  * newfstatat 会进 syscall_guard 的接管层，那里对 79/291 做结果补丁；
@@ -2460,6 +2525,27 @@ static int openat_retry_abs_symlink(int dirfd, const char *q, int flags,
  *           失败返回，**不得**再对原路径重试 —— 重试会把 ELOOP 改写成
  *           ENOENT（内核解析那条容器视角的绝对目标时找不到）。
  */
+/*
+ * 链接环（返回 -2）时也必须给 out 写一个确定的值。
+ *
+ * 历史上 -2 分支不写 out，而十余处调用方用 `if (rr)` 判成功，于是把
+ * 未初始化的栈缓冲当路径交给内核（审计 A2-1）。这里把 out 置为未解析
+ * 的输入（等价于"没展开"），放不下就置空串（内核给 ENOENT）——无论
+ * 调用方怎么判，都不会再读到垃圾。
+ */
+static void resolve_loop_fill(const char *in, char *out, size_t out_size)
+{
+    size_t n;
+
+    if (out == NULL || out_size == 0)
+        return;
+    n = (in != NULL) ? strlen(in) : 0;
+    if (in != NULL && n < out_size && in != out)
+        memmove(out, in, n + 1);
+    else if (in != out)
+        out[0] = '\0';
+}
+
 static int resolve_symlink_full(const char *translated,
                                 char *out, size_t out_size)
 {
@@ -2558,6 +2644,7 @@ static int resolve_symlink_full(const char *translated,
             int k;
             for (k = 0; k < nseen; k++) {
                 if (strcmp(seen[k], cur) == 0) {
+                    resolve_loop_fill(translated, out, out_size);
                     errno = ELOOP;
                     return -2;
                 }
@@ -2676,6 +2763,7 @@ static int resolve_intermediate_symlinks(const char *translated,
                 for (k = 0; k < nseen; k++)
                     if (strcmp(seen[k], pm) == 0) dup = 1;
                 if (dup) {
+                    resolve_loop_fill(translated, out, out_size);
                     errno = ELOOP;
                     return -2;
                 }
@@ -2800,9 +2888,10 @@ static int resolve_intermediate_symlinks(const char *translated,
                 int k;
                 for (k = 0; k < nseen; k++) {
                     if (strcmp(seen[k], cur) == 0) {
+                        /* 原先这里先置 ELOOP 又被 saved_errno 覆盖（审计 A2-1） */
+                        resolve_loop_fill(translated, out, out_size);
                         errno = ELOOP;
-                        errno = saved_errno;
-                return -2;
+                        return -2;
                     }
                 }
                 if (nseen < 16)
@@ -3041,7 +3130,12 @@ static int stat_pre_resolve(const char *translated, int dirfd, int flags,
     {
         char mid[MAX_PATH_LEN];
         int rr = resolve_intermediate_symlinks(translated, mid, sizeof(mid));
-        if (rr && strlen(mid) < out_size) {
+        if (rr == -2) {             /* 中间组件成环：ELOOP 上抛（审计 A2-5） */
+            resolve_loop_fill(translated, out, out_size);
+            errno = ELOOP;
+            return -2;
+        }
+        if (rr > 0 && strlen(mid) < out_size) {
             memcpy(out, mid, strlen(mid) + 1);
             translated = out;       /* 叶子判定以展开后的路径为准 */
             changed = 1;
@@ -3060,7 +3154,7 @@ static int stat_pre_resolve(const char *translated, int dirfd, int flags,
             char full[MAX_PATH_LEN];
             int rr = resolve_symlink_full(translated, full, sizeof(full));
             if (rr == -2)
-                return -2;
+                { resolve_loop_fill(translated, out, out_size); errno = ELOOP; return -2; }
             if (rr == 1 && strlen(full) < out_size) {
                 memcpy(out, full, strlen(full) + 1);
                 return 1;
@@ -3083,7 +3177,7 @@ static int stat_pre_resolve(const char *translated, int dirfd, int flags,
         char full[MAX_PATH_LEN];
         int rr = resolve_symlink_full(translated, full, sizeof(full));
         if (rr == -2)
-            return -2;
+            { resolve_loop_fill(translated, out, out_size); errno = ELOOP; return -2; }
         if (rr == 1 && strlen(full) < out_size) {
             memcpy(out, full, strlen(full) + 1);
             return 1;
@@ -3204,7 +3298,11 @@ int open(const char *path, int flags, ...) {
          */
         if (!(flags & O_NOFOLLOW)) {
             char mid[MAX_PATH_LEN];
-            if (resolve_intermediate_symlinks(q, mid, sizeof(mid))) {
+            int rir_1 = 0;
+            rir_1 = resolve_intermediate_symlinks(q, mid, sizeof(mid));
+            if (rir_1 == -2)
+                return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+            if (rir_1 > 0) {
                 q = mid;
                 return call_real_open(q, flags, mode);
             }
@@ -3337,7 +3435,11 @@ int open64(const char *path, int flags, ...) {
          */
         if (!(flags & O_NOFOLLOW)) {
             char mid[MAX_PATH_LEN];
-            if (resolve_intermediate_symlinks(q, mid, sizeof(mid))) {
+            int rir_2 = 0;
+            rir_2 = resolve_intermediate_symlinks(q, mid, sizeof(mid));
+            if (rir_2 == -2)
+                return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+            if (rir_2 > 0) {
                 q = mid;
                 return real_open64(q, flags, mode);
             }
@@ -3548,7 +3650,10 @@ int openat(int dirfd, const char *path, int flags, ...) {
     if (!(flags & O_NOFOLLOW)) {
         char mid[MAX_PATH_LEN];
         int rr = resolve_intermediate_symlinks(q, mid, sizeof(mid));
-        if (rr) { if(rr)            q = mid;
+        if (rr == -2)
+            return -1;      /* 链接环：errno 已是 ELOOP（审计 A2-1） */
+        if (rr > 0) {
+            q = mid;
             return call_real_openat(AT_FDCWD, q, flags, mode);
         }
     }
@@ -3607,7 +3712,11 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     /* 与 openat 同款（理由见那里） */
     if (!(flags & O_NOFOLLOW)) {
         char mid[MAX_PATH_LEN];
-        if (resolve_intermediate_symlinks(q, mid, sizeof(mid))) {
+        int rir_3 = 0;
+        rir_3 = resolve_intermediate_symlinks(q, mid, sizeof(mid));
+        if (rir_3 == -2)
+            return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+        if (rir_3 > 0) {
             q = mid;
             return real_openat64(AT_FDCWD, q, flags, mode);
         }
@@ -3833,8 +3942,13 @@ int newfstatat(int dirfd, const char *path, struct stat *buf, int flags) {
      * ★ 先探后改（理由见 stat_pre_resolve）★
      * AT_SYMLINK_NOFOLLOW 时该函数直接返回 0，语义不受影响。
      */
-    if (stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_)))
-        p = rs_;
+    {
+        int rr = stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_));
+        if (rr == -2)
+            return -1;      /* 链接环：errno 已是 ELOOP（审计 A2-5） */
+        if (rr > 0)
+            p = rs_;
+    }
     rc = real_newfstatat(dirfd, p, buf, flags);
     /*
      * ★ 绝对链接重试 —— 但**绝不**在 AT_SYMLINK_NOFOLLOW 下做 ★
@@ -3939,7 +4053,11 @@ int lstat(const char *path, struct stat *buf) {
      */
     {
         char mid[MAX_PATH_LEN];
-        if (resolve_intermediate_symlinks(p, mid, sizeof(mid))) {
+        int rir_4 = 0;
+        rir_4 = resolve_intermediate_symlinks(p, mid, sizeof(mid));
+        if (rir_4 == -2)
+            return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+        if (rir_4 > 0) {
             memcpy(rs_, mid, strlen(mid) + 1);
             p = rs_;
         }
@@ -4027,7 +4145,11 @@ int lstat64(const char *path, struct stat64 *buf) {
     /* 与 lstat 同款：只解析中间组件（理由见那里） */
     {
         char mid[MAX_PATH_LEN];
-        if (resolve_intermediate_symlinks(p, mid, sizeof(mid))) {
+        int rir_5 = 0;
+        rir_5 = resolve_intermediate_symlinks(p, mid, sizeof(mid));
+        if (rir_5 == -2)
+            return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+        if (rir_5 > 0) {
             memcpy(rs_, mid, strlen(mid) + 1);
             p = rs_;
         }
@@ -4086,7 +4208,11 @@ int access(const char *path, int mode) {
      * 下面的 resolve_abs_symlink 兜底只处理**叶子**是链接的情形；
      * 中间组件必须在这里先展开，否则内核按真实根解析 → 跑到外层。
      */
-    if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    int rir_6 = 0;
+    rir_6 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+    if (rir_6 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_6 > 0)
         p = mid_;
 
     rc = real_access(p, mode);
@@ -4652,7 +4778,11 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
      * 而宿主正确返回 `/tmp/acc-d/f`（实测 2026-09-20）。
      * /proc 透传路径同样要过一遍（/proc/self/root/tmp/lnk 的中间组件）。
      */
-    if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    int rir_7 = 0;
+    rir_7 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+    if (rir_7 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_7 > 0)
         p = mid_;
 
     /*
@@ -4689,9 +4819,9 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
  *
  * cap = 缓冲可用字节数：
  *   - 栈缓冲传 sizeof(buf)；
- *   - glibc malloc 返回的堆缓冲没有可查的容量，传 SIZE_MAX 表示
- *     "不会越界"（与 getcwd(NULL, 0) 分支的既有先例一致 —— 剥前缀只缩
- *     不涨，bind 反查的目标名也短于宿主前缀，实际不会写入超过原串长度）。
+ *   - glibc malloc 返回的堆缓冲**不要**走这里，用 realpath_fixup_heap()：
+ *     那是精确分配（容量 = strlen+1），反向 bind 可能变长，曾因传
+ *     SIZE_MAX 而堆溢出。
  */
 static int realpath_fixup_inplace(char *buf, size_t cap)
 {
@@ -4719,6 +4849,39 @@ static int realpath_fixup_inplace(char *buf, size_t cap)
         }
     }
     return changed;
+}
+
+/*
+ * 堆缓冲版本的反向翻译（realpath(x,NULL) / canonicalize_file_name /
+ * __realpath_chk(x,NULL) / getcwd(NULL,0)）。
+ *
+ * ★ 不能假设容量是 SIZE_MAX ★
+ * glibc 按结果长度精确分配（strdup 语义），可用容量只有 strlen+1。
+ * 剥 rootfs 前缀只会变短，但反向 bind 的 target 可能比 source 长
+ * （例：-b /sdcard:/mnt/sdcard），原地 memcpy 会写出堆块。
+ * 这里按需 realloc；realloc 失败则保留已剥前缀的结果（与栈缓冲
+ * 分支"放不下"的处理一致）。返回值可能与入参不同，调用方必须用返回值。
+ */
+static char *realpath_fixup_heap(char *r)
+{
+    char reb[MAX_PATH_LEN];
+
+    if (r == NULL)
+        return NULL;
+    /* 只缩不涨；"正好在 rootfs 根" 写 2 字节，原串长度 >= 1 → 容量 >= 2 */
+    (void)strip_rootfs_prefix_inplace(r);
+    if (detranslate_binds(r, reb, sizeof(reb)) == 1) {
+        size_t need = strlen(reb) + 1;
+
+        if (need > strlen(r) + 1) {
+            char *nr = (char *)realloc(r, need);
+            if (nr == NULL)
+                return r;
+            r = nr;
+        }
+        memcpy(r, reb, need);
+    }
+    return r;
 }
 
 /* Hook: realpath */
@@ -4769,7 +4932,11 @@ char *realpath(const char *path, char *resolved) {
         char mid_[MAX_PATH_LEN];
         char full_[MAX_PATH_LEN];
 
-        if (resolve_intermediate_symlinks(pre, mid_, sizeof(mid_)))
+        int rir_8 = 0;
+        rir_8 = resolve_intermediate_symlinks(pre, mid_, sizeof(mid_));
+        if (rir_8 == -2)
+            return NULL;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+        if (rir_8 > 0)
             pre = mid_;
         {
             int rr;
@@ -4800,16 +4967,17 @@ char *realpath(const char *path, char *resolved) {
      * ★ resolved == NULL 分支也要修整 ★
      *
      * glibc 此时在堆上按需分配返回缓冲（realpath(path, NULL)，
-     * bash/dash 的 abs 目录解析走这条）。那里没有可查的容量，传
-     * SIZE_MAX —— 剥前缀只会变短，原地 memmove 安全
-     * （getcwd(NULL, 0) 分支已有同款处理先例）。
+     * bash/dash 的 abs 目录解析走这条）。容量只有 strlen+1，反向 bind
+     * 可能变长 → 用 realpath_fixup_heap() 按需 realloc。
      *
      * 栈缓冲分支传 PATH_MAX：glibc 的契约是向 resolved 至多写
      * PATH_MAX 字节（调用方因此按 PATH_MAX 备缓冲），cap 取同一值
      * 可保证 bind 反查的 memcpy 绝不越过调用方缓冲的真实边界
      * （sizeof(translated)=8192 会虚高，不能用）。
      */
-    realpath_fixup_inplace(r, resolved == NULL ? SIZE_MAX : (size_t)PATH_MAX);
+    if (resolved == NULL)
+        return realpath_fixup_heap(r);
+    realpath_fixup_inplace(r, (size_t)PATH_MAX);
     return r;
 }
 
@@ -5008,8 +5176,12 @@ static int fortify_open_common(int dirfd, int use64, int use_at,
     int  r_, fd;
 
     /* ① 中间组件（O_NOFOLLOW 时不动） */
-    if (!(flags & O_NOFOLLOW) &&
-        resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    int rir_9 = 0;
+    if (!(flags & O_NOFOLLOW))
+        rir_9 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+    if (rir_9 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_9 > 0)
         p = mid_;
 
     /* ② 失败后重试：只在 ENOENT（不改写其它 errno 语义） */
@@ -5214,7 +5386,11 @@ ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t buflen) {
      *     宿主 : readlink("/tmp/rlx/dirlink/leaf") = /tmp/acc-d/f
      *     bxroot: FAIL errno=2                    ❌
      */
-    if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    int rir_10 = 0;
+    rir_10 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+    if (rir_10 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_10 > 0)
         p = mid_;
 
     {
@@ -5262,7 +5438,11 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
         p = translated;
 
     /* ★ 中间组件解析（叶子不动）——理由见 __readlink_chk */
-    if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    int rir_11 = 0;
+    rir_11 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+    if (rir_11 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_11 > 0)
         p = mid_;
 
     {
@@ -5316,7 +5496,11 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
         char mid_[MAX_PATH_LEN];
         char full_[MAX_PATH_LEN];
 
-        if (resolve_intermediate_symlinks(pre, mid_, sizeof(mid_)))
+        int rir_12 = 0;
+        rir_12 = resolve_intermediate_symlinks(pre, mid_, sizeof(mid_));
+        if (rir_12 == -2)
+            return NULL;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+        if (rir_12 > 0)
             pre = mid_;
         {
             int rr = resolve_symlink_full(pre, full_, sizeof(full_));
@@ -5336,10 +5520,12 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
     if (r == NULL)
         return NULL;   /* 失败路径：不动 */
 
-    /* resolved == NULL 时 glibc malloc 返回堆缓冲 → SIZE_MAX（同 realpath）；
+    /* resolved == NULL 时 glibc malloc 返回堆缓冲 → realpath_fixup_heap；
      * 否则调用方给了 resolvedlen（_FORTIFY_SOURCE 保证 >= PATH_MAX），
      * 直接用真实容量。 */
-    realpath_fixup_inplace(r, resolved == NULL ? SIZE_MAX : resolvedlen);
+    if (resolved == NULL)
+        return realpath_fixup_heap(r);   /* 精确分配的堆缓冲，见 realpath_fixup_heap */
+    realpath_fixup_inplace(r, resolvedlen);
     return r;
 }
 
@@ -5892,12 +6078,15 @@ char *getcwd(char *buf, size_t size) {
         if (r == NULL)
             return NULL;
         /*
-         * size 传 0 时 glibc 按需分配；估算可用容量用已分配长度。
-         * 这里传 SIZE_MAX 语义上表示"缓冲足够大，不会 ENOSPC" ——
-         * 剥前缀只缩不涨，bind 反查的目标名也短于宿主前缀。
+         * size == 0：glibc 按结果长度精确分配，容量不可假设为 SIZE_MAX
+         * （反向 bind 可能变长）→ 走按需 realloc 的堆版本。
+         * size > 0：glibc 分配了 size 字节，按真实容量修整，放不下按
+         * POSIX 报 ERANGE（并释放缓冲，避免泄漏）。
          */
-        if (getcwd_fixup(r, SIZE_MAX) != 0) {
-            /* 理论上到不了；真到了也不能返回错的东西 */
+        if (size == 0)
+            return realpath_fixup_heap(r);
+        if (getcwd_fixup(r, size) != 0) {
+            free(r);
             errno = ERANGE;
             return NULL;
         }
@@ -5943,10 +6132,8 @@ char *canonicalize_file_name(const char *path) {
     if (r == NULL)
         return NULL;   /* 失败路径：不动 */
 
-    /* 无缓冲实参，glibc 必走 malloc 返回 → SIZE_MAX（同 realpath 的
-     * resolved == NULL 分支）。 */
-    realpath_fixup_inplace(r, SIZE_MAX);
-    return r;
+    /* 无缓冲实参，glibc 必走 malloc 返回 → 按需 realloc 的堆版本 */
+    return realpath_fixup_heap(r);
 }
 
 /*
@@ -6030,7 +6217,11 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
      * 实现之一，某些程序直接调它。
      * ★ 缓冲必须在函数作用域（p 会指向它们）—— -Wdangling-pointer ★
      */
-    if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    int rir_13 = 0;
+    rir_13 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+    if (rir_13 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_13 > 0)
         p = mid_;
     if (!(flags & AT_SYMLINK_NOFOLLOW)) {
         int rr = stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_));
@@ -6686,7 +6877,11 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
             dirfd = AT_FDCWD;
     }
     /* 中间组件解析（理由见 access() 处的完整说明） */
-    if (resolve_intermediate_symlinks(p, mid2_, sizeof(mid2_)))
+    int rir_14 = 0;
+    rir_14 = resolve_intermediate_symlinks(p, mid2_, sizeof(mid2_));
+    if (rir_14 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_14 > 0)
         p = mid2_;
 
     rc = fn(dirfd, p, mode, flags);
@@ -6771,7 +6966,11 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
      *     宿主 : readlink("/tmp/rlx/dirlink/leaf") = /tmp/acc-d/f
      *     bxroot: FAIL errno=2                    ❌
      */
-    if (resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    int rir_15 = 0;
+    rir_15 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+    if (rir_15 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_15 > 0)
         p = mid_;
 
     /*
@@ -7074,8 +7273,12 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
      */
     /* ① 中间组件 ② 最后一段（缓冲必须在函数作用域：p 会指向它们）
      * 空路径（AT_EMPTY_PATH，作用于 fd 自身）不做链接解析。 */
-    if (p != NULL && p[0] != '\0' &&
-        resolve_intermediate_symlinks(p, mid_, sizeof(mid_)))
+    int rir_16 = 0;
+    if (p != NULL && p[0] != '\0')
+        rir_16 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+    if (rir_16 == -2)
+        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+    if (rir_16 > 0)
         p = mid_;
     if (p != NULL && p[0] != '\0' && !(flags & AT_SYMLINK_NOFOLLOW)) {
         int rr = stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_));
@@ -11729,6 +11932,15 @@ int setuid(uid_t uid) {
         errno = e;
         return (int)r;
     }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(uid_t);
+        if (fn_ == NULL)
+            fn_ = (int (*)(uid_t))bxroot_next_symbol("setuid");
+        if (fn_ != NULL)
+            return fn_(uid);
+    }
     errno = ENOSYS;
     return -1;
 }
@@ -11738,6 +11950,15 @@ int setgid(gid_t gid) {
     if (bxroot_fakeroot_setter(2, (unsigned long)gid, 0, 0, &r, &e) == 1) {
         errno = e;
         return (int)r;
+    }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(gid_t);
+        if (fn_ == NULL)
+            fn_ = (int (*)(gid_t))bxroot_next_symbol("setgid");
+        if (fn_ != NULL)
+            return fn_(gid);
     }
     errno = ENOSYS;
     return -1;
@@ -11766,6 +11987,15 @@ int seteuid(uid_t euid) {
         errno = e;
         return (int)r;
     }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(uid_t);
+        if (fn_ == NULL)
+            fn_ = (int (*)(uid_t))bxroot_next_symbol("seteuid");
+        if (fn_ != NULL)
+            return fn_(euid);
+    }
     errno = ENOSYS;
     return -1;
 }
@@ -11775,6 +12005,15 @@ int setegid(gid_t egid) {
     if (bxroot_fakeroot_setter(11, (unsigned long)egid, 0, 0, &r, &e) == 1) {
         errno = e;
         return (int)r;
+    }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(gid_t);
+        if (fn_ == NULL)
+            fn_ = (int (*)(gid_t))bxroot_next_symbol("setegid");
+        if (fn_ != NULL)
+            return fn_(egid);
     }
     errno = ENOSYS;
     return -1;
@@ -11787,6 +12026,15 @@ int setreuid(uid_t r_, uid_t e_) {
         errno = e;
         return (int)r;
     }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(uid_t, uid_t);
+        if (fn_ == NULL)
+            fn_ = (int (*)(uid_t, uid_t))bxroot_next_symbol("setreuid");
+        if (fn_ != NULL)
+            return fn_(r_, e_);
+    }
     errno = ENOSYS;
     return -1;
 }
@@ -11797,6 +12045,15 @@ int setregid(gid_t r_, gid_t e_) {
                                &r, &e) == 1) {
         errno = e;
         return (int)r;
+    }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(gid_t, gid_t);
+        if (fn_ == NULL)
+            fn_ = (int (*)(gid_t, gid_t))bxroot_next_symbol("setregid");
+        if (fn_ != NULL)
+            return fn_(r_, e_);
     }
     errno = ENOSYS;
     return -1;
@@ -11809,6 +12066,15 @@ int setresuid(uid_t r_, uid_t e_, uid_t s_) {
         errno = e;
         return (int)r;
     }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(uid_t, uid_t, uid_t);
+        if (fn_ == NULL)
+            fn_ = (int (*)(uid_t, uid_t, uid_t))bxroot_next_symbol("setresuid");
+        if (fn_ != NULL)
+            return fn_(r_, e_, s_);
+    }
     errno = ENOSYS;
     return -1;
 }
@@ -11819,6 +12085,15 @@ int setresgid(gid_t r_, gid_t e_, gid_t s_) {
                                (unsigned long)s_, &r, &e) == 1) {
         errno = e;
         return (int)r;
+    }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(gid_t, gid_t, gid_t);
+        if (fn_ == NULL)
+            fn_ = (int (*)(gid_t, gid_t, gid_t))bxroot_next_symbol("setresgid");
+        if (fn_ != NULL)
+            return fn_(r_, e_, s_);
     }
     errno = ENOSYS;
     return -1;
@@ -11831,6 +12106,15 @@ int setgroups(size_t n, const gid_t *list) {
                                &r, &e) == 1) {
         errno = e;
         return (int)r;
+    }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static int (*fn_)(size_t, const gid_t *);
+        if (fn_ == NULL)
+            fn_ = (int (*)(size_t, const gid_t *))bxroot_next_symbol("setgroups");
+        if (fn_ != NULL)
+            return fn_(n, list);
     }
     errno = ENOSYS;
     return -1;
@@ -11846,6 +12130,15 @@ uid_t setfsuid(uid_t fsuid) {
         errno = e;
         return (uid_t)r;
     }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static uid_t (*fn_)(uid_t);
+        if (fn_ == NULL)
+            fn_ = (uid_t (*)(uid_t))bxroot_next_symbol("setfsuid");
+        if (fn_ != NULL)
+            return fn_(fsuid);
+    }
     errno = ENOSYS;
     return (uid_t)-1;
 }
@@ -11855,6 +12148,15 @@ gid_t setfsgid(gid_t fsgid) {
     if (bxroot_fakeroot_setter(9, (unsigned long)fsgid, 0, 0, &r, &e) == 1) {
         errno = e;
         return (gid_t)r;
+    }
+    /* fakeroot 未启用：原样透传给 libc 真身（审计 B2-4；原先直接 ENOSYS，
+     * 导致非 -0 模式下所有降权调用失败） */
+    {
+        static gid_t (*fn_)(gid_t);
+        if (fn_ == NULL)
+            fn_ = (gid_t (*)(gid_t))bxroot_next_symbol("setfsgid");
+        if (fn_ != NULL)
+            return fn_(fsgid);
     }
     errno = ENOSYS;
     return (gid_t)-1;

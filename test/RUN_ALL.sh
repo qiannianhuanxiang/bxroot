@@ -855,6 +855,13 @@ else
     run_step "沙箱逃逸"
 fi
 
+# 安全审计修复（链接环 ELOOP / 裸 syscall dirfd / 用户 SIGSYS / set*id 透传 / 空 argv）
+if [ -f test/RUN_AUDIT_FIXES.sh ]; then
+    run_step "审计修复回归" sh test/RUN_AUDIT_FIXES.sh
+else
+    run_step "审计修复回归"
+fi
+
 # exec 参数条数 / 长环境变量 / 嵌套 shebang（BXR-ARG-1 / ENV-1 / SB-1）
 if [ -f test/RUN_ARG_LIMITS.sh ]; then
     run_step "exec 参数边界" sh test/RUN_ARG_LIMITS.sh

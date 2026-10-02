@@ -87,6 +87,10 @@ static volatile unsigned int g_hits[SC_MAX];
  * 不要用 glibc 的 si_syscall 宏 —— 部分版本未定义，且 si_addr 在 SIGSYS
  * 下与 si_call_addr 重叠，容易误读。
  */
+/* <linux/audit.h> / SYS_SECCOMP 在部分头文件组合下不可用，这里固定数值 */
+#define BX_SYS_SECCOMP          1
+#define BX_AUDIT_ARCH_AARCH64   0xC00000B7u
+
 struct raw_sigsys_info {
     void   *call_addr;
     int     syscall;
@@ -365,7 +369,20 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
     if (si == NULL || u == NULL)
         return;
 
+    /*
+     * ★ 只处理内核 seccomp 产生的 SIGSYS（审计 SL-1）★
+     * kill/tgkill/rt_sigqueueinfo 发来的 SIGSYS 的 si_code 是 SI_USER /
+     * SI_TKILL / SI_QUEUE，其 siginfo 内容由发送方控制；若照常处理，
+     * 会改写被中断点的 x0 并按伪造字段重放系统调用。
+     * si_arch 也必须是本架构，否则 syscall 号的解释不成立。
+     */
+    if (si->si_code != BX_SYS_SECCOMP)
+        return;
     rs = (struct raw_sigsys_info *)((char *)si + 16);
+#if defined(__aarch64__)
+    if (rs->arch != BX_AUDIT_ARCH_AARCH64)
+        return;
+#endif
     sc = rs->syscall;
     g_total++;
 

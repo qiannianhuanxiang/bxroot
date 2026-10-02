@@ -890,7 +890,8 @@ static void fr_record_merge(fr_record *dst, const fr_record *src)
  * 内部：读-改-写一条记录。
  * 这样 chown 之后再 chmod 不会把之前记的属主冲掉，反之亦然。
  */
-static int fr_map_update(fakeroot_map *m, fr_key k, const fr_record *delta)
+static int fr_map_update_unlocked(fakeroot_map *m, fr_key k,
+                                  const fr_record *delta)
 {
     fr_record cur;
     bool      found = false;
@@ -920,7 +921,24 @@ static int fr_map_update(fakeroot_map *m, fr_key k, const fr_record *delta)
     cur.uid_faked  = delta->uid_faked;
     cur.gid_faked  = delta->gid_faked;
     cur.mode_faked = delta->mode_faked;
-    return fakeroot_map_put(m, k, &cur);
+    return fakeroot_map_put_unlocked(m, k, &cur);
+}
+
+/*
+ * 加锁包装（审计 FR-1）。
+ *
+ * 读-改-写必须整体在锁内：原实现在锁外 probe 并写 m->slots[idx]，
+ * 而另一线程的 put 可能正在 fr_map_compact（释放旧 slots）→ UAF /
+ * 堆破坏，且两线程的合并会互相丢失。
+ */
+static int fr_map_update(fakeroot_map *m, fr_key k, const fr_record *delta)
+{
+    int rc;
+
+    fr_lock(m);
+    rc = fr_map_update_unlocked(m, k, delta);
+    fr_unlock(m);
+    return rc;
 }
 
 /* 把一条增量同时写进 by_path（可选）与 by_inode（可选）。 */
