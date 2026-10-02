@@ -19,6 +19,7 @@
  *   - rootfs 根 → /
  *   - rootfs 外路径 → 原样
  *   - bind 反向映射命中（直接注入 g_config.bind_sources/bind_targets）
+ *   - D/E：堆缓冲 realpath_fixup_heap 的扩容与扩容失败（审计 A3-1 / PR #1 P2）
  *
  * 用法：sh test/RUN_REALPATH_FIXUP.sh
  */
@@ -30,7 +31,25 @@
 /* 与 probe_d3_fixup.c 同款：避开 crtbeginS 的 __dso_handle 冲突，
  * 链接期配合 -Wl,--allow-multiple-definition。 */
 #define __dso_handle bxroot_internal_dso_handle
+
+/*
+ * realloc 故障注入（PR #1 审核 P2）：g_fail_realloc 置位时下一次 realloc
+ * 返回 NULL，其余时间转发 libc 真身。宏须在 include 前生效才能覆盖
+ * realpath_fixup_heap 内部的调用；默认关闭，对 preload.c 其它代码零影响。
+ */
+#include <stdlib.h>
+static int g_fail_realloc;
+static void *probe_realloc(void *p, size_t n)
+{
+    if (g_fail_realloc) {
+        g_fail_realloc = 0;
+        return NULL;
+    }
+    return realloc(p, n);
+}
+#define realloc probe_realloc
 #include "../src/runtime/preload.c"
+#undef realloc
 
 static int g_ok = 0, g_fail = 0;
 
@@ -126,6 +145,61 @@ int main(void) {
     /* 同一 bind、容量充足：正常反查 */
     check_inplace("cap 充足走 bind 反查", "/data/rootfs-test/h/xyz",
                   "/sdcard-very-long-target-name/xyz", SIZE_MAX, RF);
+
+    printf("=== D. 堆缓冲（realpath(x,NULL)/getcwd(NULL,0)，审计 A3-1）===\n");
+    /*
+     * glibc 按结果长度精确分配。反向 bind 后变长时，旧实现以 SIZE_MAX
+     * 为容量原地 memcpy → 写出堆块。realpath_fixup_heap 必须 realloc。
+     * 用 strdup 模拟精确分配，校验结果内容（配 ASan 时越界会直接报错）。
+     */
+    {
+        static const struct { const char *in, *want, *name; } T[] = {
+            { "/data/rootfs-test/h/xyz", "/sdcard-very-long-target-name/xyz", "堆缓冲 bind 变长 → realloc" },
+            { "/data/rootfs-test/tmp/x.txt", "/tmp/x.txt", "堆缓冲只剥前缀" },
+            { "/data/rootfs-test", "/", "堆缓冲 rootfs 根 → /" },
+        };
+        for (size_t k = 0; k < sizeof(T) / sizeof(T[0]); k++) {
+            char *r = realpath_fixup_heap(strdup(T[k].in));
+            if (r != NULL && strcmp(r, T[k].want) == 0) {
+                g_ok++;
+                printf("  ✅ %s\n", T[k].name);
+            } else {
+                g_fail++;
+                printf("  ❌ %s：got=%s\n", T[k].name, r ? r : "(null)");
+            }
+            free(r);
+        }
+    }
+
+    printf("=== E. 堆缓冲扩容失败（PR #1 审核 P2）===\n");
+    {
+        /* realloc 失败时不得返回未完成反向 bind 的宿主路径 */
+        char *r;
+        errno = 0;
+        g_fail_realloc = 1;
+        r = realpath_fixup_heap(strdup("/data/rootfs-test/h/xyz"));
+        if (r == NULL && errno == ENOMEM) {
+            g_ok++;
+            printf("  ✅ realloc 失败 → NULL + ENOMEM\n");
+        } else {
+            g_fail++;
+            printf("  ❌ realloc 失败仍返回：%s errno=%d\n", r ? r : "(null)", errno);
+            free(r);
+        }
+        g_fail_realloc = 0;
+        /* 不需要扩容的路径不受影响 */
+        g_fail_realloc = 1;
+        r = realpath_fixup_heap(strdup("/data/rootfs-test/tmp/x.txt"));
+        if (r != NULL && strcmp(r, "/tmp/x.txt") == 0) {
+            g_ok++;
+            printf("  ✅ 无需扩容时不触发 realloc\n");
+        } else {
+            g_fail++;
+            printf("  ❌ 无需扩容路径：%s\n", r ? r : "(null)");
+        }
+        free(r);
+        g_fail_realloc = 0;
+    }
 
     printf("\n=== 结果: %d 通过 / %d 失败 ===\n", g_ok, g_fail);
     return g_fail ? 1 : 0;

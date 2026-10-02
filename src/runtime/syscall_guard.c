@@ -323,6 +323,9 @@ extern int l2s_rt_resolve_fake_link(const char *path, char *out,
  * 行为一致，安全。 */
 extern int bxroot_absolutize(const char *path, char *out, size_t outsz)
     __attribute__((weak));
+/* (dirfd, 相对路径) 按 dirfd 的客户视角路径绝对化（见 preload.c）。weak 同上。 */
+extern int bxroot_absolutize_at(int dirfd, const char *path, char *out,
+                                size_t outsz) __attribute__((weak));
 
 /*
  * l2s 的 unlink 语义核心（实现见 l2s-runtime.c）：递减链长，归零回收
@@ -1012,6 +1015,13 @@ long syscall(long number, ...)
 #define SG_SLOT_SIZE 4096
 #define SG_SLOT_COUNT (SG_POOL_SIZE / SG_SLOT_SIZE)
     static char sg_pool[SG_POOL_SIZE];
+    /*
+     * ★ 全部取槽点共用**一个**取号器（审计 SG-2）★
+     * 原先 4 处各有独立计数器，都从 0 起步：同一次调用里翻译缓冲(tbuf)
+     * 与中间链接缓冲(rbuf)第一次就落在同一个槽 → 互相覆写已交给内核的
+     * 路径。单一计数器保证同一调用内各次取号拿到不同槽。
+     */
+    static unsigned int sg_pool_seq_all;
 
     init_trace();
 
@@ -1292,9 +1302,41 @@ long syscall(long number, ...)
             char absb[8192];
             const char *src = pth;
 
-            if (pth[0] != '/' && pth != NULL && bxroot_absolutize != NULL &&
-                bxroot_absolutize(pth, absb, sizeof(absb)) > 0)
-                src = absb;
+            /*
+             * ★ 只有"相对于 cwd"的相对路径才能按 cwd 绝对化（审计 SG-1）★
+             * *at 族的路径参数前一位是 dirfd（symlinkat 的 a2 前是 a1，
+             * renameat/linkat 的 a3 前是 a2，规律一致）；inotify_add_watch(27)
+             * 的 a0 是 inotify fd 而非 dirfd，路径确实相对 cwd。
+             *   - 真 dirfd + 相对路径：应相对 dirfd 解析，按 cwd 拼会作用到
+             *     错误文件（unlinkat 删错）；
+             *   - 空串（AT_EMPTY_PATH，作用于 fd 本身）：拼成 cwd 会把
+             *     statx(fd,"",AT_EMPTY_PATH) 变成 stat(cwd)。
+             * 这两种都保持原样交给内核。
+             */
+            int dfd_ = SG_AT_FDCWD;
+            if (i >= 1 && number != 27 /* inotify_add_watch */)
+                dfd_ = (int)*args[i - 1];
+
+            if (pth[0] == '\0' || pth[0] == '/') {
+                /* 空串作用于 fd 本身；绝对路径与 dirfd 无关 */
+            } else if (dfd_ == SG_AT_FDCWD) {
+                if (bxroot_absolutize != NULL &&
+                    bxroot_absolutize(pth, absb, sizeof(absb)) > 0)
+                    src = absb;
+            } else if (bxroot_absolutize_at != NULL) {
+                int ar = bxroot_absolutize_at(dfd_, pth, absb, sizeof(absb));
+                if (ar > 0) {
+                    /* 真 dirfd：按 dirfd 的客户视角路径拼，翻译层再夹紧 `..` */
+                    src = absb;
+                } else if (ar < 0) {
+                    /*
+                     * dirfd 无效 / 非目录 / 过长：调用必须以该错误失败。
+                     * 退回原样透传会让内核按宿主视角解析（PR #1 审核 P1）。
+                     */
+                    errno = -ar;
+                    return -1;
+                }
+            }
 
         if (looks_like_guest_abs_path(src)) {
             /*
@@ -1351,9 +1393,8 @@ long syscall(long number, ...)
              * 取号对槽位数取模实现轮转 —— 16 个槽位意味着要过 16 次调用
              * 才回到同一块，而调用方持有路径指针的时间远短于此。
              */
-            static unsigned int sg_pool_seq;
 
-            unsigned int seq = __atomic_fetch_add(&sg_pool_seq, 1, __ATOMIC_RELAXED);
+            unsigned int seq = __atomic_fetch_add(&sg_pool_seq_all, 1, __ATOMIC_RELAXED);
             char *tbuf = sg_pool + (size_t)(seq % SG_SLOT_COUNT) * SG_SLOT_SIZE;
             size_t need = SG_SLOT_SIZE;
 
@@ -1407,8 +1448,7 @@ long syscall(long number, ...)
              * 解析结果仍放槽位池（与 tr 同款），保持无锁与信号安全。
              */
             if (tr > 0) {
-                static unsigned int sg_pool_seq2;
-                unsigned int s2 = __atomic_fetch_add(&sg_pool_seq2, 1,
+                unsigned int s2 = __atomic_fetch_add(&sg_pool_seq_all, 1,
                                                      __ATOMIC_RELAXED);
                 char *rbuf = sg_pool + (size_t)(s2 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
 
@@ -1520,8 +1560,7 @@ long syscall(long number, ...)
             }
 
             if (need_leaf == 1) {
-                static unsigned int sg_pool_seq3;
-                unsigned int s3 = __atomic_fetch_add(&sg_pool_seq3, 1,
+                unsigned int s3 = __atomic_fetch_add(&sg_pool_seq_all, 1,
                                                      __ATOMIC_RELAXED);
                 char *lbuf = sg_pool + (size_t)(s3 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
 
@@ -1539,8 +1578,7 @@ long syscall(long number, ...)
                  * 真符号链接不会被命中，保持 ELOOP。
                  */
                 if (l2s_rt_resolve_fake_link != NULL) {
-                    static unsigned int sg_pool_seq4;
-                    unsigned int s4 = __atomic_fetch_add(&sg_pool_seq4, 1,
+                    unsigned int s4 = __atomic_fetch_add(&sg_pool_seq_all, 1,
                                                          __ATOMIC_RELAXED);
                     char *lbuf = sg_pool + (size_t)(s4 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
 

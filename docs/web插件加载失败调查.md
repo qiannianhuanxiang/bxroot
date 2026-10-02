@@ -93,7 +93,7 @@ $ cd /root && DSH_HOME=/root/.dsh DSHA_STARTUP_PROFILE=webprobe DSHA_UI_LANGUAGE
     "$APP_LIB/libproroot-bridge.so" "$APP_LIB/libproroot-linker.so" --argv0 node \
       --preload "$APP_LIB/libproroot-runtime.so" \
       "$ROOTFS/usr/local/bin/node" "$DSH_JS" --profile webprobe --port 44911 --no-open
-dsh web: http://127.0.0.1:44911/?token=ebP2nn06iP4CIqifEufM4BC1_d3zLqK57QS67mQxsEM
+dsh web: http://127.0.0.1:44911/?token=<redacted>
 rc=124        ← 124 = timeout 杀掉，说明一直在正常服务
 ```
 
@@ -211,7 +211,7 @@ export async function resolve(specifier, context, nextResolve) {
 [HOOK] resolve specifier=dsh-task-notifier  parentURL=file:///root/.dsh/profiles/webprobe/
 [HOOK]   -> OK {"url":"file:///root/dsha-task-notifier/lib/index.js","format":"module"}
 ... （5 个全 OK）
-dsh web: http://127.0.0.1:44921/?token=dgqOXMhimcny69HOodU1PIPzX9b8bbqEdXSFduNZY9Q
+dsh web: http://127.0.0.1:44921/?token=<redacted>
 ```
 
 **bxroot 下（同一 hook、同一 profile 内容）：**
@@ -502,7 +502,7 @@ node[1]: pthread_create: Invalid argument
 [HOOK] resolve specifier=dsh-status-overlay      parentURL=... -> OK {"url":"file:///root/dsha-status-overlay/lib/index.js", ...}
 [HOOK] resolve specifier=dsh-web-mobile          parentURL=... -> OK {"url":"file:///root/dsha-web-mobile/lib/index.js", ...}
 [HOOK] resolve specifier=dsh-app-integration     parentURL=... -> OK {"url":"file:///root/dsha-app-integration/index.js", ...}
-dsh web: http://127.0.0.1:44927/?token=BqLajf4YEjOLPnTwbCCsiZ-BfAVYq2q6HBwKhdJEw8Q
+dsh web: http://127.0.0.1:44927/?token=<redacted>
 rc=137    ← 110 秒到点被 KILL，说明一直在正常服务
 ```
 
