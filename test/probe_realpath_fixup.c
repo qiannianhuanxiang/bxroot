@@ -201,6 +201,52 @@ int main(void) {
         g_fail_realloc = 0;
     }
 
+    printf("=== F. /proc/<who> 判别不受 pid 位数影响 ===\n");
+    {
+        /*
+         * 旧实现用 "slash 偏移 == 4/11" 判 self/thread-self：4 位 pid
+         * （1000–9999）偏移恰为 4 → 被当 self、不读对方 environ、答调用者
+         * 自己的 guest_exe。RUN_PROC_VIEW 因此只在 sh 的 pid < 10000 时红。
+         *
+         * 确定性：直接对 proc_who_kind 逐一喂 1..11 位数字，不依赖真实 pid
+         * 落在哪个区间。11 位覆盖 "thread-self" 的长度。
+         */
+        static const char *DIG = "12345678901";
+        int all = 1;
+        for (int d = 1; d <= 11; d++) {
+            char p[64];
+            const char *sl = NULL;
+            snprintf(p, sizeof p, "/proc/%.*s/exe", d, DIG);
+            int k = proc_who_kind(p, &sl);
+            if (k != 2 || sl == NULL || strcmp(sl, "/exe") != 0) {
+                all = 0;
+                g_fail++;
+                printf("  ❌ %-22s kind=%d（期望 2 = 数字 pid）\n", p, k);
+            }
+        }
+        if (all) {
+            g_ok++;
+            printf("  ✅ 1..11 位数字 pid 全部判为 pid（不被当 self/thread-self）\n");
+        }
+
+        static const struct { const char *p; int want; } K[] = {
+            { "/proc/self/exe",         1 },
+            { "/proc/thread-self/exe",  1 },
+            { "/proc/selfx/exe",        0 },
+            { "/proc/12a/exe",          0 },
+            { "/proc/net/dev",          0 },
+        };
+        for (size_t i = 0; i < sizeof K / sizeof K[0]; i++) {
+            const char *sl = NULL;
+            int k = proc_who_kind(K[i].p, &sl);
+            if (k == K[i].want) {
+                g_ok++;  printf("  ✅ %-22s kind=%d\n", K[i].p, k);
+            } else {
+                g_fail++; printf("  ❌ %-22s kind=%d 期望 %d\n", K[i].p, k, K[i].want);
+            }
+        }
+    }
+
     printf("\n=== 结果: %d 通过 / %d 失败 ===\n", g_ok, g_fail);
     return g_fail ? 1 : 0;
 }
