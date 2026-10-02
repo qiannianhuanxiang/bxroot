@@ -1,5 +1,5 @@
 # Bxroot 顶层 Makefile
-# 构建所有 5 个组件（DSHA bxroot 原生库接口）
+# 构建所有 6 个组件（DSHA bxroot 原生库接口）
 
 CC = aarch64-linux-gnu-gcc-13
 BUILD_DIR = build
@@ -133,6 +133,7 @@ install-dsha: all
 	cp $(BUILD_DIR)/libbxroot-linker.so $(DSHA_LIB_DIR)/ 2>/dev/null || true
 	cp $(BUILD_DIR)/libbxroot-bridge.so $(DSHA_LIB_DIR)/ 2>/dev/null || true
 	cp $(BUILD_DIR)/libbxroot-stub-loader.so $(DSHA_LIB_DIR)/ 2>/dev/null || true
+	cp $(BUILD_DIR)/libbxroot-ulx.so $(DSHA_LIB_DIR)/
 	@echo "部署完成！重启 DSHA 应用以生效。"
 	@ls -la $(DSHA_LIB_DIR)/libbxroot*
 

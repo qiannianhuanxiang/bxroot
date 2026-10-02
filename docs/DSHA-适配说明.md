@@ -7,7 +7,7 @@
 
 | | bxroot | DSHA |
 |---|---|---|
-| 提供什么 | 5 个 .so、`BXROOT_*` 环境变量、`-r/-w/-b/-0` 参数 | 5 个 .so 的打包、一个 Java 适配类 |
+| 提供什么 | 6 个 native 产物、`BXROOT_*` 环境变量、`-r/-w/-b/-0` 参数 | 6 个产物的打包、一个 Java 适配类 |
 | 是否知道对方 | **不知道 DSHA 存在** | 知道 bxroot 的接口约定 |
 | 定制内容 | 无 | 仅配置翻译，无 bxroot 内部逻辑 |
 
@@ -92,7 +92,7 @@ bxroot 侧的默认值（`<rootfs>/.l2s`）已与 DSHA 的 `PROOT_L2S_DIR` 对�
 - `ProotBootstrap.runtime()`：bxroot → proroot → proot 三选一降级链（API 26+）
 - `WebProcSel.isBxrootWebPayload`：上述第三个 trap 已修（DSHA 侧
   `WebProcSelTest` 15/15 通过，含 `neverMistakesBxrootLauncherForWeb`）
-- jniLibs 五件套全部 16KB 页对齐（LOAD 段 0x4000）
+- jniLibs 六件套全部 16KB 页对齐（LOAD 段 0x4000）
 - `THIRD_PARTY_NOTICES.md` MIT 条目 + 产物 sha256
 - ConfigStore 三值泛化（旧 prefs 键兼容）、ConfigFragment 三选一 UI
 
