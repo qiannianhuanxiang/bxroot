@@ -19,13 +19,14 @@
 # 前缀，再发真 svc（重入守卫 + fail-open，见 livepatch.c）。
 #
 # 三组判据（bxroot 成功且与官方一致）：
-#   A. getent -s dns hosts <host>      → 出 IP（rc=0）
+#   A. getent -s dns ahostsv4 <host>   → 出 IPv4（rc=0）
 #   B. python getaddrinfo(<host>)      → 出 IP
 #   C. python gethostbyname(<host>)    → 出 IP
-#   并附 files 分支不回归：getent hosts localhost 仍出 127.0.0.1。
+#   并附 files 分支不回归：getent hosts localhost 与外层答案一致。
 #
-# 判别力：BXROOT_NO_PATHRELAY=1 时三者全部回到 TEMP_FAIL/rc=2（本脚本
-# 显式跑一遍并断言"关掉就红"），证明绿是 path-relay 挣来的。
+# 判别力（F）：BXROOT_NO_PATHRELAY=1 时 res_init 读不到 resolv.conf，
+# nameserver 退回 127.0.0.1；开启时读到与外层相同的 nameserver。判据看
+# nameserver 而不看"能否解析"——容器 127.0.0.1:53 可能恰有解析服务。
 #
 # 环境：需要外层 proroot（launcher+LD_PRELOAD 在此不可测）+ build/ 产物 +
 # 容器有网。无网时 getent dns 会 rc=2，此时按"环境不满足"跳过（exit 2）。
@@ -72,16 +73,21 @@ FAIL=0
 bad()  { FAIL=$((FAIL + 1)); echo "  ❌ $*"; }
 good() { echo "  ✅ $*"; }
 
-# 从 getent hosts 输出里抓第一个 IPv4（宽松匹配，避免 IP 段变化写死）。
+# 从 getent 输出里抓第一个 IPv4（宽松匹配，避免 IP 段变化写死）。
 ipv4() { grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1; }
 
-echo "--- A) getent -s dns hosts（bxroot 默认，path-relay 开）---"
-a_out=$("$BX" -- /usr/bin/getent -s dns hosts "$HOST1" 2>&1); a_rc=$?
+# ★ A/E 用 ahostsv4，不用 hosts ★
+# `getent hosts` 走 gethostbyname2 的 AF_INET6 优先顺序：有 AAAA 的域名
+# （pypi.org 走 Fastly，双栈）只返回 IPv6，ipv4() 抓不到 → 误报失败
+# （实测：外层与 bxroot 都只出 2a04:4e42::223 等，rc=0）。ahostsv4 只问 A
+# 记录，同样经 resolver 读 resolv.conf，对 path-relay 的判别力不变。
+echo "--- A) getent -s dns ahostsv4（bxroot 默认，path-relay 开）---"
+a_out=$("$BX" -- /usr/bin/getent -s dns ahostsv4 "$HOST1" 2>&1); a_rc=$?
 a_ip=$(printf '%s\n' "$a_out" | ipv4)
 if [ "$a_rc" = 0 ] && [ -n "$a_ip" ]; then
-    good "getent -s dns hosts $HOST1 → $a_ip (rc=0)"
+    good "getent -s dns ahostsv4 $HOST1 → $a_ip (rc=0)"
 else
-    bad "getent -s dns hosts $HOST1 失败：rc=$a_rc out=[$a_out]"
+    bad "getent -s dns ahostsv4 $HOST1 失败：rc=$a_rc out=[$a_out]"
 fi
 
 if [ "$HAVE_PY" = 1 ]; then
@@ -104,22 +110,25 @@ else
     echo "--- B/C) 跳过 python 判据（rootfs 无 python3）---"
 fi
 
-echo "--- D) files 分支不回归（localhost 仍走 /etc/hosts）---"
-d_out=$("$BX" -- /usr/bin/getent hosts localhost 2>&1)
-# 判据：命中 localhost 的**任一环回地址**即算 files 分支正常。
-# 不写死 127.0.0.1 —— getent 按 /etc/hosts 与 gai.conf 的顺序，可能先返回
-# IPv6 ::1（容器裸环境、官方基线、bxroot 三方一致如此），那不是回归。
-case "$d_out" in
-*127.0.0.1*|*::1*localhost*|*localhost*)
-    good "getent hosts localhost → $(echo "$d_out" | tr '\n' ' ')（files 分支正常）" ;;
-*) bad "getent hosts localhost 回归：[$d_out]" ;;
-esac
+echo "--- D) files 分支不回归（与外层同答案）---"
+# ★ 判据是"与外层一致"，不是"必须出 localhost" ★
+# files 分支的答案取决于容器的 /etc/hosts。DSHA 容器里它可能是**空文件**
+# （实测 0 字节）—— 那时外层 getent hosts localhost 本身就 rc=2、无输出，
+# 要求 bxroot 出 127.0.0.1 等于要求它凭空发明条目。改为与外层逐字比对：
+# 外层有就必须一样，外层没有 bxroot 也不能有。
+d_host=$(getent hosts localhost 2>&1); d_hrc=$?
+d_out=$("$BX" -- /usr/bin/getent hosts localhost 2>&1); d_rc=$?
+if [ "$d_rc" = "$d_hrc" ] && [ "$d_out" = "$d_host" ]; then
+    good "getent hosts localhost 与外层一致（rc=$d_rc，[$(echo "$d_out" | tr '\n' ' ')]）"
+else
+    bad "getent hosts localhost 与外层不一致：外层 rc=$d_hrc [$d_host] vs bxroot rc=$d_rc [$d_out]"
+fi
 
 # --- 官方双基线对照（可选）：bxroot 的 IP 应与官方一致 ---
 if [ "$HAVE_OFF" = 1 ]; then
     echo "--- E) 官方 runtime 双基线对照 ---"
     off_ip=$(BXROOT_RUN_RUNTIME="$OFFICIAL_SO" "$BX" --no-check -- \
-        /usr/bin/getent -s dns hosts "$HOST1" 2>&1 | ipv4)
+        /usr/bin/getent -s dns ahostsv4 "$HOST1" 2>&1 | ipv4)
     if [ -z "$off_ip" ]; then
         echo "  ⏭️  官方基线未解析（可能无网波动），跳过对照"
     elif [ "$a_ip" = "$off_ip" ]; then
@@ -132,16 +141,40 @@ else
     echo "--- E) 无官方 off-rt.so，跳过双基线对照 ---"
 fi
 
-# --- 判别力：关掉 path-relay 必须变红 ---
-echo "--- F) 判别力：BXROOT_NO_PATHRELAY=1 应回到 TEMP_FAIL ---"
-f_rc=0
-BXROOT_NO_PATHRELAY=1 "$BX" -- /usr/bin/getent -s dns hosts "$HOST1" \
-    >/dev/null 2>&1 || f_rc=$?
-if [ "$f_rc" != 0 ]; then
-    good "关闭 path-relay 后 getent -s dns rc=$f_rc（缺陷复现，证明绿是修复挣来的）"
+# --- 判别力：关掉 path-relay，resolver 必须读不到 resolv.conf ---
+#
+# ★ 判据是 res_init 读到的 nameserver，不是"能否解析" ★
+# 读不到 resolv.conf 时 glibc 退回默认 nameserver 127.0.0.1。若容器
+# 127.0.0.1:53 恰好有解析服务（DSHA 容器实测有），getent 照样 rc=0 ——
+# 旧判据"关掉必须 rc!=0"因此误报。真正被 path-relay 决定的是"resolver
+# 有没有读到 resolv.conf"：开 → ns0 = resolv.conf 里的地址；关 → 127.0.0.1。
+echo "--- F) 判别力：BXROOT_NO_PATHRELAY=1 时 res_init 读不到 resolv.conf ---"
+FW=$(mktemp -d /tmp/bxroot-dns-f-XXXXXX)
+f_ok=0
+i=1
+while [ $i -le 10 ]; do
+    if gcc -O1 -w -o "$FW/resinit" "$ROOT/test/probe_resinit.c" -lresolv \
+        2>"$FW/cc.err"; then f_ok=1; break; fi
+    grep -q 'internal compiler error' "$FW/cc.err" || break
+    i=$((i + 1))
+done
+if [ "$f_ok" = 1 ]; then
+    f_host=$("$FW/resinit" 2>&1 | sed -n 's/^ns0=//p')
+    f_on=$("$BX" --no-check -- "$FW/resinit" 2>&1 | sed -n 's/^ns0=//p')
+    f_off=$(BXROOT_NO_PATHRELAY=1 "$BX" --no-check -- "$FW/resinit" 2>&1 | sed -n 's/^ns0=//p')
+    if [ -z "$f_host" ] || [ "$f_host" = "127.0.0.1" ]; then
+        echo "  ⏭️  外层 resolv.conf 本身就是 127.0.0.1/读不到（ns0=[$f_host]），F 无判别力，跳过"
+    elif [ "$f_on" = "$f_host" ] && [ "$f_off" != "$f_host" ]; then
+        good "path-relay 开 ns0=$f_on（=外层），关 ns0=${f_off:-空}（读不到 resolv.conf，绿是修复挣来的）"
+    elif [ "$f_on" != "$f_host" ]; then
+        bad "path-relay 开时 res_init 未读到 resolv.conf：ns0=[$f_on] 期望 [$f_host]"
+    else
+        bad "关闭 path-relay 后 res_init 仍读到 resolv.conf（ns0=$f_off）—— 判别力不足，绿可能来自别处"
+    fi
 else
-    bad "关闭 path-relay 后仍成功（rc=0）—— 判别力不足，绿可能来自别处"
+    echo "  ⏭️  跳过 F（probe_resinit 无法编译，可能缺 libresolv-dev）"
 fi
+rm -rf "$FW"
 
 # --- G) 绝对符号链接布局的 resolv.conf（BUG-D1，systemd-resolved 默认）---
 #   /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf（绝对目标）时，
