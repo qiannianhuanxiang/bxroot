@@ -33,3 +33,6 @@ unsigned long bxroot_syscall_guard_blocked(void);
  */
 unsigned bxroot_test_path_arg_mask(long nr);
 
+/* 测试钩子：路径参数 aI 配对的 dirfd 位置；-1 = 无 dirfd（相对 cwd） */
+int bxroot_test_path_arg_dirfd(long nr, int i);
+

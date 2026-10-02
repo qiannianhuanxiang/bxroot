@@ -156,6 +156,54 @@ static void test_table(void)
         }
     }
 
+    printf("--- 路径参数配对的 dirfd 位置（PR #1 复审：不得用 i-1 推断）---\n");
+
+    /*
+     * 对表中**每一个**路径位，dirfd 位置必须是：-1，或一个非路径参数。
+     * 若 dirfd 指向另一个路径参数（mount/pivot_root 的 a0），指针会被当 fd
+     * → EBADF。穷举 0..511 号，防止以后新增表项时再犯。
+     */
+    {
+        int ok = 1;
+        char why[160] = "";
+        for (long nr = 0; nr < 512 && ok; nr++) {
+            unsigned m = bxroot_test_path_arg_mask(nr);
+            for (int i = 0; i < 6; i++) {
+                if (!(m & (1u << i)))
+                    continue;
+                int d = bxroot_test_path_arg_dirfd(nr, i);
+                if (d >= 6 || d >= i || (d >= 0 && (m & (1u << d)))) {
+                    ok = 0;
+                    snprintf(why, sizeof(why), "nr=%ld a%d → dirfd a%d 非法", nr, i, d);
+                    break;
+                }
+            }
+        }
+        check("所有路径位的 dirfd 位置都不是路径参数", ok, why);
+    }
+    {
+        static const struct { long nr; int i, d; const char *name; } D[] = {
+            {  40, 0, -1, "mount a0（source）无 dirfd"          },
+            {  40, 1, -1, "mount a1（target）无 dirfd"          },
+            {  41, 1, -1, "pivot_root a1（put_old）无 dirfd"    },
+            {  39, 0, -1, "umount2 a0 无 dirfd"                 },
+            {  27, 1, -1, "inotify_add_watch a0 是 inotify fd" },
+            { 221, 0, -1, "execve a0 无 dirfd"                  },
+            {  35, 1,  0, "unlinkat a1 配 a0"                   },
+            { 291, 1,  0, "statx a1 配 a0"                      },
+            {  38, 3,  2, "renameat a3 配 a2"                   },
+            {  37, 3,  2, "linkat a3 配 a2"                     },
+            { 429, 3,  2, "move_mount a3 配 a2"                 },
+            {  36, 2,  1, "symlinkat a2 配 a1"                  },
+        };
+        for (size_t k = 0; k < sizeof(D) / sizeof(D[0]); k++) {
+            int got = bxroot_test_path_arg_dirfd(D[k].nr, D[k].i);
+            char buf[160];
+            snprintf(buf, sizeof(buf), "%s（期望 %d，实得 %d）", D[k].name, D[k].d, got);
+            check("dirfd 配对", got == D[k].d, buf);
+        }
+    }
+
     printf("--- 绝不能列成路径的 ---\n");
 
     /*
