@@ -953,6 +953,50 @@ unsigned bxroot_test_path_arg_mask(long nr)
     return path_arg_mask(nr);
 }
 
+/*
+ * 路径参数 → 与之配对的 dirfd 参数位置（-1 = 无 dirfd，相对 cwd）。
+ *
+ * ★ 必须按调用号显式列出，不能用 "i - 1" 推断 ★
+ * 早先的写法默认"路径前一位就是 dirfd"，只把 inotify_add_watch 当例外。
+ * 但 mount(40) / pivot_root(41) 的 a1 也是路径，而 a0 是**路径指针**；
+ * 把指针截成 int 当 dirfd 交给 bxroot_absolutize_at → fstat 失败 →
+ * 整条调用以 EBADF 失败（PR #1 合并后复审，实测外层 EPERM/ENOSYS 变 EBADF）。
+ * 同理 umount2/chroot/statfs/truncate/chdir/xattr 族/execve 都没有 dirfd。
+ *
+ * 只有真正带 dirfd 的 *at 族才返回非负值；新增路径型调用时必须同步
+ * 这里，否则按 cwd 解析（与内核对"无 dirfd 调用"的语义一致，安全侧）。
+ */
+static int path_arg_dirfd(long nr, int i)
+{
+    switch (nr) {
+    /* dirfd 在 a0、路径在 a1 */
+    case 291: case 79: case 78: case 48: case 56: case 35: case 34:
+    case 439: case 281: case 33: case 53: case 54: case 88: case 452:
+    case 437: case 264: case 428:
+        return i == 1 ? 0 : -1;
+
+    /* 双路径：a0/a1 与 a2/a3 两对（renameat / renameat2 / linkat / move_mount） */
+    case 38: case 276: case 37: case 429:
+        if (i == 1) return 0;
+        if (i == 3) return 2;
+        return -1;
+
+    /* symlinkat(target, newdirfd, linkpath)：linkpath(a2) 配 a1 */
+    case 36:
+        return i == 2 ? 1 : -1;
+
+    /* 其余（inotify_add_watch 的 a0 是 inotify fd、mount/pivot_root/
+     * umount2/chroot/statfs/truncate/chdir/xattr/execve）均无 dirfd */
+    default:
+        return -1;
+    }
+}
+
+int bxroot_test_path_arg_dirfd(long nr, int i)
+{
+    return path_arg_dirfd(nr, i);
+}
+
 /* ------------------------------------------------------------------ */
 /* 对外接口                                                            */
 /* ------------------------------------------------------------------ */
@@ -1314,8 +1358,12 @@ long syscall(long number, ...)
              * 这两种都保持原样交给内核。
              */
             int dfd_ = SG_AT_FDCWD;
-            if (i >= 1 && number != 27 /* inotify_add_watch */)
-                dfd_ = (int)*args[i - 1];
+            {
+                /* 配对 dirfd 位置按调用号查表（见 path_arg_dirfd），不推断 */
+                int dpos = path_arg_dirfd(number, i);
+                if (dpos >= 0)
+                    dfd_ = (int)*args[dpos];
+            }
 
             if (pth[0] == '\0' || pth[0] == '/') {
                 /* 空串作用于 fd 本身；绝对路径与 dirfd 无关 */
