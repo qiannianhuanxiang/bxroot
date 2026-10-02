@@ -130,15 +130,17 @@ int main(int argc, char **argv)
 
     /* ---- SG-1c：无 dirfd 的双路径调用不得把前一个路径指针当 dirfd ----
      * mount/pivot_root 的 a0 是路径指针。曾用 "i-1" 推断 dirfd，指针被当 fd
-     * → EBADF（外层是 EPERM/ENOSYS）。这里只断言"不是 EBADF"：本环境无权
-     * 真正挂载，具体错误码由内核/seccomp 决定。 */
+     * → EBADF（外层是 EPERM/ENOSYS）。这里只断言"不是 EBADF"，具体错误码
+     * 由内核/seccomp 决定。
+     * ★ 路径必须不存在 ★ 有挂载权限的 root 环境里，指向真实目录（如 "tmp"）
+     * 会真的挂上 tmpfs / 换根。不存在的路径让内核以 ENOENT 等拒绝，无副作用。 */
     {
         errno = 0;
-        long r = syscall(SYS_pivot_root, "/", "tmp");
+        long r = syscall(SYS_pivot_root, "aud_nonexist_new", "aud_nonexist_old");
         if (!(r == -1 && errno == EBADF)) OK("SG-1c pivot_root a1 not paired with a0");
         else BAD("SG-1c pivot_root", "r=%ld errno=EBADF", r);
         errno = 0;
-        r = syscall(SYS_mount, "none", "tmp", "tmpfs", 0UL, NULL);
+        r = syscall(SYS_mount, "none", "aud_nonexist_mnt", "tmpfs", 0UL, NULL);
         if (!(r == -1 && errno == EBADF)) OK("SG-1c mount a1 not paired with a0");
         else BAD("SG-1c mount", "r=%ld errno=EBADF", r);
     }
