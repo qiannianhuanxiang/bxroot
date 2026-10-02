@@ -1323,10 +1323,19 @@ long syscall(long number, ...)
                 if (bxroot_absolutize != NULL &&
                     bxroot_absolutize(pth, absb, sizeof(absb)) > 0)
                     src = absb;
-            } else if (bxroot_absolutize_at != NULL &&
-                       bxroot_absolutize_at(dfd_, pth, absb, sizeof(absb)) > 0) {
-                /* 真 dirfd：按 dirfd 的客户视角路径拼，翻译层再夹紧 `..` */
-                src = absb;
+            } else if (bxroot_absolutize_at != NULL) {
+                int ar = bxroot_absolutize_at(dfd_, pth, absb, sizeof(absb));
+                if (ar > 0) {
+                    /* 真 dirfd：按 dirfd 的客户视角路径拼，翻译层再夹紧 `..` */
+                    src = absb;
+                } else if (ar < 0) {
+                    /*
+                     * dirfd 无效 / 非目录 / 过长：调用必须以该错误失败。
+                     * 退回原样透传会让内核按宿主视角解析（PR #1 审核 P1）。
+                     */
+                    errno = -ar;
+                    return -1;
+                }
             }
 
         if (looks_like_guest_abs_path(src)) {

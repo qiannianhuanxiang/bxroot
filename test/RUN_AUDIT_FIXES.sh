@@ -30,6 +30,6 @@ echo "$out" | sed 's/^/  /'
 
 echo "$out" | grep -q '^DONE bad=0$' || { echo "RESULT: FAIL"; exit 1; }
 n=$(echo "$out" | grep -c '^OK ')
-[ "$n" -ge 8 ] || { echo "RESULT: FAIL（只有 $n 项 OK，探针可能中途崩溃）"; exit 1; }
+[ "$n" -ge 13 ] || { echo "RESULT: FAIL（只有 $n 项 OK，探针可能中途崩溃）"; exit 1; }
 echo "RESULT: PASS"
 exit 0

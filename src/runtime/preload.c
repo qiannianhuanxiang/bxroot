@@ -184,7 +184,12 @@ int bxroot_absolutize(const char *path, char *out, size_t outsz)
  * translate_path 会对 `..` 做夹紧。
  *
  * 返回 >0 已改写 / 0 不适用（AT_FDCWD、绝对、空串、dirfd 不在 rootfs
- * 或 bind 视图内）/ <0 失败。
+ * 或 bind 视图内）/ <0 = -errno，调用必须以该错误失败、不得退回原行为：
+ *   -EBADF   dirfd 不是打开的 fd
+ *   -ENOTDIR dirfd 不是目录（含 O_PATH 打开的非目录）—— 若照常拼接，
+ *            规范化会把 "file/../victim" 消成 "victim"，把内核本该拒绝的
+ *            调用变成对旁边文件的有效操作（PR #1 审核 P1）
+ *   -ENAMETOOLONG 拼接结果放不下
  */
 static int resolve_dirfd_path(int dirfd, const char *path,
                               char *out, size_t outsz);
@@ -205,6 +210,24 @@ int bxroot_absolutize_at(int dirfd, const char *path, char *out, size_t outsz)
         return bxroot_absolutize(path, out, outsz);
     if (path[0] == '/' || path[0] == '\0')
         return 0;
+
+    /*
+     * ★ 先确认 dirfd 是目录 ★ 与内核同序：fd 无效 → EBADF，非目录 →
+     * ENOTDIR。fstat 对 O_PATH fd 同样有效。用裸 SYS_fstat（80）：它不在
+     * syscall_guard 的路径参数表里，不会重入翻译层。
+     */
+    {
+        struct stat dst;
+        if (syscall(SYS_fstat, dirfd, &dst) != 0) {
+            int e = errno;
+            errno = saved;
+            return -(e != 0 ? e : EBADF);
+        }
+        if (!S_ISDIR(dst.st_mode)) {
+            errno = saved;
+            return -ENOTDIR;
+        }
+    }
 
     snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dirfd);
     /* 与 resolve_dirfd_path 一致：优先 libc 真身，拿内核给的宿主真值 */
@@ -229,7 +252,7 @@ int bxroot_absolutize_at(int dirfd, const char *path, char *out, size_t outsz)
     pl = strlen(path);
     if (dl + 1 + pl + 1 > outsz) {
         errno = saved;
-        return -1;
+        return -ENAMETOOLONG;
     }
     memcpy(out, dir, dl);
     if (dl == 0 || dir[dl - 1] != '/')
@@ -4859,8 +4882,8 @@ static int realpath_fixup_inplace(char *buf, size_t cap)
  * glibc 按结果长度精确分配（strdup 语义），可用容量只有 strlen+1。
  * 剥 rootfs 前缀只会变短，但反向 bind 的 target 可能比 source 长
  * （例：-b /sdcard:/mnt/sdcard），原地 memcpy 会写出堆块。
- * 这里按需 realloc；realloc 失败则保留已剥前缀的结果（与栈缓冲
- * 分支"放不下"的处理一致）。返回值可能与入参不同，调用方必须用返回值。
+ * 这里按需 realloc；realloc 失败时释放缓冲、返回 NULL 并置 ENOMEM
+ * （不能返回半成品路径）。返回值可能与入参不同，调用方必须用返回值。
  */
 static char *realpath_fixup_heap(char *r)
 {
@@ -4875,8 +4898,16 @@ static char *realpath_fixup_heap(char *r)
 
         if (need > strlen(r) + 1) {
             char *nr = (char *)realloc(r, need);
-            if (nr == NULL)
-                return r;
+            if (nr == NULL) {
+                /*
+                 * 不能返回 r：反向 bind 尚未完成，里面是宿主视角的错误
+                 * 路径，调用方会把非 NULL 当成功继续使用（PR #1 审核 P2）。
+                 * 按 realpath/getcwd 的失败契约：释放、返回 NULL、ENOMEM。
+                 */
+                free(r);
+                errno = ENOMEM;
+                return NULL;
+            }
             r = nr;
         }
         memcpy(r, reb, need);

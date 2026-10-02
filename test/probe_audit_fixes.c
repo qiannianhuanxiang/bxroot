@@ -5,7 +5,8 @@
  *   A2-1  中间组件链接成环 → open 必须 ELOOP（原先把未初始化缓冲当路径）
  *   （A3-1 堆缓冲反向 bind 见 probe_realpath_fixup.c 的 D 段）
  *   SG-1  裸 syscall statx(fd,"",AT_EMPTY_PATH) 必须作用于 fd 本身；
- *         裸 unlinkat(真 dirfd, 相对名) 必须相对 dirfd
+ *         裸 unlinkat(真 dirfd, 相对名) 必须相对 dirfd；
+ *         非目录 dirfd（普通 / O_PATH）→ ENOTDIR，无效 fd → EBADF
  *   SL-1  用户态发来的 SIGSYS（kill）不得被当作 seccomp 处理
  *   B2-4  未开 fakeroot 时 setuid(getuid()) 必须成功（原先 ENOSYS）
  *   F5    execve 空 argv 不得让运行时越界（子进程正常退出或报错即可）
@@ -85,6 +86,46 @@ int main(int argc, char **argv)
         close(d);
         unlink("/tmp/aud_d/victim"); unlink("/tmp/victim"); rmdir("/tmp/aud_d");
         chdir("/");
+    }
+
+    /* ---- SG-1b：非目录 dirfd 必须 ENOTDIR，不得被 "file/.." 消掉（PR #1 审核 P1）---- */
+    {
+        static const struct { const char *name; int flags; } K[] = {
+            { "regular fd", O_RDWR },
+            { "O_PATH non-dir fd", O_PATH },
+        };
+        mkdir("/tmp/aud_nd", 0755);
+        for (size_t k = 0; k < sizeof(K) / sizeof(K[0]); k++) {
+            close(open("/tmp/aud_nd/file", O_CREAT | O_WRONLY, 0600));
+            close(open("/tmp/aud_nd/victim", O_CREAT | O_WRONLY, 0600));
+            int fd = open("/tmp/aud_nd/file", K[k].flags);
+            char nm[96];
+
+            errno = 0;
+            long r = syscall(SYS_unlinkat, fd, "../victim", 0);
+            int e = errno;
+            snprintf(nm, sizeof(nm), "SG-1b unlinkat %s ../victim", K[k].name);
+            if (r == -1 && e == ENOTDIR && access("/tmp/aud_nd/victim", F_OK) == 0)
+                OK(nm);
+            else
+                BAD(nm, "r=%ld errno=%d victim=%d", r, e, access("/tmp/aud_nd/victim", F_OK) == 0);
+
+            errno = 0;
+            r = syscall(SYS_openat, fd, "../victim", O_RDONLY);
+            e = errno;
+            snprintf(nm, sizeof(nm), "SG-1b openat %s ../victim", K[k].name);
+            if (r == -1 && e == ENOTDIR) OK(nm);
+            else { BAD(nm, "r=%ld errno=%d", r, e); if (r >= 0) close((int)r); }
+            close(fd);
+        }
+        /* 无效 fd → EBADF，同样不得透传 */
+        errno = 0;
+        long r = syscall(SYS_unlinkat, 987654, "victim", 0);
+        if (r == -1 && errno == EBADF && access("/tmp/aud_nd/victim", F_OK) == 0)
+            OK("SG-1b unlinkat bad fd EBADF");
+        else
+            BAD("SG-1b unlinkat bad fd", "r=%ld errno=%d", r, errno);
+        unlink("/tmp/aud_nd/file"); unlink("/tmp/aud_nd/victim"); rmdir("/tmp/aud_nd");
     }
 
     /* ---- SL-1 ---- */
