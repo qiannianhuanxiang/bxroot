@@ -2095,8 +2095,9 @@ static int proc_other_pid_guest_exe(const char *exe_path, char *out, size_t outs
      * __readlink_chk 等**不**调 ensure_real_functions 的钩子进来；进程的
      * 第一个 FS 调用若正是它（coreutils readlink 走 __readlink_chk），
      * real_open 还是 NULL → 直接放弃 → 回退成调用者自己的 guest_exe。
-     * 表现为 `readlink /proc/$$/exe` 偶发答 /usr/bin/readlink 而非 /bin/sh
-     * （RUN_ALL 里复现、单跑不复现 —— 取决于哪条钩子先被触发）。
+     * （注：`readlink /proc/$$/exe` 偶发答 /usr/bin/readlink 的**主因**不在
+     * 这里，而是调用方用指针偏移判 self、撞上 4 位 pid —— 见
+     * proc_magic_link_target 的 is_self 注释。）
      */
     ensure_real_functions();
     const size_t cap = 65536;           /* environ 上限（线程安全：堆分配） */
@@ -2144,33 +2145,57 @@ static int proc_other_pid_guest_exe(const char *exe_path, char *out, size_t outs
     return rc;
 }
 
+/*
+ * 解析 /proc/<who>/… 的 <who>：返回 1 = self/thread-self，2 = 数字 pid，
+ * 0 = 不认识。*slash 指向 <who> 之后的 '/'。
+ *
+ * ★ "是不是 self" 必须在这里按字面判定，不能事后比指针偏移 ★
+ * 旧写法在 exe 分支用 `slash != rest + 4 && slash != rest + 11` 推断
+ * "是不是 self/thread-self"。但数字 pid 的 slash 落在 rest + 位数：
+ * **4 位 pid**（1000–9999）的 slash 恰在 rest + 4，被当成 self →
+ * 跳过读对方 environ → 答成调用者自己的 guest_exe。实测
+ * `sh -c 'readlink /proc/$$/exe'` 在 sh 的 pid < 10000 时稳定答
+ * /usr/bin/readlink，≥ 10000 时正确答 /bin/sh（RUN_PROC_VIEW 偶发红
+ * 的根因：只取决于 pid 落在哪个区间）。11 位 pid 同理会撞 thread-self。
+ */
+static int proc_who_kind(const char *hostp, const char **slash)
+{
+    const char *rest = hostp + 6;   /* 调用方已确认 "/proc/" 前缀 */
+    const char *q = rest;
+
+    if (strncmp(rest, "self", 4) == 0 && rest[4] == '/') {
+        *slash = rest + 4;
+        return 1;
+    }
+    if (strncmp(rest, "thread-self", 11) == 0 && rest[11] == '/') {
+        *slash = rest + 11;
+        return 1;
+    }
+    if (*q < '0' || *q > '9')
+        return 0;
+    while (*q >= '0' && *q <= '9')
+        q++;
+    if (*q != '/')
+        return 0;
+    *slash = q;
+    return 2;
+}
+
 static int proc_magic_link_target(const char *hostp, char *out, size_t outsz)
 {
-    const char *rest;
-    const char *slash;
+    const char *slash = NULL;
     char raw[MAX_PATH_LEN];
     ssize_t n;
+    int kind;
 
     if (hostp == NULL || out == NULL || outsz == 0)
         return 0;
     if (strncmp(hostp, "/proc/", 6) != 0)
         return 0;
     ensure_real_functions();        /* 下面要用 real_readlink / real_open（见 proc_other_pid_guest_exe） */
-    rest = hostp + 6;
-    if (strncmp(rest, "self", 4) == 0 && rest[4] == '/') {
-        slash = rest + 4;
-    } else if (strncmp(rest, "thread-self", 11) == 0 && rest[11] == '/') {
-        slash = rest + 11;
-    } else {
-        const char *q = rest;
-        if (*q < '0' || *q > '9')
-            return 0;
-        while (*q >= '0' && *q <= '9')
-            q++;
-        if (*q != '/')
-            return 0;
-        slash = q;
-    }
+    kind = proc_who_kind(hostp, &slash);
+    if (kind == 0)
+        return 0;
 
     if (strcmp(slash, "/root") == 0) {
         snprintf(out, outsz, "/");
@@ -2190,7 +2215,7 @@ static int proc_magic_link_target(const char *hostp, char *out, size_t outsz)
          * 与父相同，回退值恰好正确）。
          */
         if (g_config.guest_exe != NULL && g_config.guest_exe[0] == '/') {
-            if (slash != rest + 4 && slash != rest + 11 &&
+            if (kind == 2 &&
                 proc_other_pid_guest_exe(hostp, out, outsz) == 1)
                 return 1;
             snprintf(out, outsz, "%s", g_config.guest_exe);
