@@ -464,6 +464,358 @@ static void parse_binds(void) {
 
 /*
  * ==================================================================
+ * 官方 proroot launcher 配置块（PROROOT_CFG_FD）读取
+ * ==================================================================
+ *
+ * 【场景】bxroot runtime 以 `libproroot-runtime.so` 之名替换进官方 DSHA
+ * APK 时，launcher（官方 libproroot.so，不是本项目的 libbxroot）不会设
+ * BXROOT_* 变量，而是：
+ *   1. 把一块 0x43130 字节的配置写到 `<tmp>/.proroot-config-<pid>`；
+ *   2. setenv PROROOT_CFG_FD=<该文件的路径>（名字叫 FD，内容其实是路径）；
+ *   3. setenv PROROOT_ESCAPE_FD=<指向真实 rootfs 目录的 O_PATH fd 号>；
+ *   4. setenv PROROOT_ROOTFS=<rootfs 宿主路径>。
+ * 不读这块配置，-b 绑定、-0、--link2symlink 全部静默失效（现场表现为
+ * bash 等进程被 SIGSYS 杀死后回退到 proot）。
+ *
+ * 【只解码 bxroot 用得到的字段】其余（官方 runtime 另有约 60 处读点）忽略：
+ *     +0x2008 + i*0x2008        bind[i] 的 guest 目标路径（4096 字节，NUL 结尾）
+ *     +0x3008 + i*0x2008        bind[i] 的 host 源路径
+ *     +0x42108                  bind 条数（最多 32，这里再受 MAX_BINDS 限制）
+ *     +0x4210c                  -0（fakeroot）
+ *     +0x42110                  --link2symlink
+ * 偏移取自 launcher main 写入侧与官方 runtime 读取侧的反汇编交叉验证。
+ *
+ * 【触发条件】BXROOT_ROOTFS 与 BXROOT_BINDS 均未设（用户显式配置优先），
+ * 且 PROROOT_CFG_FD 非空。
+ *
+ * 【打开文件为什么要多条腿】路径是宿主视角。在嵌套容器里直接 open 会落空，
+ * 所以依次尝试：原路径 → 规范化路径 → 剥 rootfs 前缀 → 经 ESCAPE_FD
+ * 相对打开 → 经 ESCAPE_FD 的父目录打开。全部用裸 svc，不经本库的路径翻译
+ * （翻译会把 "../x" 夹紧回 rootfs 内，等于把逃生门焊死）。
+ */
+#define PRCFG_SIZE_MIN     0x42118u
+#define PRCFG_SIZE_MAX     (2u * 1024u * 1024u)
+#define PRCFG_MAX_ENTRIES  32
+#define PRCFG_FIELD_LEN    4096u
+#define PRCFG_OFF_DST(i)   (0x2008u + (unsigned)(i) * 0x2008u)
+#define PRCFG_OFF_SRC(i)   (PRCFG_OFF_DST(i) + 0x1000u)
+#define PRCFG_OFF_NBINDS   0x42108u
+#define PRCFG_OFF_FAKEROOT 0x4210cu
+#define PRCFG_OFF_L2S      0x42110u
+
+/* 裸系统调用，返回值 <0 即 -errno。绕开本库的 syscall() 钩子。 */
+static long prcfg_sys(long nr, long a, long b, long c, long d)
+{
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    __asm__ volatile("svc 0" : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x8) : "memory", "cc");
+    return x0;
+#else
+    long r = syscall(nr, a, b, c, d);
+    return r < 0 ? -(long)errno : r;
+#endif
+}
+
+static int prcfg_openat(int dirfd, const char *path, int flags)
+{
+    long r = prcfg_sys(SYS_openat, dirfd, (long)path, flags | O_CLOEXEC, 0);
+    return r < 0 ? -1 : (int)r;
+}
+
+/* 折叠 "//"、"." 与 ".."（到根即停）。仅处理绝对路径。 */
+static int prcfg_normalize(const char *in, char *out, size_t outsz)
+{
+    size_t n = 0;
+    const char *r = in;
+
+    if (in[0] != '/' || outsz < 2)
+        return -1;
+    out[0] = '\0';
+    while (*r != '\0') {
+        size_t len;
+        while (*r == '/')
+            r++;
+        if (*r == '\0')
+            break;
+        len = strcspn(r, "/");
+        if (len == 1 && r[0] == '.') {
+            /* skip */
+        } else if (len == 2 && r[0] == '.' && r[1] == '.') {
+            char *sl = strrchr(out, '/');
+            if (sl != NULL) {
+                *sl = '\0';
+                n = (size_t)(sl - out);
+            }
+        } else {
+            if (n + 1 + len + 1 > outsz)
+                return -1;
+            out[n++] = '/';
+            memcpy(out + n, r, len);
+            n += len;
+            out[n] = '\0';
+        }
+        r += len;
+    }
+    if (n == 0) {
+        out[0] = '/';
+        out[1] = '\0';
+    }
+    return 0;
+}
+
+/* path 以 root 为目录前缀则返回其后的相对部分（可能为 ""），否则 NULL。 */
+static const char *prcfg_after_prefix(const char *path, const char *root)
+{
+    size_t rl = strlen(root);
+    if (rl == 0 || strncmp(path, root, rl) != 0)
+        return NULL;
+    if (path[rl] == '\0')
+        return path + rl;
+    if (path[rl] != '/')
+        return NULL;
+    while (path[rl] == '/')
+        rl++;
+    return path + rl;
+}
+
+static int prcfg_open(const char *cfg)
+{
+    char norm[PATH_MAX];
+    char esc_root[PATH_MAX];
+    const char *esc_env, *base;
+    int fd, escfd = -1, have_norm, have_esc = 0;
+
+    /* 腿 1：原路径（宿主视角，直接跑在 Android 上时就是这一条） */
+    fd = prcfg_openat(AT_FDCWD, cfg, O_RDONLY);
+    if (fd >= 0)
+        return fd;
+
+    /* 腿 2：规范化后重试 */
+    have_norm = (prcfg_normalize(cfg, norm, sizeof(norm)) == 0);
+    if (have_norm && strcmp(norm, cfg) != 0) {
+        fd = prcfg_openat(AT_FDCWD, norm, O_RDONLY);
+        if (fd >= 0)
+            return fd;
+    }
+    if (!have_norm)
+        return -1;
+
+    esc_env = getenv("PROROOT_ESCAPE_FD");
+    if (esc_env != NULL && esc_env[0] != '\0') {
+        char *end = NULL;
+        long v = strtol(esc_env, &end, 10);
+        if (end != esc_env && v >= 0 && v < 65536)
+            escfd = (int)v;
+    }
+
+    /* 真实 rootfs 的宿主路径：优先读 escape fd 的链接，退回 PROROOT_ROOTFS */
+    if (escfd >= 0) {
+        char lnk[64];
+        long n;
+        snprintf(lnk, sizeof(lnk), "/proc/self/fd/%d", escfd);
+        n = prcfg_sys(SYS_readlinkat, AT_FDCWD, (long)lnk,
+                      (long)esc_root, (long)(sizeof(esc_root) - 1));
+        if (n > 0) {
+            esc_root[n] = '\0';
+            have_esc = 1;
+        }
+    }
+    if (!have_esc) {
+        const char *rf = getenv("PROROOT_ROOTFS");
+        if (rf != NULL && rf[0] == '/' && strlen(rf) < sizeof(esc_root)) {
+            memcpy(esc_root, rf, strlen(rf) + 1);
+            have_esc = 1;
+        }
+    }
+    if (have_esc) {
+        size_t el = strlen(esc_root);
+        while (el > 1 && esc_root[el - 1] == '/')
+            esc_root[--el] = '\0';
+    }
+
+    /* 腿 1b：文件在 rootfs 之内 → 剥前缀，按 guest 路径打开 */
+    if (have_esc) {
+        const char *rest = prcfg_after_prefix(norm, esc_root);
+        if (rest != NULL && rest[0] != '\0') {
+            char gp[PATH_MAX];
+            if (snprintf(gp, sizeof(gp), "/%s", rest) < (int)sizeof(gp)) {
+                fd = prcfg_openat(AT_FDCWD, gp, O_RDONLY);
+                if (fd >= 0)
+                    return fd;
+            }
+        }
+    }
+
+    base = strrchr(norm, '/');
+    base = base ? base + 1 : norm;
+
+    if (escfd >= 0) {
+        char up[PATH_MAX];
+
+        /* 腿 3：经 escape fd 相对打开 —— 先 rootfs 内的相对部分，再 "../<文件名>" */
+        if (have_esc) {
+            const char *rest = prcfg_after_prefix(norm, esc_root);
+            if (rest != NULL && rest[0] != '\0') {
+                fd = prcfg_openat(escfd, rest, O_RDONLY);
+                if (fd >= 0)
+                    return fd;
+            }
+        }
+        if (snprintf(up, sizeof(up), "../%s", base) < (int)sizeof(up)) {
+            fd = prcfg_openat(escfd, up, O_RDONLY);
+            if (fd >= 0)
+                return fd;
+        }
+
+        /* 腿 3b：先开 escape fd 的父目录，再开文件名 */
+        {
+            int pfd = prcfg_openat(escfd, "..", O_RDONLY | O_DIRECTORY);
+            if (pfd >= 0) {
+                fd = prcfg_openat(pfd, base, O_RDONLY);
+                prcfg_sys(SYS_close, pfd, 0, 0, 0);
+                if (fd >= 0)
+                    return fd;
+            }
+        }
+    }
+    return -1;
+}
+
+/* 读整个文件到 malloc 缓冲；成功返回缓冲（*len 为长度），失败 NULL。 */
+static unsigned char *prcfg_slurp(int fd, size_t *len)
+{
+    unsigned char *buf = malloc(PRCFG_SIZE_MAX + 1);
+    size_t got = 0;
+
+    if (buf == NULL)
+        return NULL;
+    for (;;) {
+        long n = prcfg_sys(SYS_read, fd, (long)(buf + got),
+                           (long)(PRCFG_SIZE_MAX + 1 - got), 0);
+        if (n == -EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+        if (got > PRCFG_SIZE_MAX) {         /* 过大：不是我们认识的配置块 */
+            free(buf);
+            return NULL;
+        }
+    }
+    *len = got;
+    return buf;
+}
+
+static unsigned int prcfg_u32(const unsigned char *b, unsigned int off)
+{
+    unsigned int v;
+    memcpy(&v, b + off, sizeof(v));
+    return v;
+}
+
+/* 返回 blob 内 off 处的 NUL 结尾字段长度；无终止符或为空返回 0。 */
+static size_t prcfg_field(const unsigned char *b, unsigned int off)
+{
+    size_t n = strnlen((const char *)b + off, PRCFG_FIELD_LEN);
+    return (n >= 1 && n < PRCFG_FIELD_LEN) ? n : 0;
+}
+
+static void load_proroot_cfg(void)
+{
+    const char *cfg = getenv("PROROOT_CFG_FD");
+    unsigned char *b;
+    size_t len = 0;
+    unsigned int nb, i;
+    int fd;
+
+    if (cfg == NULL || cfg[0] == '\0')
+        return;
+    fd = prcfg_open(cfg);
+    if (fd < 0) {
+        LOG("cfg: 打不开 PROROOT_CFG_FD=%s（所有路径均失败）", cfg);
+        return;
+    }
+    b = prcfg_slurp(fd, &len);
+    prcfg_sys(SYS_close, fd, 0, 0, 0);
+    if (b == NULL || len < PRCFG_SIZE_MIN) {
+        LOG("cfg: 配置块大小不符 len=%zu", len);
+        free(b);
+        return;
+    }
+
+    nb = prcfg_u32(b, PRCFG_OFF_NBINDS);
+    if (nb > PRCFG_MAX_ENTRIES)
+        nb = PRCFG_MAX_ENTRIES;
+
+    if (nb > 0) {
+        g_config.bind_sources = calloc(MAX_BINDS, sizeof(char *));
+        g_config.bind_targets = calloc(MAX_BINDS, sizeof(char *));
+        g_config.bind_readonly = calloc(MAX_BINDS, sizeof(int));
+        if (!g_config.bind_sources || !g_config.bind_targets ||
+            !g_config.bind_readonly) {
+            free(g_config.bind_sources);
+            free(g_config.bind_targets);
+            free(g_config.bind_readonly);
+            g_config.bind_sources = NULL;
+            g_config.bind_targets = NULL;
+            g_config.bind_readonly = NULL;
+            free(b);
+            return;
+        }
+    }
+    for (i = 0; i < nb && g_config.bind_count < MAX_BINDS; i++) {
+        size_t dl = prcfg_field(b, PRCFG_OFF_DST(i));
+        size_t sl = prcfg_field(b, PRCFG_OFF_SRC(i));
+        char *src, *dst;
+
+        if (dl == 0 || sl == 0)
+            continue;
+        src = strndup((const char *)b + PRCFG_OFF_SRC(i), sl);
+        dst = strndup((const char *)b + PRCFG_OFF_DST(i), dl);
+        if (src == NULL || dst == NULL) {
+            free(src);
+            free(dst);
+            continue;
+        }
+        strip_trailing_slash(src);
+        strip_trailing_slash(dst);
+        g_config.bind_sources[g_config.bind_count] = src;
+        g_config.bind_targets[g_config.bind_count] = dst;
+        g_config.bind_readonly[g_config.bind_count] = 0;
+        g_config.bind_count++;
+        LOG("cfg bind: %s -> %s", src, dst);
+    }
+
+    /* -0：等价 BXROOT_FAKEROOT=1（显式环境变量优先） */
+    if (prcfg_u32(b, PRCFG_OFF_FAKEROOT) != 0 &&
+        getenv("BXROOT_FAKEROOT") == NULL &&
+        getenv("PROROOT_FAKEROOT") == NULL) {
+        g_config.fakeroot = true;
+        setenv("BXROOT_FAKEROOT", "1", 1);
+    }
+
+    /* --link2symlink：l2s 产物集中到 <rootfs>/.l2s（显式目录优先） */
+    if (prcfg_u32(b, PRCFG_OFF_L2S) != 0 &&
+        getenv("BXROOT_L2S_DIR") == NULL &&
+        getenv("PROOT_L2S_DIR") == NULL &&
+        g_config.rootfs != NULL && g_config.rootfs[0] != '\0') {
+        char dir[MAX_PATH_LEN];
+        if (snprintf(dir, sizeof(dir), "%s/.l2s", g_config.rootfs) <
+            (int)sizeof(dir))
+            setenv("BXROOT_L2S_DIR", dir, 1);
+    }
+
+    LOG("cfg: 从 %s 载入 %d 条 bind", cfg, g_config.bind_count);
+    free(b);
+}
+
+/*
+ * ==================================================================
  * 任务 3.5：PROROOT_* 旧前缀防呆警告
  * ==================================================================
  *
@@ -585,6 +937,8 @@ static void init_config(void) {
      * 一行归一化即可消除整类未定义行为。
      */
     env = getenv("BXROOT_ROOTFS");
+    if (!(env && env[0]))
+        env = getenv("PROROOT_ROOTFS");   /* 官方 launcher 设置（见 load_proroot_cfg） */
     g_config.rootfs = env && env[0] ? strdup(env) : strdup(BXROOT_ROOTFS);
     if (g_config.rootfs != NULL)
         strip_trailing_slash(g_config.rootfs);
@@ -611,6 +965,10 @@ static void init_config(void) {
 
     /* bind mount */
     parse_binds();
+
+    /* 官方 launcher 的配置块：仅当用户没有显式给 BXROOT_ROOTFS / BXROOT_BINDS */
+    if (g_config.bind_count == 0 && getenv("BXROOT_ROOTFS") == NULL)
+        load_proroot_cfg();
 
     LOG("config: rootfs=%s, tmp=%s, verbose=%d, fakeroot=%d, binds=%d",
         g_config.rootfs, g_config.tmp_dir, g_config.verbose, g_config.fakeroot,
