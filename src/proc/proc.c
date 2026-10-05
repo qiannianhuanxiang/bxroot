@@ -3538,7 +3538,9 @@ static int px_trampoline_exec(const char *host, char *const argv[],
  *
  * 【修法】官方 runtime 的做法（实测其子进程 argv/env）：
  *     execve(<STUB_LOADER>, [<STUB_LOADER>, <宿主 exe>, <argv[1..]>], env)
- *     env += PROROOT_STUB_GUEST_EXE=<guest 路径>  PROROOT_STUB_ROOTFS=<rootfs>
+ *     env += PROROOT_STUB_GUEST_EXE=<guest 路径>
+ *     无 PROROOT_CFG_FD 时再加 PROROOT_STUB_ROOTFS=<rootfs>
+ *     （官方 runtime 从不写 STUB_ROOTFS；有 CFG blob 时让 stub 自己读）
  * stub-loader 自己做 ELF 装载与 syscall 路径翻译（静态程序里没有我们的
  * 钩子可挂）。实测在 bxroot 进程内这样 exec，非默认 rootfs 下的静态程序
  * 读到的是 rootfs 内的 /etc 文件 —— 翻译确实生效。
@@ -3619,6 +3621,9 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
 {
     const char *stub = getenv("BXROOT_STUB_LOADER_EXEC");
     const char *rf = g_rt_cfg.have_rootfs ? g_rt_cfg.rootfs : NULL;
+    const char *cfgfd = getenv("PROROOT_CFG_FD");
+    int have_cfg = (cfgfd != NULL && cfgfd[0] != '\0');
+    int inject_stub_rootfs;
     size_t n = 0, i, ec = 0;
     int tracing = 0;
 
@@ -3628,11 +3633,27 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
      * 优先 bxroot 自己的变量，回落官方的 PROROOT_STUB_LOADER（DSHA 与外层
      * proroot 都提供它）。bxroot 自己的 libbxroot-stub-loader.so **不能**
      * 当这个用 —— 它只是 execve+LD_PRELOAD 回退（文件头注释），不做装载。
+     *
+     * ★ 有 PROROOT_CFG_FD 时不要注入 PROROOT_STUB_ROOTFS ★
+     *
+     * 官方 runtime 从不写这个变量（strings 对官方 libproroot-runtime.so
+     * 搜不到 PROROOT_STUB_ROOTFS）。beta/官方 stub 在 STUB_ROOTFS 与
+     * CFG blob 并存时，openat 仍走 blob 翻译（所以 ldconfig 能列出
+     * Ubuntu 的 .so 和 /etc/ld.so.conf.d/libc.conf），但 renameat 会
+     * 落到未翻译的 Android /etc overlay → EROFS。这就是 cfgfd 二改
+     * APK 首次引导
+     *   ldconfig.real: Renaming of /etc/ld.so.cache~ to /etc/ld.so.cache
+     *   failed: Read-only file system
+     * 的现场。有 blob 时让 stub 自己读配置，与官方 runtime 对齐。
+     * 没有 blob 的 bxroot 自己的 launcher 路径仍注入 STUB_ROOTFS。
      */
     if (stub == NULL || stub[0] == '\0')
         stub = getenv("PROROOT_STUB_LOADER");
-    if (stub == NULL || stub[0] != '/' || rf == NULL || rf[0] == '\0')
+    if (stub == NULL || stub[0] != '/')
         return -1;
+    if (!have_cfg && (rf == NULL || rf[0] == '\0'))
+        return -1;
+    inject_stub_rootfs = (!have_cfg && rf != NULL && rf[0] != '\0');
     /* 与 trampoline 同理：/data/app 下的路径要经 /proc/self/root 绕开翻译 */
     if (strncmp(stub, "/proc/", 6) == 0) {
         if (strlen(stub) >= sizeof(sp->path))
@@ -3656,8 +3677,13 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
     if (snprintf(sp->genv, sizeof(sp->genv), "PROROOT_STUB_GUEST_EXE=%s",
                  (guest != NULL && guest[0] != '\0') ? guest : host) >= (int)sizeof(sp->genv))
         return -1;
-    if (snprintf(sp->renv, sizeof(sp->renv), "PROROOT_STUB_ROOTFS=%s", rf) >= (int)sizeof(sp->renv))
-        return -1;
+    if (inject_stub_rootfs) {
+        if (snprintf(sp->renv, sizeof(sp->renv), "PROROOT_STUB_ROOTFS=%s", rf)
+            >= (int)sizeof(sp->renv))
+            return -1;
+    } else {
+        sp->renv[0] = '\0';
+    }
 
     if (envp != NULL)
         while (envp[ec] != NULL)
@@ -3688,7 +3714,8 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
         sp->ne[n++] = envp[i];
     }
     sp->ne[n++] = sp->genv;
-    sp->ne[n++] = sp->renv;
+    if (inject_stub_rootfs)
+        sp->ne[n++] = sp->renv;
     sp->ne[n] = NULL;
     return 0;
 }

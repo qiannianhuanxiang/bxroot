@@ -473,17 +473,21 @@ static void parse_binds(void) {
  *   1. 把一块 0x43130 字节的配置写到 `<tmp>/.proroot-config-<pid>`；
  *   2. setenv PROROOT_CFG_FD=<该文件的路径>（名字叫 FD，内容其实是路径）；
  *   3. setenv PROROOT_ESCAPE_FD=<指向真实 rootfs 目录的 O_PATH fd 号>；
- *   4. setenv PROROOT_ROOTFS=<rootfs 宿主路径>。
+ *   4. 可能 setenv PROROOT_ROOTFS=<rootfs 宿主路径>（字符串表里有这个
+ *      名字，但 launcher 没有 "env PROROOT_ROOTFS=" 日志；不能依赖它）。
  * 不读这块配置，-b 绑定、-0、--link2symlink 全部静默失效（现场表现为
  * bash 等进程被 SIGSYS 杀死后回退到 proot）。
  *
  * 【只解码 bxroot 用得到的字段】其余（官方 runtime 另有约 60 处读点）忽略：
+ *     +0x0000                   rootfs 宿主路径（4096 字节，NUL 结尾；可能为空）
+ *     +0x1000                   workdir（本加载器暂不消费）
  *     +0x2008 + i*0x2008        bind[i] 的 guest 目标路径（4096 字节，NUL 结尾）
  *     +0x3008 + i*0x2008        bind[i] 的 host 源路径
  *     +0x42108                  bind 条数（最多 32，这里再受 MAX_BINDS 限制）
  *     +0x4210c                  -0（fakeroot）
  *     +0x42110                  --link2symlink
  * 偏移取自 launcher main 写入侧与官方 runtime 读取侧的反汇编交叉验证。
+ * rootfs 另有一条不依赖偏移的来源：PROROOT_ESCAPE_FD 的 /proc/self/fd/N。
  *
  * 【触发条件】BXROOT_ROOTFS 与 BXROOT_BINDS 均未设（用户显式配置优先），
  * 且 PROROOT_CFG_FD 非空。
@@ -497,6 +501,8 @@ static void parse_binds(void) {
 #define PRCFG_SIZE_MAX     (2u * 1024u * 1024u)
 #define PRCFG_MAX_ENTRIES  32
 #define PRCFG_FIELD_LEN    4096u
+#define PRCFG_OFF_ROOTFS   0x0000u
+#define PRCFG_OFF_WORKDIR  0x1000u
 #define PRCFG_OFF_DST(i)   (0x2008u + (unsigned)(i) * 0x2008u)
 #define PRCFG_OFF_SRC(i)   (PRCFG_OFF_DST(i) + 0x1000u)
 #define PRCFG_OFF_NBINDS   0x42108u
@@ -789,6 +795,58 @@ static void load_proroot_cfg(void)
         g_config.bind_readonly[g_config.bind_count] = 0;
         g_config.bind_count++;
         LOG("cfg bind: %s -> %s", src, dst);
+    }
+
+    /*
+     * rootfs。官方 launcher 不一定 setenv PROROOT_ROOTFS（见文件头）。
+     * 来源按可靠程度：ESCAPE_FD 的内核路径 → blob +0x0000。
+     * 已经有 BXROOT_ROOTFS / PROROOT_ROOTFS 时不覆盖（用户/外层优先）。
+     * 必须在 --link2symlink 段之前生效：那一段用 g_config.rootfs 拼 .l2s。
+     */
+    {
+        char *rf = NULL;
+        const char *have_bx = getenv("BXROOT_ROOTFS");
+        const char *have_pr = getenv("PROROOT_ROOTFS");
+        int env_set = (have_bx != NULL && have_bx[0] != '\0') ||
+                      (have_pr != NULL && have_pr[0] != '\0');
+
+        if (!env_set) {
+            const char *esc_env = getenv("PROROOT_ESCAPE_FD");
+            if (esc_env != NULL && esc_env[0] != '\0') {
+                char *end = NULL;
+                long v = strtol(esc_env, &end, 10);
+                if (end != esc_env && *end == '\0' && v >= 0 && v < 65536) {
+                    char lnk[64], buf[PATH_MAX];
+                    long n;
+                    snprintf(lnk, sizeof(lnk), "/proc/self/fd/%ld", v);
+                    n = prcfg_sys(SYS_readlinkat, AT_FDCWD, (long)lnk,
+                                  (long)buf, (long)(sizeof(buf) - 1));
+                    if (n > 0 && buf[0] == '/') {
+                        buf[n] = '\0';
+                        rf = strdup(buf);
+                    }
+                }
+            }
+            if (rf == NULL) {
+                size_t rl = prcfg_field(b, PRCFG_OFF_ROOTFS);
+                if (rl > 0 && b[PRCFG_OFF_ROOTFS] == '/')
+                    rf = strndup((const char *)b + PRCFG_OFF_ROOTFS, rl);
+            }
+        }
+        if (rf != NULL) {
+            strip_trailing_slash(rf);
+            /* overwrite=0：不踩已有的显式环境变量 */
+            setenv("PROROOT_ROOTFS", rf, 0);
+            setenv("BXROOT_ROOTFS", rf, 0);
+            if (g_config.rootfs == NULL ||
+                strcmp(g_config.rootfs, BXROOT_ROOTFS) == 0) {
+                free(g_config.rootfs);
+                g_config.rootfs = rf;
+                rf = NULL;
+            }
+            LOG("cfg: rootfs=%s", g_config.rootfs ? g_config.rootfs : "(null)");
+            free(rf);
+        }
     }
 
     /* -0：等价 BXROOT_FAKEROOT=1（显式环境变量优先） */
