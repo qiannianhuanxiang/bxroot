@@ -2203,6 +2203,12 @@ void px_reap_child_tolerant(pid_t child, px_wait_child_fn wait_fn, void *ud,
 extern int bxroot_translate_path(const char *path, char *out, size_t out_size)
     __attribute__((weak));
 extern void bxroot_log(const char *fmt, ...) __attribute__((weak));
+/*
+ * 进程内执行静态 ELF（src/runtime/static_exec.c）。weak：proc.c 单测里没有它。
+ * 成功不返回；失败返回 -1，调用方回退 stub-loader。
+ */
+extern int px_static_exec(const char *host, char *const argv[],
+                          char *const envp[]) __attribute__((weak));
 
 
 #define PX_LOG(...) do {                                              \
@@ -3821,6 +3827,23 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
      * 仍经 real_posix_spawn，file_actions/attr 由 glibc 原样应用。
      */
     if (host != NULL && px_elf_needs_stub(host)) {
+        /*
+         * 无 file_actions/attr 时 fork + 进程内执行（与 execve 同路径）。
+         * 有 fa/attr 时仍走 stub-loader：自己复现 glibc 的 file_actions
+         * 语义成本高，冷装 ldconfig 走的是 fork+exec 不是 spawn。
+         */
+        if (fa == NULL && attr == NULL && px_static_exec != NULL) {
+            pid_t c = fork();
+            if (c == 0) {
+                (void)px_static_exec(host, argv, envp);
+                _exit(127);
+            }
+            if (c > 0) {
+                *pid = c;
+                PX_LOG("proc: spawn 无 PT_INTERP 的 ELF 经进程内执行 %s pid=%d", host, (int)c);
+                return 0;
+            }
+        }
         px_stub_plan *sp = (px_stub_plan *)malloc(sizeof(*sp));
         if (sp != NULL && px_stub_prepare(sp, host, argv, envp, argv0) == 0) {
             if (real_posix_spawn == NULL) {
@@ -4766,6 +4789,19 @@ static int px_do_execve(const char *path, char *const argv[],
             definitive_no = 1;          /* 目录不可 exec */
         } else if (S_ISREG(tst.st_mode) && (tst.st_mode & 0111) == 0) {
             definitive_no = 1;          /* 三个执行位全 0，必然不可 exec */
+        }
+
+        /*
+         * ★ 无 PT_INTERP 的 ELF：先进程内执行，失败再走 stub-loader ★
+         * execve(stub-loader) 会丢掉 runtime，而官方 stub 对绝对路径
+         * renameat/linkat/unlinkat 不翻译（ldconfig.real 写 ld.so.cache 时
+         * EROFS，见 static_exec.c 文件头）。成功则永不返回；失败（多线程、
+         * ET_EXEC 地址冲突…）落回后面的 stub 分支，行为与改前一致。
+         */
+        if (!definitive_no && px_static_exec != NULL && px_elf_needs_stub(host)) {
+            PX_LOG("proc: 进程内执行静态 ELF %s", host);
+            (void)px_static_exec(host, final_argv, final_env);
+            PX_LOG("proc: 进程内执行失败(errno=%d)，回退 stub-loader %s", errno, host);
         }
 
         if (definitive_no) {

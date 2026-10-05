@@ -108,6 +108,50 @@ echo "--- E) 动态程序不受影响 ---"
 o=$(run_rf '/tmp/p_dyn')
 [ "$o" = "marker=INSIDE-ROOTFS" ] && good "动态程序照常（trampoline 路径）" || bad "动态程序：$o"
 
+echo "--- F) 有 CFG blob 时不注入 STUB_ROOTFS ---"
+# 官方 runtime 从不写 PROROOT_STUB_ROOTFS。bxroot 在无 CFG 时仍要注入
+# （自己的 launcher 路径），有 PROROOT_CFG_FD 时必须剥掉，否则 beta stub
+# 的 renameat 落到 Android /etc overlay → ldconfig.real EROFS。
+# 探针是静态 ELF，必定走 px_stub_prepare。
+bld -O1 -static -o "$RF/tmp/p_env" "$ROOT/test/static/probe_stub_env.c" \
+    || { echo "⏭️  F 跳过：静态探针编不过"; }
+if [ -x "$RF/tmp/p_env" ]; then
+    o=$(run_rf '/tmp/p_env' | tr '\n' ' ')
+    case "$o" in
+        *"PROROOT_STUB_ROOTFS=SET"*"PROROOT_CFG_FD=EMPTY"*)
+            good "无 CFG_FD：注入 STUB_ROOTFS" ;;
+        *)
+            bad "无 CFG_FD 期望 STUB_ROOTFS=SET CFG_FD=EMPTY，实得 '$o'" ;;
+    esac
+    # 只需要环境变量非空；blob 文件存在与否不影响 inject_stub_rootfs 判定。
+    o=$(
+        export PROROOT_CFG_FD="/tmp/bxroot-cfg-dummy-$$"
+        run_rf '/tmp/p_env' | tr '\n' ' '
+    )
+    case "$o" in
+        *"PROROOT_STUB_ROOTFS=EMPTY"*"PROROOT_CFG_FD=SET"*)
+            good "有 CFG_FD：不注入 STUB_ROOTFS" ;;
+        *)
+            bad "有 CFG_FD 期望 STUB_ROOTFS=EMPTY CFG_FD=SET，实得 '$o'" ;;
+    esac
+fi
+
+echo "--- G) 静态程序的 rename/link/unlink 等路径类 syscall ---"
+# 官方 stub-loader 只翻译 openat/stat，对绝对路径的 renameat/linkat/unlinkat/
+# faccessat/fchmodat/truncate 不翻译（ldconfig.real 写 ld.so.cache 时 rename
+# 落到宿主只读 /etc → EROFS）。进程内执行（src/runtime/static_exec.c）把这些
+# svc 站点接回 runtime 的路径翻译。判据：全部成功，且宿主 /etc 没有泄漏。
+bld -O1 -static     -o "$RF/tmp/p_fs"  "$ROOT/test/static/probe_static_fsops.c" || true
+bld -O1 -static-pie -o "$RF/tmp/p_fsp" "$ROOT/test/static/probe_static_fsops.c" || true
+for v in p_fs p_fsp; do
+    [ -x "$RF/tmp/$v" ] || continue
+    rm -rf /etc/bx-fs-* 2>/dev/null
+    o=$(run_rf "/tmp/$v" | tr '\n' ' ')
+    [ "$o" = "fsops=OK " ] && good "$v：路径类 syscall 全部成功" || bad "$v：$o"
+    leak=$(ls -d /etc/bx-fs-* 2>/dev/null | tr '\n' ' ')
+    [ -z "$leak" ] && good "$v：宿主 /etc 无泄漏" || { bad "$v：宿主 /etc 泄漏 $leak"; rm -rf /etc/bx-fs-*; }
+done
+
 echo
 [ "$FAIL" -gt 0 ] && { echo "RESULT: FAIL（$FAIL 项）"; exit 1; }
 echo "RESULT: PASS"
