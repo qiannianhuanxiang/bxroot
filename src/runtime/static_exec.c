@@ -157,6 +157,30 @@ static unsigned sx_path_mask(long nr)
     }
 }
 
+/* 需要补丁的站点：入参有路径，或出参是路径（getcwd=17，内核写宿主路径回来）。 */
+static int sx_wants_site(long nr)
+{
+    return sx_path_mask(nr) != 0 || nr == 17;
+}
+
+/* 反向翻译：把内核写回的宿主路径剥成 guest 视角（用 runtime 自己的剥离逻辑）。 */
+__attribute__((weak))
+int bxroot_strip_rootfs(char *buf);
+
+static long sx_getcwd_fixup(long r, char *buf, unsigned long size)
+{
+    size_t len;
+
+    if (r <= 0 || buf == NULL || bxroot_strip_rootfs == NULL)
+        return r;
+    len = strnlen(buf, size);
+    if (len >= size)
+        return r;                       /* 没有 NUL：不是合法结果，原样交回 */
+    if (!bxroot_strip_rootfs(buf))
+        return r;
+    return (long)strlen(buf) + 1;       /* getcwd 系统调用返回含 NUL 的长度 */
+}
+
 /*
  * 由汇编跳板调用（此时 TPIDR_EL0 已切回动态 libc 的 TLS）。
  * 返回内核原始约定（负 errno = 错误）。
@@ -170,6 +194,9 @@ long px_static_dispatch(long a0, long a1, long a2, long a3, long a4, long a5,
     char buf[2][SX_PATHBUF];
     int i, used = 0;
 
+    if (nr == 17)
+        return sx_getcwd_fixup(sx_sc6(nr, a0, a1, a2, a3, a4, a5),
+                               (char *)(uintptr_t)a0, (unsigned long)a1);
     if (mask == 0 || bxroot_translate_path == NULL)
         return sx_sc6(nr, a0, a1, a2, a3, a4, a5);
 
@@ -276,11 +303,25 @@ typedef struct {
     size_t veneer_cap;
 } sx_image;
 
+
+static void sx_unload(sx_image *img)
+{
+    unsigned long ps, lo, hi;
+    if (img == NULL || img->hi <= img->lo)
+        return;
+    ps = (unsigned long)getpagesize();
+    lo = img->lo & ~(ps - 1);
+    hi = (img->hi + img->veneer_cap + ps - 1) & ~(ps - 1);
+    if (hi > lo)
+        (void)sx_sc6(SYS_munmap, (long)lo, (long)(hi - lo), 0, 0, 0, 0);
+    img->lo = img->hi = 0;
+}
+
 static int sx_load(const char *path, sx_image *img, size_t veneer_bytes)
 {
     Elf64_Ehdr eh;
     unsigned long lo = ~0UL, hi = 0, align = 4096;
-    unsigned long ps = 4096;
+    unsigned long ps = (unsigned long)getpagesize();
     long fd;
     unsigned i;
     char *res;
@@ -378,11 +419,18 @@ static int sx_load(const char *path, sx_image *img, size_t veneer_bytes)
         me = va + p->p_memsz;
         if (p->p_memsz > p->p_filesz) {
             if (p->p_filesz > 0 && fpe > fe) {
-                if (!(prot & PROT_WRITE))
-                    SC(SYS_mprotect, img->base + (fe & ~(ps - 1)), ps, prot | PROT_WRITE, 0);
+                unsigned long pg = img->base + (fe & ~(ps - 1));
+                if (!(prot & PROT_WRITE)) {
+                    long pr = SC(SYS_mprotect, pg, ps, prot | PROT_WRITE, 0);
+                    if (pr != 0) {
+                        SC(SYS_close, fd, 0, 0, 0);
+                        errno = (int)-pr;
+                        return -1;
+                    }
+                }
                 memset((void *)(img->base + fe), 0, fpe - fe);
                 if (!(prot & PROT_WRITE))
-                    SC(SYS_mprotect, img->base + (fe & ~(ps - 1)), ps, prot, 0);
+                    SC(SYS_mprotect, pg, ps, prot, 0);
             }
             if (me > fpe) {
                 unsigned long s = p->p_filesz > 0 ? fpe : a;
@@ -443,7 +491,7 @@ static size_t sx_scan(uint32_t *code, size_t n, uint32_t *pool, size_t pool_cap_
         long m;
 
         if (ins == SX_SVC_INSN) {
-            if (nr >= 0 && sx_path_mask(nr) != 0) {
+            if (nr >= 0 && sx_wants_site(nr)) {
                 if (pool != NULL) {
                     uint32_t *v = pool + total * (SX_VENEER_SIZE / 4);
                     long off;
@@ -602,6 +650,7 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     /* 先按最大站点数估个 veneer 区：第一遍装载后才知道，所以保守取 4096 个 */
     if (sx_load(host, img, 4096 * SX_VENEER_SIZE) != 0) {
         int e = errno;
+        sx_unload(img);
         free(img);
         errno = e;
         return -1;
@@ -610,6 +659,7 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     sites = sx_count_sites(img);
     if (sites * SX_VENEER_SIZE > img->veneer_cap) {
         /* 站点超过预留：不半补（半补 = 一部分路径仍泄漏到宿主），整体放弃 */
+        sx_unload(img);
         free(img);
         errno = ENOEXEC;
         return -1;
@@ -621,8 +671,9 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
                         PROT_READ | PROT_WRITE, 0, 0, 0);
         unsigned k;
         size_t placed = 0;
+        unsigned long ps = (unsigned long)getpagesize();
 
-        if (m != 0) { free(img); errno = (int)-m; return -1; }
+        if (m != 0) { sx_unload(img); free(img); errno = (int)-m; return -1; }
         for (k = 0; k < img->nph; k++) {
             const Elf64_Phdr *p = &img->ph[k];
             unsigned long seg, len;
@@ -631,12 +682,26 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
 
             if (p->p_type != PT_LOAD || !(p->p_flags & PF_X))
                 continue;
-            seg = (img->base + p->p_vaddr) & ~4095UL;
-            len = (((img->base + p->p_vaddr + p->p_memsz) + 4095UL) & ~4095UL) - seg;
+            seg = (img->base + p->p_vaddr) & ~(ps - 1);
+            len = (((img->base + p->p_vaddr + p->p_memsz) + ps - 1) & ~(ps - 1)) - seg;
             prot = PROT_READ | PROT_EXEC;
             if (p->p_flags & PF_W)
                 prot |= PROT_WRITE;
-            SC(SYS_mprotect, seg, len, PROT_READ | PROT_WRITE | PROT_EXEC, 0);
+            /*
+             * Android 可能拒绝 RWX。先试 RWX；不行就 RW 写入再恢复原权限。
+             * 两次都失败则放弃，避免往 RX 页写触发 SIGSEGV。
+             */
+            {
+                long pr = SC(SYS_mprotect, seg, len, PROT_READ | PROT_WRITE | PROT_EXEC, 0);
+                if (pr != 0)
+                    pr = SC(SYS_mprotect, seg, len, PROT_READ | PROT_WRITE, 0);
+                if (pr != 0) {
+                    sx_unload(img);
+                    free(img);
+                    errno = (int)-pr;
+                    return -1;
+                }
+            }
             got = sx_scan((uint32_t *)(img->base + p->p_vaddr), p->p_filesz / 4,
                           (uint32_t *)(img->veneer_pool + placed * SX_VENEER_SIZE),
                           img->veneer_cap - placed * SX_VENEER_SIZE);
@@ -655,6 +720,7 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     stk = (char *)sx_sc6(SYS_mmap, 0, (long)SX_STACK_SIZE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
     if ((unsigned long)stk >= (unsigned long)-4095L) {
+        sx_unload(img);
         free(img);
         errno = ENOMEM;
         return -1;
@@ -667,11 +733,17 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     sa = (char **)calloc(nargc + 1, sizeof(char *));
     se = (char **)calloc(nenv + 1, sizeof(char *));
     if (sa == NULL || se == NULL) {
+        if (stk) (void)sx_sc6(SYS_munmap, (long)stk, (long)SX_STACK_SIZE, 0, 0, 0, 0);
+        sx_unload(img);
         free(img);
         errno = ENOMEM;
         return -1;
     }
-#define SX_PUSH(dst, s) do { size_t _l = strlen(s) + 1; top -= _l; memcpy(top, (s), _l); (dst) = top; } while (0)
+#define SX_PUSH(dst, s) do { \
+        size_t _l = strlen(s) + 1; \
+        if ((size_t)(top - stk) < _l + 64) { (void)sx_sc6(SYS_munmap, (long)stk, (long)SX_STACK_SIZE, 0, 0, 0, 0); sx_unload(img); free(img); errno = E2BIG; return -1; } \
+        top -= _l; memcpy(top, (s), _l); (dst) = top; \
+    } while (0)
     for (i = nargc; i-- > 0;)
         SX_PUSH(sa[i], argv[i]);
     for (i = nenv; i-- > 0;)
@@ -679,7 +751,13 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     SX_PUSH(execfn, host);
     top = (char *)((unsigned long)top & ~15UL) - 16;
     rnd = top;
-    memcpy(rnd, (void *)getauxval(AT_RANDOM), 16);
+    {
+        unsigned long ar = getauxval(AT_RANDOM);
+        if (ar != 0)
+            memcpy(rnd, (void *)ar, 16);
+        else if (sx_sc6(278 /* getrandom */, (long)rnd, 16, 0, 0, 0, 0) != 16)
+            memset(rnd, 0xa5, 16);
+    }
 
 #define SX_AUX(k, val) do { av[na++] = (unsigned long)(k); av[na++] = (unsigned long)(val); } while (0)
     if (getauxval(AT_SYSINFO_EHDR))

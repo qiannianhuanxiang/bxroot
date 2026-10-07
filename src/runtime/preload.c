@@ -1589,6 +1589,15 @@ int bxroot_translate_path(const char *path, char *out, size_t out_size) {
 }
 
 /*
+ * 反向翻译入口：把内核写回的宿主路径原地剥成 guest 视角（getcwd 等出参用）。
+ * 与 getcwd 钩子同一个 strip_rootfs_prefix_inplace。返回 1 = 改写了。
+ * 给 static_exec.c 用：静态程序的内联 getcwd svc 不经 libc 钩子。
+ */
+int bxroot_strip_rootfs(char *buf) {
+    return strip_rootfs_prefix_inplace(buf);
+}
+
+/*
  * ★ path-relay 的绝对符号链接重试腿（BUG-D1 修复，2026-09-28）★
  *
  * 【问题】glibc resolver（res_ninit）用**库内内联 svc openat** 读

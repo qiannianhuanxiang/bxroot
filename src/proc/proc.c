@@ -2211,6 +2211,42 @@ extern int px_static_exec(const char *host, char *const argv[],
                           char *const envp[]) __attribute__((weak));
 
 
+
+/* /proc/self/status 的 Threads:。读不到当多线程处理（保守，不走 fork）。 */
+static long px_nraw(long nr, long a, long b, long c, long d)
+{
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : "memory", "cc");
+    return x0;
+#else
+    long r = syscall(nr, a, b, c, d);
+    return r < 0 ? -(long)errno : r;
+#endif
+}
+
+static int px_self_thread_count(void)
+{
+    char buf[4096];
+    long fd = px_nraw(SYS_openat, AT_FDCWD, (long)"/proc/self/status", O_RDONLY | O_CLOEXEC, 0);
+    long n;
+    char *p;
+
+    if (fd < 0)
+        return 99;
+    n = px_nraw(SYS_read, fd, (long)buf, (long)(sizeof(buf) - 1), 0);
+    (void)px_nraw(SYS_close, fd, 0, 0, 0);
+    if (n <= 0)
+        return 99;
+    buf[n] = '\0';
+    p = strstr(buf, "Threads:");
+    return p ? atoi(p + 8) : 99;
+}
+
 #define PX_LOG(...) do {                                              \
         if (bxroot_log != NULL && g_rt_cfg.verbose) {                 \
             bxroot_log(__VA_ARGS__);                                  \
@@ -2766,9 +2802,10 @@ static int px_xlate_trampoline(void *ud, const char *path, char *out, size_t out
  * 此时不写 BXROOT_GUEST_EXE（沿用继承值，行为与从前一致）。
  */
 static const char *g_exec_guest_exe;
+static const char *g_exec_orig_comm;
 
 static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
-                           const char *guest_exe)
+                           const char *guest_exe, const char *orig_comm)
 {
     size_t n = 0;
 
@@ -2853,9 +2890,9 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
      *     ln -s /tmp/A /tmp/B; exec /tmp/B
      *     期望 comm = 'B'（调用者给的链接名），而非 'A' 或 'sh'。
      */
-    if (guest_exe != NULL && guest_exe[0] != '\0' && n < cap) {
+    if (orig_comm != NULL && orig_comm[0] != '\0' && n < cap) {
         kv[n].name = "BXROOT_ORIG_COMM";
-        kv[n].value = guest_exe;
+        kv[n].value = orig_comm;
         kv[n].mode = PX_ENV_SET;
         n++;
     }
@@ -2880,7 +2917,7 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
         return -1;
     }
 
-    nf = px_build_forced(&g_rt_cfg, forced, 7, g_exec_guest_exe);
+    nf = px_build_forced(&g_rt_cfg, forced, 7, g_exec_guest_exe, g_exec_orig_comm);
     if (nf <= 0) {
         return -1;
     }
@@ -3832,10 +3869,17 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
          * 有 fa/attr 时仍走 stub-loader：自己复现 glibc 的 file_actions
          * 语义成本高，冷装 ldconfig 走的是 fork+exec 不是 spawn。
          */
-        if (fa == NULL && attr == NULL && px_static_exec != NULL) {
+        if (fa == NULL && attr == NULL && px_static_exec != NULL &&
+            px_self_thread_count() == 1) {
+            /*
+             * 只在单线程父进程里 fork：多线程 fork 会继承其它线程持有的
+             * malloc 锁，子进程里再 malloc 可能死锁（Astra W4）。
+             * 子进程 static_exec 失败则改走 stub-loader，不再直接 127。
+             */
             pid_t c = fork();
             if (c == 0) {
                 (void)px_static_exec(host, argv, envp);
+                (void)px_stub_exec(host, argv, envp, argv0);
                 _exit(127);
             }
             if (c > 0) {
@@ -4663,15 +4707,22 @@ static int px_do_execve(const char *path, char *const argv[],
          * 解释器，这正是内核对 /proc/self/exe 的原生语义）。
          * 两者上游语义不同，见各自注释。
          */
-        const char *ge = raw_guest[0] != '\0' ? raw_guest : guest;
+        const char *exe = (guest != NULL && guest[0] != '\0') ? guest : raw_guest;
+        const char *comm = (raw_guest[0] != '\0') ? raw_guest : guest;
         const char *rf = g_rt_cfg.rootfs;
         size_t rl = (rf != NULL) ? strlen(rf) : 0;
 
-        if (rl > 0 && ge != NULL && strncmp(ge, rf, rl) == 0 &&
-            (ge[rl] == '/' || ge[rl] == '\0')) {
-            g_exec_guest_exe = (ge[rl] == '\0') ? "/" : (ge + rl);
+        if (rl > 0 && exe != NULL && strncmp(exe, rf, rl) == 0 &&
+            (exe[rl] == '/' || exe[rl] == '\0')) {
+            g_exec_guest_exe = (exe[rl] == '\0') ? "/" : (exe + rl);
         } else {
-            g_exec_guest_exe = ge;
+            g_exec_guest_exe = exe;
+        }
+        if (rl > 0 && comm != NULL && strncmp(comm, rf, rl) == 0 &&
+            (comm[rl] == '/' || comm[rl] == '\0')) {
+            g_exec_orig_comm = (comm[rl] == '\0') ? "/" : (comm + rl);
+        } else {
+            g_exec_orig_comm = comm;
         }
     }
     if (px_runtime_build_env(envp, &env) == 0) {
@@ -4682,6 +4733,7 @@ static int px_do_execve(const char *path, char *const argv[],
         final_env = envp;      /* 注入被禁用/失败 → 沿用调用方的 */
     }
     g_exec_guest_exe = NULL;
+    g_exec_orig_comm = NULL;
     (void)final_env_use;
 
     /* 4) 转发
@@ -4781,14 +4833,14 @@ static int px_do_execve(const char *path, char *const argv[],
                 if (errno == ENOENT || errno == ENOTDIR) {
                     definitive_no = 1;  /* 确实不存在 */
                 }
+                /* EACCES 等：不碰未初始化的 tst，交给后面 trampoline/execve */
             } else {
                 tst = raw_st;
+                if (S_ISDIR(tst.st_mode))
+                    definitive_no = 1;          /* 目录不可 exec */
+                else if (S_ISREG(tst.st_mode) && (tst.st_mode & 0111) == 0)
+                    definitive_no = 1;          /* 三个执行位全 0 */
             }
-        }
-        if (!definitive_no && S_ISDIR(tst.st_mode)) {
-            definitive_no = 1;          /* 目录不可 exec */
-        } else if (S_ISREG(tst.st_mode) && (tst.st_mode & 0111) == 0) {
-            definitive_no = 1;          /* 三个执行位全 0，必然不可 exec */
         }
 
         /*
