@@ -7,10 +7,12 @@
 #define BXROOT_STATIC_EXEC_H
 
 /*
- * host 为**已翻译的宿主路径**；argv/envp 原样成为新程序的 argv/envp。
+ * host 为**已翻译的宿主路径**；argv0 非空时替换新程序的 argv[0]（guest 视角，
+ * 与 execve 不改 argv[0] 的语义一致）；envp 原样成为新程序的环境。
  * 成功不返回；失败返回 -1 且进程状态未被改动（errno 已置），调用方应回退
  * 到 stub-loader。多线程进程、ET_EXEC 地址冲突、站点超出预留均属失败。
  */
-int px_static_exec(const char *host, char *const argv[], char *const envp[]);
+int px_static_exec(const char *host, const char *argv0,
+                   char *const argv[], char *const envp[]);
 
 #endif /* BXROOT_STATIC_EXEC_H */

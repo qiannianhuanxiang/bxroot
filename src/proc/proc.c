@@ -2207,8 +2207,8 @@ extern void bxroot_log(const char *fmt, ...) __attribute__((weak));
  * 进程内执行静态 ELF（src/runtime/static_exec.c）。weak：proc.c 单测里没有它。
  * 成功不返回；失败返回 -1，调用方回退 stub-loader。
  */
-extern int px_static_exec(const char *host, char *const argv[],
-                          char *const envp[]) __attribute__((weak));
+extern int px_static_exec(const char *host, const char *argv0,
+                          char *const argv[], char *const envp[]) __attribute__((weak));
 
 
 
@@ -2801,8 +2801,8 @@ static int px_xlate_trampoline(void *ud, const char *path, char *out, size_t out
  * 不在 exec 路径上的 exec（如纯逻辑测试直接调 build_env）保持 NULL，
  * 此时不写 BXROOT_GUEST_EXE（沿用继承值，行为与从前一致）。
  */
-static const char *g_exec_guest_exe;
-static const char *g_exec_orig_comm;
+static __thread const char *g_exec_guest_exe;
+static __thread const char *g_exec_orig_comm;
 
 static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
                            const char *guest_exe, const char *orig_comm)
@@ -2870,7 +2870,7 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
      * guest_exe 为 NULL/空时跳过（不发明值：宁可不写，也不写一个
      * 会误导客户的假路径）。
      */
-    if (guest_exe != NULL && guest_exe[0] != '\0' && n < cap) {
+    if (guest_exe != NULL && guest_exe[0] == '/' && n < cap) {
         kv[n].name = "BXROOT_GUEST_EXE";
         kv[n].value = guest_exe;
         kv[n].mode = PX_ENV_SET;
@@ -3878,7 +3878,7 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
              */
             pid_t c = fork();
             if (c == 0) {
-                (void)px_static_exec(host, argv, envp);
+                (void)px_static_exec(host, argv0, argv, envp);
                 (void)px_stub_exec(host, argv, envp, argv0);
                 _exit(127);
             }
@@ -4605,6 +4605,14 @@ static int px_do_execve(const char *path, char *const argv[],
         }
 
         /*
+         * ★ 调用者给的路径必须在符号链接展开**之前**保存 ★
+         * 上游语义：/proc/pid/comm 用 execve 的 raw user path。`ln -s /tmp/A /tmp/B;
+         * exec /tmp/B` 期望 comm=B；原先在展开后才拷，得到 A（设计注释 2888-2891
+         * 自己写的断言）。shebang 场景下它仍是脚本路径，见下面原有说明。
+         */
+        px_cfg_str(raw_guest, sizeof(raw_guest), guest);
+
+        /*
          * ★ 先把"绝对目标符号链接"展开掉 —— 必须在 shebang 判断之前 ★
          *
          * 【为什么必须在前】内核解析链接目标时按**真实根**走，bxroot 拦不到，
@@ -4646,8 +4654,6 @@ static int px_do_execve(const char *path, char *const argv[],
          * 而非重写后的解释器路径）。px_rewrite_shebang 会把 guest
          * 覆写成解释器，所以必须先拷一份。
          */
-        px_cfg_str(raw_guest, sizeof(raw_guest), guest);
-
         sb_rc = px_rewrite_shebang_chain(host, sizeof(host), guest, sizeof(guest),
                                          &argv, &sb_chain);
         if (sb_rc < 0) {
@@ -4852,7 +4858,7 @@ static int px_do_execve(const char *path, char *const argv[],
          */
         if (!definitive_no && px_static_exec != NULL && px_elf_needs_stub(host)) {
             PX_LOG("proc: 进程内执行静态 ELF %s", host);
-            (void)px_static_exec(host, final_argv, final_env);
+            (void)px_static_exec(host, raw_argv0[0] != '\0' ? raw_argv0 : guest, final_argv, final_env);
             PX_LOG("proc: 进程内执行失败(errno=%d)，回退 stub-loader %s", errno, host);
         }
 

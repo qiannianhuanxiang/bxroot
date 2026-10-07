@@ -96,6 +96,9 @@ int bxroot_resolve_abs_symlink(const char *translated, char *out, size_t out_siz
 __attribute__((weak))
 void bxroot_log(const char *fmt, ...);
 
+/* 新程序的 guest 视角可执行路径（来自 envp 的 BXROOT_GUEST_EXE），答 /proc/self/exe 用。 */
+static char sx_guest_exe[PATH_MAX];
+
 /* 动态 libc 的 TPIDR_EL0（exec 前记下）。汇编跳板用 adrp 直接引用。 */
 unsigned long px_static_dyn_tls __attribute__((visibility("hidden")));
 
@@ -183,6 +186,36 @@ static long sx_getcwd_fixup(long r, char *buf, unsigned long size)
 }
 
 /*
+ * readlinkat(78)：
+ *   - /proc/self/exe → 新程序的 guest 路径（内核只会答 bridge/linker，必错）；
+ *     与 runtime 的 readlink 钩子同语义：guest_exe 不是绝对路径时不伪装。
+ *   - 其它路径：内核写回的是宿主路径，原地剥 rootfs 前缀（和 getcwd 同类）。
+ * readlink 的结果不带 NUL，所以用临时缓冲做剥离，再按原长度回写。
+ */
+static long sx_readlinkat_fixup(long r, char *buf, unsigned long size)
+{
+    char tmp[SX_PATHBUF];
+    size_t n;
+
+    if (r <= 0 || buf == NULL || bxroot_strip_rootfs == NULL || (unsigned long)r >= sizeof(tmp))
+        return r;
+    memcpy(tmp, buf, (size_t)r);
+    tmp[r] = '\0';
+    if (!bxroot_strip_rootfs(tmp))
+        return r;
+    n = strlen(tmp);
+    if (n > size)
+        n = size;                       /* readlink 截断语义：不报错 */
+    memcpy(buf, tmp, n);
+    return (long)n;
+}
+
+static int sx_is_proc_self_exe(const char *p)
+{
+    return p != NULL && strcmp(p, "/proc/self/exe") == 0;
+}
+
+/*
  * 由汇编跳板调用（此时 TPIDR_EL0 已切回动态 libc 的 TLS）。
  * 返回内核原始约定（负 errno = 错误）。
  */
@@ -195,6 +228,26 @@ long px_static_dispatch(long a0, long a1, long a2, long a3, long a4, long a5,
     char buf[2][SX_PATHBUF];
     int i, used = 0;
 
+    if (nr == 78 && sx_guest_exe[0] == '/' &&
+        sx_is_proc_self_exe((const char *)(uintptr_t)a1)) {
+        size_t n = strlen(sx_guest_exe);
+        if ((unsigned long)a3 < n)
+            n = (size_t)a3;             /* 截断，不带 NUL，与内核一致 */
+        memcpy((void *)(uintptr_t)a2, sx_guest_exe, n);
+        return (long)n;
+    }
+    if (nr == 78) {
+        /* 走下面的入参翻译 + 发 svc，再对出参做反向翻译 */
+        long rr;
+        char tbuf[SX_PATHBUF];
+        long aa1 = a1;
+        const char *pp = (const char *)(uintptr_t)a1;
+        if (pp != NULL && pp[0] == '/' && bxroot_translate_path != NULL &&
+            bxroot_translate_path(pp, tbuf, sizeof(tbuf)) > 0)
+            aa1 = (long)(uintptr_t)tbuf;
+        rr = sx_sc6(nr, a0, aa1, a2, a3, a4, a5);
+        return sx_readlinkat_fixup(rr, (char *)(uintptr_t)a2, (unsigned long)a3);
+    }
     if (nr == 17)
         return sx_getcwd_fixup(sx_sc6(nr, a0, a1, a2, a3, a4, a5),
                                (char *)(uintptr_t)a0, (unsigned long)a1);
@@ -761,12 +814,13 @@ static void sx_reset_process_state(void)
 /* 入口                                                                */
 /* ------------------------------------------------------------------ */
 
-int px_static_exec(const char *host, char *const argv[], char *const envp[])
+int px_static_exec(const char *host, const char *argv0, char *const argv[], char *const envp[])
 {
     sx_image *img;
     size_t sites, nargc = 0, nenv = 0, i;
     unsigned long av[64], *sp, *w;
     int na = 0, nav;
+    int no_vdso = 0;
     char *stk, *top, *rnd, *execfn;
     char **sa, **se;
     unsigned long tls;
@@ -873,6 +927,48 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     while (argv[nargc] != NULL) nargc++;
     if (envp != NULL)
         while (envp[nenv] != NULL) nenv++;
+
+    /*
+     * argv[0] 用调用者给的（guest 视角）而不是翻译后的宿主路径：execve 不改 argv[0]，
+     * 程序看到的 argv[0] 泄漏 /data/data/.../ubuntu/... 会被 basename/usage/argv0 判断用到。
+     * 为此复制一份 argv 向量（只换第 0 项），不动调用者的数组。
+     */
+    if (argv0 != NULL && argv0[0] != '\0' && nargc > 0) {
+        char **nv = (char **)calloc(nargc + 1, sizeof(char *));
+        if (nv != NULL) {
+            memcpy(nv, argv, nargc * sizeof(char *));
+            nv[0] = (char *)(uintptr_t)argv0;
+            argv = nv;
+        }
+    }
+
+    /*
+     * ldd 模式（LD_TRACE_LOADED_OBJECTS 非空）：目标是 ld.so 自身时，真 ld.so 会照
+     * LD_PRELOAD 把 runtime 装进去并多列一行 / 报 "cannot be preloaded"。与
+     * px_stub_prepare 同判据：此时摘掉 LD_PRELOAD，并且不给 AT_SYSINFO_EHDR
+     * （官方 stub 路径的 ldd 输出没有 linux-vdso 行）。
+     */
+    {
+        int tracing = 0;
+        char **fenv;
+        size_t k, m = 0;
+
+        for (k = 0; k < nenv; k++)
+            if (strncmp(envp[k], "LD_TRACE_LOADED_OBJECTS=", 24) == 0 && envp[k][24] != '\0')
+                tracing = 1;
+        if (tracing) {
+            fenv = (char **)calloc(nenv + 1, sizeof(char *));
+            if (fenv != NULL) {
+                for (k = 0; k < nenv; k++)
+                    if (strncmp(envp[k], "LD_PRELOAD=", 11) != 0)
+                        fenv[m++] = envp[k];
+                fenv[m] = NULL;
+                envp = fenv;
+                nenv = m;
+                no_vdso = 1;
+            }
+        }
+    }
     {
         /* 字符串 + argv/envp 指针数组 + auxv(≤40 项×16) + 对齐余量，必须整体放得进栈 */
         size_t need = strlen(host) + 1 + (nargc + nenv + 4) * sizeof(char *) + 40 * 16 + 512;
@@ -922,7 +1018,7 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     }
 
 #define SX_AUX(k, val) do { av[na++] = (unsigned long)(k); av[na++] = (unsigned long)(val); } while (0)
-    if (getauxval(AT_SYSINFO_EHDR))
+    if (!no_vdso && getauxval(AT_SYSINFO_EHDR))
         SX_AUX(AT_SYSINFO_EHDR, getauxval(AT_SYSINFO_EHDR));
     SX_AUX(AT_HWCAP, getauxval(AT_HWCAP));
     SX_AUX(AT_HWCAP2, getauxval(AT_HWCAP2));
@@ -953,6 +1049,30 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     for (i = 0; i < nenv; i++) *w++ = (unsigned long)se[i];
     *w++ = 0;
     memcpy(w, av, (size_t)nav * 8);
+
+    /*
+     * 新程序的身份：BXROOT_GUEST_EXE 答 /proc/self/exe，BXROOT_ORIG_COMM 的 basename
+     * 作 comm（prctl(PR_SET_NAME)）。缺失时 comm 退回 host 的 basename。
+     */
+    {
+        const char *gx = NULL, *oc = NULL, *base;
+        char nm[16];
+        size_t k2;
+
+        for (k2 = 0; k2 < nenv; k2++) {
+            if (strncmp(envp[k2], "BXROOT_GUEST_EXE=", 17) == 0) gx = envp[k2] + 17;
+            else if (strncmp(envp[k2], "BXROOT_ORIG_COMM=", 17) == 0) oc = envp[k2] + 17;
+        }
+        sx_guest_exe[0] = '\0';
+        if (gx != NULL && gx[0] == '/' && strlen(gx) < sizeof(sx_guest_exe))
+            memcpy(sx_guest_exe, gx, strlen(gx) + 1);
+        base = (oc != NULL && oc[0] != '\0') ? oc : host;
+        if (strrchr(base, '/') != NULL)
+            base = strrchr(base, '/') + 1;
+        memset(nm, 0, sizeof nm);
+        strncpy(nm, base, 15);
+        (void)sx_sc6(167 /* prctl */, 15 /* PR_SET_NAME */, (long)nm, 0, 0, 0, 0);
+    }
 
     sx_reset_process_state();
 
