@@ -5395,11 +5395,29 @@ static int px_do_spawn(pid_t *pid, const char *path,
         }
     }
 
-    /* 3) envp 重建 */
+    /* 3) envp 重建
+     *
+     * 槽位必须先设：px_build_forced 读 g_exec_guest_exe / g_exec_orig_comm，不设就
+     * 什么都不写，子进程继承父进程的 BXROOT_GUEST_EXE / ORIG_COMM（comm 与
+     * /proc/self/exe 都是父进程的）。spawn 的调用者路径 path 已是 guest 视角。
+     */
+    {
+        const char *rf_ = g_rt_cfg.rootfs;
+        size_t rl_ = (rf_ != NULL) ? strlen(rf_) : 0;
+        const char *gp = (path != NULL && path[0] == '/') ? path : NULL;
+
+        if (gp != NULL && rl_ > 0 && strncmp(gp, rf_, rl_) == 0 &&
+            (gp[rl_] == '/' || gp[rl_] == '\0'))
+            gp = (gp[rl_] == '\0') ? "/" : gp + rl_;
+        g_exec_guest_exe = gp;                 /* 相对名不写：preload 要求绝对路径 */
+        g_exec_orig_comm = (path != NULL) ? path : NULL;
+    }
     if (px_runtime_build_env(envp, &env) == 0) {
         final_env = env.v;
         g_rt_stats.spawn_env_injected++;
     }
+    g_exec_guest_exe = NULL;
+    g_exec_orig_comm = NULL;
 
     /* 4) 转发
      *
