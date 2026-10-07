@@ -75,6 +75,7 @@
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -345,19 +346,16 @@ typedef struct {
     unsigned nph;
     unsigned long veneer_pool;      /* 预留的 veneer 区（紧邻镜像） */
     size_t veneer_cap;
+    unsigned long rsv_base, rsv_len;  /* 实际 mmap 保留区（含 ET_DYN 对齐余量） */
 } sx_image;
 
 
 static void sx_unload(sx_image *img)
 {
-    unsigned long ps, lo, hi;
-    if (img == NULL || img->hi <= img->lo)
+    if (img == NULL || img->rsv_len == 0)
         return;
-    ps = (unsigned long)getpagesize();
-    lo = img->lo & ~(ps - 1);
-    hi = (img->hi + img->veneer_cap + ps - 1) & ~(ps - 1);
-    if (hi > lo)
-        (void)sx_sc6(SYS_munmap, (long)lo, (long)(hi - lo), 0, 0, 0, 0);
+    (void)sx_sc6(SYS_munmap, (long)img->rsv_base, (long)img->rsv_len, 0, 0, 0, 0);
+    img->rsv_base = img->rsv_len = 0;
     img->lo = img->hi = 0;
 }
 
@@ -366,14 +364,24 @@ static int sx_load(const char *path, sx_image *img, size_t veneer_bytes)
     Elf64_Ehdr eh;
     unsigned long lo = ~0UL, hi = 0, align = 4096;
     unsigned long ps = (unsigned long)getpagesize();
+    unsigned long fsize = 0;
+    unsigned nload = 0;
+    int entry_ok = 0;
     long fd;
     unsigned i;
     char *res;
     size_t vz = (veneer_bytes + ps - 1) & ~(ps - 1);
+    struct stat fst;
 
     memset(img, 0, sizeof(*img));
     fd = SC(SYS_openat, -100, path, O_RDONLY | O_CLOEXEC, 0);
     if (fd < 0) { errno = (int)-fd; return -1; }
+    if (sx_sc6(SYS_fstat, fd, (long)&fst, 0, 0, 0, 0) != 0) {
+        SC(SYS_close, fd, 0, 0, 0);
+        errno = EIO;
+        return -1;
+    }
+    fsize = (unsigned long)fst.st_size;
     if (sx_sc6(SYS_pread64, fd, (long)&eh, sizeof eh, 0, 0, 0) != (long)sizeof eh ||
         memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
         eh.e_machine != EM_AARCH64 || (eh.e_type != ET_DYN && eh.e_type != ET_EXEC) ||
@@ -395,19 +403,43 @@ static int sx_load(const char *path, sx_image *img, size_t veneer_bytes)
         }
         if (p->p_type != PT_LOAD)
             continue;
+        /*
+         * 坏/恶意 ELF 一律在这里（任何映射、任何进程状态改动之前）拒绝，
+         * 调用方据此安全回退 stub-loader。内核对这些同样返回 ENOEXEC。
+         */
+        if (p->p_filesz > p->p_memsz ||                       /* 文件映射越过保留区 */
+            p->p_vaddr + p->p_memsz < p->p_vaddr ||          /* 回绕 */
+            p->p_offset + p->p_filesz < p->p_offset ||
+            p->p_offset + p->p_filesz > fsize ||              /* 截断文件 → SIGBUS */
+            (p->p_align != 0 && (p->p_align & (p->p_align - 1)) != 0) ||  /* 非 2 的幂 */
+            p->p_align > (1UL << 30) ||                      /* 防 hi-lo+align 回绕 */
+            (p->p_align > 1 && (p->p_vaddr % p->p_align) != (p->p_offset % p->p_align))) {
+            SC(SYS_close, fd, 0, 0, 0);
+            errno = ENOEXEC;
+            return -1;
+        }
         if (p->p_align > align)
             align = p->p_align;
         if ((p->p_vaddr & ~(ps - 1)) < lo)
             lo = p->p_vaddr & ~(ps - 1);
         if (p->p_vaddr + p->p_memsz > hi)
             hi = p->p_vaddr + p->p_memsz;
+        nload++;
+        if (p->p_flags & PF_X)
+            if (eh.e_entry >= p->p_vaddr && eh.e_entry < p->p_vaddr + p->p_memsz)
+                entry_ok = 1;                                  /* e_entry 落在可执行段内 */
     }
-    if (hi <= lo) {
+    if (nload == 0 || hi <= lo || hi + ps < hi || !entry_ok) {
         SC(SYS_close, fd, 0, 0, 0);
         errno = ENOEXEC;
         return -1;
     }
     hi = (hi + ps - 1) & ~(ps - 1);
+    if (hi <= lo || hi - lo + vz + align < hi - lo) {           /* 向上取整后再查一次回绕 */
+        SC(SYS_close, fd, 0, 0, 0);
+        errno = ENOEXEC;
+        return -1;
+    }
 
     /* 镜像 + 紧随其后的 veneer 区一起保留，保证 B 可达（±128MB） */
     if (eh.e_type == ET_EXEC) {
@@ -419,7 +451,15 @@ static int sx_load(const char *path, sx_image *img, size_t veneer_bytes)
             errno = (int)-(long)res;
             return -1;
         }
+        if ((unsigned long)res != lo) {             /* 旧内核把 flag 当 hint：没落在要求的地址 */
+            (void)sx_sc6(SYS_munmap, (long)res, (long)(hi - lo + vz), 0, 0, 0, 0);
+            SC(SYS_close, fd, 0, 0, 0);
+            errno = EEXIST;
+            return -1;
+        }
         img->base = 0;
+        img->rsv_base = lo;
+        img->rsv_len  = hi - lo + vz;
     } else {
         res = (char *)sx_sc6(SYS_mmap, 0, (long)(hi - lo + vz + align), PROT_NONE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -429,6 +469,8 @@ static int sx_load(const char *path, sx_image *img, size_t veneer_bytes)
             return -1;
         }
         img->base = (((unsigned long)res + align - 1) & ~(align - 1)) - lo;
+        img->rsv_base = (unsigned long)res;
+        img->rsv_len  = hi - lo + vz + align;
     }
     img->lo = img->base + lo;
     img->hi = img->base + hi;
@@ -669,10 +711,49 @@ static void sx_reset_process_state(void)
     SC(SYS_rt_sigaction, 31, &sa, 0, 8);
     SC(SYS_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &unblock, 0, 8);
 
+    /* execve 会关闭备用信号栈；runtime 的 crash.c 装了 altstack，静态程序不该跑在它上面 */
+    {
+        struct { void *sp; int flags; unsigned long size; } ss;
+        memset(&ss, 0, sizeof ss);
+        ss.flags = 2;                               /* SS_DISABLE */
+        SC(SYS_sigaltstack, &ss, 0, 0, 0);
+    }
+
+    /*
+     * 关闭全部 FD_CLOEXEC 描述符，含 fd>=1024（RLIMIT_NOFILE 可到 1M）。
+     * 优先 close_range(…, CLOSE_RANGE_CLOEXEC 不适用，这里要「只关带标志的」)：
+     * 先按 3..1023 逐个判，再用 close_range 的 UNSHARE 不可用，故对 >=1024 读
+     * /proc/self/fd 枚举。
+     */
     for (fd = 3; fd < 1024; fd++) {
         long fl = SC(SYS_fcntl, fd, F_GETFD, 0, 0);
         if (fl >= 0 && (fl & FD_CLOEXEC))
             SC(SYS_close, fd, 0, 0, 0);
+    }
+    {
+        char dbuf[2048];
+        long dfd = SC(SYS_openat, -100, "/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+        if (dfd >= 0) {
+            long n;
+            while ((n = SC(SYS_getdents64, dfd, dbuf, sizeof dbuf, 0)) > 0) {
+                long off = 0;
+                while (off < n) {
+                    unsigned short reclen = *(unsigned short *)(void *)(dbuf + off + 16);
+                    const char *nm = dbuf + off + 19;
+                    long v = 0;
+                    int digits = 0;
+                    while (*nm >= '0' && *nm <= '9') { v = v * 10 + (*nm - '0'); nm++; digits++; }
+                    if (digits && *nm == '\0' && v >= 1024 && v != dfd) {
+                        long fl = SC(SYS_fcntl, v, F_GETFD, 0, 0);
+                        if (fl >= 0 && (fl & FD_CLOEXEC))
+                            SC(SYS_close, v, 0, 0, 0);
+                    }
+                    if (reclen == 0) break;
+                    off += reclen;
+                }
+            }
+            SC(SYS_close, dfd, 0, 0, 0);
+        }
     }
 }
 
@@ -792,10 +873,25 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     while (argv[nargc] != NULL) nargc++;
     if (envp != NULL)
         while (envp[nenv] != NULL) nenv++;
+    {
+        /* 字符串 + argv/envp 指针数组 + auxv(≤40 项×16) + 对齐余量，必须整体放得进栈 */
+        size_t need = strlen(host) + 1 + (nargc + nenv + 4) * sizeof(char *) + 40 * 16 + 512;
+        for (i = 0; i < nargc; i++) need += strlen(argv[i]) + 1;
+        for (i = 0; i < nenv; i++)  need += strlen(envp[i]) + 1;
+        if (need >= SX_STACK_SIZE) {
+            (void)sx_sc6(SYS_munmap, (long)stk, (long)SX_STACK_SIZE, 0, 0, 0, 0);
+            sx_unload(img);
+            free(img);
+            errno = E2BIG;
+            return -1;
+        }
+    }
     sa = (char **)calloc(nargc + 1, sizeof(char *));
     se = (char **)calloc(nenv + 1, sizeof(char *));
     if (sa == NULL || se == NULL) {
-        if (stk) (void)sx_sc6(SYS_munmap, (long)stk, (long)SX_STACK_SIZE, 0, 0, 0, 0);
+        free(sa);
+        free(se);
+        (void)sx_sc6(SYS_munmap, (long)stk, (long)SX_STACK_SIZE, 0, 0, 0, 0);
         sx_unload(img);
         free(img);
         errno = ENOMEM;
@@ -803,7 +899,7 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     }
 #define SX_PUSH(dst, s) do { \
         size_t _l = strlen(s) + 1; \
-        if ((size_t)(top - stk) < _l + 64) { (void)sx_sc6(SYS_munmap, (long)stk, (long)SX_STACK_SIZE, 0, 0, 0, 0); sx_unload(img); free(img); errno = E2BIG; return -1; } \
+        if ((size_t)(top - stk) < _l + 64) { free(sa); free(se); (void)sx_sc6(SYS_munmap, (long)stk, (long)SX_STACK_SIZE, 0, 0, 0, 0); sx_unload(img); free(img); errno = E2BIG; return -1; } \
         top -= _l; memcpy(top, (s), _l); (dst) = top; \
     } while (0)
     for (i = nargc; i-- > 0;)
@@ -814,11 +910,15 @@ int px_static_exec(const char *host, char *const argv[], char *const envp[])
     top = (char *)((unsigned long)top & ~15UL) - 16;
     rnd = top;
     {
-        unsigned long ar = getauxval(AT_RANDOM);
-        if (ar != 0)
-            memcpy(rnd, (void *)ar, 16);
-        else if (sx_sc6(278 /* getrandom */, (long)rnd, 16, 0, 0, 0, 0) != 16)
-            memset(rnd, 0xa5, 16);
+        /* execve 给的是全新随机字节；复用宿主的会让 canary/pointer guard 与 runtime 相同 */
+        long g = sx_sc6(278 /* getrandom */, (long)rnd, 16, 0, 0, 0, 0);
+        if (g != 16) {
+            unsigned long ar = getauxval(AT_RANDOM);
+            if (ar != 0)
+                memcpy(rnd, (void *)ar, 16);
+            else
+                memset(rnd, 0xa5, 16);
+        }
     }
 
 #define SX_AUX(k, val) do { av[na++] = (unsigned long)(k); av[na++] = (unsigned long)(val); } while (0)
