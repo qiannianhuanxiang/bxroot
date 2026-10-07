@@ -236,13 +236,29 @@ long px_static_dispatch(long a0, long a1, long a2, long a3, long a4, long a5,
  *   [160] q0..q7 (128 字节 → 288)                     [288..304) 对齐
  */
 extern void px_static_tramp(void);
+/*
+ * 入口约定：x16 = 返回地址（站点+4），x17 = 本跳板地址（已被 veneer 用掉）。
+ * 栈帧 688 字节（16 对齐）：
+ *   [0]   x29,x30     [16] x1..x17 (17 个 → 152)     [152] 静态 TPIDR_EL0
+ *   [160] NZCV        [176] q0..q31 (512 字节 → 688)
+ *
+ * ★ 已知偏差（如实）：真 syscall 保留 x16/x17，这里不保留 ★
+ *   返回时 x16=站点+4，x17=&px_static_tramp。AArch64 没有不占寄存器的间接
+ *   跳转，返回路径至少要一个寄存器放地址，故无法在这个设计里同时还原两者。
+ *   依据是 x16/x17 是 IP0/IP1：编译器只在 PLT/veneer 里用，不会让它们跨
+ *   内联 svc 存活。离线扫描 ldconfig.real 等 75 个补丁站点，svc 之后到
+ *   x16/x17 被重写前读取它们的次数为 0。这是文档化的假设，不是无条件保证。
+ *
+ * v0-v31 与 NZCV 则完整保存：C 的 dispatch 可以随意破坏它们，而真 syscall 不会。
+ */
 __asm__(
     ".text\n"
     ".globl px_static_tramp\n"
     ".hidden px_static_tramp\n"
     ".type  px_static_tramp,%function\n"
     "px_static_tramp:\n"
-    "    sub  sp, sp, #304\n"
+    "    bti  c\n"
+    "    sub  sp, sp, #688\n"
     "    stp  x29, x30, [sp, #0]\n"
     "    mov  x29, sp\n"
     "    stp  x1,  x2,  [sp, #16]\n"
@@ -254,23 +270,51 @@ __asm__(
     "    stp  x13, x14, [sp, #112]\n"
     "    stp  x15, x16, [sp, #128]\n"
     "    str  x17,      [sp, #144]\n"
-    "    stp  q0,  q1,  [sp, #160]\n"
-    "    stp  q2,  q3,  [sp, #192]\n"
-    "    stp  q4,  q5,  [sp, #224]\n"
-    "    stp  q6,  q7,  [sp, #256]\n"
+    "    mrs  x9,  nzcv\n"
+    "    str  x9,       [sp, #160]\n"
+    "    stp  q0,  q1,  [sp, #176]\n"
+    "    stp  q2,  q3,  [sp, #208]\n"
+    "    stp  q4,  q5,  [sp, #240]\n"
+    "    stp  q6,  q7,  [sp, #272]\n"
+    "    stp  q8,  q9,  [sp, #304]\n"
+    "    stp  q10, q11, [sp, #336]\n"
+    "    stp  q12, q13, [sp, #368]\n"
+    "    stp  q14, q15, [sp, #400]\n"
+    "    stp  q16, q17, [sp, #432]\n"
+    "    stp  q18, q19, [sp, #464]\n"
+    "    stp  q20, q21, [sp, #496]\n"
+    "    stp  q22, q23, [sp, #528]\n"
+    "    stp  q24, q25, [sp, #560]\n"
+    "    stp  q26, q27, [sp, #592]\n"
+    "    stp  q28, q29, [sp, #624]\n"
+    "    stp  q30, q31, [sp, #656]\n"
     "    mrs  x9, tpidr_el0\n"
     "    str  x9, [sp, #152]\n"
     "    adrp x10, px_static_dyn_tls\n"
     "    ldr  x10, [x10, :lo12:px_static_dyn_tls]\n"
     "    msr  tpidr_el0, x10\n"
-    "    mov  x6, x8\n"                       /* 第 7 参 = syscall 号；x0..x5 原样 */
+    "    mov  x6, x8\n"                          /* 第 7 参 = syscall 号；x0..x5 原样 */
     "    bl   px_static_dispatch\n"
     "    ldr  x9, [sp, #152]\n"
     "    msr  tpidr_el0, x9\n"
-    "    ldp  q0,  q1,  [sp, #160]\n"
-    "    ldp  q2,  q3,  [sp, #192]\n"
-    "    ldp  q4,  q5,  [sp, #224]\n"
-    "    ldp  q6,  q7,  [sp, #256]\n"
+    "    ldp  q30, q31, [sp, #656]\n"
+    "    ldp  q28, q29, [sp, #624]\n"
+    "    ldp  q26, q27, [sp, #592]\n"
+    "    ldp  q24, q25, [sp, #560]\n"
+    "    ldp  q22, q23, [sp, #528]\n"
+    "    ldp  q20, q21, [sp, #496]\n"
+    "    ldp  q18, q19, [sp, #464]\n"
+    "    ldp  q16, q17, [sp, #432]\n"
+    "    ldp  q14, q15, [sp, #400]\n"
+    "    ldp  q12, q13, [sp, #368]\n"
+    "    ldp  q10, q11, [sp, #336]\n"
+    "    ldp  q8,  q9,  [sp, #304]\n"
+    "    ldp  q6,  q7,  [sp, #272]\n"
+    "    ldp  q4,  q5,  [sp, #240]\n"
+    "    ldp  q2,  q3,  [sp, #208]\n"
+    "    ldp  q0,  q1,  [sp, #176]\n"
+    "    ldr  x9,       [sp, #160]\n"
+    "    msr  nzcv, x9\n"
     "    ldp  x1,  x2,  [sp, #16]\n"
     "    ldp  x3,  x4,  [sp, #32]\n"
     "    ldp  x5,  x6,  [sp, #48]\n"
@@ -279,11 +323,11 @@ __asm__(
     "    ldp  x11, x12, [sp, #96]\n"
     "    ldp  x13, x14, [sp, #112]\n"
     "    ldr  x15,      [sp, #128]\n"
-    "    ldr  x16,      [sp, #136]\n"         /* 返回地址 */
+    "    ldr  x16,      [sp, #136]\n"            /* 返回地址 */
     "    ldr  x17,      [sp, #144]\n"
     "    ldp  x29, x30, [sp, #0]\n"
-    "    add  sp, sp, #304\n"
-    "    br   x16\n"                          /* x0 = 结果，回站点下一条 */
+    "    add  sp, sp, #688\n"
+    "    br   x16\n"                              /* x0 = 结果，回站点下一条 */
     ".size px_static_tramp, .-px_static_tramp\n"
 );
 
@@ -456,10 +500,28 @@ static int sx_load(const char *path, sx_image *img, size_t veneer_bytes)
 /* 站点扫描与改写                                                       */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 对 Rd=8 的写都算屏障（而不只是 movk）。Rd 在 bit[4:0]。
+ * 粗粒度判据：任何「数据处理立即数 / 寄存器 / 加载」类指令，Rd==8 即清掉 nr。
+ * 误清的代价只是少补一个站点（fail-open 到原 svc，路径泄漏可被 B 类回归发现），
+ * 误留的代价是把别的 syscall 当成路径类，所以宁可多清。
+ */
+static int sx_writes_x8(uint32_t ins)
+{
+    if ((ins & 0x1fu) != 8u)
+        return 0;
+    /* 排除不写 Rd 的：STR/STP 的 bit[4:0] 是 Rt（源），比较/测试类 Rd=XZR 不会是 8 */
+    if ((ins & 0x3f000000u) == 0x39000000u) return 0;  /* STR/STRB/STRH imm (unsigned offset) */
+    if ((ins & 0x3f200c00u) == 0x38000000u) return 0;  /* STUR 族 */
+    if ((ins & 0x3fc00000u) == 0x29000000u) return 0;  /* STP (signed offset) */
+    if ((ins & 0x3fc00000u) == 0x28800000u) return 0;  /* STP (post-index) */
+    if ((ins & 0x3fc00000u) == 0x29800000u) return 0;  /* STP (pre-index) */
+    return 1;
+}
+
 static int sx_is_barrier(uint32_t ins)
 {
-    if ((ins & 0xff80001fu) == 0xf2800008u) return 1;   /* movk x8 */
-    if ((ins & 0xff80001fu) == 0x72800008u) return 1;   /* movk w8 */
+    if (sx_writes_x8(ins)) return 1;                    /* 任何对 x8/w8 的写 */
     if ((ins >> 26) == 0x05u || (ins >> 26) == 0x25u) return 1;   /* B / BL */
     if ((ins >> 24) == 0x54u) return 1;                 /* B.cond */
     if ((ins & 0x7e000000u) == 0x34000000u) return 1;   /* CBZ/CBNZ */
