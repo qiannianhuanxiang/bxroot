@@ -67,6 +67,27 @@
 
 static volatile int g_installed = 0;
 
+/*
+ * ★ guest 为 SIGSYS 设置的处理方式（影子槽）★ 2026-10-09 真机缺陷
+ *
+ * 真实的 SIGSYS 处理器必须始终是本文件的 sigsys_handler：seccomp 的 TRAP
+ * 只能靠它兜成 ENOSYS/重放。但 guest 可能自己调 sigaction/signal 给 SIGSYS
+ * 装处理器 —— 交互式 bash 就会：给所有「致命信号」（含 SIGSYS）装
+ * termsig_sighandler。旧实现对真处理器「放行」，于是 bash 的处理器顶掉了
+ * 我们的，随后 faccessat2 被 seccomp TRAP，SIGSYS 直接投递给 bash 的终止
+ * 处理器，bash 当成致命信号退出（rc=159）；前一版还因吞掉 SIG_DFL 而无限
+ * 递归（rc=139）。
+ *
+ * 官方 runtime 的做法（反汇编 sigaction/signal，影子表 + 真处理器常驻）：
+ * guest 的设置只记录在影子槽里，查询（oldact）时回读影子槽，真处理器不动；
+ * 信号到来时：seccomp 产生的由我们兜底，其余（kill 等用户发来的）再按影子槽
+ * 的设置转交给 guest。
+ *
+ * 影子槽只有一份：SIGSYS 是进程级处理方式，不分线程。
+ */
+static volatile int g_guest_set = 0;            /* guest 是否设置过 */
+static struct sigaction g_guest_sa;             /* guest 要求的处理方式 */
+
 static volatile int g_verbose = 0;
 static volatile unsigned long g_total = 0;
 
@@ -358,6 +379,57 @@ static long replay_accept(long fd, long addr, long addrlen)
     return (long)(-(long)errno);
 }
 
+/* 裸 gettid：信号处理器里不走 libc 的包装 */
+static long gettid_raw(void)
+{
+    return raw4(178 /* gettid */, 0, 0, 0, 0);
+}
+
+/*
+ * 把「非 seccomp 产生的 SIGSYS」交给 guest 设置的处理方式。
+ * 只在信号处理器里调用：不 malloc、不 stdio。
+ *
+ * - 没设置过 / SIG_IGN：忽略（SIGSYS 默认动作是终止，但 guest 没有表示
+ *   想要它，且这条路径上的发送者几乎一定是 bash 之类的自发 kill）。
+ * - SIG_DFL：guest 明确要求默认动作 —— 把真实处理器摘成 SIG_DFL 后重发给
+ *   自己，让进程以 SIGSYS 终止，与不带 runtime 时一致。
+ * - 自定义处理器：原样调用（SA_SIGINFO 与否按 guest 设置的标志）。
+ *   这里不能再递归调用自己：自定义处理器里若 kill(getpid(), SIGSYS)，
+ *   kill 钩子会把它吞掉（见 proc.c 的 px_is_self_sigsys），不会回到这里。
+ */
+static void guest_sigsys_dispatch(int sig, siginfo_t *si, void *uc)
+{
+    if (!g_guest_set)
+        return;
+    if (g_guest_sa.sa_handler == SIG_IGN)
+        return;
+    if (g_guest_sa.sa_handler == SIG_DFL) {
+        struct sigaction dfl;
+        extern int __libc_sigaction(int, const struct sigaction *,
+                                    struct sigaction *);
+
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        if (__libc_sigaction != NULL)
+            (void)__libc_sigaction(SIGSYS, &dfl, NULL);
+        {
+            sigset_t s;
+
+            sigemptyset(&s);
+            sigaddset(&s, SIGSYS);
+            (void)raw4(SYS_RT_SIGPROCMASK, SIG_UNBLOCK, (long)&s, 0,
+                       SYS_SIGSETSIZE);
+        }
+        (void)raw4(131 /* tgkill */, (long)getpid(), (long)gettid_raw(),
+                   SIGSYS, 0);
+        return;
+    }
+    if (g_guest_sa.sa_flags & SA_SIGINFO)
+        g_guest_sa.sa_sigaction(sig, si, uc);
+    else
+        g_guest_sa.sa_handler(sig);
+}
+
 static void sigsys_handler(int sig, siginfo_t *si, void *uc)
 {
     struct raw_sigsys_info *rs;
@@ -375,13 +447,20 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
      * SI_TKILL / SI_QUEUE，其 siginfo 内容由发送方控制；若照常处理，
      * 会改写被中断点的 x0 并按伪造字段重放系统调用。
      * si_arch 也必须是本架构，否则 syscall 号的解释不成立。
+     *
+     * 这类「不是 seccomp 产生的」SIGSYS 转交给 guest 为 SIGSYS 设置的处理方式
+     * （影子槽，见文件头的 g_guest_sa）。guest 没设置过则保持原行为：忽略。
      */
-    if (si->si_code != BX_SYS_SECCOMP)
+    if (si->si_code != BX_SYS_SECCOMP) {
+        guest_sigsys_dispatch(sig, si, uc);
         return;
+    }
     rs = (struct raw_sigsys_info *)((char *)si + 16);
 #if defined(__aarch64__)
-    if (rs->arch != BX_AUDIT_ARCH_AARCH64)
+    if (rs->arch != BX_AUDIT_ARCH_AARCH64) {
+        guest_sigsys_dispatch(sig, si, uc);
         return;
+    }
 #endif
     sc = rs->syscall;
     g_total++;
@@ -621,13 +700,21 @@ sighandler_t signal(int signum, sighandler_t handler)
     static sighandler_t (*real_fn)(int, sighandler_t) = NULL;
     struct sigaction cur;
 
-    if (signum == SIGSYS && g_installed &&
-        (handler == SIG_IGN || handler == SIG_DFL)) {
-        /* 回读当前处理器作为返回值；读失败则返回 SIG_ERR 保持诚实 */
+    if (signum == SIGSYS && g_installed) {
+        /*
+         * guest 对 SIGSYS 的任何设置（含自定义处理器）都只记到影子槽，
+         * 真处理器不动；返回「上一个」guest 设置，没有则按默认 SIG_DFL。
+         * 与 sigaction 钩子共用同一份影子槽，两条路径语义一致。
+         */
+        sighandler_t prev = g_guest_set ? g_guest_sa.sa_handler : SIG_DFL;
+
         memset(&cur, 0, sizeof(cur));
-        if (__libc_sigaction_ref(SIGSYS, NULL, &cur) == 0)
-            return cur.sa_handler;
-        return SIG_ERR;
+        cur.sa_handler = handler;
+        sigemptyset(&cur.sa_mask);
+        cur.sa_flags = 0;
+        g_guest_sa = cur;
+        g_guest_set = 1;
+        return prev;
     }
 
     if (real_fn == NULL)
@@ -651,9 +738,25 @@ sighandler_t signal(int signum, sighandler_t handler)
  */
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old)
 {
-    if (sig == SIGSYS && act != NULL && g_installed) {
-        if (act->sa_handler == SIG_IGN || act->sa_handler == SIG_DFL)
-            return 0;   /* 静默拒绝，保持我们的处理器 */
+    if (sig == SIGSYS && g_installed) {
+        /*
+         * 影子槽：先回读「上一个」guest 设置给 oldact，再记录新的。
+         * 真处理器始终是 sigsys_handler，不被 guest 顶掉；查询时 guest
+         * 看到的是它自己设置过的值（没设置过则 SIG_DFL），与不带 runtime
+         * 时的可观测行为一致。
+         */
+        if (old != NULL) {
+            memset(old, 0, sizeof(*old));
+            if (g_guest_set)
+                *old = g_guest_sa;
+            else
+                old->sa_handler = SIG_DFL;
+        }
+        if (act != NULL) {
+            g_guest_sa = *act;
+            g_guest_set = 1;
+        }
+        return 0;
     }
 
     /*

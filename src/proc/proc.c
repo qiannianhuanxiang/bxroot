@@ -6358,9 +6358,38 @@ int pclose(FILE *stream)
 /* kill 家族                                                           */
 /* ------------------------------------------------------------------ */
 
+/*
+ * ★ 进程发给自己的 SIGSYS 必须吞掉（2026-10-09 真机缺陷）★
+ *
+ * 真机 DSHA 内置终端：交互式 bash 给 SIGSYS 装了自己的终止处理器
+ * （termsig_sighandler：先恢复默认处理，再 kill(getpid(), sig)）。
+ * runtime 的 signal()/sigaction() 钩子为了保住 seccomp 兜底处理器，会静默
+ * 吞掉对 SIGSYS 的 SIG_DFL/SIG_IGN 设置，于是 bash 的处理器没被摘掉，
+ * kill(getpid(), SIGSYS) 又进同一个处理器 → 无限递归 → 栈耗尽 SIGSEGV
+ *（"[proroot] child killed by signal 11"，退出码 139）。strace 里是
+ * 1702 次 kill(self, SIGSYS)。
+ *
+ * 官方 runtime 的做法（反汇编 kill/tkill/tgkill，日志串
+ * "[proroot-kill] swallow self SIGSYS"）：进程发给自己的 SIGSYS 直接吞掉，
+ * 返回成功但不真正发送。真正的 seccomp SIGSYS 是内核直接投递的，不经过
+ * kill()，所以不受影响。只吞 SIGSYS，其它信号照常。
+ *
+ * pid 的取值：== 自己、或 0（调用者所在进程组，必含自己）、或负值（killpg）
+ * 都不吞 —— 只吞「明确指向自己」的那一种，避免误吞对别人的信号。
+ */
+static int px_is_self_sigsys(pid_t pid, int sig)
+{
+    return sig == SIGSYS && pid > 0 && pid == px_self_pid();
+}
+
 static int px_do_kill(pid_t pid, int sig, int (*real_fn)(pid_t, int))
 {
     proc_kill_verdict v;
+
+    if (px_is_self_sigsys(pid, sig)) {
+        PX_LOG("proc: 吞掉发给自己的 SIGSYS（pid=%d）", (int)pid);
+        return 0;
+    }
 
     px_runtime_init();
     v = px_check_kill(g_rt_ledger, NULL, &PX_SYSOPS, px_self_pid(), pid, sig);
@@ -6430,6 +6459,11 @@ int tgkill(int tgid, int tid, int sig)
     static int (*real_tgkill)(int, int, int) = NULL;
 
     if (tgid == (int)px_self_pid()) {
+        if (sig == SIGSYS) {
+            /* 同 px_do_kill：发给本进程内线程的 SIGSYS 也吞掉 */
+            PX_LOG("proc: 吞掉发给自己线程的 SIGSYS（tid=%d）", tid);
+            return 0;
+        }
         if (real_tgkill == NULL) {
             real_tgkill = (int (*)(int, int, int))px_dlsym("tgkill");
         }

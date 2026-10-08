@@ -903,6 +903,9 @@ fi
 if [ -f test/RUN_LIVEPATCH_MULTISEG.sh ]; then
     run_step "livepatch 多段 r-x 全扫描" sh test/RUN_LIVEPATCH_MULTISEG.sh
 fi
+if [ -f test/RUN_SIGSYS_GUEST.sh ]; then
+    run_step "guest SIGSYS 影子槽 / 自发 SIGSYS" sh test/RUN_SIGSYS_GUEST.sh
+fi
 
 # livepatch 对抗性审计（对两个真实 libc 交叉核对命中，无误伤）
 if [ -f test/RUN_LIVEPATCH_AUDIT.sh ]; then
