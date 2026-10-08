@@ -678,6 +678,17 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# 官方 launcher 配置块（PROROOT_CFG_FD）：runtime 替换进官方 DSHA APK 后，
+# -b 绑定 / -0 / --link2symlink 全靠读这块配置。没有外层 proroot 时按
+# 环境不满足跳过（rc=2）。
+# ---------------------------------------------------------------------
+if [ -f test/RUN_PROROOT_CFG.sh ]; then
+    run_step "官方配置块 CFG_FD" sh test/RUN_PROROOT_CFG.sh
+else
+    run_step "官方配置块 CFG_FD"
+fi
+
+# ---------------------------------------------------------------------
 # SysV 共享内存模拟（sysvshm.c）：语义对照官方 + 双向互通 + 并发
 # ---------------------------------------------------------------------
 if [ -f test/RUN_SYSVSHM.sh ]; then
@@ -888,6 +899,12 @@ if [ -f test/RUN_LIVEPATCH_SCAN.sh ]; then
     run_step "livepatch 指令扫描" sh test/RUN_LIVEPATCH_SCAN.sh
 else
     run_step "livepatch 指令扫描"
+fi
+if [ -f test/RUN_LIVEPATCH_MULTISEG.sh ]; then
+    run_step "livepatch 多段 r-x 全扫描" sh test/RUN_LIVEPATCH_MULTISEG.sh
+fi
+if [ -f test/RUN_SIGSYS_GUEST.sh ]; then
+    run_step "guest SIGSYS 影子槽 / 自发 SIGSYS" sh test/RUN_SIGSYS_GUEST.sh
 fi
 
 # livepatch 对抗性审计（对两个真实 libc 交叉核对命中，无误伤）

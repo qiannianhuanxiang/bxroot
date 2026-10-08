@@ -2203,7 +2203,49 @@ void px_reap_child_tolerant(pid_t child, px_wait_child_fn wait_fn, void *ud,
 extern int bxroot_translate_path(const char *path, char *out, size_t out_size)
     __attribute__((weak));
 extern void bxroot_log(const char *fmt, ...) __attribute__((weak));
+/*
+ * 进程内执行静态 ELF（src/runtime/static_exec.c）。weak：proc.c 单测里没有它。
+ * 成功不返回；失败返回 -1，调用方回退 stub-loader。
+ */
+extern int px_static_exec(const char *host, const char *argv0,
+                          char *const argv[], char *const envp[]) __attribute__((weak));
 
+
+
+/* /proc/self/status 的 Threads:。读不到当多线程处理（保守，不走 fork）。 */
+static long px_nraw(long nr, long a, long b, long c, long d)
+{
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : "memory", "cc");
+    return x0;
+#else
+    long r = syscall(nr, a, b, c, d);
+    return r < 0 ? -(long)errno : r;
+#endif
+}
+
+static int px_self_thread_count(void)
+{
+    char buf[4096];
+    long fd = px_nraw(SYS_openat, AT_FDCWD, (long)"/proc/self/status", O_RDONLY | O_CLOEXEC, 0);
+    long n;
+    char *p;
+
+    if (fd < 0)
+        return 99;
+    n = px_nraw(SYS_read, fd, (long)buf, (long)(sizeof(buf) - 1), 0);
+    (void)px_nraw(SYS_close, fd, 0, 0, 0);
+    if (n <= 0)
+        return 99;
+    buf[n] = '\0';
+    p = strstr(buf, "Threads:");
+    return p ? atoi(p + 8) : 99;
+}
 
 #define PX_LOG(...) do {                                              \
         if (bxroot_log != NULL && g_rt_cfg.verbose) {                 \
@@ -2759,10 +2801,11 @@ static int px_xlate_trampoline(void *ud, const char *path, char *out, size_t out
  * 不在 exec 路径上的 exec（如纯逻辑测试直接调 build_env）保持 NULL，
  * 此时不写 BXROOT_GUEST_EXE（沿用继承值，行为与从前一致）。
  */
-static const char *g_exec_guest_exe;
+static __thread const char *g_exec_guest_exe;
+static __thread const char *g_exec_orig_comm;
 
 static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
-                           const char *guest_exe)
+                           const char *guest_exe, const char *orig_comm)
 {
     size_t n = 0;
 
@@ -2827,7 +2870,7 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
      * guest_exe 为 NULL/空时跳过（不发明值：宁可不写，也不写一个
      * 会误导客户的假路径）。
      */
-    if (guest_exe != NULL && guest_exe[0] != '\0' && n < cap) {
+    if (guest_exe != NULL && guest_exe[0] == '/' && n < cap) {
         kv[n].name = "BXROOT_GUEST_EXE";
         kv[n].value = guest_exe;
         kv[n].mode = PX_ENV_SET;
@@ -2847,9 +2890,9 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
      *     ln -s /tmp/A /tmp/B; exec /tmp/B
      *     期望 comm = 'B'（调用者给的链接名），而非 'A' 或 'sh'。
      */
-    if (guest_exe != NULL && guest_exe[0] != '\0' && n < cap) {
+    if (orig_comm != NULL && orig_comm[0] != '\0' && n < cap) {
         kv[n].name = "BXROOT_ORIG_COMM";
-        kv[n].value = guest_exe;
+        kv[n].value = orig_comm;
         kv[n].mode = PX_ENV_SET;
         n++;
     }
@@ -2874,7 +2917,7 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
         return -1;
     }
 
-    nf = px_build_forced(&g_rt_cfg, forced, 7, g_exec_guest_exe);
+    nf = px_build_forced(&g_rt_cfg, forced, 7, g_exec_guest_exe, g_exec_orig_comm);
     if (nf <= 0) {
         return -1;
     }
@@ -3538,7 +3581,9 @@ static int px_trampoline_exec(const char *host, char *const argv[],
  *
  * 【修法】官方 runtime 的做法（实测其子进程 argv/env）：
  *     execve(<STUB_LOADER>, [<STUB_LOADER>, <宿主 exe>, <argv[1..]>], env)
- *     env += PROROOT_STUB_GUEST_EXE=<guest 路径>  PROROOT_STUB_ROOTFS=<rootfs>
+ *     env += PROROOT_STUB_GUEST_EXE=<guest 路径>
+ *     无 PROROOT_CFG_FD 时再加 PROROOT_STUB_ROOTFS=<rootfs>
+ *     （官方 runtime 从不写 STUB_ROOTFS；有 CFG blob 时让 stub 自己读）
  * stub-loader 自己做 ELF 装载与 syscall 路径翻译（静态程序里没有我们的
  * 钩子可挂）。实测在 bxroot 进程内这样 exec，非默认 rootfs 下的静态程序
  * 读到的是 rootfs 内的 /etc 文件 —— 翻译确实生效。
@@ -3619,6 +3664,9 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
 {
     const char *stub = getenv("BXROOT_STUB_LOADER_EXEC");
     const char *rf = g_rt_cfg.have_rootfs ? g_rt_cfg.rootfs : NULL;
+    const char *cfgfd = getenv("PROROOT_CFG_FD");
+    int have_cfg = (cfgfd != NULL && cfgfd[0] != '\0');
+    int inject_stub_rootfs;
     size_t n = 0, i, ec = 0;
     int tracing = 0;
 
@@ -3628,11 +3676,27 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
      * 优先 bxroot 自己的变量，回落官方的 PROROOT_STUB_LOADER（DSHA 与外层
      * proroot 都提供它）。bxroot 自己的 libbxroot-stub-loader.so **不能**
      * 当这个用 —— 它只是 execve+LD_PRELOAD 回退（文件头注释），不做装载。
+     *
+     * ★ 有 PROROOT_CFG_FD 时不要注入 PROROOT_STUB_ROOTFS ★
+     *
+     * 官方 runtime 从不写这个变量（strings 对官方 libproroot-runtime.so
+     * 搜不到 PROROOT_STUB_ROOTFS）。beta/官方 stub 在 STUB_ROOTFS 与
+     * CFG blob 并存时，openat 仍走 blob 翻译（所以 ldconfig 能列出
+     * Ubuntu 的 .so 和 /etc/ld.so.conf.d/libc.conf），但 renameat 会
+     * 落到未翻译的 Android /etc overlay → EROFS。这就是 cfgfd 二改
+     * APK 首次引导
+     *   ldconfig.real: Renaming of /etc/ld.so.cache~ to /etc/ld.so.cache
+     *   failed: Read-only file system
+     * 的现场。有 blob 时让 stub 自己读配置，与官方 runtime 对齐。
+     * 没有 blob 的 bxroot 自己的 launcher 路径仍注入 STUB_ROOTFS。
      */
     if (stub == NULL || stub[0] == '\0')
         stub = getenv("PROROOT_STUB_LOADER");
-    if (stub == NULL || stub[0] != '/' || rf == NULL || rf[0] == '\0')
+    if (stub == NULL || stub[0] != '/')
         return -1;
+    if (!have_cfg && (rf == NULL || rf[0] == '\0'))
+        return -1;
+    inject_stub_rootfs = (!have_cfg && rf != NULL && rf[0] != '\0');
     /* 与 trampoline 同理：/data/app 下的路径要经 /proc/self/root 绕开翻译 */
     if (strncmp(stub, "/proc/", 6) == 0) {
         if (strlen(stub) >= sizeof(sp->path))
@@ -3656,8 +3720,13 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
     if (snprintf(sp->genv, sizeof(sp->genv), "PROROOT_STUB_GUEST_EXE=%s",
                  (guest != NULL && guest[0] != '\0') ? guest : host) >= (int)sizeof(sp->genv))
         return -1;
-    if (snprintf(sp->renv, sizeof(sp->renv), "PROROOT_STUB_ROOTFS=%s", rf) >= (int)sizeof(sp->renv))
-        return -1;
+    if (inject_stub_rootfs) {
+        if (snprintf(sp->renv, sizeof(sp->renv), "PROROOT_STUB_ROOTFS=%s", rf)
+            >= (int)sizeof(sp->renv))
+            return -1;
+    } else {
+        sp->renv[0] = '\0';
+    }
 
     if (envp != NULL)
         while (envp[ec] != NULL)
@@ -3688,7 +3757,8 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
         sp->ne[n++] = envp[i];
     }
     sp->ne[n++] = sp->genv;
-    sp->ne[n++] = sp->renv;
+    if (inject_stub_rootfs)
+        sp->ne[n++] = sp->renv;
     sp->ne[n] = NULL;
     return 0;
 }
@@ -3794,6 +3864,30 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
      * 仍经 real_posix_spawn，file_actions/attr 由 glibc 原样应用。
      */
     if (host != NULL && px_elf_needs_stub(host)) {
+        /*
+         * 无 file_actions/attr 时 fork + 进程内执行（与 execve 同路径）。
+         * 有 fa/attr 时仍走 stub-loader：自己复现 glibc 的 file_actions
+         * 语义成本高，冷装 ldconfig 走的是 fork+exec 不是 spawn。
+         */
+        if (fa == NULL && attr == NULL && px_static_exec != NULL &&
+            px_self_thread_count() == 1) {
+            /*
+             * 只在单线程父进程里 fork：多线程 fork 会继承其它线程持有的
+             * malloc 锁，子进程里再 malloc 可能死锁（Astra W4）。
+             * 子进程 static_exec 失败则改走 stub-loader，不再直接 127。
+             */
+            pid_t c = fork();
+            if (c == 0) {
+                (void)px_static_exec(host, argv0, argv, envp);
+                (void)px_stub_exec(host, argv, envp, argv0);
+                _exit(127);
+            }
+            if (c > 0) {
+                *pid = c;
+                PX_LOG("proc: spawn 无 PT_INTERP 的 ELF 经进程内执行 %s pid=%d", host, (int)c);
+                return 0;
+            }
+        }
         px_stub_plan *sp = (px_stub_plan *)malloc(sizeof(*sp));
         if (sp != NULL && px_stub_prepare(sp, host, argv, envp, argv0) == 0) {
             if (real_posix_spawn == NULL) {
@@ -4511,6 +4605,14 @@ static int px_do_execve(const char *path, char *const argv[],
         }
 
         /*
+         * ★ 调用者给的路径必须在符号链接展开**之前**保存 ★
+         * 上游语义：/proc/pid/comm 用 execve 的 raw user path。`ln -s /tmp/A /tmp/B;
+         * exec /tmp/B` 期望 comm=B；原先在展开后才拷，得到 A（设计注释 2888-2891
+         * 自己写的断言）。shebang 场景下它仍是脚本路径，见下面原有说明。
+         */
+        px_cfg_str(raw_guest, sizeof(raw_guest), guest);
+
+        /*
          * ★ 先把"绝对目标符号链接"展开掉 —— 必须在 shebang 判断之前 ★
          *
          * 【为什么必须在前】内核解析链接目标时按**真实根**走，bxroot 拦不到，
@@ -4552,8 +4654,6 @@ static int px_do_execve(const char *path, char *const argv[],
          * 而非重写后的解释器路径）。px_rewrite_shebang 会把 guest
          * 覆写成解释器，所以必须先拷一份。
          */
-        px_cfg_str(raw_guest, sizeof(raw_guest), guest);
-
         sb_rc = px_rewrite_shebang_chain(host, sizeof(host), guest, sizeof(guest),
                                          &argv, &sb_chain);
         if (sb_rc < 0) {
@@ -4613,15 +4713,22 @@ static int px_do_execve(const char *path, char *const argv[],
          * 解释器，这正是内核对 /proc/self/exe 的原生语义）。
          * 两者上游语义不同，见各自注释。
          */
-        const char *ge = raw_guest[0] != '\0' ? raw_guest : guest;
+        const char *exe = (guest != NULL && guest[0] != '\0') ? guest : raw_guest;
+        const char *comm = (raw_guest[0] != '\0') ? raw_guest : guest;
         const char *rf = g_rt_cfg.rootfs;
         size_t rl = (rf != NULL) ? strlen(rf) : 0;
 
-        if (rl > 0 && ge != NULL && strncmp(ge, rf, rl) == 0 &&
-            (ge[rl] == '/' || ge[rl] == '\0')) {
-            g_exec_guest_exe = (ge[rl] == '\0') ? "/" : (ge + rl);
+        if (rl > 0 && exe != NULL && strncmp(exe, rf, rl) == 0 &&
+            (exe[rl] == '/' || exe[rl] == '\0')) {
+            g_exec_guest_exe = (exe[rl] == '\0') ? "/" : (exe + rl);
         } else {
-            g_exec_guest_exe = ge;
+            g_exec_guest_exe = exe;
+        }
+        if (rl > 0 && comm != NULL && strncmp(comm, rf, rl) == 0 &&
+            (comm[rl] == '/' || comm[rl] == '\0')) {
+            g_exec_orig_comm = (comm[rl] == '\0') ? "/" : (comm + rl);
+        } else {
+            g_exec_orig_comm = comm;
         }
     }
     if (px_runtime_build_env(envp, &env) == 0) {
@@ -4632,6 +4739,7 @@ static int px_do_execve(const char *path, char *const argv[],
         final_env = envp;      /* 注入被禁用/失败 → 沿用调用方的 */
     }
     g_exec_guest_exe = NULL;
+    g_exec_orig_comm = NULL;
     (void)final_env_use;
 
     /* 4) 转发
@@ -4731,14 +4839,27 @@ static int px_do_execve(const char *path, char *const argv[],
                 if (errno == ENOENT || errno == ENOTDIR) {
                     definitive_no = 1;  /* 确实不存在 */
                 }
+                /* EACCES 等：不碰未初始化的 tst，交给后面 trampoline/execve */
             } else {
                 tst = raw_st;
+                if (S_ISDIR(tst.st_mode))
+                    definitive_no = 1;          /* 目录不可 exec */
+                else if (S_ISREG(tst.st_mode) && (tst.st_mode & 0111) == 0)
+                    definitive_no = 1;          /* 三个执行位全 0 */
             }
         }
-        if (!definitive_no && S_ISDIR(tst.st_mode)) {
-            definitive_no = 1;          /* 目录不可 exec */
-        } else if (S_ISREG(tst.st_mode) && (tst.st_mode & 0111) == 0) {
-            definitive_no = 1;          /* 三个执行位全 0，必然不可 exec */
+
+        /*
+         * ★ 无 PT_INTERP 的 ELF：先进程内执行，失败再走 stub-loader ★
+         * execve(stub-loader) 会丢掉 runtime，而官方 stub 对绝对路径
+         * renameat/linkat/unlinkat 不翻译（ldconfig.real 写 ld.so.cache 时
+         * EROFS，见 static_exec.c 文件头）。成功则永不返回；失败（多线程、
+         * ET_EXEC 地址冲突…）落回后面的 stub 分支，行为与改前一致。
+         */
+        if (!definitive_no && px_static_exec != NULL && px_elf_needs_stub(host)) {
+            PX_LOG("proc: 进程内执行静态 ELF %s", host);
+            (void)px_static_exec(host, raw_argv0[0] != '\0' ? raw_argv0 : guest, final_argv, final_env);
+            PX_LOG("proc: 进程内执行失败(errno=%d)，回退 stub-loader %s", errno, host);
         }
 
         if (definitive_no) {
@@ -5274,11 +5395,29 @@ static int px_do_spawn(pid_t *pid, const char *path,
         }
     }
 
-    /* 3) envp 重建 */
+    /* 3) envp 重建
+     *
+     * 槽位必须先设：px_build_forced 读 g_exec_guest_exe / g_exec_orig_comm，不设就
+     * 什么都不写，子进程继承父进程的 BXROOT_GUEST_EXE / ORIG_COMM（comm 与
+     * /proc/self/exe 都是父进程的）。spawn 的调用者路径 path 已是 guest 视角。
+     */
+    {
+        const char *rf_ = g_rt_cfg.rootfs;
+        size_t rl_ = (rf_ != NULL) ? strlen(rf_) : 0;
+        const char *gp = (path != NULL && path[0] == '/') ? path : NULL;
+
+        if (gp != NULL && rl_ > 0 && strncmp(gp, rf_, rl_) == 0 &&
+            (gp[rl_] == '/' || gp[rl_] == '\0'))
+            gp = (gp[rl_] == '\0') ? "/" : gp + rl_;
+        g_exec_guest_exe = gp;                 /* 相对名不写：preload 要求绝对路径 */
+        g_exec_orig_comm = (path != NULL) ? path : NULL;
+    }
     if (px_runtime_build_env(envp, &env) == 0) {
         final_env = env.v;
         g_rt_stats.spawn_env_injected++;
     }
+    g_exec_guest_exe = NULL;
+    g_exec_orig_comm = NULL;
 
     /* 4) 转发
      *
@@ -6219,9 +6358,38 @@ int pclose(FILE *stream)
 /* kill 家族                                                           */
 /* ------------------------------------------------------------------ */
 
+/*
+ * ★ 进程发给自己的 SIGSYS 必须吞掉（2026-10-09 真机缺陷）★
+ *
+ * 真机 DSHA 内置终端：交互式 bash 给 SIGSYS 装了自己的终止处理器
+ * （termsig_sighandler：先恢复默认处理，再 kill(getpid(), sig)）。
+ * runtime 的 signal()/sigaction() 钩子为了保住 seccomp 兜底处理器，会静默
+ * 吞掉对 SIGSYS 的 SIG_DFL/SIG_IGN 设置，于是 bash 的处理器没被摘掉，
+ * kill(getpid(), SIGSYS) 又进同一个处理器 → 无限递归 → 栈耗尽 SIGSEGV
+ *（"[proroot] child killed by signal 11"，退出码 139）。strace 里是
+ * 1702 次 kill(self, SIGSYS)。
+ *
+ * 官方 runtime 的做法（反汇编 kill/tkill/tgkill，日志串
+ * "[proroot-kill] swallow self SIGSYS"）：进程发给自己的 SIGSYS 直接吞掉，
+ * 返回成功但不真正发送。真正的 seccomp SIGSYS 是内核直接投递的，不经过
+ * kill()，所以不受影响。只吞 SIGSYS，其它信号照常。
+ *
+ * pid 的取值：== 自己、或 0（调用者所在进程组，必含自己）、或负值（killpg）
+ * 都不吞 —— 只吞「明确指向自己」的那一种，避免误吞对别人的信号。
+ */
+static int px_is_self_sigsys(pid_t pid, int sig)
+{
+    return sig == SIGSYS && pid > 0 && pid == px_self_pid();
+}
+
 static int px_do_kill(pid_t pid, int sig, int (*real_fn)(pid_t, int))
 {
     proc_kill_verdict v;
+
+    if (px_is_self_sigsys(pid, sig)) {
+        PX_LOG("proc: 吞掉发给自己的 SIGSYS（pid=%d）", (int)pid);
+        return 0;
+    }
 
     px_runtime_init();
     v = px_check_kill(g_rt_ledger, NULL, &PX_SYSOPS, px_self_pid(), pid, sig);
@@ -6291,6 +6459,11 @@ int tgkill(int tgid, int tid, int sig)
     static int (*real_tgkill)(int, int, int) = NULL;
 
     if (tgid == (int)px_self_pid()) {
+        if (sig == SIGSYS) {
+            /* 同 px_do_kill：发给本进程内线程的 SIGSYS 也吞掉 */
+            PX_LOG("proc: 吞掉发给自己线程的 SIGSYS（tid=%d）", tid);
+            return 0;
+        }
         if (real_tgkill == NULL) {
             real_tgkill = (int (*)(int, int, int))px_dlsym("tgkill");
         }

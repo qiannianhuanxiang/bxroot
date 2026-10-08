@@ -51,9 +51,13 @@ done
 W=${TMPDIR:-/tmp}/l2s_cleanup_$$
 mkdir -p "$W"
 trap 'rm -rf "$W" /tmp/l2scl_*' EXIT INT TERM
-# 集中目录是 <rootfs>/.l2s == 容器视角 /.l2s；每个用例前清空它，
-# 用例后数它 —— 这是"中间文件是否回收"的直接判据。
-L2SDIR=/.l2s
+# 集中目录必须是本测试私有的临时路径。
+# 生产环境 PROOT_L2S_DIR / 容器视角 /.l2s 里是真实 rootfs 的硬链接后备
+# （例如 /usr/bin/perl → /.l2s/.l2s.perl.dpkg-new0001）。曾经把
+# L2SDIR=/.l2s 再 rm -rf，会把生产树的 perl backing 一并清掉。
+# 用例后数这个私有目录 —— 仍是"中间文件是否回收"的直接判据。
+L2SDIR="$W/l2s-central"
+mkdir -p "$L2SDIR"
 
 # ---------- 探针：所有会改变计数的入口，逐步打印 nlink 与目录残留 ----------
 cat > "$W/probe.c" <<'EOF'
@@ -143,7 +147,7 @@ run_bx() {    # $1 = 工作目录  $2 = central|scatter
     if [ "$2" = scatter ]; then
         BXROOT_LINK2SYMLINK=1 BXROOT_L2S_DIR= timeout 120 "$BX" -- "$W/probe" "$1" 2>&1
     else
-        BXROOT_LINK2SYMLINK=1 timeout 120 "$BX" -- "$W/probe" "$1" 2>&1
+        BXROOT_LINK2SYMLINK=1 BXROOT_L2S_DIR="$L2SDIR" timeout 120 "$BX" -- "$W/probe" "$1" 2>&1
     fi | grep -v '^\[bxroot\]'
 }
 # 官方基线里 stray 恒 0（它的中间文件不在客户树里），bxroot 散落布局下
@@ -188,7 +192,7 @@ sed 's/^/   /' "$W/off.txt"
 for L in central scatter; do
     echo "== $L 布局 =="
     WD=/tmp/l2scl_$L
-    rm -rf "$WD" "$L2SDIR"; mkdir -p "$WD"
+    rm -rf "$WD" "$L2SDIR"; mkdir -p "$WD" "$L2SDIR"
     run_bx "$WD" "$L" > "$W/bx_$L.txt"
     grep -q '^END' "$W/bx_$L.txt" || { bad "探针没跑完"; sed 's/^/   /' "$W/bx_$L.txt" | head -20; continue; }
 
@@ -197,7 +201,7 @@ for L in central scatter; do
     if [ "$L" = scatter ]; then
         BXROOT_LINK2SYMLINK=1 BXROOT_L2S_DIR= "$BX" -- /bin/sh -c "echo x > $WD/chk/f && ln $WD/chk/f $WD/chk/g" >/dev/null 2>&1
     else
-        BXROOT_LINK2SYMLINK=1 "$BX" -- /bin/sh -c "echo x > $WD/chk/f && ln $WD/chk/f $WD/chk/g" >/dev/null 2>&1
+        BXROOT_LINK2SYMLINK=1 BXROOT_L2S_DIR="$L2SDIR" "$BX" -- /bin/sh -c "echo x > $WD/chk/f && ln $WD/chk/f $WD/chk/g" >/dev/null 2>&1
     fi
     tgt=$(readlink "$WD/chk/f" 2>/dev/null)
     case "$L:$tgt" in
@@ -229,7 +233,7 @@ for L in central scatter; do
     [ "$r" = 0 ] && good "外层视角客户目录 0 个 .l2s.*" || bad "外层视角客户目录残留 $r 个 .l2s.*"
     # (6) 集中目录不出现在 / 以外：客户 ls -a 工作目录里不该有 .l2s 目录
     if [ "$L" = central ]; then
-        e=$(BXROOT_LINK2SYMLINK=1 "$BX" -- /bin/sh -c "ls -a $WD /tmp | grep -c '^\.l2s\$'" 2>/dev/null | tail -1)
+        e=$(BXROOT_LINK2SYMLINK=1 BXROOT_L2S_DIR="$L2SDIR" "$BX" -- /bin/sh -c "ls -a $WD /tmp | grep -c '^\.l2s\$'" 2>/dev/null | tail -1)
         [ "${e:-0}" = 0 ] && good "集中目录不泄漏到 /tmp 或工作目录的列举中" || bad "在 /tmp 或工作目录列举里看到 .l2s 目录"
     fi
     rm -rf "$WD"

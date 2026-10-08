@@ -74,7 +74,8 @@ fi
 SRC="src/runtime/preload.c \
      src/l2s/l2s.c src/l2s/l2s-runtime.c \
      src/runtime/fakeroot.c src/runtime/crash.c src/runtime/sigsys.c \
-     src/runtime/syscall_guard.c src/runtime/livepatch.c"
+     src/runtime/syscall_guard.c src/runtime/livepatch.c \
+     src/runtime/static_exec.c"
 
 # 警告策略：原先的 -w 会把**全部**警告静默掉 —— 包括 -Wformat=2。
 # 真实教训：launcher.c 里一处 fprintf 少传两个实参（栈上取垃圾指针），

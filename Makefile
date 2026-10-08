@@ -72,7 +72,8 @@ $(BUILD_DIR)/libbxroot-ulx.so: src/ldr/ulx.c src/ldr/early_sigsys.h
 L2S_SRC = src/l2s/l2s.c src/l2s/l2s-runtime.c
 FR_SRC  = src/runtime/fakeroot.c
 CR_SRC  = src/runtime/crash.c
-SG_SRC  = src/runtime/sigsys.c src/runtime/syscall_guard.c src/runtime/livepatch.c
+SG_SRC  = src/runtime/sigsys.c src/runtime/syscall_guard.c src/runtime/livepatch.c \
+          src/runtime/static_exec.c
 
 PROC_SRC  = $(PROC_DIR)/proc.c
 
@@ -88,6 +89,7 @@ $(BUILD_DIR)/libbxroot-runtime.so: src/runtime/preload.c src/runtime/config.h \
         src/runtime/sigsys.c src/runtime/sigsys.h \
         src/runtime/syscall_guard.c src/runtime/syscall_guard.h \
         src/runtime/livepatch.c src/runtime/livepatch.h \
+        src/runtime/static_exec.c src/runtime/static_exec.h \
         $(PROC_SRC) $(PROC_DIR)/proc.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(SO_CFLAGS) -Isrc/l2s -I$(PROC_DIR) -DFAKEROOT_PURE_LOGIC \

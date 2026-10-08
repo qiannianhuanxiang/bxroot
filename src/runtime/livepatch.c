@@ -661,20 +661,26 @@ static int patch_one(uint32_t *p, const lp_site *s)
 }
 
 /*
- * 找 libc.so.6 的**可执行**段范围 [lo,hi)（r-xp 的那一段），供扫描界定。
- * 只扫这一段：数据段里可能恰好有等于 svc/mov 编码的字节，扫到就会误判。
- * 返回 0 = 没找到。
+ * 收集 libc.so.6 的**全部可执行**段范围，供扫描界定。
+ * 只扫可执行段：数据段里可能恰好有等于 svc/mov 编码的字节，扫到就会误判。
+ * 返回收集到的段数（0 = 没找到）。
+ *
+ * ★ 旧实现 find_libc_exec_range 只返回第一段（2026-10-09 真机证伪）★
+ * 一个 libc 有多段 r-x，且被版本表补丁劈开后更碎；99/293 站点可能在
+ * 任一段。只取第一段会让整个扫描对这些站点失明。
  */
-static int find_libc_exec_range(uintptr_t *lo_out, uintptr_t *hi_out)
+#define LP_MAX_SEGS 16
+static int lp_collect_libc_exec_segments(uintptr_t *lo_out, uintptr_t *hi_out,
+                                         int max)
 {
     FILE *f = fopen("/proc/self/maps", "r");
     char line[1024];
-    int found = 0;
+    int n = 0;
 
     if (f == NULL)
         return 0;
 
-    while (fgets(line, sizeof(line), f) != NULL) {
+    while (n < max && fgets(line, sizeof(line), f) != NULL) {
         unsigned long long a, b, off;
         char perms[8];
 
@@ -684,13 +690,12 @@ static int find_libc_exec_range(uintptr_t *lo_out, uintptr_t *hi_out)
             continue;
         if (perms[2] != 'x')                 /* 只要可执行段 */
             continue;
-        *lo_out = (uintptr_t)a;
-        *hi_out = (uintptr_t)b;
-        found = 1;
-        break;
+        lo_out[n] = (uintptr_t)a;
+        hi_out[n] = (uintptr_t)b;
+        n++;
     }
     fclose(f);
-    return found;
+    return n;
 }
 
 /*
@@ -1277,6 +1282,16 @@ int bxroot_livepatch_apply(void)
                 uint32_t *p = (uint32_t *)(g_base + g_sites[i].off);
                 g_hits += patch_one(p, &g_sites[i]);
             }
+            /*
+             * ★ 必须复位 r-x（2026-10-09 真机定位）★
+             * 原先补完不复位：这段页留成 RWX，把 libc 的 r-x 映射劈成几段。
+             * 下面的运行期扫描只认「第一段」，于是版本表偏移对不上的 libc
+             * （DSHA 自带 2.39-0ubuntu8.5，与表按 8.9 登记的偏移对不上）上，
+             * 三个 99/293 站点恰好落在被劈出的后段，扫描一个都没碰到
+             * → 新线程里 rseq/set_robust_list 撞 seccomp，SIGSYS 杀进程。
+             */
+            (void)mprotect((void *)lo, (size_t)(hi - lo),
+                           PROT_READ | PROT_EXEC);
         }
     }
 
@@ -1286,19 +1301,35 @@ int bxroot_livepatch_apply(void)
      * 关键）。只扫 libc 的 r-x 段；期间把该段临时置为可写，改完复位。
      */
     {
-        uintptr_t elo = 0, ehi = 0;
-        int have_libc_exec = find_libc_exec_range(&elo, &ehi);
+        /*
+         * 扫 libc 的**全部**可执行段，不是只扫第一段。glibc 的 r-x 本来就
+         * 是两段（0x0.. 与 0xd8000..），且被版本表补丁劈开过；99/293 的
+         * 站点会落在任意一段。先把段范围一次收齐再逐个处理，避免边改
+         * 保护位边读 /proc/self/maps 造成段划分漂移。
+         */
+        uintptr_t seg_lo[LP_MAX_SEGS], seg_hi[LP_MAX_SEGS];
+        int nseg = lp_collect_libc_exec_segments(seg_lo, seg_hi, LP_MAX_SEGS);
+        int have_libc_exec = (nseg > 0);
 
-        if (have_libc_exec && ehi > elo) {
-            if (mprotect((void *)elo, (size_t)(ehi - elo),
-                         PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-                g_scan_hits = lp_scan_and_patch(elo, ehi);
-                g_hits += g_scan_hits;
-                /* 复位为 r-x，缩小可写代码页窗口（失败不致命，已改完）。 */
-                (void)mprotect((void *)elo, (size_t)(ehi - elo),
-                               PROT_READ | PROT_EXEC);
+        if (have_libc_exec) {
+            int k;
+
+            for (k = 0; k < nseg; k++) {
+                if (seg_hi[k] <= seg_lo[k])
+                    continue;
+                if (mprotect((void *)seg_lo[k], (size_t)(seg_hi[k] - seg_lo[k]),
+                             PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                    int h = lp_scan_and_patch(seg_lo[k], seg_hi[k]);
+
+                    g_scan_hits += h;
+                    g_hits += h;
+                    /* 复位为 r-x，缩小可写代码页窗口（失败不致命，已改完）。 */
+                    (void)mprotect((void *)seg_lo[k],
+                                   (size_t)(seg_hi[k] - seg_lo[k]),
+                                   PROT_READ | PROT_EXEC);
+                }
             }
-        } else if (!have_libc_exec) {
+        } else {
             /*
              * ★ 第三部分：静态链接 guest —— 扫主可执行映像 r-x 段 ★
              * 没有独立 libc.so.6 r-x 段 = 静态链接特征（glibc 代码在主
