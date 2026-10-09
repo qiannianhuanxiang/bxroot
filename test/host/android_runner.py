@@ -137,7 +137,7 @@ def main():
     print(json.dumps(dict(skipped='non-executable-script', reason='Android denied memfd chmod; raw X_OK verified by RUN_HOST_WORLD.sh')), flush=True)
     run('guest-clean-env', ['/tmp/bx-native-probe', 'guest-clean-env'], needles=('V2352A',))
     run('host-env-home', ['/bin/bash', '-c', '/system/bin/sh -c \'echo HOME=$HOME TMPDIR=$TMPDIR; test -w "$HOME"; test -w "$TMPDIR"\''], needles=('HOME=/data/', 'TMPDIR=/data/'))
-    run('auto-guest-ldconfig', ['/bin/bash', '-c', '/sbin/ldconfig; rc=$?; echo ldconfig=$rc; exit $rc'], needles=('ldconfig=0',))
+    run('auto-guest-ldconfig', ['/bin/bash', '-c', '/sbin/ldconfig -N -X; rc=$?; echo ldconfig=$rc; exit $rc'], needles=('ldconfig=0',))
     summary = dict(runtime_sha256=digest, passed=sum(r['ok'] for r in results), total=len(results))
     print(json.dumps(summary), flush=True)
     for fd in keep:

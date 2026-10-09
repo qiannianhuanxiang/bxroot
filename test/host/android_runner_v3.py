@@ -20,6 +20,7 @@ def main():
     p.add_argument('--base', default='http://127.0.0.1:37692')
     p.add_argument('--rootfs', default='/data/data/com.termux/files/home/dsharf')
     p.add_argument('--libdir', default='/data/data/com.termux/files/home/bxoff')
+    p.add_argument('--diagnostics', action='store_true')
     a = p.parse_args()
     fds = []
     def mem(name):
@@ -107,7 +108,19 @@ def main():
         print(json.dumps(result, ensure_ascii=False), flush=True)
     # Alias /workspace intentionally creates a cwd ambiguity for /root.
     enter = '"$ENTRY_LOADER" "$BXROOT_ENTER" --cwd /root'
+    if a.diagnostics:
+        run('script-open-probe', '/tmp/probe', ['script-open'])
+        for shell in ('bash', 'dash'):
+            run('direct-script-' + shell, '/bin/bash', ['-c', '/bin/' + shell + ' /tmp/bx-v3-script value'], expected=29, needles=('SCRIPT=value', 'V2352A'))
+            run('reentry-script-' + shell, '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- /bin/' + shell + ' /tmp/bx-v3-script value\''], expected=29, needles=('SCRIPT=value', 'V2352A'))
+        run('persistent-script-ldd', '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- /usr/bin/ldd --version\''], needles=('ldd',))
+        run('anonymous-shebang', '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- /tmp/bx-v3-script value\''], expected=29, needles=('SCRIPT=value', 'V2352A'))
+        print(json.dumps(dict(diagnostics=True, passed=sum(r['ok'] for r in results), total=len(results))), flush=True)
+        for fd in fds:
+            os.close(fd)
+        raise SystemExit(0 if all(r['ok'] for r in results) else 1)
     run('session-fd-mode', '/tmp/probe', ['fd'], needles=('SEALS=15 WRITE=-9', 'GUEST_UID=0 REAL_UID='))
+    run('proc-fd-script-open', '/tmp/probe', ['script-open'], needles=('RESOLVE=0:', 'OPEN='))
     run('initial-bash-slots', '/bin/bash', ['-c', 'echo "FD=$BXROOT_SESSION_FD ENTER=$BXROOT_ENTER"; test -n "$BXROOT_SESSION_FD"; ' + enter + ' -- /usr/bin/printf "REENTER_OK\\n"'], needles=('FD=', 'REENTER_OK'))
     run('native-shell-reentry', '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- /usr/bin/printf "HOST_BACK\\n"\''], needles=('HOST_BACK',))
     run('node-host-guest-native', '/usr/local/bin/node', ['-e', 'const c=require("child_process");const code="const c=require(\\\"child_process\\\");const r=c.spawnSync(\\\"getprop\\\",[\\\"ro.product.model\\\"],{encoding:\\\"utf8\\\"});console.log(\\\"MODEL=\\\"+r.stdout.trim());process.exit(r.status);";const r=c.spawnSync("/system/bin/sh",["-c",\'exec "$ENTRY_LOADER" "$BXROOT_ENTER" --cwd /root -- /usr/local/bin/node -e "$1"\',"sh",code],{encoding:"utf8"});console.log(r.stdout);console.error(r.stderr);process.exit(r.status??1);'], needles=('MODEL=V2352A',))
@@ -120,11 +133,8 @@ def main():
     run('readonly-bind-preserved', '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- /usr/local/bin/node -e "try{require(\\\"fs\\\").openSync(\\\"/workspace\\\",\\\"w\\\");process.exit(1)}catch(e){console.log(e.code);process.exit(e.code===\\\"EROFS\\\"?0:2)}"\''], needles=('EROFS',))
     run('reentry-bind-env', '/bin/bash', ['-c', '/system/bin/sh -c \'"$ENTRY_LOADER" "$BXROOT_ENTER" --cwd /root -- /bin/bash -c "printf BINDS=\\$BXROOT_BINDS\\\\n"\''], needles=('/tmp/bx-v3-script',))
     run('script-to-host', '/bin/bash', ['-c', 'p=$("$ENTRY_LOADER" "$BXROOT_ENTER" --cwd /root --to-host /tmp/bx-v3-script); echo P=$p; /system/bin/toybox head -1 "$p"'], needles=('P=/proc/', '#!/bin/sh'))
-    # Anonymous script bind sources are valid only while the owner process
-    # keeps the memfd alive; a guest exec child cannot inherit this pathname
-    # mapping. The path conversion case above verifies the supported handoff.
-    print(json.dumps(dict(name='guest-script-anonymous-bind', skipped=True,
-                          reason='anonymous memfd bind source is not persistent across exec')), flush=True)
+    run('guest-script', '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- /tmp/bx-v3-script value\''], expected=29, needles=('SCRIPT=value', 'V2352A'))
+    run('persistent-script-ldd', '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- /usr/bin/ldd --version\''], needles=('ldd',))
     run('guest-path-search', '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- printf "NAME_OK\\n"\''], needles=('NAME_OK',))
     run('pty-reentry-size', '/bin/bash', ['-c', '/system/bin/sh -c \'' + enter + ' -- /bin/bash -c "/system/bin/toybox stty size"\''], needles=('31 89',))
     run('pty-reentry-input', '/bin/bash', ['-c', 'exec /system/bin/sh -c \'exec ' + enter + ' -- /bin/bash -c "echo READY; read v; echo INPUT=\\$v; exit 7"\''], expected=7, needles=('INPUT=hello',), input_after='READY', input_text=b'hello\n')

@@ -633,6 +633,12 @@ fi
 if [ -f test/RUN_HOST_ENTER.sh ]; then
     run_step "native host 到 guest 回入口" sh test/RUN_HOST_ENTER.sh
 fi
+if [ -f test/RUN_ENTER_ELF.sh ]; then
+    run_step "native 回入口 ELF 契约" sh test/RUN_ENTER_ELF.sh
+fi
+if [ -f test/RUN_PROC_FD.sh ]; then
+    run_step "proc fd 句柄解析" sh test/RUN_PROC_FD.sh
+fi
 
 # ---------------------------------------------------------------------
 # 最低内核版本依据（行动清单 #10，上游 #417）：实测 statx/execveat 可用性 +

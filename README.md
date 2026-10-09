@@ -537,6 +537,6 @@ BXROOT_AUTO_HOST=1 BXROOT_HOST_PATH=/system/bin:/system/xbin:/vendor/bin bxroot 
 
 Termux 中通过真实 bridge/linker + 匿名 memfd 加载完成 **25/25** 回归；分类/环境 **77** 检查、真实分流 **175** 检查全部通过。设计、运行方式和剩余边界见 [第二版说明](docs/bx-host-第二版.md)。这是实验实现，全量回归尚未通过；源码提交不等同于更新 DSHA APK 或发布 Release。
 
-### 第三版规划：双向执行与会话交接
+### 第三版：双向执行与会话交接
 
-下一阶段已补齐显式 host→guest 回入口、版本化会话上下文、cwd 与文件路径交接，形成 guest→host→guest 调用链。实现、测试结果和边界见 [第三版规划](docs/bx-host-第三版规划.md)。DSHA 设备接口与 Termux companion 仍保持为独立适配阶段，不写入通用运行时核心。
+启用 `BXROOT_AUTO_HOST=1 BXROOT_REENTRY=1` 后，原生侧可通过 `"$BXROOT_ENTER" --cwd /root -- PROGRAM [ARGS...]` 回到同一 guest 配置。第三版包含版本化只读会话 fd、cwd/路径转换、环境交接及无 libc 依赖的 Android PIE 回入口。运行方法、验证结果和限制见 [第三版说明](docs/bx-host-第三版.md)，原设计见 [第三版规划](docs/bx-host-第三版规划.md)。真机验证来自 Termux，不等同于 DSHA APK 集成；设备接口与 Termux companion 保持独立适配。

@@ -2606,6 +2606,20 @@ static int proc_who_kind(const char *hostp, const char **slash)
     return 2;
 }
 
+/* A proc fd is a kernel handle, not the pathname printed by readlink.
+ * In particular memfd and unlinked targets cannot be reopened by that name. */
+static int proc_fd_magic_leaf(const char *path)
+{
+    const char *slash, *p;
+    if (path == NULL || strncmp(path, "/proc/", 6) != 0 ||
+        proc_who_kind(path, &slash) == 0 || strncmp(slash, "/fd/", 4) != 0)
+        return 0;
+    p = slash + 4;
+    if (*p < '0' || *p > '9') return 0;
+    while (*p >= '0' && *p <= '9') p++;
+    return *p == '\0';
+}
+
 static int proc_magic_link_target(const char *hostp, char *out, size_t outsz)
 {
     const char *slash = NULL;
@@ -2809,6 +2823,8 @@ static int resolve_abs_symlink(const char *translated,
 
         if (real_readlink == NULL)
             return 0;
+        if (proc_fd_magic_leaf(cur))
+            break;
 
         n = real_readlink(cur, tgt, sizeof(tgt) - 1);
         if (n <= 0)
@@ -3061,6 +3077,8 @@ static int resolve_symlink_full(const char *translated,
 
         if (real_readlink == NULL)
             return 0;
+        if (proc_fd_magic_leaf(cur))
+            break;
 
         /*
          * ★ /proc 魔法链接优先：内核给的目标是宿主视角（exe 甚至是

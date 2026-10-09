@@ -17,8 +17,26 @@ static long raw(long nr, long a, long b, long c, long d, long e, long f)
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5) : "memory", "cc");
     return x0;
 }
+extern int bxroot_translate_path(const char *, char *, size_t) __attribute__((weak));
+extern int bxroot_resolve_leaf_links(const char *, char *, size_t) __attribute__((weak));
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "script-open")) {
+        const char *path = argc > 2 ? argv[2] : "/tmp/bx-v3-script";
+        char tr[4096], res[4096]; int fd, err;
+        int t = bxroot_translate_path ? bxroot_translate_path(path, tr, sizeof(tr)) : -99;
+        int rr = bxroot_resolve_leaf_links ? bxroot_resolve_leaf_links(t > 0 ? tr : path, res, sizeof(res)) : -99;
+        fd = open(path, O_RDONLY); err = errno;
+        printf("TRANSLATE=%d:%s RESOLVE=%d:%s OPEN=%d ERRNO=%d\n", t, t > 0 ? tr : "", rr, rr > 0 ? res : "", fd, err);
+        int ok = fd >= 0 && rr == 0;
+        if (fd >= 0) {
+            char header[10] = {0};
+            if (read(fd, header, 9) != 9 || memcmp(header, "#!/bin/sh", 9)) ok = 0;
+            close(fd);
+        }
+        return ok ? 0 : 1;
+    }
+
     const char *p = getenv("BXROOT_SESSION_FD");
     int fd = p && *p ? atoi(p) : -1;
     if (argc > 1 && !strcmp(argv[1], "fd")) {
