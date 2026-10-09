@@ -13386,6 +13386,8 @@ static void constructor(void) {
 
     /* Before this constructor rebuilds environ: bash imports original envp. */
     {
+        extern void bx_native_session_capture(void) __attribute__((weak));
+        if (bx_native_session_capture != NULL) bx_native_session_capture();
         extern int bx_host_world_init_path(void) __attribute__((weak));
         if (bx_host_world_init_path != NULL && bx_host_world_init_path() < 0)
             fprintf(stderr, "bxroot warning: cannot append native PATH (%s)\n", strerror(errno));
@@ -13692,6 +13694,11 @@ static void constructor(void) {
              */
             setenv(BXROOT_WORKDIR_DONE_ENV, "1", 1);
         }
+    }
+    {
+        extern int bx_native_session_init(void) __attribute__((weak));
+        if (bx_native_session_init != NULL && bx_native_session_init() < 0)
+            fprintf(stderr, "bxroot: native session unavailable (%s)\n", strerror(errno));
     }
 }
 

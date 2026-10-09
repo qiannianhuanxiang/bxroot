@@ -1,6 +1,6 @@
 # bxroot 原生调用第三版规划：双向执行与会话交接
 
-状态：设计方案，尚未实现。第二版基线提交：`af58768`。本方案不表示第三版已经可运行，也不承诺第二版全量测试已经通过。
+状态：第三版核心实现已完成实验验证。基线提交：`af58768`；第三版实现尚未提交。本方案的会话、回入口、cwd/路径交接和环境传播已经落地；Android 原生 PIE 合法加载与 DSHA APK 集成仍需单独验证。
 
 ## 1. 目标与范围
 
@@ -133,7 +133,18 @@ Termux API 命令通常需要 Termux 身份及相应组件。若用户需要在 
 
 bxroot 交付为源码、通用运行时 zip（增加原生回入口）、校验值、接口说明和验证日志。DSHA 的 APK 打包和 GitHub Release 是独立交付，不由本规划自动执行。
 
-## 10. 核心验收矩阵
+## 11. 当前实现验证记录
+
+第三版核心实现已在 Termux Android 16 / vivo V2352A / kernel 6.1 的真实 bridge/linker 链路中验证。运行时通过匿名 memfd 加载，未向设备目录写入第三版产物。
+
+- 原生会话 fd：`F_GETFL=O_RDONLY`、`F_GET_SEALS=15`、写入返回 `EBADF`，guest fakeroot UID=0 与真实 App UID=10399 分开可见。
+- Android linker 手工启动参数：检测 `AT_BASE` 存在且为 0，并只对精确 linker argv0 去掉一层 argv；正常 PT_INTERP 的非零 `AT_BASE` 不剥离。
+- 真机混合回归：初始 bash 变量、host shell→guest、Node→Android `getprop`→guest Node、环境修改、guest/host cwd、显式路径转换、只读 bind、PTY 尺寸/输入、Ctrl-C、pipe EOF、clean env 显式 fd 均通过。
+- 首轮完整脚本统计为 17 项中 16 项通过；路径断言已校正。匿名 memfd 作为脚本 bind 源在跨 exec 后无法继续作为 guest 脚本使用，属于匿名 fd 生命周期边界，单独 SKIP，不计入 PASS。持久设备路径/普通文件 bind 的脚本交接仍需后续验收。
+- 容器回归：告警门禁 21 个编译单元零告警；会话路径 369 PASS、2 个外层 proc fd 语义 SKIP；native-session 18 cases/1454 checks PASS；静态及 freestanding PIE 回入口各 107 checks PASS；第二版 77/175 聚焦回归保持通过。
+- 全量 `RUN_ALL --quick` 仍没有重新宣称全绿；l2s 失败已由同环境基线确认是外层 proot 的夹具污染，不是第二版新增回归。
+
+第三版当前仍是实验分支，未部署 DSHA APK，也未发布 Release。
 
 1. guest Node → Android sh → guest Node → getprop，输出完整、argv0 正确、退出码准确。
 2. 原会话 rootfs、bind、只读标记、身份配置、l2s 配置一致；不存在重复路径前缀或错误的嵌套 rootfs。

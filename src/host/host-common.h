@@ -85,6 +85,35 @@ static inline int bxhc_elf(int fd, const char *path, bxhc_pread_fn pread_fn)
     if (have_interp) return kind;
     return bxhc_u64(eh + 24) && bxhc_native_tree(path) ? BX_HOST_WORLD_STATIC : BX_HOST_WORLD_NO;
 }
+static inline int bxhc_guest_elf(int fd, bxhc_pread_fn pread_fn)
+{
+    unsigned char eh[64], ph[56];
+    char interp[256];
+    uint64_t phoff;
+    unsigned entsize, count, i;
+    int have = 0;
+    if (pread_fn(fd, eh, sizeof(eh), 0) != (long)sizeof(eh) ||
+        eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F' ||
+        eh[4] != 2 || eh[5] != 1 || eh[6] != 1 || bxhc_u16(eh + 18) != 183 ||
+        (bxhc_u16(eh + 16) != 2 && bxhc_u16(eh + 16) != 3) || bxhc_u16(eh + 52) != 64)
+        return 0;
+    phoff = bxhc_u64(eh + 32); entsize = bxhc_u16(eh + 54); count = bxhc_u16(eh + 56);
+    if (entsize < sizeof(ph) || !count || count > 128 || phoff > INT64_MAX - (uint64_t)count * entsize) return 0;
+    for (i = 0; i < count; i++) {
+        uint64_t off, len;
+        if (pread_fn(fd, ph, sizeof(ph), phoff + (uint64_t)i * entsize) != (long)sizeof(ph)) return 0;
+        if (bxhc_u32(ph) != 3) continue;
+        if (have++) return 0;
+        off = bxhc_u64(ph + 8); len = bxhc_u64(ph + 32);
+        if (len < 2 || len > sizeof(interp) || off > INT64_MAX - len ||
+            pread_fn(fd, interp, (size_t)len, off) != (long)len ||
+            interp[len - 1] != '\0' || bxhc_len(interp) != len - 1) return 0;
+        if (!bxhc_equal(interp, "/lib/ld-linux-aarch64.so.1") &&
+            !bxhc_equal(interp, "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1") &&
+            !bxhc_equal(interp, "/lib64/ld-linux-aarch64.so.1")) return 0;
+    }
+    return have == 1;
+}
 static inline int bxhc_env_name(const char *e, const char *name)
 {
     size_t i = 0;

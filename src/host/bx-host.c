@@ -149,36 +149,65 @@ static int bx_classify_elf(const char *path)
     return kind ? kind : -1;
 }
 
-static void bx_env_push(char **out, size_t *n, size_t cap, char *value)
+static const char *bx_env_value(char *const env[], const char *name)
 {
-    if (*n + 1 < cap)
-        out[(*n)++] = value;
+    size_t n = bx_strlen(name), i;
+    for (i = 0; env && env[i]; i++)
+        if (bxhc_env_name(env[i], name)) return env[i] + n + 1;
+    return NULL;
 }
-
-static size_t bx_host_env(char **out, size_t cap, char *const envp[])
+static char *bx_env_entry(char **cursor, const char *key, const char *value)
+{
+    char *start = *cursor;
+    while (*key) *(*cursor)++ = *key++;
+    *(*cursor)++ = '=';
+    while (*value) *(*cursor)++ = *value++;
+    *(*cursor)++ = 0;
+    return start;
+}
+static char **bx_host_env(char *const input[])
 {
     static char *const fixed[] = {
-        (char *)"PATH=/system/bin:/system/xbin:/vendor/bin",
-        (char *)"ANDROID_ROOT=/system",
-        (char *)"ANDROID_DATA=/data",
+        (char *)"ANDROID_ROOT=/system", (char *)"ANDROID_DATA=/data",
         (char *)"ANDROID_RUNTIME_ROOT=/apex/com.android.runtime",
         (char *)"ANDROID_ART_ROOT=/apex/com.android.art",
         (char *)"ANDROID_I18N_ROOT=/apex/com.android.i18n",
-        (char *)"ANDROID_TZDATA_ROOT=/apex/com.android.tzdata",
-        (char *)"HOME=/data/local/tmp",
-        (char *)"TMPDIR=/data/local/tmp",
-        NULL
+        (char *)"ANDROID_TZDATA_ROOT=/apex/com.android.tzdata", NULL
     };
-    size_t n = 0, i, k;
-    for (k = 0; fixed[k] != NULL; k++)
-        bx_env_push(out, &n, cap, fixed[k]);
-    for (i = 0; envp != NULL && envp[i] != NULL; i++) {
-        const char *e = envp[i];
-        if (bxhc_keep_env(e))
-            bx_env_push(out, &n, cap, envp[i]);
+    const char *path = bx_env_value(input, "BXROOT_HOST_PATH");
+    const char *home = bx_env_value(input, "BXROOT_HOST_HOME");
+    const char *tmp = bx_env_value(input, "BXROOT_HOST_TMPDIR");
+    const char *session = bx_env_value(input, "BXROOT_SESSION_FD");
+    const char *entry = bx_env_value(input, "BXROOT_ENTER");
+    char cwd[BX_MAX_PATH], *cursor, **env;
+    size_t i, count = 0, n = 0, bytes;
+    long mapping;
+    if (!path) path = BX_HOST_DEFAULT_PATH;
+    if (bx_raw6(17 /* getcwd */, (long)cwd, sizeof(cwd), 0, 0, 0, 0) < 0)
+        (void)bx_copy(cwd, sizeof(cwd), "/");
+    if (!home || home[0] != '/') home = cwd;
+    if (!tmp || tmp[0] != '/') tmp = cwd;
+    for (i = 0; input && input[i]; i++) {
+        if (i >= 131072) return NULL;
+        if (bxhc_keep_env(input[i])) count++;
     }
-    out[n] = NULL;
-    return n;
+    bytes = bx_strlen(path) + bx_strlen(home) + bx_strlen(tmp) + 80;
+    if (session && entry) bytes += bx_strlen(session) + bx_strlen(entry);
+    mapping = bx_raw6(222 /* mmap */, 0, (count + 12) * sizeof(char *) + bytes,
+                     3, 0x22, -1, 0);
+    if (mapping < 0 && mapping >= -4095) return NULL;
+    env = (char **)mapping; cursor = (char *)(env + count + 12);
+    env[n++] = bx_env_entry(&cursor, "PATH", path);
+    env[n++] = bx_env_entry(&cursor, "HOME", home);
+    env[n++] = bx_env_entry(&cursor, "TMPDIR", tmp);
+    if (session && entry) {
+        env[n++] = bx_env_entry(&cursor, "BXROOT_SESSION_FD", session);
+        env[n++] = bx_env_entry(&cursor, "BXROOT_ENTER", entry);
+    }
+    for (i = 0; fixed[i]; i++) env[n++] = fixed[i];
+    for (i = 0; input && input[i]; i++) if (bxhc_keep_env(input[i])) env[n++] = input[i];
+    env[n] = NULL;
+    return env;
 }
 
 static void bx_error(const char *s)
@@ -237,7 +266,7 @@ static int bx_resolve(const char *name, char *path, size_t cap)
 static int bx_main(long argc, char **argv, char **envp)
 {
     char path[BX_MAX_PATH];
-    char *host_env[BX_MAX_ENV];
+    char **host_env;
     int kind, rc;
 
     if (argc < 2 || bx_streq(argv[1], "--help") || bx_streq(argv[1], "-h")) {
@@ -266,7 +295,8 @@ static int bx_main(long argc, char **argv, char **envp)
         bx_error("target is not a bionic ELF");
         return 126;
     }
-    (void)bx_host_env(host_env, BX_MAX_ENV, envp);
+    host_env = bx_host_env(envp);
+    if (!host_env) { bx_error("cannot allocate host environment"); return 126; }
     /* argv[0] 保留调用者写的名字，toybox 的多调用分派依赖这一点。 */
     (void)bx_exec(path, &argv[1], host_env);
     bx_error("execve failed");

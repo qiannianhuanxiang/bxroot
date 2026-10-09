@@ -2937,7 +2937,7 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
 
 int px_runtime_build_env(char *const envp[], px_envout *out)
 {
-    px_env_kv forced[24];  /* identity + native PATH/config + guest loader */
+    px_env_kv forced[32];  /* identity + native PATH/config + guest loader */
     char *native_path = NULL;
     const char *const *src = envp != NULL ? (const char *const *)envp
                                         : (const char *const *)environ;
@@ -2982,6 +2982,15 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
         }
     }
 
+    {
+        extern const char *bx_native_session_value(const char *) __attribute__((weak));
+        const char *const names[] = {"BXROOT_SESSION_FD", "BXROOT_ENTER", "BXROOT_REENTRY", "BXROOT_GUEST_PATH"};
+        size_t i;
+        for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            const char *value = bx_native_session_value ? bx_native_session_value(names[i]) : NULL;
+            if (value) forced[nf++] = (px_env_kv){names[i], value, PX_ENV_SET};
+        }
+    }
     memset(&pol, 0, sizeof(pol));
     pol.forced = forced;
     pol.forced_n = (size_t)nf;

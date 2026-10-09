@@ -624,6 +624,15 @@ fi
 if [ -f test/RUN_HOST_DISPATCH.sh ]; then
     run_step "native exec/spawn 绑定语义" sh test/RUN_HOST_DISPATCH.sh
 fi
+if [ -f test/RUN_HOST_SESSION.sh ]; then
+    run_step "native 会话与双向路径" sh test/RUN_HOST_SESSION.sh
+fi
+if [ -f test/RUN_NATIVE_SESSION.sh ]; then
+    run_step "native 会话后端生命周期" sh test/RUN_NATIVE_SESSION.sh
+fi
+if [ -f test/RUN_HOST_ENTER.sh ]; then
+    run_step "native host 到 guest 回入口" sh test/RUN_HOST_ENTER.sh
+fi
 
 # ---------------------------------------------------------------------
 # 最低内核版本依据（行动清单 #10，上游 #417）：实测 statx/execveat 可用性 +

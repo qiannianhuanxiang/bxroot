@@ -9,6 +9,7 @@
 #include <sys/syscall.h>
 
 extern char **environ;
+extern const char *bx_native_session_value(const char *) __attribute__((weak));
 static long hw_raw6(long nr, long a, long b, long c, long d, long e, long f)
 {
 #if defined(__aarch64__)
@@ -89,12 +90,22 @@ static int hw_script_interpreter(const char *path, bx_host_world_mapper mapper,
     if (hw_copy(backing, BX_HOST_PATH_MAX, literal) != 0) return -1;
     return hw_elf(backing) == BX_HOST_WORLD_BIONIC;
 }
+static const char *hw_env_value(char *const env[], const char *name);
 int bx_host_world_classify_mapped(const char *p, bx_host_world_mapper mapper)
 {
     char interp[BX_HOST_PATH_MAX], arg[256];
+    const char *entry = bx_native_session_value ? bx_native_session_value("BXROOT_ENTER") : NULL;
     int saved = errno, k;
     if (!p || !*p) return BX_HOST_WORLD_NO;
     k = hw_elf(p);
+    if (!k && entry && !strcmp(p, entry)) {
+        long fd = hw_open(p);
+        if (fd >= 0) {
+            /* Validate the explicit static entry with the same ELF parser. */
+            k = bxhc_elf((int)fd, "/system/bin/bx-enter", hw_pread);
+            hw_close(fd);
+        }
+    }
     if (!k && hw_script_interpreter(p, mapper, interp, arg) > 0)
         k = BX_HOST_WORLD_SCRIPT;
     errno = saved;
@@ -204,23 +215,25 @@ int bx_host_world_build_env(char *const input[], char ***out)
     char *const *src = input ? input : environ;
     const char *home = hw_env_value(environ, "BXROOT_HOST_HOME");
     const char *tmp = hw_env_value(environ, "BXROOT_HOST_TMPDIR");
+    const char *session = bx_native_session_value ? bx_native_session_value("BXROOT_SESSION_FD") : NULL;
+    const char *entry = bx_native_session_value ? bx_native_session_value("BXROOT_ENTER") : NULL;
 
     char cwd[BX_HOST_PATH_MAX], *s, **env;
     size_t keep = 0, i, n = 0, bytes;
     if (!out) { errno = EINVAL; return -1; }
     *out = NULL;
     for (i = 0; src && src[i]; i++) {
-        if (bxhc_keep_env(src[i])) keep++;
+        if (bxhc_keep_env(src[i]) && !bxhc_env_name(src[i], "BXROOT_SESSION_FD") && !bxhc_env_name(src[i], "BXROOT_ENTER")) keep++;
         if (i >= 131072) { errno = E2BIG; return -1; }
     }
     if (hw_raw6(SYS_getcwd, (long)cwd, sizeof(cwd), 0, 0, 0, 0) < 0)
         (void)hw_copy(cwd, sizeof(cwd), "/");
     if (!home || home[0] != '/') home = cwd;
     if (!tmp || tmp[0] != '/') tmp = cwd;
-    bytes = strlen(hw_path()) + strlen(home) + strlen(tmp) + 32;
-    env = calloc(1, (keep + 10) * sizeof(char *) + bytes);
+    bytes = strlen(hw_path()) + strlen(home) + strlen(tmp) + 80 + (session ? strlen(session) : 0) + (entry ? strlen(entry) : 0);
+    env = calloc(1, (keep + 12) * sizeof(char *) + bytes);
     if (!env) return -1;
-    s = (char *)(env + keep + 10);
+    s = (char *)(env + keep + 12);
 #define HW_ENV(key, value) do { \
     env[n++] = s; memcpy(s, key "=", sizeof(key)); s += sizeof(key); \
     memcpy(s, value, strlen(value) + 1); s += strlen(value) + 1; \
@@ -228,9 +241,11 @@ int bx_host_world_build_env(char *const input[], char ***out)
     HW_ENV("PATH", hw_path());
     HW_ENV("HOME", home);
     HW_ENV("TMPDIR", tmp);
+    if (session) HW_ENV("BXROOT_SESSION_FD", session);
+    if (entry) HW_ENV("BXROOT_ENTER", entry);
 #undef HW_ENV
     for (i = 0; fixed[i]; i++) env[n++] = (char *)fixed[i];
-    for (i = 0; src && src[i]; i++) if (bxhc_keep_env(src[i])) env[n++] = src[i];
+    for (i = 0; src && src[i]; i++) if (bxhc_keep_env(src[i]) && !bxhc_env_name(src[i], "BXROOT_SESSION_FD") && !bxhc_env_name(src[i], "BXROOT_ENTER")) env[n++] = src[i];
     env[n] = NULL;
     *out = env;
     return 0;

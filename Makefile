@@ -21,6 +21,9 @@ LAUNCH_LDFLAGS = -static -Wl,-z,max-page-size=16384 -Wl,-e,bx_early_start
 HOST_CFLAGS = -O2 -Wall -Wextra -D_GNU_SOURCE -ffreestanding -fno-stack-protector -fno-pie
 HOST_LDFLAGS = -static -nostdlib -Wl,-z,max-page-size=16384 -Wl,-e,_start
 
+ENTER_CFLAGS = -O2 -Wall -Wextra -D_GNU_SOURCE -DBX_ENTER_NATIVE -ffreestanding -fno-builtin -fno-stack-protector -fPIE -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+ENTER_LDFLAGS = -nostdlib -pie -Wl,--dynamic-linker=/system/bin/linker64 -Wl,-e,bx_native_start -Wl,-z,max-page-size=16384 -Wl,--no-undefined
+
 # D4 进程管理层的源目录（proc.c / proc.h）。
 #
 # 优先仓库内的 src/proc —— 克隆下来即可构建，不依赖仓库外的兄弟目录。
@@ -40,7 +43,8 @@ TARGETS = \
 	$(BUILD_DIR)/libbxroot-bridge.so \
 	$(BUILD_DIR)/libbxroot-stub-loader.so \
 	$(BUILD_DIR)/libbxroot-ulx.so \
-	$(BUILD_DIR)/bx-host
+	$(BUILD_DIR)/bx-host \
+	$(BUILD_DIR)/libbxroot-enter.so
 
 .PHONY: all clean install install-dsha debug runtime test test-quick
 
@@ -64,6 +68,11 @@ $(BUILD_DIR)/libbxroot-ulx.so: src/ldr/ulx.c src/ldr/early_sigsys.h
 $(BUILD_DIR)/bx-host: src/host/bx-host.c src/host/host-common.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(HOST_CFLAGS) $(HOST_LDFLAGS) -o $@ $<
+
+# === Native return to the original guest session ===
+$(BUILD_DIR)/libbxroot-enter.so: src/host/bx-enter.c src/host/session.c src/host/enter-libc.c src/host/session.h src/host/host-world.h src/host/host-common.h
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(ENTER_CFLAGS) $(ENTER_LDFLAGS) -o $@ src/host/bx-enter.c src/host/session.c src/host/enter-libc.c
 
 # === Runtime (LD_PRELOAD hook + l2s 硬链接模拟 + D4 进程管理) ===
 #
@@ -101,12 +110,13 @@ $(BUILD_DIR)/libbxroot-runtime.so: src/runtime/preload.c src/runtime/config.h \
         src/runtime/livepatch.c src/runtime/livepatch.h \
         src/runtime/static_exec.c src/runtime/static_exec.h \
         src/host/host-world.c src/host/host-world.h src/host/host-common.h \
+        src/host/session.c src/host/session.h src/host/native-session.c \
         $(PROC_SRC) $(PROC_DIR)/proc.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(SO_CFLAGS) -Isrc/l2s -I$(PROC_DIR) -Isrc/host -DFAKEROOT_PURE_LOGIC \
 	    -DPX_PURE_LOGIC=0 \
 	    -o $@ src/runtime/preload.c $(L2S_SRC) $(FR_SRC) $(CR_SRC) $(SG_SRC) \
-	    src/host/host-world.c \
+	    src/host/host-world.c src/host/session.c src/host/native-session.c \
 	    $(PROC_SRC) $(SO_LDFLAGS)
 
 # === Linker (dlopen/dlsym 拦截) ===
@@ -132,6 +142,7 @@ install: all
 	cp $(BUILD_DIR)/libbxroot.so $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/libbxroot-ulx.so $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/bx-host $(INSTALL_DIR)/
+	cp $(BUILD_DIR)/libbxroot-enter.so $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/libbxroot-runtime.so $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/libbxroot-linker.so $(INSTALL_DIR)/ 2>/dev/null || true
 	cp $(BUILD_DIR)/libbxroot-bridge.so $(INSTALL_DIR)/ 2>/dev/null || true
@@ -145,6 +156,7 @@ install-dsha: all
 	@echo "目标: $(DSHA_LIB_DIR)"
 	cp $(BUILD_DIR)/libbxroot.so $(DSHA_LIB_DIR)/
 	cp $(BUILD_DIR)/bx-host $(DSHA_LIB_DIR)/
+	cp $(BUILD_DIR)/libbxroot-enter.so $(DSHA_LIB_DIR)/
 	cp $(BUILD_DIR)/libbxroot-runtime.so $(DSHA_LIB_DIR)/
 	cp $(BUILD_DIR)/libbxroot-linker.so $(DSHA_LIB_DIR)/ 2>/dev/null || true
 	cp $(BUILD_DIR)/libbxroot-bridge.so $(DSHA_LIB_DIR)/ 2>/dev/null || true
@@ -157,6 +169,7 @@ install-dsha: all
 clean:
 	rm -f $(BUILD_DIR)/libbxroot.so $(BUILD_DIR)/libbxroot-ulx.so
 	rm -f $(BUILD_DIR)/bx-host
+	rm -f $(BUILD_DIR)/libbxroot-enter.so
 	rm -f $(BUILD_DIR)/libbxroot-*.so
 	@echo "清理完成"
 

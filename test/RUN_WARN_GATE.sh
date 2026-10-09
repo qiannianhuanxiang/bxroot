@@ -125,6 +125,10 @@ src/linker/linker.c
 src/ldr/ulx.c
 src/host/host-world.c
 src/host/bx-host.c
+src/host/bx-enter.c
+src/host/session.c
+src/host/enter-libc.c
+src/host/native-session.c
 src/runtime/static_exec.c"
 
 # ★ 最后两项是 2026-09-19 补进来的 ★
@@ -243,12 +247,16 @@ for f in $UNITS; do
     #
     # 而报错信息会把 ICE 说成"真错误"，把排查方向指向 src/runtime/sigsys.c
     # 的代码 —— 那里其实没有任何问题。**假红比不红更贵**。
+    EXTRA=""
+    case "$f" in
+        src/host/enter-libc.c) EXTRA="-DBX_ENTER_NATIVE -ffreestanding -fno-builtin -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" ;;
+    esac
     rc=1
     i=1
     ICE=0
     while [ "$i" -le 10 ]; do
         # shellcheck disable=SC2086
-        "$CC" $BASE -O1 -I"${PROC_DIR:-.}" $DEFS -c -o /dev/null "$f" \
+        "$CC" $BASE $EXTRA -O1 -I"${PROC_DIR:-.}" $DEFS -c -o /dev/null "$f" \
             >/dev/null 2>"/tmp/bxroot-warn-$$.txt"
         rc=$?
         grep -q 'internal compiler error' "/tmp/bxroot-warn-$$.txt" || break

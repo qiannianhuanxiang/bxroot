@@ -1557,6 +1557,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (getenv("BXROOT_REENTRY") && !strcmp(getenv("BXROOT_REENTRY"), "1")) {
+        const char *path = getenv("PATH");
+        if ((getenv("BXROOT_GUEST_PATH") == NULL &&
+             setenv("BXROOT_GUEST_PATH", path ? path : BX_HOST_GUEST_DEFAULT_PATH, 1)) ||
+            (getenv("BXROOT_SESSION_FD") == NULL && setenv("BXROOT_SESSION_FD", "", 1))) {
+            fprintf(stderr, "bxroot: cannot reserve native session environment (%s)\n", strerror(errno));
+            free_config(&cfg); return 1;
+        }
+    }
     if (bx_host_world_enabled != NULL && bx_host_world_guest_path != NULL &&
         bx_host_world_enabled()) {
         char *path = NULL;
@@ -1601,6 +1610,13 @@ int main(int argc, char **argv) {
     }
 
 
+    if (getenv("BXROOT_REENTRY") && !strcmp(getenv("BXROOT_REENTRY"), "1") && getenv("BXROOT_ENTER") == NULL) {
+        char entry[PATH_MAX];
+        if (join_dir_name(entry, sizeof(entry), lib_dir, "libbxroot-enter.so") != 0 || setenv("BXROOT_ENTER", entry, 1) != 0) {
+            fprintf(stderr, "bxroot: cannot reserve native entry path (%s)\n", strerror(errno));
+            free_config(&cfg); return 1;
+        }
+    }
     /* 构建 runtime 库路径：优先使用 BXROOT_LIB_PATH（DSHA 设置），否则用本目录同名文件 */
     const char *env_lib_path = getenv("BXROOT_LIB_PATH");
     char runtime_lib[PATH_MAX];

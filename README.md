@@ -539,4 +539,4 @@ Termux 中通过真实 bridge/linker + 匿名 memfd 加载完成 **25/25** 回�
 
 ### 第三版规划：双向执行与会话交接
 
-下一阶段优先补齐显式 host→guest 回入口、版本化会话上下文、cwd 与文件路径交接，形成 guest→host→guest 调用链。方案、实施顺序和验收矩阵见 [第三版规划](docs/bx-host-第三版规划.md)。该方案尚未实现；DSHA 设备接口与 Termux companion 保持为独立适配阶段，不写入通用运行时核心。
+下一阶段已补齐显式 host→guest 回入口、版本化会话上下文、cwd 与文件路径交接，形成 guest→host→guest 调用链。实现、测试结果和边界见 [第三版规划](docs/bx-host-第三版规划.md)。DSHA 设备接口与 Termux companion 仍保持为独立适配阶段，不写入通用运行时核心。
