@@ -43,6 +43,10 @@
  * 链接时须 `-Wl,-e,bx_early_start`，详见该头文件。
  */
 #include "../ldr/early_sigsys.h"
+#include "../host/host-world.h"
+/* Older standalone launcher tests may omit the optional backend. */
+#pragma weak bx_host_world_enabled
+#pragma weak bx_host_world_guest_path
 
 /*
  * 版本号。
@@ -1551,6 +1555,24 @@ int main(int argc, char **argv) {
     if (parse_args(argc, argv, &cfg) < 0) {
         free_config(&cfg);
         return 1;
+    }
+
+    if (bx_host_world_enabled != NULL && bx_host_world_guest_path != NULL &&
+        bx_host_world_enabled()) {
+        char *path = NULL;
+        const char *home = getenv("HOME"), *tmp = getenv("TMPDIR");
+        if (getenv("BXROOT_HOST_HOME") == NULL && home && home[0] == '/')
+            setenv("BXROOT_HOST_HOME", home, 1);
+        if (getenv("BXROOT_HOST_TMPDIR") == NULL && tmp && tmp[0] == '/')
+            setenv("BXROOT_HOST_TMPDIR", tmp, 1);
+        if (bx_host_world_guest_path(getenv("PATH"), getenv("BXROOT_HOST_PATH"), &path) != 0 ||
+            setenv("PATH", path, 1) != 0) {
+            fprintf(stderr, "bxroot: cannot prepare native PATH (%s)\n", strerror(errno));
+            free(path);
+            free_config(&cfg);
+            return 1;
+        }
+        free(path);
     }
 
     /* 获取本程序所在目录（用于查找 runtime .so） */

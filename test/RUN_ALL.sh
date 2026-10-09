@@ -611,6 +611,21 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# 显式 Android bionic world 入口：bx-host 产物形状（第一版）
+# ---------------------------------------------------------------------
+if [ -f test/RUN_HOST_EXEC.sh ]; then
+    run_step "bx-host 宿主 ELF 入口" sh test/RUN_HOST_EXEC.sh
+else
+    run_step "bx-host 宿主 ELF 入口"
+fi
+if [ -f test/RUN_HOST_WORLD.sh ]; then
+    run_step "native world 分类与环境" sh test/RUN_HOST_WORLD.sh
+fi
+if [ -f test/RUN_HOST_DISPATCH.sh ]; then
+    run_step "native exec/spawn 绑定语义" sh test/RUN_HOST_DISPATCH.sh
+fi
+
+# ---------------------------------------------------------------------
 # 最低内核版本依据（行动清单 #10，上游 #417）：实测 statx/execveat 可用性 +
 # 源码回退策略 + README 声明一致性（门槛 4.11，非照搬上游的 4.19）
 # ---------------------------------------------------------------------

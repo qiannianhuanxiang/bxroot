@@ -16,6 +16,10 @@ SO_CFLAGS = -shared -fPIC $(COMMON_CFLAGS)
 #   可执行文件的加载段对齐由链接器按 max-page-size 决定。
 SO_LDFLAGS = -ldl -nostartfiles -Wl,-z,max-page-size=16384
 LAUNCH_LDFLAGS = -static -Wl,-z,max-page-size=16384 -Wl,-e,bx_early_start
+# bx-host 不依赖 libc：它要在 guest 的 static-exec 路径中自举，且所有
+# 检查/exec 都发 raw svc，避免再次进入 bxroot 的 exec hook。
+HOST_CFLAGS = -O2 -Wall -Wextra -D_GNU_SOURCE -ffreestanding -fno-stack-protector -fno-pie
+HOST_LDFLAGS = -static -nostdlib -Wl,-z,max-page-size=16384 -Wl,-e,_start
 
 # D4 进程管理层的源目录（proc.c / proc.h）。
 #
@@ -35,7 +39,8 @@ TARGETS = \
 	$(BUILD_DIR)/libbxroot-linker.so \
 	$(BUILD_DIR)/libbxroot-bridge.so \
 	$(BUILD_DIR)/libbxroot-stub-loader.so \
-	$(BUILD_DIR)/libbxroot-ulx.so
+	$(BUILD_DIR)/libbxroot-ulx.so \
+	$(BUILD_DIR)/bx-host
 
 .PHONY: all clean install install-dsha debug runtime test test-quick
 
@@ -46,14 +51,19 @@ runtime:
 	@sh ./BUILD_RUNTIME.sh
 
 # === Launcher (静态二进制，伪装为 libbxroot.so) ===
-$(BUILD_DIR)/libbxroot.so: src/launcher/launcher.c
+$(BUILD_DIR)/libbxroot.so: src/launcher/launcher.c src/host/host-world.c src/host/host-world.h src/host/host-common.h
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(COMMON_CFLAGS) $(LAUNCH_LDFLAGS) -o $@ $<
+	$(CC) $(COMMON_CFLAGS) $(LAUNCH_LDFLAGS) -o $@ src/launcher/launcher.c src/host/host-world.c
 
 # === 用户态 exec 加载器（静态可执行，伪装为 .so；见 src/ldr/ulx.c） ===
 $(BUILD_DIR)/libbxroot-ulx.so: src/ldr/ulx.c src/ldr/early_sigsys.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(COMMON_CFLAGS) $(LAUNCH_LDFLAGS) -o $@ src/ldr/ulx.c
+
+# === Explicit host-world entry (Android bionic) ===
+$(BUILD_DIR)/bx-host: src/host/bx-host.c src/host/host-common.h
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(HOST_CFLAGS) $(HOST_LDFLAGS) -o $@ $<
 
 # === Runtime (LD_PRELOAD hook + l2s 硬链接模拟 + D4 进程管理) ===
 #
@@ -90,11 +100,13 @@ $(BUILD_DIR)/libbxroot-runtime.so: src/runtime/preload.c src/runtime/config.h \
         src/runtime/syscall_guard.c src/runtime/syscall_guard.h \
         src/runtime/livepatch.c src/runtime/livepatch.h \
         src/runtime/static_exec.c src/runtime/static_exec.h \
+        src/host/host-world.c src/host/host-world.h src/host/host-common.h \
         $(PROC_SRC) $(PROC_DIR)/proc.h
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(SO_CFLAGS) -Isrc/l2s -I$(PROC_DIR) -DFAKEROOT_PURE_LOGIC \
+	$(CC) $(SO_CFLAGS) -Isrc/l2s -I$(PROC_DIR) -Isrc/host -DFAKEROOT_PURE_LOGIC \
 	    -DPX_PURE_LOGIC=0 \
 	    -o $@ src/runtime/preload.c $(L2S_SRC) $(FR_SRC) $(CR_SRC) $(SG_SRC) \
+	    src/host/host-world.c \
 	    $(PROC_SRC) $(SO_LDFLAGS)
 
 # === Linker (dlopen/dlsym 拦截) ===
@@ -119,6 +131,7 @@ install: all
 	@mkdir -p $(INSTALL_DIR)
 	cp $(BUILD_DIR)/libbxroot.so $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/libbxroot-ulx.so $(INSTALL_DIR)/
+	cp $(BUILD_DIR)/bx-host $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/libbxroot-runtime.so $(INSTALL_DIR)/
 	cp $(BUILD_DIR)/libbxroot-linker.so $(INSTALL_DIR)/ 2>/dev/null || true
 	cp $(BUILD_DIR)/libbxroot-bridge.so $(INSTALL_DIR)/ 2>/dev/null || true
@@ -131,6 +144,7 @@ install-dsha: all
 	@echo "部署到 DSHA nativeLibraryDir..."
 	@echo "目标: $(DSHA_LIB_DIR)"
 	cp $(BUILD_DIR)/libbxroot.so $(DSHA_LIB_DIR)/
+	cp $(BUILD_DIR)/bx-host $(DSHA_LIB_DIR)/
 	cp $(BUILD_DIR)/libbxroot-runtime.so $(DSHA_LIB_DIR)/
 	cp $(BUILD_DIR)/libbxroot-linker.so $(DSHA_LIB_DIR)/ 2>/dev/null || true
 	cp $(BUILD_DIR)/libbxroot-bridge.so $(DSHA_LIB_DIR)/ 2>/dev/null || true
@@ -142,6 +156,7 @@ install-dsha: all
 # === 清理 ===
 clean:
 	rm -f $(BUILD_DIR)/libbxroot.so $(BUILD_DIR)/libbxroot-ulx.so
+	rm -f $(BUILD_DIR)/bx-host
 	rm -f $(BUILD_DIR)/libbxroot-*.so
 	@echo "清理完成"
 

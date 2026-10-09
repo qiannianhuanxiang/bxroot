@@ -75,7 +75,7 @@ SRC="src/runtime/preload.c \
      src/l2s/l2s.c src/l2s/l2s-runtime.c \
      src/runtime/fakeroot.c src/runtime/crash.c src/runtime/sigsys.c \
      src/runtime/syscall_guard.c src/runtime/livepatch.c \
-     src/runtime/static_exec.c"
+     src/runtime/static_exec.c src/host/host-world.c"
 
 # 警告策略：原先的 -w 会把**全部**警告静默掉 —— 包括 -Wformat=2。
 # 真实教训：launcher.c 里一处 fprintf 少传两个实参（栈上取垃圾指针），
@@ -230,5 +230,14 @@ if [ -n "$MISSING" ]; then
     echo "      构建按失败处理。"
     exit 1
 fi
+for s in bx_host_world_enabled bx_host_world_exec bx_host_world_classify bx_host_world_resolve \
+         bx_host_world_classify_mapped bx_host_world_exec_mapped bx_host_world_prepare_mapped \
+         bx_host_world_prepare bx_host_world_dispose bx_host_world_build_env \
+         bx_host_world_free_env bx_host_world_init_path bx_host_world_guest_path \
+         bx_host_world_script_access; do
+    nm -D --defined-only "$OUT" | awk '{print $3}' | grep -qx "$s" || {
+        echo "missing native backend symbol: $s"; exit 1;
+    }
+done
 echo "   ✅ D4 进程管理符号全部导出（$D4_N/$D4_N，含 waitpid/wait4/wait3/waitid）"
 exit 0

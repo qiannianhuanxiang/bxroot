@@ -1110,6 +1110,19 @@ long syscall(long number, ...)
      * 同一套 trampoline / shebang / 静态 ELF 逻辑，不再维护第二份。
      * 用 weak 引用：单独编译本文件的单测里没有它们，退回原路径。
      */
+    /* Opt-in native dispatch also covers already translated /system paths.
+     * Internal trampoline/host exec use inline svc, so this cannot recurse. */
+    {
+        extern int bx_host_world_enabled(void) __attribute__((weak));
+        if (bx_host_world_enabled != NULL && bx_host_world_enabled()) {
+            if (number == 221 && bxroot_exec_hook_execve != NULL)
+                return bxroot_exec_hook_execve((const char *)a0,
+                    (char *const *)a1, (char *const *)a2);
+            if (number == 281 && bxroot_exec_hook_execveat != NULL)
+                return bxroot_exec_hook_execveat((int)a0, (const char *)a1,
+                    (char *const *)a2, (char *const *)a3, (int)a4);
+        }
+    }
     if (number == 221 /* execve */ && bxroot_exec_hook_execve != NULL) {
         const char *ep = (const char *)a0;
         /*

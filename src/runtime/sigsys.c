@@ -406,7 +406,7 @@ static void guest_sigsys_dispatch(int sig, siginfo_t *si, void *uc)
     if (g_guest_sa.sa_handler == SIG_DFL) {
         struct sigaction dfl;
         extern int __libc_sigaction(int, const struct sigaction *,
-                                    struct sigaction *);
+                                    struct sigaction *) __attribute__((weak));
 
         memset(&dfl, 0, sizeof(dfl));
         dfl.sa_handler = SIG_DFL;

@@ -122,7 +122,10 @@ src/launcher/launcher.c
 src/bridge/bridge.c
 src/stub-loader/stub-loader.c
 src/linker/linker.c
-src/ldr/ulx.c"
+src/ldr/ulx.c
+src/host/host-world.c
+src/host/bx-host.c
+src/runtime/static_exec.c"
 
 # ★ 最后两项是 2026-09-19 补进来的 ★
 #

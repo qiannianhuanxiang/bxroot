@@ -14,6 +14,39 @@
 /* 纯逻辑/钩子层的开关由 proc.h 统一定义（默认 PX_PURE_LOGIC=1）。
  * 这里刻意**不**再定义一次 —— 两处各写一套必然漂移。 */
 #include "proc.h"
+#if !PX_PURE_LOGIC
+#include "../host/host-world.h"
+/* Standalone proc hook tests may omit the optional native backend. A partial
+ * backend must never make AUTO_HOST enter missing weak functions. */
+#pragma weak bx_host_world_enabled
+#pragma weak bx_host_world_classify_mapped
+#pragma weak bx_host_world_prepare_mapped
+#pragma weak bx_host_world_dispose
+#pragma weak bx_host_world_build_env
+#pragma weak bx_host_world_free_env
+#pragma weak bx_host_world_exec_mapped
+#pragma weak bx_host_world_init_path
+#pragma weak bx_host_world_guest_path
+__attribute__((noinline))
+static int px_host_has_entry(void (*fn)(void))
+{
+    void (*volatile value)(void) = fn;
+    return value != NULL;
+}
+static int px_auto_host(void)
+{
+    return px_host_has_entry((void (*)(void))bx_host_world_enabled) &&
+           px_host_has_entry((void (*)(void))bx_host_world_classify_mapped) &&
+           px_host_has_entry((void (*)(void))bx_host_world_prepare_mapped) &&
+           px_host_has_entry((void (*)(void))bx_host_world_dispose) &&
+           px_host_has_entry((void (*)(void))bx_host_world_build_env) &&
+           px_host_has_entry((void (*)(void))bx_host_world_free_env) &&
+           px_host_has_entry((void (*)(void))bx_host_world_exec_mapped) &&
+           px_host_has_entry((void (*)(void))bx_host_world_init_path) &&
+           px_host_has_entry((void (*)(void))bx_host_world_guest_path) &&
+           bx_host_world_enabled();
+}
+#endif
 
 #include <errno.h>
 #include <limits.h>
@@ -2681,7 +2714,10 @@ int px_runtime_init(void)
         px_cfg_bool(&g_rt_cfg.inject, v);
     }
 
+    if (px_auto_host() && bx_host_world_init_path() != 0)
+        PX_LOG("proc: failed to append host PATH (errno=%d)", errno);
     px_cfg_merge_preload();
+
 
     /* 账本 + 锁 + atfork */
     g_rt_lockops.lock = px_rt_lock;
@@ -2901,7 +2937,10 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
 
 int px_runtime_build_env(char *const envp[], px_envout *out)
 {
-    px_env_kv forced[7];   /* 4 原有 + GUEST_EXE + ORIG_COMM + 余量 */
+    px_env_kv forced[24];  /* identity + native PATH/config + guest loader */
+    char *native_path = NULL;
+    const char *const *src = envp != NULL ? (const char *const *)envp
+                                        : (const char *const *)environ;
     px_envpolicy pol;
     int nf;
 
@@ -2920,6 +2959,27 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
     nf = px_build_forced(&g_rt_cfg, forced, 7, g_exec_guest_exe, g_exec_orig_comm);
     if (nf <= 0) {
         return -1;
+    }
+
+    if (px_auto_host()) {
+        const char *host_path = getenv("BXROOT_HOST_PATH");
+        const char *guest_path = px_env_lookup(src, "PATH");
+        const char *const names[] = {
+            "BXROOT_HOST_PATH", "BXROOT_HOST_HOME", "BXROOT_HOST_TMPDIR",
+            "BXROOT_BINDS", "PROROOT_BINDS", "PROROOT_CFG_FD", "PROROOT_ESCAPE_FD",
+            "PROROOT_TRAMPOLINE_PATH", "PROROOT_LINKER_PATH", "PROROOT_LIB_PATH",
+            "PROROOT_STUB_LOADER", "BXROOT_ULX_PATH", "BXROOT_ULX_LDSO"
+        };
+        size_t i;
+        if (bx_host_world_guest_path(guest_path, host_path, &native_path) != 0)
+            return -1;
+        forced[nf++] = (px_env_kv){"PATH", native_path, PX_ENV_SET};
+        forced[nf++] = (px_env_kv){"BXROOT_AUTO_HOST", "1", PX_ENV_SET};
+        for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            const char *value = getenv(names[i]);
+            if (value != NULL)
+                forced[nf++] = (px_env_kv){names[i], value, PX_ENV_SET};
+        }
     }
 
     memset(&pol, 0, sizeof(pol));
@@ -2981,10 +3041,9 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
          * 两者都对，只是分属不同层 —— 兜底是钩子层的责任，
          * 正如上面那段注释原本就写明的。
          */
-        const char *const *src =
-            (envp != NULL) ? (const char *const *)envp
-                           : (const char *const *)environ;
         int rc = px_env_build(src, &pol, out, NULL);
+        { int saved = errno; free(native_path); errno = saved; }
+
         if (rc != PX_OK) {
             /*
              * ★ 失败必须**可见**（P2 修复的第二半）★
@@ -4252,6 +4311,10 @@ static int px_resolve_abs_symlink(const char *in, char *out, size_t outsz)
 
     if (in == NULL || out == NULL || outsz == 0)
         return 0;
+    /* /proc fd/root/cwd are kernel magic links, not guest symlinks. Keep the
+     * original handle path (not /memfd:... or an unlinked inode's display name). */
+    if (strncmp(in, "/proc/", 6) == 0)
+        return 0;
     if (strlen(in) >= sizeof(cur))
         return 0;
     memcpy(cur, in, strlen(in) + 1);
@@ -4259,8 +4322,6 @@ static int px_resolve_abs_symlink(const char *in, char *out, size_t outsz)
     for (depth = 0; depth < 8; depth++) {
         char tgt[PX_PATH_MAX];
         ssize_t n;
-        const char *rf;
-        size_t rl;
 
         /*
          * ★ 必须用**裸 syscall** 读链接目标 ★
@@ -4281,26 +4342,19 @@ static int px_resolve_abs_symlink(const char *in, char *out, size_t outsz)
         if (tgt[0] != '/')
             break;
 
-        /* 目标按 rootfs 再翻译一次（幂等：已带前缀的不重复拼） */
-        rf = g_rt_cfg.rootfs;
-        rl = (rf != NULL) ? strlen(rf) : 0;
-        if (rl > 0 && strncmp(tgt, rf, rl) == 0 &&
-            (tgt[rl] == '\0' || tgt[rl] == '/')) {
-            if (strlen(tgt) >= sizeof(cur))
+        /* Absolute link targets are guest paths too. Apply the complete
+         * translator (including binds/self-maps), never a bare rootfs prefix.
+         * Already translated backing paths remain idempotent. */
+        {
+            char mapped[PX_PATH_MAX];
+            int tr = px_runtime_translate(tgt, mapped, sizeof(mapped));
+            const char *next;
+            if (tr < 0)
                 return 0;
-            memcpy(cur, tgt, strlen(tgt) + 1);
-        } else {
-            /*
-             * 用显式长度拼接而不是 snprintf("%s%s")：
-             * 后者让 gcc 无法证明不发生截断（-Wformat-truncation），
-             * 而本项目的告警门禁是零容忍。手工 memcpy 的边界完全可见。
-             */
-            size_t tl = strlen(tgt);
-
-            if (rl + tl + 1u > sizeof(cur))
-                return 0;           /* 拼出来放不下 → 如实放弃 */
-            memcpy(cur, rf, rl);
-            memcpy(cur + rl, tgt, tl + 1u);
+            next = tr > 0 ? mapped : tgt;
+            if (strlen(next) >= sizeof(cur))
+                return 0;
+            memcpy(cur, next, strlen(next) + 1);
         }
     }
 
@@ -4442,6 +4496,153 @@ static int px_rewrite_shebang_chain(char *host, size_t host_cap,
     return changed;
 }
 
+/* The shebang interpreter shares the same bind and symlink view as the
+ * script itself. Return an actual backing path for raw Android execution. */
+static int px_host_map_path(const char *path, char *out, size_t cap)
+{
+    char backing[PX_PATH_MAX], resolved[PX_PATH_MAX];
+    const char *use;
+    int tr = px_runtime_translate(path, backing, sizeof(backing));
+    if (tr < 0) { errno = ENAMETOOLONG; return -1; }
+    use = tr > 0 ? backing : path;
+    if (px_resolve_abs_symlink(use, resolved, sizeof(resolved)))
+        use = resolved;
+    if (strlen(use) >= cap) { errno = ENAMETOOLONG; return -1; }
+    memcpy(out, use, strlen(use) + 1u);
+    return 1;
+}
+
+/* Automatic native fallback uses guest-visible host search directories.
+ * Each candidate is translated exactly like an explicit exec before raw ELF
+ * inspection and permission probing. The explicit bx-host tool may still
+ * request a real host path; AUTO_HOST must never ignore a bind override. */
+static int px_host_resolve_name(const char *name, char *out, size_t cap)
+{
+    const char *search = getenv("BXROOT_HOST_PATH");
+    const char *p;
+    size_t nl;
+    int denied = 0;
+
+    if (name == NULL || name[0] == '\0' || strchr(name, '/') != NULL) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (search == NULL)
+        search = BX_HOST_DEFAULT_PATH;
+    nl = strlen(name);
+    for (p = search; *p != '\0';) {
+        const char *end = strchr(p, ':');
+        size_t dl = end != NULL ? (size_t)(end - p) : strlen(p);
+        char candidate[PX_PATH_MAX], backing[PX_PATH_MAX];
+        char resolved[PX_PATH_MAX];
+        int tr;
+
+        if (dl != 0 && p[0] == '/' && nl < sizeof(candidate) - 1u &&
+            dl <= sizeof(candidate) - nl - 2u) {
+            memcpy(candidate, p, dl);
+            candidate[dl] = '/';
+            memcpy(candidate + dl + 1u, name, nl + 1u);
+            tr = px_runtime_translate(candidate, backing, sizeof(backing));
+            if (tr >= 0) {
+                if (tr == 0)
+                    px_cfg_str(backing, sizeof(backing), candidate);
+                if (px_resolve_abs_symlink(backing, resolved, sizeof(resolved)))
+                    px_cfg_str(backing, sizeof(backing), resolved);
+                if (bx_host_world_classify_mapped(backing, px_host_map_path) != BX_HOST_WORLD_NO) {
+                    if (px_raw_svc5(SYS_faccessat, AT_FDCWD, (long)backing,
+                                    X_OK, 0, 0) == 0) {
+                        size_t bl = strlen(backing);
+                        if (bl >= cap) {
+                            errno = ENAMETOOLONG;
+                            return -1;
+                        }
+                        memcpy(out, backing, bl + 1u);
+                        return 0;
+                    }
+                    if (errno == EACCES)
+                        denied = 1;
+                }
+            }
+        }
+        if (end == NULL)
+            break;
+        p = end + 1;
+    }
+    errno = denied ? EACCES : ENOENT;
+    return -1;
+}
+
+static int px_host_try_exec_candidate(const char *candidate,
+                                      char *const argv[],
+                                      char *const envp[])
+{
+    char host[PX_PATH_MAX];
+    int kind;
+
+    if (!px_auto_host() || candidate == NULL)
+        return 0;
+    if (strlen(candidate) >= sizeof(host)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(host, candidate, strlen(candidate) + 1);
+    kind = bx_host_world_classify_mapped(host, px_host_map_path);
+    if (kind == BX_HOST_WORLD_NO)
+        return 0;
+    PX_LOG("proc: host world %s -> %s (kind=%d)", candidate, host, kind);
+    (void)bx_host_world_exec_mapped(host, argv, envp, px_host_map_path);
+    /* 能返回就表示 raw exec 失败；errno 由 host-world 保留。 */
+    return -1;
+}
+
+static int px_host_try_spawn_candidate(
+    pid_t *pid, const char *candidate,
+    const posix_spawn_file_actions_t *fa,
+    const posix_spawnattr_t *attr,
+    char *const argv[], char *const envp[], int *rc_out)
+{
+    char host[PX_PATH_MAX];
+    char **host_env = NULL;
+    bx_host_plan hp;
+    int kind, rc;
+
+    /* V2 routes only absolute backing paths. A relative target can change
+     * meaning after spawn file_actions addchdir/addfchdir; classifying it in
+     * the parent cwd would clean the wrong executable's environment. */
+    if (!px_auto_host() || candidate == NULL || candidate[0] != '/')
+        return 0;
+    if (strlen(candidate) >= sizeof(host)) { *rc_out = ENAMETOOLONG; return 1; }
+    memcpy(host, candidate, strlen(candidate) + 1);
+    kind = bx_host_world_classify_mapped(host, px_host_map_path);
+    if (kind == BX_HOST_WORLD_NO)
+        return 0;
+    if (real_posix_spawn == NULL) {
+        real_posix_spawn =
+            (int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                     const posix_spawnattr_t *, char *const[], char *const[]))
+                px_dlsym("posix_spawn");
+    }
+    if (real_posix_spawn == NULL) {
+        *rc_out = ENOSYS;
+        return 1;
+    }
+    rc = bx_host_world_prepare_mapped(host, argv, px_host_map_path, &hp);
+    if (rc <= 0) { *rc_out = rc < 0 ? errno : ENOEXEC; return 1; }
+    if (bx_host_world_build_env(envp, &host_env) != 0) {
+        *rc_out = errno;
+        bx_host_world_dispose(&hp);
+        return 1;
+    }
+    PX_LOG("proc: host world spawn %s -> %s (kind=%d)", candidate, host, kind);
+    rc = real_posix_spawn(pid, hp.target, fa, attr, (char *const *)hp.argv, host_env);
+    bx_host_world_free_env(host_env);
+    bx_host_world_dispose(&hp);
+    if (rc == 0 && pid != NULL && *pid > 0)
+        (void)px_ledger_add(g_rt_ledger, *pid, px_self_pid(), PX_TAG_SPAWN);
+    *rc_out = rc;
+    return 1;
+}
+
 static int px_do_execve(const char *path, char *const argv[],
                         char *const envp[], const char *path_env,
                         int use_search)
@@ -4456,6 +4657,11 @@ static int px_do_execve(const char *path, char *const argv[],
     char *const *final_env;
     char *const *final_argv;
     int rc;
+
+    if (path == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
 
     /*
      * ★ shebang 的改写结果必须放在**函数作用域**，不能放在下面的
@@ -4511,6 +4717,12 @@ static int px_do_execve(const char *path, char *const argv[],
     g_rt_stats.exec_calls++;
 
     /*
+     * 第二版 host world：分类和执行使用同一翻译后的 backing path。
+     * 只有 BXROOT_AUTO_HOST=1 才启用，默认行为完全不变。
+     */
+    /* Inspect only after translating to the actual backing file below. */
+
+    /*
      * ★ shebang（`#!`）重定向 ★
      *
      * 【缺陷（实测，2026-09-17）】带 `#!` 的可执行脚本在 bxroot 下**无法直接
@@ -4555,6 +4767,14 @@ static int px_do_execve(const char *path, char *const argv[],
         if (use_search) {
             if (px_resolve_exec_path(path, path_env, host, sizeof(host),
                                      guest, sizeof(guest)) != 0) {
+                char host_fallback[PX_PATH_MAX];
+                if (px_auto_host() &&
+                    px_host_resolve_name(path, host_fallback,
+                                          sizeof(host_fallback)) == 0) {
+                    PX_LOG("proc: guest PATH 未命中，host PATH 命中 %s", host_fallback);
+                    (void)bx_host_world_exec_mapped(host_fallback, argv, envp, px_host_map_path);
+                    return -1;
+                }
                 return -1;   /* errno 已置 ENOENT */
             }
         } else {
@@ -4645,6 +4865,11 @@ static int px_do_execve(const char *path, char *const argv[],
             }
         }
 
+        /* guest PATH 命中后仍可能是 /system 下的 bionic ELF；此时
+         * guest 优先规则不冲突，因为命中的就是明确宿主路径。 */
+        if (px_host_try_exec_candidate(host, argv, envp) < 0)
+            return -1;
+
         /*
          * ★ shebang 重写**前**保存 raw user path（上游同款）★
          *
@@ -4713,7 +4938,7 @@ static int px_do_execve(const char *path, char *const argv[],
          * 解释器，这正是内核对 /proc/self/exe 的原生语义）。
          * 两者上游语义不同，见各自注释。
          */
-        const char *exe = (guest != NULL && guest[0] != '\0') ? guest : raw_guest;
+        const char *exe = (guest[0] != '\0') ? guest : raw_guest;
         const char *comm = (raw_guest[0] != '\0') ? raw_guest : guest;
         const char *rf = g_rt_cfg.rootfs;
         size_t rl = (rf != NULL) ? strlen(rf) : 0;
@@ -5269,10 +5494,20 @@ static int px_do_spawn(pid_t *pid, const char *path,
 
     g_rt_stats.spawn_calls++;
 
+    /* 第二版：host world 只在显式开关下启用，且不改变默认 spawn。 */
+    /* Inspect only after translating to the actual backing file below. */
+
     /* 1) 路径解析 */
     if (use_search) {
         if (px_resolve_exec_path(path, getenv("PATH"), host, sizeof(host),
                                  NULL, 0) != 0) {
+            char host_fallback[PX_PATH_MAX];
+            if (px_auto_host() &&
+                px_host_resolve_name(path, host_fallback,
+                                      sizeof(host_fallback)) == 0 &&
+                px_host_try_spawn_candidate(pid, host_fallback, fa, attr,
+                                            argv, envp, &rc))
+                return rc;
             return errno ? errno : ENOENT;
         }
         /*
@@ -5308,6 +5543,8 @@ static int px_do_spawn(pid_t *pid, const char *path,
                 px_cfg_str(host, sizeof(host), resolved);
             }
         }
+        if (px_host_try_spawn_candidate(pid, host, fa, attr, argv, envp, &rc))
+            return rc;
         dl_name = "posix_spawnp";
         g_rt_stats.spawn_path_translated++;
     } else {
@@ -5331,6 +5568,8 @@ static int px_do_spawn(pid_t *pid, const char *path,
                 px_cfg_str(host, sizeof(host), resolved);
             }
         }
+        if (px_host_try_spawn_candidate(pid, host, fa, attr, argv, envp, &rc))
+            return rc;
         dl_name = "posix_spawn";
     }
 

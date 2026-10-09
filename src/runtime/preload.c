@@ -13384,6 +13384,12 @@ static void constructor(void) {
     if (getenv("BXROOT_NO_AUTORUN") != NULL)
         return;
 
+    /* Before this constructor rebuilds environ: bash imports original envp. */
+    {
+        extern int bx_host_world_init_path(void) __attribute__((weak));
+        if (bx_host_world_init_path != NULL && bx_host_world_init_path() < 0)
+            fprintf(stderr, "bxroot warning: cannot append native PATH (%s)\n", strerror(errno));
+    }
     init_config();
     init_l2s();
     init_fakeroot();

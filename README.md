@@ -512,3 +512,27 @@ glibc 与内核的 `struct sigaction` **布局不同**：
 用 `__libc_sigaction`（`GLIBC_PRIVATE`）做布局转换。
 
 （相反，`sigset_t` 两边都是 128 字节位图，布局一致，裸调用安全。）
+
+## Android bionic world：`bx-host` 第一版
+
+bxroot 的 guest 是 Ubuntu/glibc 用户空间，而 `/system/bin`、`/apex` 下的 Android 程序由 bionic linker 加载。不要把两种 libc 的动态库混进同一进程；第一版提供显式的 `bx-host` 入口，在 guest 中切换到 Android bionic world：
+
+```sh
+bx-host /system/bin/getprop ro.product.model
+bx-host toybox uname -a
+bx-host /system/bin/sh -c 'getprop ro.product.model'
+```
+
+`bx-host` 是无 libc 的静态 AArch64 程序，读取目标 ELF 的 `PT_INTERP`，只接受 Android linker 的 bionic ELF，并通过 raw `execve` 直接进入宿主程序。它清理 guest 的 `LD_PRELOAD`、`LD_LIBRARY_PATH`、`BXROOT_*` 和 `PROROOT_*`，设置最小 Android 环境，同时保留原始 `argv[0]`、stdio、PTY、信号和退出状态。
+
+Termux 中的 v4 guest 已实测 `getprop`、`toybox`、宿主 shell 链和环境清洗均通过。`bx-host` 不改变 UID 或 SELinux 权限。
+
+### 第二版：可选自动分流
+
+```sh
+BXROOT_AUTO_HOST=1 BXROOT_HOST_PATH=/system/bin:/system/xbin:/vendor/bin bxroot ...
+```
+
+启用后 guest 同名程序优先，exec/spawn 自动根据 ELF interpreter 分流，宿主候选和脚本解释器遵守 rootfs/bind。guest PATH 后追加宿主目录，宿主进程清理 glibc loader 环境，保留应用变量、argv0、stdio、PTY、信号和退出状态。默认不开启；显式 `BXROOT_HOST_PATH=""` 禁止宿主名字 fallback。
+
+Termux 中通过真实 bridge/linker + 匿名 memfd 加载完成 **25/25** 回归；分类/环境 **77** 检查、真实分流 **175** 检查全部通过。设计、运行方式和剩余边界见 [第二版说明](docs/bx-host-第二版.md)。这是实验实现，全量回归尚未通过；源码提交不等同于更新 DSHA APK 或发布 Release。
