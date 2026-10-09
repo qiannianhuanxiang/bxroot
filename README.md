@@ -536,3 +536,7 @@ BXROOT_AUTO_HOST=1 BXROOT_HOST_PATH=/system/bin:/system/xbin:/vendor/bin bxroot 
 启用后 guest 同名程序优先，exec/spawn 自动根据 ELF interpreter 分流，宿主候选和脚本解释器遵守 rootfs/bind。guest PATH 后追加宿主目录，宿主进程清理 glibc loader 环境，保留应用变量、argv0、stdio、PTY、信号和退出状态。默认不开启；显式 `BXROOT_HOST_PATH=""` 禁止宿主名字 fallback。
 
 Termux 中通过真实 bridge/linker + 匿名 memfd 加载完成 **25/25** 回归；分类/环境 **77** 检查、真实分流 **175** 检查全部通过。设计、运行方式和剩余边界见 [第二版说明](docs/bx-host-第二版.md)。这是实验实现，全量回归尚未通过；源码提交不等同于更新 DSHA APK 或发布 Release。
+
+### 第三版规划：双向执行与会话交接
+
+下一阶段优先补齐显式 host→guest 回入口、版本化会话上下文、cwd 与文件路径交接，形成 guest→host→guest 调用链。方案、实施顺序和验收矩阵见 [第三版规划](docs/bx-host-第三版规划.md)。该方案尚未实现；DSHA 设备接口与 Termux companion 保持为独立适配阶段，不写入通用运行时核心。
