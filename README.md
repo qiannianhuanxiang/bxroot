@@ -539,4 +539,46 @@ Termux 中通过真实 bridge/linker + 匿名 memfd 加载完成 **25/25** 回�
 
 ### 第三版：双向执行与会话交接
 
-启用 `BXROOT_AUTO_HOST=1 BXROOT_REENTRY=1` 后，原生侧可通过 `"$BXROOT_ENTER" --cwd /root -- PROGRAM [ARGS...]` 回到同一 guest 配置。第三版包含版本化只读会话 fd、cwd/路径转换、环境交接及无 libc 依赖的 Android PIE 回入口。运行方法、验证结果和限制见 [第三版说明](docs/bx-host-第三版.md)，原设计见 [第三版规划](docs/bx-host-第三版规划.md)。真机验证来自 Termux，不等同于 DSHA APK 集成；设备接口与 Termux companion 保持独立适配。
+
+
+## v3 安全审计与 PROROOT 对比
+
+Native v3 的 guest / Android host / guest 链路使用版本化 session 和只读 sealed memfd。
+读取端强制检查 `F_SEAL_SEAL`、`F_SEAL_SHRINK`、`F_SEAL_GROW`、`F_SEAL_WRITE`，避免
+把可写 memfd 当作可信 session。回归命令：
+
+```sh
+make test-quick
+```
+
+bxroot 与 PROROOT 的对比必须使用同一设备、同一 rootfs、同一 Node 版本和同样的
+bind 参数，并确认没有自动 fallback。推荐至少测：
+
+```sh
+/usr/bin/time -f '%e sec' sh -c '
+i=0; while [ "$i" -lt 1000 ]; do /bin/true; i=$((i+1)); done'
+
+/usr/bin/time -f '%e sec' sh -c '
+i=0; while [ "$i" -lt 300 ]; do node -e "process.stdout.write(\"ok\")"; i=$((i+1)); done'
+
+/usr/bin/time -f '%e sec' pnpm install --ignore-scripts
+/usr/bin/time -f '%e sec' git status
+```
+
+同时记录软/硬链接、`rename`、`lstat`、`readlink`、`/proc/self/fd`、并发 Node 和
+host -> guest 回入的成功率、错误类型、fallback 状态及中位耗时。出现
+`automatic proot fallback` 的结果不能作为 bxroot 结果。
+
+### 安全边界
+
+bxroot 是兼容性运行时，不是安全沙箱：
+
+- `BXROOT_FAKEROOT=1` 只伪造 guest 看到的 UID/GID，不能获得 Android root；
+- 静态 ELF、裸 syscall 和未覆盖的内核接口可能绕过部分 LD_PRELOAD 视图；
+- bind 源路径由启动参数决定，不可信 guest 不应获得敏感宿主目录；
+- guest 能读取运行库和环境配置时，不应把 bxroot 当作权限边界；
+- `bx-host` 进入 Android bionic world，但身份仍受应用 UID 和 SELinux 约束。
+
+bxroot 源码、测试和 Android arm64 运行库通过 GitHub release 发布。DSHA 二改 APK
+不属于 bxroot release 内容，仅作为本地测试产物保留，不上传 DSHA APK、DSHA 源码或
+DSHA 专用日志。

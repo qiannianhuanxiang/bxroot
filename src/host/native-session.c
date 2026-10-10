@@ -114,10 +114,23 @@ int bx_native_session_init(void)
     bx_session_init(&s);
     if (fdtext && *fdtext) {
         fd = bx_session_fd_number(fdtext);
-        if (fd < 0 || bx_session_read(fd, &s)) goto fail;
+        if (fd < 0 || bx_session_read(fd, &s)) {
+            /* DSHA 的旧 envp 可能携带已失效的 native session；当前
+               PROROOT_CFG_FD 仍是权威配置，可安全重建一次。显式
+               --session-fd 不带该标记时保持严格失败。 */
+            if (native_env("PROROOT_CFG_FD") && *native_env("PROROOT_CFG_FD")) {
+                bx_session_dispose(&s); bx_session_init(&s); fd = -1; goto create_fresh;
+            }
+            goto fail;
+        }
         v = bx_session_get(&s, "BXROOT_ROOTFS");
         if (!v || strcmp(v, g_config.rootfs) ||
-            !bx_session_get(&s, "BXROOT_ENTER") || !bx_session_get(&s, "_GUEST_PATH")) { errno = ESTALE; goto fail; }
+            !bx_session_get(&s, "BXROOT_ENTER") || !bx_session_get(&s, "_GUEST_PATH")) {
+            if (native_env("PROROOT_CFG_FD") && *native_env("PROROOT_CFG_FD")) {
+                bx_session_dispose(&s); bx_session_init(&s); fd = -1; goto create_fresh;
+            }
+            errno = ESTALE; goto fail;
+        }
         /* DSHA 的 PROROOT_CFG_FD 与 BXROOT_BINDS 可能同时携带同一条 bind。
            配置解析会去重/重排，不能用原始记录数判断会话过期；按有效
            (host, guest, ro) 集合逐项核对，仍拒绝任何实际路径或只读属性漂移。 */
@@ -129,7 +142,12 @@ int bx_native_session_init(void)
                     s.binds[i].ro == (unsigned)(g_config.bind_readonly && g_config.bind_readonly[j])) {
                     found = 1; break;
                 }
-            if (!found) { errno = ESTALE; goto fail; }
+            if (!found) {
+                if (native_env("PROROOT_CFG_FD") && *native_env("PROROOT_CFG_FD")) {
+                    bx_session_dispose(&s); bx_session_init(&s); fd = -1; goto create_fresh;
+                }
+                errno = ESTALE; goto fail;
+            }
         }
         for (i = 0; i < (size_t)g_config.bind_count; i++) {
             size_t j; int found = 0;
@@ -139,11 +157,17 @@ int bx_native_session_init(void)
                     s.binds[j].ro == (unsigned)(g_config.bind_readonly && g_config.bind_readonly[i])) {
                     found = 1; break;
                 }
-            if (!found) { errno = ESTALE; goto fail; }
+            if (!found) {
+                if (native_env("PROROOT_CFG_FD") && *native_env("PROROOT_CFG_FD")) {
+                    bx_session_dispose(&s); bx_session_init(&s); fd = -1; goto create_fresh;
+                }
+                errno = ESTALE; goto fail;
+            }
         }
         if (bx_session_raw(SYS_fcntl, fd, F_SETFD, 0, 0, 0, 0) < 0) goto fail;
         goto publish;
     }
+create_fresh:
     runtime = native_env("PROROOT_LIB_PATH"); if (!runtime || !*runtime) runtime = native_env("BXROOT_LIB_PATH");
     if (!runtime && dladdr((void *)bx_native_session_init, &info) && info.dli_fname) runtime = info.dli_fname;
     if (!entry || !*entry) {

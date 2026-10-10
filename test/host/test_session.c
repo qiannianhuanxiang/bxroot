@@ -98,6 +98,21 @@ static void expect_guest(const bx_session *s,const char *suffix,const char *want
     int rc=bx_session_to_guest(s,h,got,sizeof(got));
     CHECK(rc==0 && !strcmp(got,want),"to-guest %s: rc=%d got=%s want=%s",suffix,rc,rc?"<error>":got,want);
 }
+static void test_unsealed_rejected(void)
+{
+    bx_session s; int fd = (int)syscall(SYS_memfd_create, "bx-session-unsealed", 0);
+    const unsigned char blob[] = "BXSESS3\0";
+    bx_session_init(&s);
+    CHECK(fd >= 0 && write(fd, blob, sizeof(blob)) == (ssize_t)sizeof(blob), "unsealed session fixture created");
+    if (fd >= 0) {
+        errno = 0;
+        CHECK(bx_session_read(fd, &s) < 0 && errno == EPROTO, "unsealed session fd rejected");
+        close(fd);
+    }
+    CHECK(s.nkv == 0 && s.nb == 0, "unsealed rejection leaves destination empty");
+    bx_session_dispose(&s);
+}
+
 static void test_mapping(void)
 {
     bx_session s;char host[BX_SESSION_PATH],got[BX_SESSION_PATH];basic(&s);
@@ -228,8 +243,8 @@ static void test_api(void)
 }
 static int raw_blob(const unsigned char *data,size_t n)
 {
-    int fd=(int)syscall(SYS_memfd_create,"bx-session-bad",0);
-    if(fd<0 || write(fd,data,n)!=(ssize_t)n){perror("memfd blob");exit(2);}return fd;
+    int fd=(int)syscall(SYS_memfd_create,"bx-session-bad",3);
+    if(fd<0 || write(fd,data,n)!=(ssize_t)n || fcntl(fd,F_ADD_SEALS,15)<0){perror("memfd blob");exit(2);}return fd;
 }
 static uint32_t get32(const unsigned char *p){return p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
 static void put32(unsigned char *p,uint32_t v){p[0]=(unsigned char)v;p[1]=(unsigned char)(v>>8);p[2]=(unsigned char)(v>>16);p[3]=(unsigned char)(v>>24);}
@@ -320,7 +335,7 @@ int main(int argc,char **argv)
     char jump[BX_SESSION_PATH];path(jump,sizeof(jump),"nested/deep");link_at("root/host-jump",jump);
     path(jump,sizeof(jump),"nested/output");link_at("host-directory-alias",jump);
     link_at("root/bin","usr/bin");link_at("root/absolute-link","/usr/bin/test");link_at("root/relative-link","usr/bin/test");link_at("root/loop-a","loop-b");link_at("root/loop-b","loop-a");
-    independent_proc_diagnostic();test_mapping();test_api();test_wire_fd();
+    independent_proc_diagnostic();test_unsealed_rejected();test_mapping();test_api();test_wire_fd();
     printf("RESULT: %s session checks=%u passed=%u failures=%u skipped=%u\n",failures?"FAIL":"PASS",checks,checks-failures,failures,skipped);
     return failures?1:0;
 }

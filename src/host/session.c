@@ -308,7 +308,16 @@ static int pread_all(int fd, unsigned char *p,size_t n,size_t off)
 }
 int bx_session_read(int fd,bx_session *s)
 {
-    unsigned char header[24],*b=NULL; uint32_t len,nk,nb;size_t pos=24,i;bx_session tmp; int e;
+    unsigned char header[24],*b=NULL; uint32_t len,nk,nb;size_t pos=24,i;bx_session tmp; int e, seals;
+    /* Session 内容包含宿主路径、加载器路径和环境配置。只校验 wire
+       格式不足以建立信任：调用者可用普通可写 memfd 伪造同样内容，随后
+       在 re-entry 前改写它。创建端固定加这四个 seal，读取端必须强制验证。 */
+    seals = (int)bx_session_raw(SYS_fcntl, fd, F_GET_SEALS, 0, 0, 0, 0);
+    if (seals < 0 || (seals & (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE)) !=
+                     (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE)) {
+        errno = EPROTO;
+        return -1;
+    }
     bx_session_init(&tmp);
     if(pread_all(fd,header,24,0)) return -1;
     len=get32(header+12);nk=get32(header+16);nb=get32(header+20);
