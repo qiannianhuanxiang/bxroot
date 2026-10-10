@@ -116,11 +116,31 @@ int bx_native_session_init(void)
         fd = bx_session_fd_number(fdtext);
         if (fd < 0 || bx_session_read(fd, &s)) goto fail;
         v = bx_session_get(&s, "BXROOT_ROOTFS");
-        if (!v || strcmp(v, g_config.rootfs) || s.nb != (size_t)g_config.bind_count ||
+        if (!v || strcmp(v, g_config.rootfs) ||
             !bx_session_get(&s, "BXROOT_ENTER") || !bx_session_get(&s, "_GUEST_PATH")) { errno = ESTALE; goto fail; }
-        for (i = 0; i < (size_t)g_config.bind_count; i++)
-            if (strcmp(s.binds[i].host, g_config.bind_sources[i]) || strcmp(s.binds[i].guest, g_config.bind_targets[i]) ||
-                s.binds[i].ro != (unsigned)(g_config.bind_readonly && g_config.bind_readonly[i])) { errno = ESTALE; goto fail; }
+        /* DSHA 的 PROROOT_CFG_FD 与 BXROOT_BINDS 可能同时携带同一条 bind。
+           配置解析会去重/重排，不能用原始记录数判断会话过期；按有效
+           (host, guest, ro) 集合逐项核对，仍拒绝任何实际路径或只读属性漂移。 */
+        for (i = 0; i < (size_t)s.nb; i++) {
+            size_t j; int found = 0;
+            for (j = 0; j < (size_t)g_config.bind_count; j++)
+                if (!strcmp(s.binds[i].host, g_config.bind_sources[j]) &&
+                    !strcmp(s.binds[i].guest, g_config.bind_targets[j]) &&
+                    s.binds[i].ro == (unsigned)(g_config.bind_readonly && g_config.bind_readonly[j])) {
+                    found = 1; break;
+                }
+            if (!found) { errno = ESTALE; goto fail; }
+        }
+        for (i = 0; i < (size_t)g_config.bind_count; i++) {
+            size_t j; int found = 0;
+            for (j = 0; j < s.nb; j++)
+                if (!strcmp(s.binds[j].host, g_config.bind_sources[i]) &&
+                    !strcmp(s.binds[j].guest, g_config.bind_targets[i]) &&
+                    s.binds[j].ro == (unsigned)(g_config.bind_readonly && g_config.bind_readonly[i])) {
+                    found = 1; break;
+                }
+            if (!found) { errno = ESTALE; goto fail; }
+        }
         if (bx_session_raw(SYS_fcntl, fd, F_SETFD, 0, 0, 0, 0) < 0) goto fail;
         goto publish;
     }
