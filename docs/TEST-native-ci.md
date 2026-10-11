@@ -23,4 +23,4 @@
 
 后续只读核查还确认：GH_TOKEN/GITHUB_TOKEN不存在，git credential helper未配置，Docker/Podman均不可用；公共Actions API读取被网络工具拒绝（api.github.com解析为非公网地址）。没有读取/输出凭据值，没有重复push认证失败，也没有换通道绕过网络工具拒绝。
 
-`test/RUN_ISOLATED_AUDITS.sh` 是另一条外部受限Docker审计入口，需要预加载arm64工具镜像、rootless/userns-remap、builtin seccomp等条件。当前没有Docker/Podman，仅语法/dry-run/拒绝设备执行已验证。其结果即使收集成功也标记受限观测/不完整原生语义，不用来替代APK应用UID的最终seccomp/ABI验证。
+`test/RUN_ISOLATED_AUDITS.sh` 是另一条外部受限Docker审计入口，需要预加载arm64工具镜像、rootless/userns-remap、builtin seccomp等条件。当前Docker vfs/无网络变体在离线镜像导入时因vfs layerdb错误退出。之后直接使用 `unshare -Urmpf --mount-proc` 创建私有user/mount/PID namespace；探测成功，并在其中运行 `RUN_L2S_MOCK.sh`、`RUN_SHM_CLAIM.sh`、`RUN_SHM_ID_ABA.sh`、`RUN_SHM_FORK_GATE.sh` 全部通过。该namespace继承外层PRoot进程树，所以不改变原生l2s/SIGSYS证据；mount/chroot/全号扫描仍未执行。其余结果即使收集成功也标记受限观测/不完整原生语义，不用来替代APK应用UID的最终seccomp/ABI验证。
