@@ -19,6 +19,8 @@
 
 ## 运行条件
 
-恢复既有仓库GitHub认证后可推送该分支，在PR或workflow_dispatch中执行原生作业。此前公开bxroot仓库的授权不等于当前会话仍有可用凭据；不得把凭据写进仓库、日志或URL。没有认证或真实runner结果时，本文件只能说明入口准备完成，不能声称剩余原生测试通过。
+恢复既有仓库GitHub认证后可推送该分支，通过PR触发原生作业。`workflow_dispatch` 手动入口需先让GitHub在默认分支注册该workflow，不能假定仅在新分支新增文件就已有手动入口。此前公开bxroot仓库的授权不等于当前会话仍有可用凭据；不得把凭据写进仓库、日志或URL。没有认证或真实runner结果时，本文件只能说明入口准备完成，不能声称剩余原生测试通过。
+
+后续只读核查还确认：GH_TOKEN/GITHUB_TOKEN不存在，git credential helper未配置，Docker/Podman均不可用；公共Actions API读取被网络工具拒绝（api.github.com解析为非公网地址）。没有读取/输出凭据值，没有重复push认证失败，也没有换通道绕过网络工具拒绝。
 
 `test/RUN_ISOLATED_AUDITS.sh` 是另一条外部受限Docker审计入口，需要预加载arm64工具镜像、rootless/userns-remap、builtin seccomp等条件。当前没有Docker/Podman，仅语法/dry-run/拒绝设备执行已验证。其结果即使收集成功也标记受限观测/不完整原生语义，不用来替代APK应用UID的最终seccomp/ABI验证。
