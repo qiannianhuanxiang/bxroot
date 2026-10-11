@@ -42,15 +42,15 @@ static int guest_env(const bx_session *s,int fd,const char *cwd,const char *exe,
     {
         const char *root=val(s,"BXROOT_ROOTFS","");
         /* The native loader resolves dependencies before guest preload hooks exist.
-         * Always supply host-visible default directories, even when the session
-         * saved an LD_LIBRARY_PATH containing only guest-visible paths. */
+         * Preserve the session's explicit search order, then provide host-visible
+         * rootfs defaults as fallback when saved entries are guest-visible only. */
         if(snprintf(libs,sizeof(libs),"%s/usr/lib/aarch64-linux-gnu:%s/lib/aarch64-linux-gnu:%s/lib:%s/usr/lib",root,root,root,root)>=(int)sizeof(libs)) {errno=ENAMETOOLONG;return -1;}
         const char *saved=bx_session_get(s,"_LIBRARY_PATH");
         size_t len=strlen(libs), extra=saved ? strlen(saved) : 0;
         char *search=calloc(len+extra+2,1);
         if(!search)return -1;
-        memcpy(search,libs,len);
-        if(extra) {search[len]=':';memcpy(search+len+1,saved,extra);}
+        if(extra) {memcpy(search,saved,extra);search[extra]=':';}
+        memcpy(search+(extra ? extra+1 : 0),libs,len);
         int rc=env_set("LD_LIBRARY_PATH",search);
         free(search);
         if(rc)return -1;

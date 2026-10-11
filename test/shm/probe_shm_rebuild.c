@@ -33,7 +33,7 @@ static int remove_ids(int *ids, int n)
     for (int i = 0; i < n; i++) {
         int duplicate = 0;
         for (int j = 0; j < i; j++) if (ids[j] == ids[i]) duplicate = 1;
-        if (ids[i] >= 0 && !duplicate && shmctl(ids[i], IPC_RMID, NULL) &&
+        if (ids[i] >= 0 && !duplicate && test_shmctl_retry(ids[i], IPC_RMID, NULL) &&
             errno != EINVAL && errno != EIDRM) failed = 1;
     }
     return failed ? -1 : 0;
@@ -61,7 +61,7 @@ int main(int argc, char **argv)
                 char go; struct reply r = {-1, -1};
                 close(gates[1]); close(reports[0]);
                 if (io(gates[0], &go, 1, 0)) _exit(1);
-                if (worker == 0) r.rc = shmctl(ids[0], IPC_RMID, NULL);
+                if (worker == 0) r.rc = test_shmctl_retry(ids[0], IPC_RMID, NULL);
                 else { r.id = test_shmget_retry(key, 4096, IPC_CREAT | 0600); r.rc = r.id >= 0 ? 0 : -1; }
                 if (io(reports[1], &r, sizeof r, 1)) _exit(1);
                 _exit(r.rc ? 1 : 0);
@@ -97,7 +97,7 @@ int main(int argc, char **argv)
         /* If both creators observed the old ID, no new ID need exist. */
         int fresh = shmget(key, 4096, IPC_CREAT | IPC_EXCL | 0600);
         if (fresh < 0) { perror("recreate after RMID"); return 1; }
-        if (shmctl(fresh, IPC_RMID, NULL)) return 1;
+        if (test_shmctl_retry(fresh, IPC_RMID, NULL)) return 1;
     }
     puts("RMID_REBUILD_DONE rounds=100");
     return 0;

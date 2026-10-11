@@ -34,24 +34,32 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
     exit 2
 }
 [ -x "$ROOT/tools/bxroot-run" ] || { echo "⏭️  跳过：缺 tools/bxroot-run"; exit 2; }
+[ -n "${PROROOT_ROOTFS:-${BXROOT_RUN_ROOTFS_HOST:-}}" ] || {
+    echo "⏭️  跳过：无 PROROOT_ROOTFS 或 BXROOT_RUN_ROOTFS_HOST"; exit 2;
+}
 
-PROBE_C=${TMPDIR:-/tmp}/l2s_scatter_probe.c
-PROBE=${TMPDIR:-/tmp}/l2s_scatter_probe
-WORK=${TMPDIR:-/tmp}/l2s_scatter_work
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-l2s-scattered-XXXXXX") || exit 1
+PROBE_C="$W/probe.c"
+PROBE="$W/probe"
+WORK="$W/work"
+mkdir -p -- "$WORK"
+trap 'rm -rf -- "$W"' EXIT INT TERM
 
 cat > "$PROBE_C" <<'EOF'
 #define _GNU_SOURCE
+#include <limits.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-int main(void){
-    const char *a = "/tmp/l2s_scatter_work/a";
-    const char *b = "/tmp/l2s_scatter_work/b";
+int main(int argc, char **argv){
+    char a[PATH_MAX], b[PATH_MAX];
     struct stat s, l;
     char buf[64];
     ssize_t n;
     int fd, bad = 0;
+    if (argc != 2 || snprintf(a, sizeof a, "%s/a", argv[1]) >= (int)sizeof a ||
+        snprintf(b, sizeof b, "%s/b", argv[1]) >= (int)sizeof b) return 2;
 
     unlink(a); unlink(b);
     fd = open(a, O_CREAT|O_WRONLY|O_TRUNC, 0644);
@@ -94,11 +102,8 @@ fi
 mkdir -p "$WORK"
 
 # ★ 关键：显式清空，强制散落布局 ★
-BXROOT_L2S_DIR= "$ROOT/tools/bxroot-run" -- "$PROBE"
+BXROOT_L2S_DIR= "$ROOT/tools/bxroot-run" -- "$PROBE" "$WORK"
 rc=$?
-
-rm -f "$PROBE" "$PROBE_C"
-rm -rf "$WORK"
 
 if [ "$rc" -eq 0 ]; then
     echo "RESULT: PASS —— 散落布局下硬链接契约成立"

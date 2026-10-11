@@ -215,6 +215,8 @@ squashfuse 的价值在于只读压缩 rootfs、inode 映射、缓存和 FUSE �
 
 ## 一次性并行处理结果
 
+> 下文为历史审查快照；最新源码和验证状态以 `TEST-shm-final-closure.md` 为准。后续已接入 copyout gate、OFD claim 和固定目录 fd，生产端到端验证仍未完成。
+
 本轮并行完成三项工作：
 
 - 发布失败处理已收紧：只有 `EEXIST` 走竞争分支；其他错误清理自有 segment 后原样返回；竞争赢家必须重新读取并确认 segment 存在。
@@ -252,4 +254,16 @@ squashfuse 的价值在于只读压缩 rootfs、inode 映射、缓存和 FUSE �
 
 验证：探针以 `-Wall -Wextra -Werror` 编译通过；在当前原生环境执行时明确以 `ENOSYS` 失败（SysV IPC 被环境禁用），因此没有运行会创建实际共享内存对象的路径。launcher 和 proc fd 回归仍通过，编译告警门禁零告警。
 
-测试 key 仍为固定值；探针现在使用 `IPC_EXCL` claim 初始 key，遇到冲突会失败而不会删除未知对象。完全随机隔离和 runner 级对象登记仍是后续增强项。
+
+## 最终并行收尾
+
+已完成并验证：
+
+- SHM 后备目录固定 anchor fd：初始化阶段创建并校验，handler 使用相对 leaf 操作；扫描使用独立目录 OFD；anchor 失效时 fail-closed；static exec 按经过 fstat 校验的 getter 保留 anchor，避免 fd 数字复用误保留。
+- bxroot 内部 keyed mutator 使用非等待 claim 文件协调 `shmget`、stale 清理和 RMID；claim 忙时返回 `EAGAIN`，测试 caller 做有限重试。该协议不约束未采用它的官方 proroot 进程，混合并发仍有边界。
+- IPC_STAT 只在栈上构造结果并调用 `shm-copyout.h`；默认 gate 返回 `ENOSYS`，验证过完整过滤链后才允许构建 `BXROOT_SHM_COPYOUT_VERIFIED=1` 使用 raw 172/271。无直接用户指针写回和 memcpy fallback。
+- `Makefile` 和告警门禁均包含 `sysvshm.c` / `shm-copyout.h`。
+
+最终验证：22 个编译单元零告警；SHM/copyout/anchor 探针编译通过；copyout gate-disabled 和 safe-copyout 通过；anchor 生命周期通过；exec、proc-fd、session 回归通过；脚本语法和 diff 检查通过。
+
+客观限制：当前原生环境 SysV IPC 创建返回 ENOSYS；Android APK/guest 最终 seccomp 链和 bionic `shmid_ds` ABI 尚未验证；普通 rename/quarantine 之外的官方混合进程不受 bxroot claim 协议约束；static-exec 的同进程并发 close/reuse 仍不是安全沙箱保证。默认构建禁用 IPC_STAT 是有意的兼容性收缩，发布说明必须明确。

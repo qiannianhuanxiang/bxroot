@@ -30,4 +30,14 @@ static inline int test_shmget_retry(key_t key, size_t size, int flags)
     }
     return -1;
 }
+static inline int test_shmctl_retry(int id, int cmd, struct shmid_ds *buf)
+{
+    struct timespec delay = {0, 1000000};
+    for (int attempt = 0; attempt < 100; attempt++) {
+        int rc = shmctl(id, cmd, buf);
+        if (rc == 0 || errno != EAGAIN) return rc;
+        nanosleep(&delay, NULL);
+    }
+    return -1;
+}
 #endif

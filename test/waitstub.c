@@ -1,30 +1,9 @@
 /*
- * waitstub.c -- 供 test_wait_hooks 使用的「真实实现」替身
- *
- * ★ 它存在的唯一理由 ★
- *
- * 被测的生产 .so（libbxroot-runtime.so）里的钩子是用
- * `dlsym(RTLD_NEXT, "waitpid")` 之类的形式去取「真实实现」的。
- * 本容器的外层 proot 运行时**破坏了 RTLD_NEXT**（实测：dlopen + dlsym
- * 之后 RTLD_NEXT 解析 libc 导出符号返回 NULL，报
- * "undefined symbol: getpid"），而真实 LD_PRELOAD 注入在本容器里
- * 完全不被采纳（实测连一个玩具 preload 都不生效）。
- *
- * 但 RTLD_NEXT 的语义是「按加载顺序在本库**之后**找同名符号」。于是可以
- * 构造一个等价于真实插入的场景：
- *
- *   1. dlopen(被测产物, RTLD_GLOBAL)
- *   2. dlopen(本文件编出的 libwaitstub.so, RTLD_GLOBAL)   ← 排在产物之后
- *   3. 通过 dlsym(产物句柄, "waitpid") 拿到**钩子本体**并直接调用
- *
- * 此时钩子内部的 RTLD_NEXT 查找会先命中本文件的同名符号 ——
- * 与真实 preload 下「找到 libc 的 waitpid」是同一个代码路径、
- * 同一套分支。区别只在于底下那层是 syscall() 直调而不是 glibc 包装。
- *
- * 每个替换实现都记一次调用数（waitstub_calls），测试据此断言
- * 「钩子确实把调用转发下去了」而不是自己吞了。
+ * Independent wait syscall adapter tested via dlsym(stub_handle, name).
+ * Late RTLD_GLOBAL loading is not an RTLD_NEXT interposition guarantee.
+ * The counter proves direct stub calls only; runtime is allowed to resolve libc
+ * or a syscall backend without visiting this fixture.
  */
-
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
@@ -35,12 +14,31 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static volatile int g_calls;
+static int g_calls;
+
+static long stub_raw5(long nr, long a, long b, long c, long d, long e)
+{
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    register long x4 __asm__("x4") = e;
+    __asm__ __volatile__("svc #0" : "+r"(x0)
+                         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+                         : "memory", "cc");
+    if (x0 < 0 && x0 >= -4095) { errno = (int)-x0; return -1; }
+    return x0;
+#else
+    return syscall(nr, a, b, c, d, e);
+#endif
+}
 
 __attribute__((constructor))
 static void waitstub_ctor(void)
 {
-    fprintf(stderr, "[waitstub] 已加载（作为「真实实现」排在产物之后）\n");
+    fprintf(stderr, "[waitstub] 已加载（独立 syscall fixture）\n");
 }
 
 /*
@@ -51,42 +49,41 @@ static void waitstub_ctor(void)
  */
 pid_t waitpid(pid_t pid, int *status, int options)
 {
-    g_calls++;
+    __atomic_add_fetch(&g_calls, 1, __ATOMIC_RELAXED);
     errno = 0;
-    return (pid_t)syscall(SYS_wait4, (int)pid, status,
-                          options & ~WNOWAIT, (void *)0);
+    return (pid_t)stub_raw5(SYS_wait4, pid, (long)status,
+                          options & ~WNOWAIT, 0, 0);
 }
 
 pid_t wait4(pid_t pid, int *status, int options, struct rusage *rusage)
 {
-    g_calls++;
+    __atomic_add_fetch(&g_calls, 1, __ATOMIC_RELAXED);
     errno = 0;
-    return (pid_t)syscall(SYS_wait4, (int)pid, status,
-                          options & ~WNOWAIT, (void *)rusage);
+    return (pid_t)stub_raw5(SYS_wait4, pid, (long)status,
+                          options & ~WNOWAIT, (long)rusage, 0);
 }
 
 pid_t wait3(int *status, int options, struct rusage *rusage)
 {
-    g_calls++;
+    __atomic_add_fetch(&g_calls, 1, __ATOMIC_RELAXED);
     errno = 0;
-    return (pid_t)syscall(SYS_wait4, -1, status,
-                          options & ~WNOWAIT, (void *)rusage);
+    return (pid_t)stub_raw5(SYS_wait4, -1, (long)status,
+                          options & ~WNOWAIT, (long)rusage, 0);
 }
 
 int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options)
 {
-    g_calls++;
+    __atomic_add_fetch(&g_calls, 1, __ATOMIC_RELAXED);
     errno = 0;
-    return (int)syscall(SYS_waitid, (int)idtype, (int)id, infop, options,
-                        (void *)0);
+    return (int)stub_raw5(SYS_waitid, idtype, id, (long)infop, options, 0);
 }
 
 int waitstub_calls(void)
 {
-    return g_calls;
+    return __atomic_load_n(&g_calls, __ATOMIC_RELAXED);
 }
 
 void waitstub_reset(void)
 {
-    g_calls = 0;
+    __atomic_store_n(&g_calls, 0, __ATOMIC_RELAXED);
 }

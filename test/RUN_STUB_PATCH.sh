@@ -16,7 +16,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-stub-XXXXXX")
-trap 'rm -rf "$W"; rm -f /tmp/.bxroot_stub_*_p_static 2>/dev/null' EXIT
+trap 'rm -rf -- "$W"' EXIT INT TERM
 
 command -v readelf >/dev/null 2>&1 || { echo "⏭️  跳过：没有 readelf"; exit 2; }
 bld() {

@@ -5845,6 +5845,9 @@ int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *fa,
 /* fork / vfork                                                        */
 /* ------------------------------------------------------------------ */
 
+extern int bxroot_sysvshm_fork_begin(void) __attribute__((weak));
+extern void bxroot_sysvshm_fork_end(void) __attribute__((weak));
+
 pid_t fork(void)
 {
     pid_t child;
@@ -5873,7 +5876,17 @@ pid_t fork(void)
         return -1;
     }
 
+    if (bxroot_sysvshm_fork_begin != NULL) {
+        int gate = bxroot_sysvshm_fork_begin();
+        if (gate < 0) { errno = -gate; return -1; }
+    }
     child = (pid_t)real_fork();
+    {
+        int saved_errno=errno;
+        if (bxroot_sysvshm_fork_begin != NULL && bxroot_sysvshm_fork_end != NULL)
+            bxroot_sysvshm_fork_end();
+        errno=saved_errno;
+    }
     if (child > 0) {
         int rc = px_forkguard_parent_register(&g_rt_guard, g_rt_ledger, child);
         if (px_fork_should_abort(rc)) {

@@ -1,43 +1,10 @@
 /*
- * test_wait_hooks.c -- 验证 preload.c 的 wait 家族钩子（P0-3 / D4 补充项）
- *
- * ★ 这个测试能证明什么、不能证明什么（务必先读）★
- *
- * 能证明：
- *   - 构建产物**真实导出** waitpid / wait4 / wait3 / waitid（dlopen + dlsym
- *     拿到的就是 .so 动态符号表里的那四个函数，等于运行期的插入入口）；
- *   - 这四个钩子**确实按契约把回收掉的 pid 标成 PX_REAPED**，以及
- *     **在不能标的时候没有标**（WNOHANG 返回 0、停住的子进程）——
- *     判据不是「看返回值」，而是直接查 .so 内部 pid 账本的 life 字段。
- *
- * 不能证明：
- *   - 真实 LD_PRELOAD 场景下 PLT 插入是否生效。本容器外层 proot 会吞掉
- *     注入（已知限制，见 _shared/容器内测试不可信.md），所以这里用
- *     dlopen + dlsym **直接调用**同一份机器码。走的是同一个函数体、
- *     同一份账本，但绕过了符号插入那一层。
- *
- * 另一个必须说明的模拟：真实场景里子进程是 proc.c 的 fork 钩子记进账本的；
- * 本测试不经过那个钩子（测试进程自己没被 preload），所以 fork 之后**显式**
- * 调 px_ledger_add 模拟 fork 钩子的登记动作 —— 与 proc.c:
- * px_forkguard_parent_register 的行为一致。
- *
- * ★ 怎么绕过「本容器 LD_PRELOAD 与 RTLD_NEXT 都不可用」★
- *
- * 实测两条硬约束：① LD_PRELOAD 在本容器完全不被采纳（连玩具 preload
- * 都收不到）；② dlsym(RTLD_NEXT, ...) 在 dlopen 场景下解析 libc 导出
- * 符号返回 NULL（外层 proot 的加载器行为异常）。
- *
- * 于是本文件用 waitstub.c 构造一个**语义等价**的插入场景：
- *   1. dlopen(被测产物, RTLD_GLOBAL)          ← 排在前面（= preload 的效果）
- *   2. dlopen(libwaitstub.so, RTLD_GLOBAL)    ← 排在后面，充当「真实实现」
- *   3. dlsym(产物句柄, "waitpid") 拿到**钩子本体**并直接调用
- *
- * 钩子内部的 RTLD_NEXT 查找会先命中 libwaitstub.so 的同名符号，
- * 走的是与真实 preload 完全相同的代码路径；测试还会断言
- * 「stub 确实被调用过」（否则钩子就是在自己吞调用，没转发）。
- *
- * 用法：BXROOT_WAIT_TEST_LIB=<产物.so> BXROOT_WAIT_STUB_LIB=<libwaitstub.so> ./test_wait_hooks
- *       RUN_WAIT_TESTS.sh 会自己构建并调用它。
+ * wait hooks: directly call exported runtime functions and verify real child
+ * status plus the runtime ledger. A late RTLD_GLOBAL dlopen does NOT guarantee
+ * RTLD_NEXT resolves a stub: libc may already precede it in the lookup scope,
+ * the runtime may cache a resolver result or use a raw syscall fallback.
+ * Test the stub independently through its own handle; never infer PLT injection
+ * or a selected forwarding backend from its mere presence in the link map.
  */
 
 #define _GNU_SOURCE
@@ -49,6 +16,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -96,17 +64,40 @@ static px_ledger *(*p_runtime_ledger)(void);
 static int         (*p_stub_calls)(void);
 static void        (*p_stub_reset)(void);
 
-/* 钩子是否真的把调用转发给了 stub（而不是自己吞掉） */
-static void expect_forwarded(const char *who)
+/* Independent kernel oracle: bypass libc/runtime symbol resolution on ARM64. */
+static pid_t kernel_wait(pid_t pid, int *status, int options)
 {
-    if (p_stub_calls == NULL) {
-        return;
-    }
-    CHECK(p_stub_calls() > 0, "%s 已转发到真实实现（stub 调用数=%d）",
-          who, p_stub_calls());
-    if (p_stub_reset != NULL) {
-        p_stub_reset();
-    }
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = SYS_wait4;
+    register long x0 __asm__("x0") = pid;
+    register long x1 __asm__("x1") = (long)status;
+    register long x2 __asm__("x2") = options;
+    register long x3 __asm__("x3") = 0;
+    __asm__ __volatile__("svc #0" : "+r"(x0)
+                         : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : "memory", "cc");
+    if (x0 < 0 && x0 >= -4095) { errno = (int)-x0; return -1; }
+    return (pid_t)x0;
+#else
+    return (pid_t)syscall(SYS_wait4, pid, status, options, NULL);
+#endif
+}
+
+static int kill_owned_child(pid_t pid, int sig)
+{
+    if (pid <= 0) { fprintf(stderr, "refusing non-positive child pid\n"); exit(1); }
+    return kill(pid, sig);
+}
+
+static void expect_kernel_reaped(const char *who, pid_t pid)
+{
+    int st = 0;
+    pid_t rc;
+    if (pid <= 0) { fprintf(stderr, "invalid oracle pid\n"); exit(1); }
+    errno = 0;
+    rc = kernel_wait(pid, &st, WNOHANG);
+    CHECK(rc == -1 && errno == ECHILD,
+          "%s: kernel 确认正 PID %d 已回收（rc=%d errno=%d）",
+          who, (int)pid, (int)rc, errno);
 }
 
 /* 账本里这个 pid 的 life（取不到时返回 -1） */
@@ -125,11 +116,60 @@ static int life_of(pid_t pid)
 static pid_t spawn_registered(void)
 {
     pid_t p = fork();
+    if (p < 0) {
+        perror("spawn_registered: fork");
+        exit(1);
+    }
 
     if (p > 0) {
-        (void)p_ledger_add(g_l, p, 0, PX_TAG_FORK);
+        if (p_ledger_add(g_l, p, 0, PX_TAG_FORK) != PX_OK) {
+            (void)kill_owned_child(p, SIGKILL);
+            (void)kernel_wait(p, NULL, 0);
+            fprintf(stderr, "ledger registration failed\n");
+            exit(1);
+        }
     }
     return p;
+}
+
+static void case_stub_contract(void *hs)
+{
+    pid_t (*s_waitpid)(pid_t, int *, int) = dlsym(hs, "waitpid");
+    pid_t (*s_wait4)(pid_t, int *, int, struct rusage *) = dlsym(hs, "wait4");
+    pid_t (*s_wait3)(int *, int, struct rusage *) = dlsym(hs, "wait3");
+    int (*s_waitid)(idtype_t, id_t, siginfo_t *, int) = dlsym(hs, "waitid");
+    int i;
+    CASE("S0 独立 stub 契约：句柄直调四入口、精确计数和 kernel 状态");
+    CHECK(s_waitpid && s_wait4 && s_wait3 && s_waitid && p_stub_calls && p_stub_reset,
+          "stub 四入口与计数接口完整");
+    if (!(s_waitpid && s_wait4 && s_wait3 && s_waitid && p_stub_calls && p_stub_reset))
+        exit(1);
+    for (i = 0; i < 4; i++) {
+        pid_t p = fork(), rc;
+        int st = 0;
+        siginfo_t si;
+        struct rusage ru;
+        if (p < 0) { perror("stub fork"); exit(1); }
+        if (p == 0) _exit(20 + i);
+        p_stub_reset();
+        memset(&si, 0, sizeof si);
+        memset(&ru, 0, sizeof ru);
+        if (i == 0) rc = s_waitpid(p, &st, 0);
+        else if (i == 1) rc = s_wait4(p, &st, 0, &ru);
+        else if (i == 2) rc = s_wait3(&st, 0, &ru);
+        else {
+            int result = s_waitid(P_PID, (id_t)p, &si, WEXITED | WNOWAIT);
+            CHECK(result == 0 && si.si_pid == p && si.si_code == CLD_EXITED &&
+                  si.si_status == 23, "stub waitid WNOWAIT 保留真实退出状态");
+            CHECK(p_stub_calls() == 1, "stub waitid 精确调用数=1（实际%d）", p_stub_calls());
+            rc = kernel_wait(p, &st, 0);
+        }
+        CHECK(rc == p && WIFEXITED(st) && WEXITSTATUS(st) == 20 + i,
+              "stub 入口%d交付真实 kernel 子进程状态", i);
+        CHECK(p_stub_calls() == 1, "stub 入口%d精确计数=1（实际%d）", i, p_stub_calls());
+        expect_kernel_reaped("stub", p);
+    }
+    p_stub_reset();
 }
 
 /* ---------------- 用例 ---------------- */
@@ -149,7 +189,7 @@ static void case_exited_normal(void)
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 7, "退出码 = 7（%d）",
           WEXITSTATUS(st));
     CHECK(life_of(p) == PX_REAPED, "★账本已标 REAPED（%d）", life_of(p));
-    expect_forwarded("waitpid");
+    expect_kernel_reaped("waitpid", p);
 }
 
 static void case_wnohang_zero(void)
@@ -170,11 +210,11 @@ static void case_wnohang_zero(void)
     CHECK(life_of(p) == PX_LIVE, "★账本仍是 LIVE，没有被误标（%d）",
           life_of(p));
 
-    CHECK(kill(p, SIGKILL) == 0, "子进程仍可被 kill（说明白名单没被污染）");
+    CHECK(kill_owned_child(p, SIGKILL) == 0, "子进程仍可被 kill（说明白名单没被污染）");
     rc = p_waitpid(p, &st, 0);
     CHECK(rc == p && WIFSIGNALED(st), "随后的阻塞 waitpid 正常收到 SIGKILL");
     CHECK(life_of(p) == PX_REAPED, "此时才标 REAPED（%d）", life_of(p));
-    expect_forwarded("waitpid(WNOHANG)");
+    expect_kernel_reaped("waitpid(WNOHANG)", p);
 }
 
 static void case_wait4(void)
@@ -192,7 +232,7 @@ static void case_wait4(void)
     CHECK(rc == p, "wait4 返回子 pid（%d）", (int)rc);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 3, "退出码 = 3");
     CHECK(life_of(p) == PX_REAPED, "★账本已标 REAPED（%d）", life_of(p));
-    expect_forwarded("wait4");
+    expect_kernel_reaped("wait4", p);
 }
 
 static void case_wait4_wnohang(void)
@@ -208,10 +248,10 @@ static void case_wait4_wnohang(void)
     CHECK(rc == 0, "wait4(WNOHANG) 返回 0（%d）", (int)rc);
     CHECK(life_of(p) == PX_LIVE, "★账本仍是 LIVE（%d）", life_of(p));
 
-    kill(p, SIGKILL);
+    kill_owned_child(p, SIGKILL);
     CHECK(p_wait4(p, &st, 0, NULL) == p, "收尾 wait4 正常");
     CHECK(life_of(p) == PX_REAPED, "收尾后标 REAPED（%d）", life_of(p));
-    expect_forwarded("wait4");
+    expect_kernel_reaped("wait4", p);
 }
 
 static void case_wait3(void)
@@ -227,7 +267,7 @@ static void case_wait3(void)
     CHECK(rc == p, "wait3 返回该子 pid（%d）", (int)rc);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 5, "退出码 = 5");
     CHECK(life_of(p) == PX_REAPED, "★账本已标 REAPED（%d）", life_of(p));
-    expect_forwarded("wait3");
+    expect_kernel_reaped("wait3", p);
 }
 
 static void case_waitid_ppid(void)
@@ -246,7 +286,7 @@ static void case_waitid_ppid(void)
     CHECK(si.si_pid == p && si.si_code == CLD_EXITED,
           "si_pid=%d si_code=CLD_EXITED(%d)", (int)si.si_pid, si.si_code);
     CHECK(life_of(p) == PX_REAPED, "★账本已标 REAPED（%d）", life_of(p));
-    expect_forwarded("waitid");
+    expect_kernel_reaped("waitid", p);
 }
 
 static void case_waitid_wnohang_empty(void)
@@ -281,7 +321,7 @@ static void case_stopped_not_reaped(void)
     }
 
     usleep(100000);
-    kill(p, SIGSTOP);
+    kill_owned_child(p, SIGSTOP);
     rc = p_waitpid(p, &st, WUNTRACED);
     CHECK(rc == p, "waitpid(WUNTRACED) 返回子 pid（%d）", (int)rc);
     CHECK(WIFSTOPPED(st), "状态是「已停止」而非退出");
@@ -290,8 +330,8 @@ static void case_stopped_not_reaped(void)
      */
     CHECK(life_of(p) == PX_LIVE, "★账本仍是 LIVE（%d）", life_of(p));
 
-    kill(p, SIGCONT);
-    kill(p, SIGKILL);
+    kill_owned_child(p, SIGCONT);
+    kill_owned_child(p, SIGKILL);
     rc = p_waitpid(p, &st, 0);
     CHECK(rc == p && WIFSIGNALED(st), "继续后仍能正常回收");
     CHECK(life_of(p) == PX_REAPED, "退出后才标 REAPED（%d）", life_of(p));
@@ -401,39 +441,37 @@ static void case_ledger_drains(void)
 /* ---------------- 入口 ---------------- */
 static int run_all(void)
 {
-    void *h;
+    void *h, *hs;
     const char *lib = getenv("BXROOT_WAIT_TEST_LIB");
 
     if (lib == NULL || lib[0] == '\0') {
         fprintf(stderr, "缺少 BXROOT_WAIT_TEST_LIB\n");
-        return 2;
+        return 1;
     }
 
     printf("== wait 家族钩子验证 ==\n");
     printf("   被测库: %s\n", lib);
 
-    /* 顺序是关键：产物先加载（= 被 preload 的那个），stub 后加载
-     * （= 它「后面」的真实实现，钩子的 RTLD_NEXT 会命中它）。 */
+    /* Preserve late loading as an observation, not an RTLD_NEXT guarantee. */
     h = dlopen(lib, RTLD_NOW | RTLD_GLOBAL);
     if (h == NULL) {
         fprintf(stderr, "dlopen(产物) 失败: %s\n", dlerror());
-        return 2;
+        return 1;
     }
     {
         const char *stub = getenv("BXROOT_WAIT_STUB_LIB");
-        void *hs;
         if (stub == NULL || stub[0] == '\0') {
             fprintf(stderr, "缺少 BXROOT_WAIT_STUB_LIB\n");
-            return 2;
+            return 1;
         }
         hs = dlopen(stub, RTLD_NOW | RTLD_GLOBAL);
         if (hs == NULL) {
             fprintf(stderr, "dlopen(stub) 失败: %s\n", dlerror());
-            return 2;
+            return 1;
         }
         p_stub_calls = (int (*)(void))dlsym(hs, "waitstub_calls");
         p_stub_reset = (void (*)(void))dlsym(hs, "waitstub_reset");
-        CHECK(p_stub_calls != NULL, "stub 已加载并可用于「是否转发」断言");
+        CHECK(p_stub_calls != NULL, "stub 已加载供独立契约测试");
     }
 
     /* 动态符号表里必须真的有这四个（这就是 LD_PRELOAD 的插入入口） */
@@ -448,20 +486,20 @@ static int run_all(void)
           (void *)(uintptr_t)p_waitpid, (void *)(uintptr_t)p_wait4,
           (void *)(uintptr_t)p_wait3, (void *)(uintptr_t)p_waitid);
     if (!(p_waitpid && p_wait4 && p_wait3 && p_waitid)) {
-        return 2;
+        return 1;
     }
 
     p_runtime_ledger = (px_ledger *(*)(void))dlsym(h, "px_runtime_ledger");
     CHECK(p_runtime_ledger != NULL, "能从产物里解析 px_runtime_ledger");
     if (p_runtime_ledger == NULL) {
-        return 2;
+        return 1;
     }
     g_l = p_runtime_ledger();
     CHECK(g_l != NULL,
           "构造函数 px_runtime_init() 已建立账本（%p）—— 顺带证明 D4 初始化真的跑了",
           (void *)g_l);
     if (g_l == NULL) {
-        return 2;
+        return 1;
     }
 
     p_ledger_add = (int (*)(px_ledger *, pid_t, pid_t, uint32_t))
@@ -475,21 +513,19 @@ static int run_all(void)
     CHECK(p_ledger_add && p_ledger_get && p_ledger_live && p_ledger_reaped,
           "账本查询原语可用");
 
-    /*
-     * 先自证 harness 成立：直接调一次 waitpid（会解析到谁来着不重要），
-     * 关键是后面每个用例里的 expect_forwarded 断言 —— 若钩子没转发，
-     * 那些断言会失败而不是静默通过。
-     */
-    CASE("W0b harness 自证：钩子内部 RTLD_NEXT 能命中 stub");
+    case_stub_contract(hs);
+    CASE("W0b runtime 自证：真实 kernel 回收与 ledger 同时成立");
     {
         pid_t p = spawn_registered();
         int st = 0;
-        if (p == 0) { _exit(0); }
-        if (p_stub_reset) { p_stub_reset(); }
-        (void)p_waitpid(p, &st, 0);
-        CHECK(p_stub_calls != NULL && p_stub_calls() > 0,
-              "stub 被命中（%d 次）—— 否则本测试的「真实实现」根本没接上",
-              p_stub_calls ? p_stub_calls() : -1);
+        if (p == 0) { _exit(9); }
+        p_stub_reset();
+        CHECK(p_waitpid(p, &st, 0) == p && WIFEXITED(st) && WEXITSTATUS(st) == 9,
+              "runtime 交付真实子进程退出9");
+        CHECK(life_of(p) == PX_REAPED, "runtime 自证 ledger REAPED");
+        expect_kernel_reaped("runtime 自证", p);
+        printf("    INFO: late stub calls=%d (backend observation, not assertion)\n", p_stub_calls());
+        p_stub_reset();
     }
 
     case_exited_normal();
@@ -512,9 +548,11 @@ static int run_all(void)
     return g_failed ? 1 : 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     pid_t child;
+    int crash_selftest = argc == 2 && strcmp(argv[1], "--crash-selftest") == 0;
+    if (argc != 1 && !crash_selftest) return 1;
     int st = 0;
 
     /*
@@ -525,6 +563,12 @@ int main(void)
     fflush(NULL);          /* 先把父进程已缓冲的内容落盘，避免 fork 后重复 */
     child = fork();
     if (child == 0) {
+        if (crash_selftest) {
+            pid_t self = getpid();
+            if (self <= 0) _exit(1);
+            (void)kill_owned_child(self, SIGKILL);
+            _exit(1);
+        }
         int rc = run_all();
         /*
          * ★ 必须先 fflush 再 _exit ★
@@ -537,15 +581,17 @@ int main(void)
     }
     if (child < 0) {
         perror("fork");
-        return 2;
+        return 1;
     }
-    if (waitpid(child, &st, 0) != child) {
+    pid_t got;
+    do { got = kernel_wait(child, &st, 0); } while (got < 0 && errno == EINTR);
+    if (got != child) {
         perror("waitpid");
-        return 2;
+        return 1;
     }
     if (WIFSIGNALED(st)) {
         printf("子进程被信号 %d 终止（库的构造函数副作用？）\n", WTERMSIG(st));
-        return 2;
+        return 1;
     }
-    return WEXITSTATUS(st);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }

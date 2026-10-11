@@ -2179,6 +2179,10 @@ static void test_real_exec_env(void)
         pid_t child = fork();
 
         CHECK(child >= 0);
+        if (child < 0) {
+            px_ledger_destroy(l);
+            return;
+        }
         if (child == 0) {
             /* 子进程：睡一会儿，等父进程来杀 */
             usleep(200000);

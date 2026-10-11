@@ -48,14 +48,9 @@ for m in /proc/[0-9]*/maps; do
 done
 [ -n "$APP_LIB" ] || { echo "⏭️  跳过：探测不到官方库目录"; exit 2; }
 
-W=${TMPDIR:-/tmp}/l2s_cleanup_$$
-mkdir -p "$W"
-trap 'rm -rf "$W" /tmp/l2scl_*' EXIT INT TERM
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-l2s-cleanup-XXXXXX") || exit 1
+trap 'rm -rf -- "$W"' EXIT INT TERM
 # 集中目录必须是本测试私有的临时路径。
-# 生产环境 PROOT_L2S_DIR / 容器视角 /.l2s 里是真实 rootfs 的硬链接后备
-# （例如 /usr/bin/perl → /.l2s/.l2s.perl.dpkg-new0001）。曾经把
-# L2SDIR=/.l2s 再 rm -rf，会把生产树的 perl backing 一并清掉。
-# 用例后数这个私有目录 —— 仍是"中间文件是否回收"的直接判据。
 L2SDIR="$W/l2s-central"
 mkdir -p "$L2SDIR"
 
@@ -184,15 +179,15 @@ END
 EXPECT_EOF
 
 echo "== 0) 官方基线（信息）=="
-mkdir -p /tmp/l2scl_off
-run_off /tmp/l2scl_off > "$W/off.txt"
+run_off "$W/off" > "$W/off.txt"
 grep -q '^END' "$W/off.txt" || { echo "⏭️  跳过：官方探针没跑完"; sed 's/^/   /' "$W/off.txt" | head; exit 2; }
 sed 's/^/   /' "$W/off.txt"
 
 for L in central scatter; do
     echo "== $L 布局 =="
-    WD=/tmp/l2scl_$L
-    rm -rf "$WD" "$L2SDIR"; mkdir -p "$WD" "$L2SDIR"
+    WD="$W/$L"
+    rm -rf -- "$WD" "$L2SDIR"
+    mkdir -p -- "$WD" "$L2SDIR"
     run_bx "$WD" "$L" > "$W/bx_$L.txt"
     grep -q '^END' "$W/bx_$L.txt" || { bad "探针没跑完"; sed 's/^/   /' "$W/bx_$L.txt" | head -20; continue; }
 
@@ -210,7 +205,7 @@ for L in central scatter; do
         scatter:*.l2s.f*)       good "l2s 生效（散落布局，f -> $tgt）" ;;
         *) bad "l2s 未生效或布局不对（readlink f = '$tgt'）—— 后续结论无效" ;;
     esac
-    rm -rf "$WD/chk"; rm -rf "$L2SDIR"/.l2s.f0001* 2>/dev/null
+    rm -rf -- "$WD/chk" "$L2SDIR"
 
     # (2) 与 Linux 语义逐行对照（EXPECT），并报告与官方的差异（信息）
     if norm "$W/bx_$L.txt" > "$W/b" && cmp -s "$W/expect.txt" "$W/b"; then
@@ -233,7 +228,7 @@ for L in central scatter; do
     [ "$r" = 0 ] && good "外层视角客户目录 0 个 .l2s.*" || bad "外层视角客户目录残留 $r 个 .l2s.*"
     # (6) 集中目录不出现在 / 以外：客户 ls -a 工作目录里不该有 .l2s 目录
     if [ "$L" = central ]; then
-        e=$(BXROOT_LINK2SYMLINK=1 BXROOT_L2S_DIR="$L2SDIR" "$BX" -- /bin/sh -c "ls -a $WD /tmp | grep -c '^\.l2s\$'" 2>/dev/null | tail -1)
+        e=$(BXROOT_LINK2SYMLINK=1 BXROOT_L2S_DIR="$L2SDIR" "$BX" -- /bin/sh -c "ls -a $WD $W | grep -c '^\.l2s\$'" 2>/dev/null | tail -1)
         [ "${e:-0}" = 0 ] && good "集中目录不泄漏到 /tmp 或工作目录的列举中" || bad "在 /tmp 或工作目录列举里看到 .l2s 目录"
     fi
     rm -rf "$WD"

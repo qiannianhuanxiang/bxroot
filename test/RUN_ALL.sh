@@ -55,43 +55,47 @@ cd "$ROOT" || { echo "❌ 无法进入仓库根目录"; exit 1; }
 
 QUICK=0
 DO_E2E=0
+RUNNER_SELFTEST=0
 for a in "$@"; do
     case "$a" in
     --quick) QUICK=1 ;;
     --e2e)   DO_E2E=1 ;;
+    --runner-selftest) RUNNER_SELFTEST=1 ;;
     esac
 done
 
 # ---------------------------------------------------------------------
-# 结果收集。用文件暂存，因为各测试跑在子 shell 里。
-#
-# ★ /tmp 在这里并不总是可用 ★ 实测：一次回归跑到一半，/tmp 的权限被
-# 清成了 000（本容器里有别的进程会动它），于是 `: > /tmp/...` 直接
-# "Permission denied"，整轮汇总崩掉 —— 而**各个测试其实是跑完了的**，
-# 只是结果记不下来。所以这里做两件事：
-#   ① 优先 mktemp（拿到一个已存在且可写的名字）；
-#   ② 拿不到就退回仓库内的临时目录，保证回归不因外部环境崩掉。
-# 注意不能简单用 `$$` 拼 /tmp 下的固定名 —— 那正是失败的那条路径。
+# 持久结果账本：不使用 /tmp，不自动删除原始日志。
+# 单纯 fork 不隔离文件系统；每步前后检查运行器健康，未审查的副作用
+# 必须 BLOCKED，不能因后续命令/路径损坏而制造大量 SKIP。
 # ---------------------------------------------------------------------
-TMPDIR_BX="${TMPDIR:-/tmp}"
-RESULT_FILE=""
-
-if command -v mktemp >/dev/null 2>&1; then
-    RESULT_FILE=$(mktemp "$TMPDIR_BX/bxroot-all-XXXXXX" 2>/dev/null) || RESULT_FILE=""
-fi
-if [ -z "$RESULT_FILE" ]; then
-    # 回退：仓库内的临时目录（随仓库可写性走，不受 /tmp 影响）
-    mkdir -p "$ROOT/.tmp-regress" 2>/dev/null
-    RESULT_FILE="$ROOT/.tmp-regress/all-$$.txt"
-    : > "$RESULT_FILE" 2>/dev/null || {
-        echo "❌ 无法创建结果文件（/tmp 与仓库内都不可写）"
-        exit 1
-    }
-fi
-: > "$RESULT_FILE" 2>/dev/null
-
-# 各测试的日志也走同一个可写目录，避免 /tmp 不可写时日志写入失败
-WORK_DIR=$(dirname "$RESULT_FILE")
+# Persist evidence outside /tmp and retain every per-step log. Child tests may
+# mutate /tmp; a transient log directory must never also own the result ledger.
+RUNNER_PATH=$PATH
+RUNNER_PYTHON=$(command -v python3) || exit 1
+RUNNER_TAIL=$(command -v tail) || exit 1
+RUNNER_CUT=$(command -v cut) || exit 1
+RUNNER_RM=$(command -v rm) || exit 1
+RUNNER_TIMEOUT=$(command -v timeout) || exit 1
+RESULT_BASE=${BXROOT_RESULT_BASE:-/root/work/bxroot-regression-results}
+case "$RESULT_BASE" in /*) ;; *) echo "ERROR: result base must be absolute"; exit 1 ;; esac
+case "$RESULT_BASE" in /tmp|/tmp/*) echo "ERROR: result ledger must be outside /tmp"; exit 1 ;; esac
+mkdir -p "$RESULT_BASE" || exit 1
+WORK_DIR=$(mktemp -d "$RESULT_BASE/quick-XXXXXX") || exit 1
+RESULT_FILE="$WORK_DIR/results.txt"
+: > "$RESULT_FILE" || exit 1
+exec 9>>"$RESULT_FILE" || exit 1
+printf '%s\n' "$ROOT" > "$WORK_DIR/root-sentinel"
+STEP_NO=0
+BLOCKED=0
+ERRORS=0
+runner_health() {
+    [ -d "$ROOT" ] && [ -r "$ROOT/test/RUN_ALL.sh" ] &&
+    [ -d /tmp ] && [ -r "$WORK_DIR/root-sentinel" ] &&
+    [ -x "$RUNNER_TAIL" ] && [ -x "$RUNNER_CUT" ] && [ -x "$RUNNER_RM" ] &&
+    "$RUNNER_TAIL" -n 0 "$WORK_DIR/root-sentinel" >/dev/null 2>&1 &&
+    "$RUNNER_PYTHON" -c 'import sys; f=open(sys.argv[1],"a"); f.close()' "$RESULT_FILE"
+}
 
 PASS=0
 FAIL=0
@@ -132,7 +136,7 @@ KNOWN_FAIL=""
 
 # 记录一条结果：$1=状态(PASS/FAIL/SKIP) $2=名称 $3=摘要
 note() {
-    printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$RESULT_FILE"
+    printf '%s|%s|%s\n' "$1" "$2" "$3" >&9 || exit 1
 }
 
 echo "======================================================"
@@ -147,83 +151,96 @@ echo
 # 之所以不直接 `set -e`：需要跑完所有测试再统一汇报，
 # 第一个失败就退出会掩盖后面测试的状态。
 # ---------------------------------------------------------------------
+# A fork/subshell isolates shell variables, cwd, signal handling and environment;
+# it does NOT isolate shared filesystems. Only reviewed fixture-local probes run.
+# BLOCKED is an unexecuted safety obligation, never a successful test or SKIP.
+runner_reviewed() {
+    [ "$RUNNER_SELFTEST" -eq 1 ] && return 0
+    case "$1" in
+    "编译告警门禁"|"l2s 运行时"|"l2s×fakeroot 协同"|"fakeroot 纯逻辑"|    "fakeroot 账本并发"|"系统调用参数位置"|"rename/link 双路径"|    "身份 syscall 伪装"|"运行时构建"|"exec 家族与失败诊断"|    "native world 分类与环境"|"native exec/spawn 绑定语义"|    "native 会话与双向路径"|"native 会话后端生命周期"|    "native host 到 guest 回入口"|"native 回入口 ELF 契约"|    "proc fd 句柄解析"|"copyout probe compile"|"copyout syscall capability"|    "SHM anchor 生命周期"|"SHM claim 协议"|"SHM runtime copyout"|    "SysV 共享内存"|"最低内核依据"|"clone3 回退链"|    "livepatch 指令扫描"|"livepatch 审计"|"livepatch 多段 r-x 全扫描"|    "guest SIGSYS 影子槽 / 自发 SIGSYS") return 0 ;;
+    "bx-host 宿主 ELF 入口"|"D3 /proc 泄漏反向翻译"|"realpath 返回值反向翻译"|"RAW_SYSCALL 透传开关"|"sigsys 裸系统调用号/sigsetsize"|"ulx 早期 SIGSYS"|"livepatch 静态主映像"|"proot CLI 兼容"|"上游 proot 选项表覆盖"|"官方配置块 CFG_FD"|"workdir 回退") return 0 ;;
+    "DNS 解析"|"system/popen 子进程"|"pthread_create 栈"|"shebang 脚本 exec"|"降权族 chage"|"任意 -i uid:gid 映射"|"身份权限爆破"|"exec 参数边界"|"D4 进程管理"|"wait 家族钩子") return 0 ;;
+    "stub-loader PT_INTERP 补丁"|"l2s 中间文件清理"|"l2s 散落布局端到端") return 0 ;;
+    "/proc 视角") return 0 ;;
+    "native fork/wait compile"|"native fork/wait 自动插入"|"static SHM fd lifecycle") return 0 ;;
+    "SHM claim 协议"|"l2s mock 契约"|"SHM ID ABA"|"static SHM syscall"|"SHM fork gate") return 0 ;;
+    *) return 1 ;;
+    esac
+}
 run_step() {
     name="$1"; shift
-    logf="$WORK_DIR/step-$$.log"
-
+    STEP_NO=$((STEP_NO + 1))
+    logf="$WORK_DIR/step-$STEP_NO.log"
+    if ! runner_health; then
+        note ERROR "$name" "runner prerequisites damaged; not executed"
+        echo "ERROR: runner health failed before $name; stop, no cascade SKIPs"
+        exit 1
+    fi
     if [ "$#" -eq 0 ]; then
-        note SKIP "$name" "无命令"
+        note SKIP "$name" "explicit missing source/artifact prerequisite"
         SKIP=$((SKIP + 1))
-        printf '⏭️  %-26s 跳过\n' "$name"
+        printf 'SKIP %-26s prerequisite absent\n' "$name"
         return 0
     fi
-
-    printf '▶️  %-26s ' "$name"
-    # shellcheck disable=SC2068
-    if "$@" >"$logf" 2>&1; then
-        rc=0
-    else
-        rc=$?
+    if ! runner_reviewed "$name"; then
+        note BLOCKED "$name" "filesystem/syscall effects require disposable-root isolation review"
+        BLOCKED=$((BLOCKED + 1))
+        printf 'BLOCKED %-26s not executed; isolation review required\n' "$name"
+        return 0
     fi
-
-    # 摘要：优先取输出里的"通过/失败"统计行，否则取末行
-    summary=$(grep -aoE '[0-9]+ *(用例|个用例|passed|通过)[^,，]*' "$logf" 2>/dev/null | tail -1)
-    [ -z "$summary" ] && summary=$(tail -1 "$logf" 2>/dev/null | cut -c1-48)
-    [ -z "$summary" ] && summary="(无输出)"
-
+    step_tmp="$WORK_DIR/tmp-$STEP_NO"
+    mkdir -p "$step_tmp" || { note ERROR "$name" "cannot create private TMPDIR"; exit 1; }
+    printf 'RUN %-26s ' "$name"
+    # No shared shell state. Preserve original PATH; retain stdout/stderr forever.
+    if (PATH=$RUNNER_PATH; export PATH; TMPDIR=$step_tmp; export TMPDIR;
+        if [ "${1:-}" = sh ]; then
+            "$RUNNER_TIMEOUT" --kill-after=5 "${BXROOT_STEP_TIMEOUT:-180}" "$@"
+        else
+            "$@"
+        fi) >"$logf" 2>&1; then rc=0; else rc=$?; fi
+    if ! runner_health; then
+        note ERROR "$name" "shared filesystem/tooling damaged; rc=$rc log=$logf"
+        echo "ERROR shared filesystem/tooling damaged; stop, log=$logf"
+        exit 1
+    fi
+    # Use a captured interpreter, not a pipeline that may be unavailable after a probe.
+    summary=$("$RUNNER_PYTHON" - "$logf" <<'SUMMARY'
+import sys
+lines=open(sys.argv[1],errors='replace').read().splitlines()
+print((lines[-1] if lines else '(empty output)')[:160].replace('|','/'))
+SUMMARY
+)
     if [ "$rc" -eq 0 ]; then
-        note PASS "$name" "$summary"
-        PASS=$((PASS + 1))
-        printf '✅ rc=0  %s\n' "$summary"
-    elif [ "$rc" -eq 2 ]; then
-        # ★ rc=2 = "环境不满足，无法测"，不是失败 ★
-        #
-        # 本项目的子测试脚本用三种退出码表达三件事，这是既定约定
-        # （见各脚本头部的"退出码"一节）：
-        #     0 = 通过      1 = 契约被破坏      2 = 环境不满足（无法测）
-        #
-        # 但本函数原先**只认 0 为通过**，把 rc=2 也记成失败。实测后果：
-        # 在干净克隆（无 build/ 产物、无真机 rootfs）里跑：
-        #
-        #     ✅ 编译告警门禁 ... ✅ dl 家族契约   ← dl 脚本自己 exit 0
-        #     ❌ l2s 端到端契约  rc=2 跳过：没有 build/libbxroot-runtime.so
-        #     通过 11 / 失败 1        ← ★ 一个"环境不满足"被报成缺陷 ★
-        #
-        # 两个脚本对同一件事用了**不同**的退出码（l2s 用 2、dl 用 0），
-        # 于是同一个环境限制只有其中一个被误报 —— 典型的约定漂移。
-        #
-        # 处置：rc=2 归入 SKIP，但**明确显示原因**（不能静默 —— 静默跳过
-        # 是本项目反复出现的缺陷模式，见 docs/测试基础设施红队报告.md）。
-        # 真正的契约破坏走 exit 1，仍归 FAIL。
-        note SKIP "$name" "rc=2 环境不满足（无法测）"
-        SKIP=$((SKIP + 1))
-        printf '⏭️  rc=2  %s\n' "$summary"
-        # 打印末几行，让"为什么跳过"可见（例如缺哪个产物）
-        tail -3 "$logf" 2>/dev/null | sed 's/^/   /'
+        note PASS "$name" "rc=0 $summary log=$logf"
+        PASS=$((PASS + 1)); echo "PASS $summary"
+    elif [ "$rc" -eq 2 ] && "$RUNNER_PYTHON" - "$logf" <<'PREREQ'
+import re, sys
+s=open(sys.argv[1],errors='replace').read()
+# Only an explicit positive prerequisite diagnostic justifies SKIP.
+valid = re.search(r'(SKIP:|跳过[:：]|rc=2 跳过|环境不满足)',s)
+broken = re.search(r'(not found|Directory nonexistent|Permission denied|cannot create|编译失败|FAIL:)',s)
+sys.exit(0 if valid and not broken else 1)
+PREREQ
+    then
+        note SKIP "$name" "rc=2 explicit prerequisite $summary log=$logf"
+        SKIP=$((SKIP + 1)); echo "SKIP $summary"
     else
-        # 已知缺陷：记 KNOWN，不计入失败总数（但仍醒目显示）
-        case " $KNOWN_FAIL " in
-            *" $name "*)
-                note KNOWN "$name" "rc=$rc $summary"
-                KNOWN=$((KNOWN + 1))
-                printf '⚠️  rc=%s （已知缺陷）%s\n' "$rc" "$summary"
-                echo "   --- 末尾 5 行 ---"
-                tail -5 "$logf" 2>/dev/null | sed 's/^/   /'
-                echo "   ----------------"
-                rm -f "$logf"
-                return 0
-                ;;
-        esac
-        note FAIL "$name" "rc=$rc $summary"
-        FAIL=$((FAIL + 1))
-        printf '❌ rc=%s  %s\n' "$rc" "$summary"
-        echo "   --- 末尾 15 行 ---"
-        tail -15 "$logf" 2>/dev/null | sed 's/^/   /'
-        echo "   ------------------"
+        note FAIL "$name" "rc=$rc $summary log=$logf"
+        FAIL=$((FAIL + 1)); echo "FAIL rc=$rc $summary"
+        "$RUNNER_TAIL" -n 15 "$logf"
     fi
-    rm -f "$logf"
     return 0
 }
+
+# Regression for the runner itself; sabotage only its owned sentinel, never /tmp.
+if [ "$RUNNER_SELFTEST" -eq 1 ]; then
+    run_step "mock pass" sh -c 'echo PASS; exit 0'
+    run_step "mock prerequisite" sh -c 'echo "SKIP: unavailable fixture"; exit 2'
+    run_step "mock false skip" sh -c 'echo "compiler not found"; exit 2'
+    run_step "mock actual fail" sh -c 'echo "FAIL: assertion"; exit 1'
+    run_step "mock infrastructure" "$RUNNER_PYTHON" -c 'import os,sys; os.unlink(sys.argv[1])' "$WORK_DIR/root-sentinel"
+    echo "ERROR: health sabotage was not detected"; exit 1
+fi
 
 # =====================================================================
 # 1. 编译告警门禁 —— 放第一位：编译不过后面都没意义
@@ -721,7 +738,17 @@ fi
 # ---------------------------------------------------------------------
 # Copyout 构建始终检查；能力探测独立子进程，不代表最终APK过滤链。
 run_step "copyout probe compile" sh test/RUN_COPYOUT_FAULT.sh --compile-only
+run_step "native fork/wait compile" sh test/RUN_NATIVE_FORK_WAIT.sh --compile-only
+run_step "native fork/wait 自动插入" sh test/RUN_NATIVE_FORK_WAIT.sh
 run_step "copyout syscall capability" sh test/RUN_COPYOUT_FAULT.sh
+run_step "SHM runtime copyout" sh test/RUN_RUNTIME_STAT.sh
+run_step "static SHM fd lifecycle" sh test/RUN_STATIC_SHM_FD.sh
+run_step "SHM anchor 生命周期" sh test/RUN_SHM_ANCHOR.sh
+run_step "SHM claim 协议" sh test/RUN_SHM_CLAIM.sh
+run_step "SHM ID ABA" sh test/RUN_SHM_ID_ABA.sh
+run_step "SHM fork gate" sh test/RUN_SHM_FORK_GATE.sh
+run_step "static SHM syscall" sh test/RUN_STATIC_SHM_SYSCALL.sh
+run_step "l2s mock 契约" sh test/RUN_L2S_MOCK.sh
 # SysV 共享内存模拟（sysvshm.c）：语义对照官方 + 双向互通 + 并发
 # ---------------------------------------------------------------------
 if [ -f test/RUN_SYSVSHM.sh ]; then
@@ -1045,15 +1072,18 @@ while IFS='|' read -r st nm sm; do
     PASS) printf '  ✅ %-24s %s\n' "$nm" "$sm" ;;
     FAIL) printf '  ❌ %-24s %s\n' "$nm" "$sm" ;;
     SKIP) printf '  ⏭️  %-24s %s\n' "$nm" "$sm" ;;
+    BLOCKED) printf '  BLOCKED %-24s %s\n' "$nm" "$sm" ;;
+    ERROR) printf '  ERROR %-24s %s\n' "$nm" "$sm" ;;
     KNOWN) printf '  ⚠️  %-24s %s\n' "$nm" "$sm" ;;
     esac
 done < "$RESULT_FILE"
 echo "------------------------------------------------------"
 echo "  通过 $PASS / 失败 $FAIL$([ "$KNOWN" -gt 0 ] && echo " / 已知缺陷 $KNOWN")"
-rm -f "$RESULT_FILE"
+echo "  Evidence: $WORK_DIR (results and all logs retained)"
 
-if [ "$FAIL" -gt 0 ]; then
-    echo "  ❌ 回归未通过"
+echo "  跳过 $SKIP / 隔离阻止 $BLOCKED / 基础设施错误 $ERRORS"
+if [ "$FAIL" -gt 0 ] || [ "$BLOCKED" -gt 0 ]; then
+    echo "  ❌ 回归未通过或未完整执行"
     exit 1
 fi
 echo "  ✅ 全部通过"

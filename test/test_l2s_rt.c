@@ -1307,12 +1307,60 @@ static void t_nlink_overflow(void)
     CHECK_EQ_I(rc, -EMLINK);
 }
 
+static void t_mock_entrypoint_contract(void)
+{
+    l2s_config cfg = L2S_CONFIG_DEFAULT;
+    struct stat st;
+    unsigned int nlink, mask;
+    uint16_t mode;
+    const l2s_scheme schemes[] = {L2S_SCHEME_PROOT, L2S_SCHEME_PROROOT};
+    CASE("M1 mock FS：两种 scheme 的 link/stat 伪装契约");
+    for (size_t i = 0; i < sizeof schemes / sizeof schemes[0]; i++) {
+        char old[32], newp[32];
+        mfs_reset();
+        snprintf(old, sizeof old, "/w/m%u", (unsigned)i);
+        snprintf(newp, sizeof newp, "/w/n%u", (unsigned)i);
+        mfs_add(old);
+        cfg.l2s_dir = NULL;
+        cfg.scheme = schemes[i];
+        CHECK_EQ_I(l2s_rt_init(&MFS_OPS, &cfg), 0);
+        CHECK_EQ_I(l2s_rt_link(old, newp), 0);
+        CHECK_EQ_I(mfs_lstat(old, &st), 0);
+        l2s_rt_patch_stat(&st, old);
+        CHECK_EQ_I(st.st_nlink, 2);
+        CHECK(!S_ISLNK(st.st_mode));
+        l2s_rt_shutdown();
+    }
+    mfs_reset();
+    cfg.l2s_dir = NULL; cfg.scheme = L2S_SCHEME_PROOT;
+    CHECK_EQ_I(l2s_rt_init(&MFS_OPS, &cfg), 0);
+    mfs_add("/w/statx");
+    CHECK_EQ_I(l2s_rt_link("/w/statx", "/w/statx2"), 0);
+    CHECK_EQ_I(mfs_lstat("/w/statx", &st), 0);
+    nlink = 0; mask = 0x200; mode = (unsigned int)st.st_mode;
+    l2s_rt_patch_statx_full(&nlink, &mask, &mode, 0x200, "/w/statx");
+    CHECK_EQ_I(nlink, 2);
+    CHECK((mode & S_IFMT) == S_IFREG);
+    l2s_rt_shutdown();
+}
+
 /* ================================================================== */
 /* main                                                                */
 /* ================================================================== */
 
 int main(void)
 {
+    if (getenv("L2S_MOCK_ONLY") != NULL) {
+        t_mock_entrypoint_contract();
+        t_fail_rename();
+        t_rollback_symlink();
+        t_broken_chain();
+        t_nlink_overflow();
+        printf("cases:  %d  (%d failed)\n", g_cases, g_failed);
+        printf("checks: %d  (%d failed)\n", g_checks, g_failed);
+        printf("RESULT: %s\n", g_failed == 0 ? "PASS" : "FAIL");
+        return g_failed == 0 ? 0 : 1;
+    }
     printf("l2s 运行时层测试\n");
     printf("沙箱根：/tmp/l2srt-*（真实 f2fs，符号链接可用）\n");
     printf("========================================\n");

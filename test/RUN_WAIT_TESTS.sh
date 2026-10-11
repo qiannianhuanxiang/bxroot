@@ -34,9 +34,16 @@ elif [ -f "$ROOT/src/proc/proc.h" ]; then
 else
     PROC_DIR="$(cd "$ROOT/../proc" 2>/dev/null && pwd)"
 fi
-OUT=/tmp/test_wait_hooks
-STUB=/tmp/libwaitstub.so
-LOG=/tmp/wait-hooks-cc.err
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-wait-XXXXXX") || exit 1
+cleanup() {
+    case "$W" in /*/bxroot-wait-*) [ -d "$W" ] && rm -rf -- "$W" ;; esac
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+OUT="$W/test_wait_hooks"
+STUB="$W/libwaitstub.so"
+LOG="$W/wait-hooks-cc.err"
 
 if [ ! -f "$LIB" ]; then
     echo "❌ 找不到被测库：$LIB"
@@ -65,17 +72,35 @@ retry_build() {
 }
 
 echo "== 构建 =="
-retry_build -O1 -g -I"$PROC_DIR" -o "$OUT" test_wait_hooks.c -ldl || exit 1
-# 「真实实现」替身：编成独立 .so，在运行时**晚于**产物 dlopen，
-# 这样钩子内部的 RTLD_NEXT 就会命中它（本容器 RTLD_NEXT 到 libc 不可用）
-retry_build -O1 -g -fPIC -shared -o "$STUB" waitstub.c || exit 1
+retry_build -O1 -g -Wall -Wextra -Werror -I"$PROC_DIR" -o "$OUT" test_wait_hooks.c -ldl || exit 1
+# Stub 是独立 syscall fixture；late dlopen 不保证 RTLD_NEXT 命中。
+# 驱动通过 stub 自有句柄直调四入口并检查精确计数，再独立验证
+# runtime 的真实 kernel 等待与 ledger。这里仍不证明 PLT 注入。
+retry_build -O1 -g -Wall -Wextra -Werror -fPIC -shared -o "$STUB" waitstub.c || exit 1
 echo "   测试驱动: $OUT"
 echo "   真实实现替身: $STUB"
 echo "   被测产物: $LIB"
 
-echo "== 运行 =="
-BXROOT_WAIT_TEST_LIB="$LIB" BXROOT_WAIT_STUB_LIB="$STUB" "$OUT" 2>/dev/null
-RC=$?
+echo "== 运行（kernel-ledger + independent-stub）=="
+RC=0
+BXROOT_WAIT_TEST_LIB="$LIB" BXROOT_WAIT_STUB_LIB="$STUB" \
+    timeout --kill-after=5 60 "$OUT" >"$W/result.log" 2>"$W/runtime.err" || RC=$?
+cat "$W/result.log"
+if [ "$RC" -ne 0 ]; then
+    cat "$W/runtime.err" >&2
+    echo "❌ wait driver rc=$RC"
+    RC=1
+elif [ "$(grep -c '^RESULT: PASS$' "$W/result.log")" -ne 1 ]; then
+    echo "❌ 缺少唯一 PASS 完成标记"
+    RC=1
+fi
+crash_rc=0
+timeout --kill-after=5 10 "$OUT" --crash-selftest >"$W/crash.log" 2>&1 || crash_rc=$?
+if [ "$crash_rc" -ne 1 ] || ! grep -q '子进程被信号 9 终止' "$W/crash.log"; then
+    echo "❌ crash harness 应返回1，实际=$crash_rc"; cat "$W/crash.log"; RC=1
+else
+    echo "✅ 私有子进程崩溃被明确归为 rc1"
+fi
 
 # 顺带做一次符号门禁：四个符号必须**导出**（UND 不算）
 echo "== 符号门禁 =="

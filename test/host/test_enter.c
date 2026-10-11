@@ -128,6 +128,14 @@ static void hasfield(const struct result *r,const char *kind,const char *key,con
     else pos+=(size_t)snprintf(want+pos,sizeof(want)-pos,"<unset>");
     snprintf(want+pos,sizeof(want)-pos,"\n");CHECK(strstr(r->text,want)!=NULL,"field %s:%s expected=%s output=%s",kind,key,value?value:"<unset>",r->text);
 }
+static void has_library_path(const struct result *r,const char *saved)
+{
+    char expected[BX_SESSION_PATH*5];
+    int n=snprintf(expected,sizeof(expected),"%s%s%s/usr/lib/aarch64-linux-gnu:%s/lib/aarch64-linux-gnu:%s/lib:%s/usr/lib",
+                   saved ? saved : "",saved && *saved ? ":" : "",root,root,root,root);
+    CHECK(n>=0 && (size_t)n<sizeof(expected),"library-path fixture fits");
+    if(n>=0 && (size_t)n<sizeof(expected))hasfield(r,"ENV","LD_LIBRARY_PATH",expected);
+}
 static void executable_case(void)
 {
     bx_session s;base(&s);char *cmd[]={helper,"--argv0","custom argv0","--","/usr/bin/probe","space arg","https://example.test/a",NULL};
@@ -136,7 +144,7 @@ static void executable_case(void)
     char expected[BX_SESSION_PATH];makepath(expected,sizeof(expected),"root/usr/bin/probe");hasfield(&r,"ARG","6",expected);hasfield(&r,"ARG","7","space arg");hasfield(&r,"ARG","8","https://example.test/a");
     hasfield(&r,"ENV","FOO","host-updated");hasfield(&r,"ENV","KEEP_EMPTY","");hasfield(&r,"ENV","PAYLOAD","{\"path\":\"/leave/as/is\",\"url\":\"https://example.test/a\"}");
     hasfield(&r,"ENV","PATH","/usr/bin:/bin");hasfield(&r,"ENV","HOME","/guest-home");hasfield(&r,"ENV","TMPDIR","/guest-tmp");hasfield(&r,"ENV","PWD","/");
-    hasfield(&r,"ENV","LD_PRELOAD","/loader/runtime.so");hasfield(&r,"ENV","LD_LIBRARY_PATH","/guest/lib:/guest/usr/lib");hasfield(&r,"ENV","BXROOT_ROOTFS",root);hasfield(&r,"ENV","BXROOT_FAKEROOT","1");hasfield(&r,"ENV","BXROOT_FAKE_UID","1234");hasfield(&r,"ENV","BXROOT_REENTRY","1");hasfield(&r,"ENV","BXROOT_ENTER",helper);hasfield(&r,"ENV","BXROOT_AUTO_HOST","1");
+    hasfield(&r,"ENV","LD_PRELOAD","/loader/runtime.so");has_library_path(&r,"/guest/lib:/guest/usr/lib");hasfield(&r,"ENV","BXROOT_ROOTFS",root);hasfield(&r,"ENV","BXROOT_FAKEROOT","1");hasfield(&r,"ENV","BXROOT_FAKE_UID","1234");hasfield(&r,"ENV","BXROOT_REENTRY","1");hasfield(&r,"ENV","BXROOT_ENTER",helper);hasfield(&r,"ENV","BXROOT_AUTO_HOST","1");
     hasfield(&r,"ENV","BXROOT_WORKDIR","/");hasfield(&r,"ENV","BXROOT_WORKDIR_DONE","1");hasfield(&r,"ENV","BXROOT_GUEST_EXE","/usr/bin/probe");
     hasfield(&r,"ENV","BXROOT_LEAK",NULL);hasfield(&r,"ENV","PROOT_LEAK",NULL);hasfield(&r,"ENV","PROROOT_LEAK",NULL);
     char binds[BX_SESSION_PATH+40];snprintf(binds,sizeof(binds),"%s:/workspace:ro",shared);hasfield(&r,"ENV","BXROOT_BINDS",binds);
@@ -154,6 +162,31 @@ static void executable_case(void)
     char *emptyargv[]={helper,"--argv0","","--","/usr/bin/probe","",NULL};
     r=run(&s,root,emptyargv,0);CHECK(r.rc==17,"empty argv0 and argument accepted rc=%d",r.rc);hasfield(&r,"ARG","3","");hasfield(&r,"ARG","7","");
     setkv(&s,"RETURN_SIGNAL","15");r=run(&s,root,emptyargv,0);CHECK(r.rc==-SIGTERM,"signal exit preserves SIGTERM rc=%d output=%s",r.rc,r.text);
+    bx_session_dispose(&s);
+}
+static void library_path_case(void)
+{
+    bx_session s;base(&s);
+    char *cmd[]={helper,"--","/usr/bin/probe",NULL};
+    char custom[BX_SESSION_PATH*2+32];
+    int n=snprintf(custom,sizeof(custom),"%s/custom-libs:%s/second-libs",shared,root);
+    CHECK(n>=0 && (size_t)n<sizeof(custom),"custom library-path fixture fits");
+    setkv(&s,"_LIBRARY_PATH",custom);
+    struct result r=run(&s,root,cmd,0);
+    CHECK(r.rc==17,"saved custom paths entry rc=%d output=%s",r.rc,r.text);
+    has_library_path(&r,custom);
+    setkv(&s,"_LIBRARY_PATH","");
+    r=run(&s,root,cmd,0);
+    CHECK(r.rc==17,"empty saved paths entry rc=%d output=%s",r.rc,r.text);
+    has_library_path(&r,"");
+    /* Omit the field entirely: missing and empty both require loader fallback. */
+    for(size_t i=0;i<s.nkv;i++)if(!strcmp(s.kv[i].name,"_LIBRARY_PATH")){
+        free(s.kv[i].name);free(s.kv[i].value);
+        memmove(&s.kv[i],&s.kv[i+1],(s.nkv-i-1)*sizeof(s.kv[0]));s.nkv--;break;
+    }
+    r=run(&s,root,cmd,0);
+    CHECK(r.rc==17,"missing saved paths entry rc=%d output=%s",r.rc,r.text);
+    has_library_path(&r,NULL);
     bx_session_dispose(&s);
 }
 static void script_case(void)
@@ -214,7 +247,7 @@ int main(int argc,char **argv)
     elf_bytes(elf,183,"/lib/ld-linux-aarch64.so.1");memset(elf+32,255,8);blob_at("root/usr/bin/phdr-overflow",elf,sizeof(elf),0700);
     char binlink[BX_SESSION_PATH];makepath(binlink,sizeof(binlink),"root/bin");
     if(symlink("usr/bin",binlink)<0){perror("bin link");return 2;}
-    executable_case();script_case();failures_case();conversion_case();
+    executable_case();library_path_case();script_case();failures_case();conversion_case();
     printf("RESULT: %s bx-enter checks=%u failures=%u\n",failures?"FAIL":"PASS",checks,failures);return failures?1:0;
 }
 #endif

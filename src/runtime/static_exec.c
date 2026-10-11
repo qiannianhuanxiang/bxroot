@@ -57,9 +57,9 @@
  *   - 多线程进程拒绝（真 execve 会杀其它线程，我们做不到）→ 调用方回退 stub。
  *   - TLS 切换只对单线程静态程序成立（动态 TLS 取 exec 线程的）。
  *   - ET_EXEC 的固定地址与 runtime/堆冲突时 MAP_FIXED_NOREPLACE 失败 → 回退。
- *   - SIGSYS 用 early handler（不碰 TLS，被 TRAP 的调用回 -ENOSYS），
- *     不再是 runtime 的完整处理器 —— 静态 glibc 在 __libc_setup_tls 前后
- *     TPIDR_EL0 指向不同 TCB，runtime 的处理器会动 errno，不安全。
+ *   - SIGSYS 用 early handler：194..197 交给仅裸 syscall/原子操作的 SHM
+ *     后端，其余 TRAP 回 -ENOSYS；不调用会动动态 TLS/errno 的完整处理器。
+ *     SHM copyout/锁能力仍由后端的 verified 构建 gate 控制。
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -98,6 +98,11 @@ void bxroot_log(const char *fmt, ...);
 
 __attribute__((weak))
 int bxroot_sysvshm_anchor_fd(void);
+__attribute__((weak))
+void bxroot_sysvshm_exec_reset(void);
+__attribute__((weak))
+int bxroot_sysvshm_emulate(long sc, unsigned long a0, unsigned long a1,
+                           unsigned long a2, long *x0);
 
 static int sx_preserve_internal_exec_fd(int fd)
 {
@@ -173,7 +178,7 @@ static unsigned sx_path_mask(long nr)
 /* 需要补丁的站点：入参有路径，或出参是路径（getcwd=17，内核写宿主路径回来）。 */
 static int sx_wants_site(long nr)
 {
-    return sx_path_mask(nr) != 0 || nr == 17;
+    return sx_path_mask(nr) != 0 || nr == 17 || (nr >= 194 && nr <= 197);
 }
 
 /* 反向翻译：把内核写回的宿主路径剥成 guest 视角（用 runtime 自己的剥离逻辑）。 */
@@ -236,6 +241,14 @@ long px_static_dispatch(long a0, long a1, long a2, long a3, long a4, long a5,
     long a[6];
     char buf[2][SX_PATHBUF];
     int i, used = 0;
+
+    if (nr >= 194 && nr <= 197 && bxroot_sysvshm_emulate != NULL) {
+        long result = -38;
+        if (bxroot_sysvshm_emulate(nr, (unsigned long)a0, (unsigned long)a1,
+                                  (unsigned long)a2, &result))
+            return result;
+        return -38;
+    }
 
     if (nr == 78 && sx_guest_exe[0] == '/' &&
         sx_is_proc_self_exe((const char *)(uintptr_t)a1)) {
@@ -715,10 +728,20 @@ static size_t sx_count_sites(const sx_image *img)
 
 static void sx_early_sigsys(int s, void *si, void *uc)
 {
+    unsigned long long *regs;
+    long result = -38;
+    long nr;
     (void)s;
-    if (si == NULL || ((int *)si)[2] != 1)      /* 只处理 seccomp 产生的 */
+    if (si == NULL || uc == NULL || ((int *)si)[2] != 1)
         return;
-    ((unsigned long *)((char *)uc + 184))[0] = (unsigned long)-38;   /* -ENOSYS */
+    /* AArch64 kernel signal ABI: mcontext.regs starts at byte 184.
+     * x8 retains the trapped syscall number; x0 is the return register.
+     * Do not call the dynamic full handler: guest TLS may not be initialized. */
+    regs = (unsigned long long *)((char *)uc + 184);
+    nr = (long)regs[8];
+    if (nr >= 194 && nr <= 197 && bxroot_sysvshm_emulate != NULL)
+        (void)bxroot_sysvshm_emulate(nr, regs[0], regs[1], regs[2], &result);
+    regs[0] = (unsigned long)result;
 }
 
 struct sx_ksigaction {
@@ -750,6 +773,8 @@ static int sx_thread_count(void)
 /* 模拟 execve 对进程状态的重置：信号处理、CLOEXEC 描述符 */
 static void sx_reset_process_state(void)
 {
+    if (bxroot_sysvshm_exec_reset != NULL)
+        bxroot_sysvshm_exec_reset();
     struct sx_ksigaction sa;
     unsigned long unblock = 1UL << (31 - 1);
     int sig, fd;

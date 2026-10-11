@@ -68,6 +68,13 @@ int main(int argc, char **argv)
         char sync_ch;
         if (pipe(pfd) != 0) { printf("pipe=ERR%d\n", errno); return 1; }
         c = fork();
+        if (c < 0) {
+            int fork_errno = errno;
+            close(pfd[0]);
+            close(pfd[1]);
+            printf("fork=ERR%d\n", fork_errno);
+            return 1;
+        }
         if (c == 0) {
             int fd;
             close(pfd[0]);

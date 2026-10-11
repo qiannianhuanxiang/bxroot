@@ -6,6 +6,10 @@
 
 无需给 sigsys/syscall_guard 增加 replay/ALLOW：inline svc 绕过符号 guard，已继承过滤器不能放宽；TRAP 271 不可重放同一个被禁调用。默认 gate 确保 handler 不发出新 syscall。
 
+## 构建入口
+
+确认目标完整过滤链后，运行 `BXROOT_BUILD_SHM_COPYOUT_VERIFIED=1 sh BUILD_RUNTIME.sh` 可构建启用版本。默认值为 0，非 0/1 值会在编译前拒绝。该变量只在构建时生成编译宏，不是 guest 运行时开关；`CFLAGS=-D...` 不会自动覆盖脚本的内部标志。
+
 ## 用法
 
 ```sh

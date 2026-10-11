@@ -135,6 +135,22 @@ static long raw_svc4(long nr, long a0, long a1, long a2, long a3)
     return x0;
 }
 
+/* Bypass our syscall symbol, but not an outer ptracer. */
+static long raw_statx(long flags, long mask, void *out, const char *path)
+{
+    register long x8 __asm__("x8") = 291;
+    register long x0 __asm__("x0") = -100;
+    register long x1 __asm__("x1") = (long)path;
+    register long x2 __asm__("x2") = flags;
+    register long x3 __asm__("x3") = mask;
+    register long x4 __asm__("x4") = (long)out;
+    register long x5 __asm__("x5") = 0;
+    __asm__ __volatile__("svc #0" : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+        : "memory", "cc");
+    return x0;
+}
+
 /* ------------------------------------------------------------------ */
 /* 桩一：路径翻译（由 syscall_guard.c 调用）                            */
 /* ------------------------------------------------------------------ */
@@ -942,22 +958,65 @@ int main(void)
             check("newfstatat(79) 的路径仍被翻译", r == 0 && g_seen_n == 1, buf);
         }
 
-        /* ★ 最关键的一条：statx 的 a4 == NULL 时**绝不能**解引用 ★
-         *
-         * a4 是 `struct statx *`。若有人把 a1 与 a4 弄反（或漏判空），
-         * 内核会回 EFAULT，而我们的补丁代码会去写地址 0 → SIGSEGV，
-         * 整个进程静默消失（本项目在 symlinkat 的 dirfd 上吃过同款）。
-         * 实测内核语义：rc=-1 / errno=EFAULT，且**路径翻译照常发生**
-         * （a1 是有效路径，与 a4 无关）。
-         */
-        seen_reset();
-        errno = 0;
-        r = syscall(291, -100, (long)GSRC, 0, 0x7ff, 0);
-        snprintf(buf, sizeof buf, "rc=%ld errno=%d 桩被调=%d", r, errno, g_seen_n);
-        check("statx 的 a4=NULL 时返回 EFAULT（内核语义，不崩溃）",
-              r == -1 && errno == EFAULT, buf);
-        check("statx 的 a4=NULL 时仍只翻译 a1（不拿 NULL 当路径）",
-              g_seen_n == 1 && g_seen[0] == GSRC && g_seen_bad == 0, buf);
+        /* A NULL output must never be patched in userspace. Compare exactly
+         * with the same translated path under this process's filter/ptracer:
+         * the current outer PRoot returns EINVAL, unlike native Linux EFAULT.
+         * Do not override errors early: invalid flags/mask and missing paths
+         * can take precedence over the output-pointer fault. */
+        {
+            struct {
+                const char *name;
+                long flags, mask;
+                int null_output;
+                const char *guard_path, *raw_path;
+            } probes[] = {
+                {"normal", 0, 0x7ff, 0, GSRC, "/proc/self/status"},
+                {"NULL", 0, 0x7ff, 1, GSRC, "/proc/self/status"},
+                {"invalid-flags/output", 0x80000000L, 0x7ff, 0, GSRC, "/proc/self/status"},
+                {"invalid-flags/NULL", 0x80000000L, 0x7ff, 1, GSRC, "/proc/self/status"},
+                {"reserved-mask/output", 0, 0x80000000L, 0, GSRC, "/proc/self/status"},
+                {"reserved-mask/NULL", 0, 0x80000000L, 1, GSRC, "/proc/self/status"},
+                {"missing/NULL", 0, 0x7ff, 1, "/proc/self/bxroot-no-such-statx", "/proc/self/bxroot-no-such-statx"}
+            };
+            for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+                struct statx baseline_out, guarded_out;
+                void *baseline_ptr = probes[i].null_output ? NULL : &baseline_out;
+                void *guarded_ptr = probes[i].null_output ? NULL : &guarded_out;
+                long baseline = raw_statx(probes[i].flags, probes[i].mask,
+                                          baseline_ptr, probes[i].raw_path);
+                int saved_errno;
+                seen_reset();
+                errno = 0;
+                r = syscall(291, -100L, (long)probes[i].guard_path,
+                            probes[i].flags, probes[i].mask, (long)guarded_ptr, 0L);
+                saved_errno = errno;
+                snprintf(buf, sizeof buf, "%s raw=%ld guard=%ld errno=%d translations=%d",
+                         probes[i].name, baseline, r, saved_errno, g_seen_n);
+                check("statx 返回值/errno 精确匹配同参 raw 基线",
+                      baseline < 0 ? r == -1 && saved_errno == -baseline : r == baseline, buf);
+                check("statx 仅翻译 a1，不把输出指针当路径",
+                      g_seen_n == 1 && g_seen[0] == probes[i].guard_path && g_seen_bad == 0, buf);
+                if (i == 0)
+                    check("statx 正常基线确实成功且输出字段有效",
+                          baseline == 0 && baseline_out.stx_mode != 0 && guarded_out.stx_mode == baseline_out.stx_mode, buf);
+                else if (i == 1)
+                    check("statx NULL 基线确实拒绝输出指针", baseline < 0, buf);
+                else if (i < 6) {
+                    /* The outer PRoot may ignore these validation bits with
+                     * a valid output. Exact equality above is mandatory even
+                     * then; it does not prove native Linux rejects the bits. */
+                    if (baseline < 0)
+                        check("statx 非法参数的原始错误优先级没有被 NULL 抢占",
+                              r == -1 && saved_errno == -baseline, buf);
+                    else
+                        check("statx 外层未拒绝参数时 guard 不编造错误",
+                              r == baseline && guarded_out.stx_mode == baseline_out.stx_mode, buf);
+                }
+                else
+                    check("statx 缺失路径保持 ENOENT 优先级",
+                          baseline == -ENOENT && r == -1 && saved_errno == ENOENT, buf);
+            }
+        }
 
         /* 负向：身份号调用**不得**触碰翻译桩 */
         seen_reset();

@@ -26,12 +26,31 @@ set -u
 ROOT=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT" || exit 1
 
-# 产物目录：全新克隆时不存在，必须自建 —— 否则链接阶段报
-# "cannot open output file .../build/....tmp: No such file or directory"，
-# 而且这个错误**不是 ICE**，会直接判定为"真错误"退出，不会重试。
-mkdir -p "$ROOT/build" || { echo "❌ 无法创建 build 目录"; exit 1; }
-
-OUT="$ROOT/build/libbxroot-runtime.so"
+# Build profiles are deliberately separate. The safe default remains gate-off until
+# the complete APK guest filter chain is verified.
+PROFILE="${BXROOT_BUILD_PROFILE:-default}"
+case "$PROFILE" in
+    default)
+        COPYOUT_VERIFIED=0
+        CLAIM_VERIFIED=0
+        OUT_DIR="$ROOT/build"
+        ;;
+    verified)
+        COPYOUT_VERIFIED="${BXROOT_BUILD_SHM_COPYOUT_VERIFIED:-}"
+        CLAIM_VERIFIED="${BXROOT_BUILD_SHM_CLAIM_VERIFIED:-}"
+        [ "$COPYOUT_VERIFIED" = 1 ] && [ "$CLAIM_VERIFIED" = 1 ] || {
+            echo "verified profile requires BXROOT_BUILD_SHM_COPYOUT_VERIFIED=1 and BXROOT_BUILD_SHM_CLAIM_VERIFIED=1" >&2
+            exit 1
+        }
+        OUT_DIR="$ROOT/build/verified"
+        ;;
+    *)
+        echo "invalid BXROOT_BUILD_PROFILE: use default or verified" >&2
+        exit 1
+        ;;
+esac
+mkdir -p "$OUT_DIR" || { echo "❌ 无法创建产物目录 $OUT_DIR"; exit 1; }
+OUT="$OUT_DIR/libbxroot-runtime.so"
 
 # ★ 中间产物与日志必须按进程隔离 ★
 #
@@ -92,6 +111,9 @@ WARN="-Wall -Wextra -Wformat=2 -Wno-nonnull-compare -Wno-unused-parameter"
 CFLAGS="-shared -fPIC $WARN -D_GNU_SOURCE="
 INCS="-Isrc/l2s -Isrc/runtime"
 DEFS="-DFAKEROOT_PURE_LOGIC -DPX_PURE_LOGIC=0"
+# Gate values are selected by PROFILE above; default is deliberately disabled.
+DEFS="$DEFS -DBXROOT_SHM_COPYOUT_VERIFIED=$COPYOUT_VERIFIED"
+DEFS="$DEFS -DBXROOT_SHM_CLAIM_VERIFIED=$CLAIM_VERIFIED"
 # ★ 16KB 页对齐（Android 15+ 16KB 内核设备硬要求；DSHA 集成调研 §六.2）
 LDFLAGS="-ldl -nostartfiles -Wl,-z,max-page-size=16384"
 
@@ -125,7 +147,9 @@ done
 echo "== 构建 libbxroot-runtime.so =="
 echo "   编译器     : $CC ($("$CC" -dumpversion))"
 echo "   proc.c     : $PROC_DIR/proc.c"
-echo "   起始优化   : $START_OPT"
+echo "   profile    : $PROFILE (copyout=$COPYOUT_VERIFIED claim=$CLAIM_VERIFIED)"
+echo "   output     : $OUT"
+echo "   start opt  : $START_OPT"
 
 # ------------------------------------------------------------------
 # 单次尝试。成功返回 0（产物已在 $TMP）。
@@ -184,6 +208,11 @@ if [ "$RC" -ne 0 ]; then
 fi
 
 mv -f "$TMP" "$OUT" || { echo "❌ mv 失败"; exit 1; }
+printf 'profile=%s\ncopyout_verified=%s\nclaim_verified=%s\ncompiler=%s\n' \
+    "$PROFILE" "$COPYOUT_VERIFIED" "$CLAIM_VERIFIED" "$CC" > "$OUT_DIR/BUILD-METADATA" || {
+        echo "❌ 无法写入构建能力元数据" >&2
+        exit 1
+    }
 
 # ------------------------------------------------------------------
 # 交付检查：产物存在 + D4 的 19 个符号已导出

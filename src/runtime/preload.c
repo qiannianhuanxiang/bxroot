@@ -66,6 +66,44 @@
  */
 #include "fakeroot.h"
 #include "crash.h"
+#include "shm-fork.h"
+
+extern void bxroot_sysvshm_fork_prepare(void) __attribute__((weak));
+extern void bxroot_sysvshm_fork_parent(void) __attribute__((weak));
+extern void bxroot_sysvshm_fork_child(void) __attribute__((weak));
+
+static void bxroot_preload_fork_prepare(void)
+{
+    if (bxroot_sysvshm_fork_prepare != NULL)
+        bxroot_sysvshm_fork_prepare();
+}
+
+static void bxroot_preload_fork_parent(void)
+{
+    if (bxroot_sysvshm_fork_parent != NULL)
+        bxroot_sysvshm_fork_parent();
+}
+
+static void bxroot_preload_fork_child(void)
+{
+    if (bxroot_sysvshm_fork_child != NULL)
+        bxroot_sysvshm_fork_child();
+}
+
+static int bxroot_preload_register_fork_hooks(void)
+{
+    static int registered;
+    int r;
+    if (registered)
+        return 0;
+    r = pthread_atfork(bxroot_preload_fork_prepare,
+                       bxroot_preload_fork_parent,
+                       bxroot_preload_fork_child);
+    if (r == 0)
+        registered = 1;
+    return r;
+}
+
 /*
  * D4 进程管理层（P0-3）。
  *
@@ -13580,6 +13618,8 @@ static void constructor(void) {
      * preload.c 的翻译器共享同一套语义，先有配置再注入翻译器。
      */
     px_runtime_init();
+    if (bxroot_preload_register_fork_hooks() != 0)
+        bxroot_log("SysV SHM fork hooks registration failed; fork claim handoff disabled\n");
 
     /*
      * 把自己记进 pid 账本。
