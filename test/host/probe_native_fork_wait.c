@@ -6,6 +6,8 @@
 #include "proc.h"
 #pragma weak px_runtime_ledger
 #pragma weak px_ledger_get
+extern px_ledger *px_runtime_ledger(void);
+extern int px_ledger_get(const px_ledger *, pid_t, px_entry_kind, px_procinfo *);
 extern int bxroot_sysvshm_fork_begin(void) __attribute__((weak));
 extern void bxroot_sysvshm_fork_end(void) __attribute__((weak));
 int main(void) {

@@ -1,0 +1,35 @@
+name: native-arm64
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Native compile and syntax checks
+        run: BXROOT_NATIVE_CI_OUTPUT="$RUNNER_TEMP/bxroot-native-ci-results" sh test/RUN_NATIVE_CI.sh --compile-only
+      - name: Native l2s, SHM and process regression
+        run: BXROOT_NATIVE_CI_OUTPUT="$RUNNER_TEMP/bxroot-native-ci-results" sh test/RUN_NATIVE_CI.sh run
+      - name: Preserve test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-arm64-evidence
+          path: |
+            ${{ runner.temp }}/bxroot-native-ci-results/**/*.log
+            ${{ runner.temp }}/bxroot-native-ci-results/**/results.txt
+            ${{ runner.temp }}/bxroot-native-ci-results/**/metadata.txt
+          if-no-files-found: warn
+          retention-days: 7

@@ -79,6 +79,11 @@ static int cleanup_fixture(void) {
  if(rmdir(fixture_dir))failed=1;
  return failed;
 }
+static volatile sig_atomic_t delivered_traps;
+static void observed_early_sigsys(int sig,siginfo_t *info,void *ctx) {
+ if(info && info->si_code==1) delivered_traps++;
+ sx_early_sigsys(sig,info,ctx);
+}
 static int run(void){
  long id=-1,r; struct shmid_ds ds;
  if(!mkdtemp(fixture_dir))return 1;
@@ -88,11 +93,22 @@ static int run(void){
  if(!sx_wants_site(194)||!sx_wants_site(197)||sx_wants_site(198))return 1;
  /* Actual static-exec reset must install early handler and retain anchor. */
  sx_reset_process_state();
+ struct sigaction observer={0};
+ observer.sa_sigaction=observed_early_sigsys;observer.sa_flags=SA_SIGINFO;
+ sigemptyset(&observer.sa_mask);
+ if(sigaction(SIGSYS,&observer,NULL))return 1;
+ delivered_traps=0;
  struct sock_filter f[]={BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K,194,0,2),BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K,197,1,0),BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_TRAP),BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
  struct sock_fprog p={sizeof f/sizeof f[0],f};
  if(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)||prctl(PR_SET_SECCOMP,SECCOMP_MODE_FILTER,&p)){perror("filter");return 2;}
  id=raw(194,0,4096,0600);
- if(id<0){printf("TRAP_UNREACHED create=%ld; outer filter/ptracer prevents SHM trap dispatch\n",id);return 2;}
+ if(!delivered_traps){printf("TRAP_UNREACHED create=%ld; outer filter/ptracer prevents SHM trap dispatch\n",id);return 2;}
+#if !BXROOT_SHM_CLAIM_VERIFIED
+ if(id!=-ENOSYS)return 1;
+ puts("STATIC_SHM_SYSCALL_PASS");return 0;
+#else
+ if(id<0){fprintf(stderr,"FAIL delivered SHM TRAP create=%ld\n",id);return 1;}
+#endif
  r=raw(195,id,2,(long)&ds);
 #if BXROOT_SHM_COPYOUT_VERIFIED
  if(r||ds.shm_segsz!=4096)return 1;
