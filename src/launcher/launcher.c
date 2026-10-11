@@ -2217,11 +2217,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "错误: execve(%s) 失败: %s\n", cfg.guest_exe, strerror(e));
         if (!cfg.quiet)
             explain_exec_failure(cfg.guest_exe, cfg.rootfs, e);
+        /* 与 shell 约定一致：找不到 127，找到但不能执行 126
+         * （原先一律 1，脚本无法区分"命令不存在"与"命令自己失败返回 1"）。 */
+        /* ENOENT 既可能表示命令本身不存在，也可能表示已有脚本的解释器不存在。
+         * 后者属于“找到但不能执行”，应返回 shell 约定的 126。 */
+        int exit_code = (e == ENOENT) ? 127 : 126;
+        if (e == ENOENT) {
+            struct stat target_st;
+            /* 只确认目标本体存在且可执行；不要在失败路径阻塞读取未知文件。 */
+            if (stat(cfg.guest_exe, &target_st) == 0 &&
+                (target_st.st_mode & 0111) != 0)
+                exit_code = 126;
+        }
         free_config(&cfg);
-        /*
-         * 与 shell 约定一致：找不到 127，找到但不能执行 126
-         * （原先一律 1，脚本无法区分"命令不存在"与"命令自己失败返回 1"）。
-         */
-        return (e == ENOENT) ? 127 : 126;
+        return exit_code;
     }
 }

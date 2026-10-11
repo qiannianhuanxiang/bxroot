@@ -85,7 +85,17 @@ chk() {   # $1 文件  $2 期望诊断片段  $3 期望 rc
 chk badinterp '解释器 /nonexistent/interp 在 rootfs 内不存在' 126
 chk plain     '没有 #! 行的文本文件' 126
 chk noexec    '没有执行权限' 126
-chk crlf      'Windows 换行' 126
+# Compare the actual execution layer, without attributing behavior to kernel versions.
+build -static -O1 -Wall -Wextra -Werror -o "$W/native" "$ROOT/test/exec/probe_crlf_baseline.c" || exit 1
+"$W/native" "$D/crlf" >"$W/crlf.native" 2>"$W/crlf.native.err"; native_rc=$?
+"$W/L" -r / -w /tmp "$D/crlf" >"$W/crlf.bx" 2>"$W/crlf.bx.err"; crlf_rc=$?
+if [ "$native_rc" = 126 ] && [ "$crlf_rc" = 126 ] && grep -qF 'Windows 换行' "$W/crlf.bx.err"; then
+    good "crlf：失败诊断与原生执行基线一致"
+elif [ "$native_rc" = 0 ] && [ "$crlf_rc" = 0 ] && cmp -s "$W/crlf.native" "$W/crlf.bx"; then
+    good "crlf：执行环境接受，完整输出与原生基线一致"
+else
+    bad "crlf：与原生基线不一致 native=$native_rc bxroot=$crlf_rc"
+fi
 chk empty     '文件是空的' 126
 # x86：外层 stub-loader 可能先于内核报错，诊断不一定能走到；只要求不是 0
 out=$("$W/L" -r / -w /tmp "$D/x86" 2>&1); rc=$?

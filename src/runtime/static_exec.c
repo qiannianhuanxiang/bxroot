@@ -96,6 +96,15 @@ int bxroot_resolve_abs_symlink(const char *translated, char *out, size_t out_siz
 __attribute__((weak))
 void bxroot_log(const char *fmt, ...);
 
+__attribute__((weak))
+int bxroot_sysvshm_anchor_fd(void);
+
+static int sx_preserve_internal_exec_fd(int fd)
+{
+    return bxroot_sysvshm_anchor_fd != NULL &&
+           bxroot_sysvshm_anchor_fd() == fd;
+}
+
 /* 新程序的 guest 视角可执行路径（来自 envp 的 BXROOT_GUEST_EXE），答 /proc/self/exe 用。 */
 static char sx_guest_exe[PATH_MAX];
 
@@ -780,7 +789,7 @@ static void sx_reset_process_state(void)
      */
     for (fd = 3; fd < 1024; fd++) {
         long fl = SC(SYS_fcntl, fd, F_GETFD, 0, 0);
-        if (fl >= 0 && (fl & FD_CLOEXEC))
+        if (fl >= 0 && (fl & FD_CLOEXEC) && !sx_preserve_internal_exec_fd(fd))
             SC(SYS_close, fd, 0, 0, 0);
     }
     {
@@ -798,7 +807,7 @@ static void sx_reset_process_state(void)
                     while (*nm >= '0' && *nm <= '9') { v = v * 10 + (*nm - '0'); nm++; digits++; }
                     if (digits && *nm == '\0' && v >= 1024 && v != dfd) {
                         long fl = SC(SYS_fcntl, v, F_GETFD, 0, 0);
-                        if (fl >= 0 && (fl & FD_CLOEXEC))
+                        if (fl >= 0 && (fl & FD_CLOEXEC) && !sx_preserve_internal_exec_fd((int)v))
                             SC(SYS_close, v, 0, 0, 0);
                     }
                     if (reclen == 0) break;

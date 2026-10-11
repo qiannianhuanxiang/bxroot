@@ -39,15 +39,27 @@ static int guest_env(const bx_session *s,int fd,const char *cwd,const char *exe,
     }
     i=(size_t)env_set("BXROOT_BINDS",binds);free(binds);if(i)return -1;
     snprintf(num,sizeof(num),"%d",fd);
-    if(!bx_session_get(s,"_LIBRARY_PATH")) {
+    {
         const char *root=val(s,"BXROOT_ROOTFS","");
+        /* The native loader resolves dependencies before guest preload hooks exist.
+         * Always supply host-visible default directories, even when the session
+         * saved an LD_LIBRARY_PATH containing only guest-visible paths. */
         if(snprintf(libs,sizeof(libs),"%s/usr/lib/aarch64-linux-gnu:%s/lib/aarch64-linux-gnu:%s/lib:%s/usr/lib",root,root,root,root)>=(int)sizeof(libs)) {errno=ENAMETOOLONG;return -1;}
+        const char *saved=bx_session_get(s,"_LIBRARY_PATH");
+        size_t len=strlen(libs), extra=saved ? strlen(saved) : 0;
+        char *search=calloc(len+extra+2,1);
+        if(!search)return -1;
+        memcpy(search,libs,len);
+        if(extra) {search[len]=':';memcpy(search+len+1,saved,extra);}
+        int rc=env_set("LD_LIBRARY_PATH",search);
+        free(search);
+        if(rc)return -1;
     }
     return env_set("BXROOT_SESSION_FD",num) || env_set("PATH",val(s,"_GUEST_PATH",BX_HOST_GUEST_DEFAULT_PATH)) ||
         env_set("HOME",val(s,"_GUEST_HOME","/root")) || env_set("TMPDIR",val(s,"_GUEST_TMPDIR","/tmp")) ||
         env_set("PWD",cwd) || env_set("BXROOT_WORKDIR",cwd) || env_set("BXROOT_WORKDIR_DONE","1") ||
         env_set("BXROOT_GUEST_EXE",exe) || env_set("BXROOT_ORIG_COMM",comm) ||
-        env_set("LD_LIBRARY_PATH",val(s,"_LIBRARY_PATH",libs)) || env_set("LD_PRELOAD",val(s,"_RUNTIME",NULL)) ||
+        env_set("LD_PRELOAD",val(s,"_RUNTIME",NULL)) ||
         env_set("BXROOT_LD_PRELOAD",val(s,"_RUNTIME",NULL)) || env_set("PROROOT_LIB_PATH",val(s,"_RUNTIME",NULL));
 }
 static int executable(const bx_session *s,const char *name,const char *cwd,char *guest,char *host)

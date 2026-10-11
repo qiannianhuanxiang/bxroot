@@ -106,6 +106,7 @@ $(BUILD_DIR)/libbxroot-runtime.so: src/runtime/preload.c src/runtime/config.h \
         src/runtime/fakeroot.c src/runtime/fakeroot.h \
         src/runtime/crash.c src/runtime/crash.h \
         src/runtime/sigsys.c src/runtime/sigsys.h \
+        src/runtime/shm-copyout.h src/runtime/sysvshm.c \
         src/runtime/syscall_guard.c src/runtime/syscall_guard.h \
         src/runtime/livepatch.c src/runtime/livepatch.h \
         src/runtime/static_exec.c src/runtime/static_exec.h \

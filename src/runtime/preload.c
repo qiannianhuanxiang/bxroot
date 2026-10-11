@@ -13528,8 +13528,9 @@ static void constructor(void) {
      */
     {
         char shm_dir[MAX_PATH_LEN];
-        if (translate_path("/tmp/.proroot-shm", shm_dir, sizeof(shm_dir)) >= 0)
-            bxroot_sysvshm_init(shm_dir);
+        if (translate_path("/tmp/.proroot-shm", shm_dir, sizeof(shm_dir)) >= 0 &&
+            bxroot_sysvshm_init(shm_dir) != 0)
+            bxroot_log("SysV SHM anchor initialization failed; emulation disabled\n");
     }
 
     /*

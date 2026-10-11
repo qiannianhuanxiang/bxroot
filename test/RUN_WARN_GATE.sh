@@ -113,6 +113,7 @@ fi
 UNITS="src/runtime/preload.c
 src/runtime/syscall_guard.c
 src/runtime/sigsys.c
+src/runtime/sysvshm.c
 src/runtime/crash.c
 src/runtime/livepatch.c
 src/runtime/fakeroot.c

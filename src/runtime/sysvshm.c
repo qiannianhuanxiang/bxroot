@@ -41,6 +41,10 @@
  */
 
 #include <stdint.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/shm.h>
+#include "shm-copyout.h"
 
 #define SHM_NR_GET  194
 #define SHM_NR_CTL  195
@@ -50,6 +54,7 @@
 #define ERR_EXIST   1   /* EPERM：官方对 EXCL 冲突的回答（内核 EEXIST=17） */
 #define ERR_NOENT   1   /* EPERM：官方对缺键的回答（内核 ENOENT=2） */
 #define ERR_INVAL   1   /* EPERM：官方对无效 id/地址/cmd 的回答（内核 EINVAL=22） */
+#define ERR_AGAIN  11   /* bxroot 内部 key claim 忙：不等待、不破坏其他 mutator */
 
 /* aarch64 裸号 */
 #define NR_OPENAT     56
@@ -73,6 +78,8 @@
 #define K_O_EXCL     0200
 #define K_O_WRONLY   01
 #define K_O_CLOEXEC  02000000
+#define K_O_NOFOLLOW 0400000
+#define K_O_NONBLOCK 04000
 #define K_PROT_RW    3
 #define K_PROT_R     1
 #define K_MAP_SHARED 1
@@ -107,18 +114,61 @@ static long shm_svc6(long nr, long a, long b, long c, long d, long e, long f)
 /* ---------------- 目录 ---------------- */
 
 static char g_shm_dir[512];
+static volatile int g_shm_dirfd = -1;
 static volatile int g_shm_ready = 0;
+static dev_t g_shm_dev;
+static ino_t g_shm_ino;
+static uid_t g_shm_owner; /* directory owner snapshot; no getuid in handler */
+
+int bxroot_sysvshm_anchor_fd(void)
+{
+    return __atomic_load_n(&g_shm_dirfd, __ATOMIC_ACQUIRE);
+}
+
+static int shm_anchor_valid(void)
+{
+    struct stat st;
+    int fd = bxroot_sysvshm_anchor_fd();
+    long r;
+    if (fd < 0 || !__atomic_load_n(&g_shm_ready, __ATOMIC_ACQUIRE))
+        return 0;
+    r = shm_svc6(NR_FSTAT, fd, (long)&st, 0, 0, 0, 0);
+    return r == 0 && S_ISDIR(st.st_mode) &&
+           st.st_dev == g_shm_dev && st.st_ino == g_shm_ino &&
+           st.st_uid == g_shm_owner && (st.st_mode & 0077) == 0;
+}
 
 int bxroot_sysvshm_init(const char *host_dir)
 {
+    struct stat st;
     size_t n;
+    long fd, r;
     if (host_dir == NULL)
         return -1;
+    if (__atomic_load_n(&g_shm_ready, __ATOMIC_ACQUIRE))
+        return shm_anchor_valid() ? 0 : -1;
     n = strlen(host_dir);
-    /* 给 "/seg-<20位>" / "/key-<-20位>" / ".tmp-<16>" 留足余量 */
     if (n == 0 || n + 64 >= sizeof(g_shm_dir))
         return -1;
+    /* Constructor-time setup only; never reopen paths from SIGSYS context. */
+    r = shm_svc6(NR_MKDIRAT, K_AT_FDCWD, (long)host_dir, 0700, 0, 0, 0);
+    if (r < 0 && r != -17 /* EEXIST */)
+        return -1;
+    fd = shm_svc6(NR_OPENAT, K_AT_FDCWD, (long)host_dir,
+                  K_O_DIRECTORY | K_O_CLOEXEC | K_O_NOFOLLOW | K_O_NONBLOCK,
+                  0, 0, 0);
+    if (fd < 0)
+        return -1;
+    r = shm_svc6(NR_FSTAT, fd, (long)&st, 0, 0, 0, 0);
+    if (r < 0 || !S_ISDIR(st.st_mode) || (st.st_mode & 0077) != 0) {
+        SVC(NR_CLOSE, fd, 0, 0);
+        return -1;
+    }
     memcpy(g_shm_dir, host_dir, n + 1);
+    g_shm_dev = st.st_dev;
+    g_shm_ino = st.st_ino;
+    g_shm_owner = st.st_uid;
+    __atomic_store_n(&g_shm_dirfd, (int)fd, __ATOMIC_RELEASE);
     __atomic_store_n(&g_shm_ready, 1, __ATOMIC_RELEASE);
     return 0;
 }
@@ -136,15 +186,13 @@ static char *shm_putl(char *p, long v)
 }
 static void shm_path(char *buf, const char *kind, long v)
 {
-    char *p = shm_puts(buf, g_shm_dir);
-    p = shm_puts(p, kind);
+    char *p = shm_puts(buf, kind[0] == '/' ? kind + 1 : kind);
     shm_putl(p, v);
 }
 
-static void shm_mkdir(void)
+static int shm_mkdir(void)
 {
-    /* 0700：与官方一致；已存在返回 -EEXIST，忽略 */
-    shm_svc6(NR_MKDIRAT, K_AT_FDCWD, (long)g_shm_dir, 0700, 0, 0, 0);
+    return shm_anchor_valid() ? 0 : -1;
 }
 
 /* ---------------- id 分配 ---------------- */
@@ -168,8 +216,9 @@ static long shm_new_segment(long size, int *out_fd)
             continue;
         shm_path(path, "/seg-", id);
         /* openat(dfd, path, flags, mode)：mode 在 a3，必须显式给 0600 */
-        fd = shm_svc6(NR_OPENAT, K_AT_FDCWD, (long)path,
-                      K_O_RDWR | K_O_CREAT | K_O_EXCL | K_O_CLOEXEC, 0600, 0, 0);
+        fd = shm_svc6(NR_OPENAT, bxroot_sysvshm_anchor_fd(), (long)path,
+                      K_O_RDWR | K_O_CREAT | K_O_EXCL | K_O_CLOEXEC | K_O_NOFOLLOW,
+                      0600, 0, 0);
         if (fd == -K_EEXIST)
             continue;
         if (fd < 0)
@@ -178,7 +227,7 @@ static long shm_new_segment(long size, int *out_fd)
             long t = SVC(NR_FTRUNCATE, fd, size, 0);
             if (t < 0) {
                 SVC(NR_CLOSE, fd, 0, 0);
-                SVC(NR_UNLINKAT, K_AT_FDCWD, path, 0);
+                SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), path, 0);
                 return t;
             }
         }
@@ -188,66 +237,158 @@ static long shm_new_segment(long size, int *out_fd)
     return -ERR_INVAL;
 }
 
+static int shm_fd_is_private_file(long fd)
+{
+    struct stat st;
+    long r = shm_svc6(NR_FSTAT, fd, (long)&st, 0, 0, 0, 0);
+    if (r < 0 || !S_ISREG(st.st_mode) || st.st_uid != g_shm_owner ||
+        (st.st_mode & 0077) != 0)
+        return 0;
+    return 1;
+}
+
 static long shm_open_seg(long id, int rdonly)
 {
     char path[600];
     if (id <= 0 || id > 0x7fffffffL)
         return -ERR_INVAL;
     shm_path(path, "/seg-", id);
-    return SVC(NR_OPENAT, K_AT_FDCWD, path,
-               (rdonly ? 0 : K_O_RDWR) | K_O_CLOEXEC);
+    {
+        long fd = SVC(NR_OPENAT, bxroot_sysvshm_anchor_fd(), path,
+                      (rdonly ? 0 : K_O_RDWR) | K_O_CLOEXEC | K_O_NOFOLLOW | K_O_NONBLOCK);
+        if (fd < 0)
+            return fd;
+        if (!shm_fd_is_private_file(fd)) {
+            SVC(NR_CLOSE, fd, 0, 0);
+            return -ERR_INVAL;
+        }
+        return fd;
+    }
 }
 
 /* ---------------- key 表 ---------------- */
+
+/* 只接受正的 31-bit 十进制 id，末尾允许一个换行。 */
+static int shm_parse_id(const char *s, long n, long *out)
+{
+    long v = 0;
+    long i = 0;
+    int digits = 0;
+    if (s == NULL || out == NULL || n <= 0)
+        return -1;
+    while (i < n && s[i] >= '0' && s[i] <= '9') {
+        int d = s[i] - '0';
+        if (v > (0x7fffffffL - d) / 10)
+            return -1;
+        v = v * 10 + d;
+        digits = 1;
+        i++;
+    }
+    if (!digits || v <= 0)
+        return -1;
+    if (i < n && s[i] == '\n')
+        i++;
+    if (i != n)
+        return -1;
+    *out = v;
+    return 0;
+}
+
+static int shm_parse_key_name(const char *s, long n, long *out)
+{
+    long i = 0, v = 0;
+    int sign = 1, digits = 0;
+    if (s == NULL || out == NULL || n <= 0)
+        return -1;
+    if (s[i] == '-') { sign = -1; i++; }
+    while (i < n && s[i] >= '0' && s[i] <= '9') {
+        int d = s[i] - '0';
+        if (v > (0x7fffffffL - d) / 10)
+            return -1;
+        v = v * 10 + d;
+        digits = 1;
+        i++;
+    }
+    if (!digits || i != n)
+        return -1;
+    *out = sign * v;
+    return 0;
+}
 
 static long shm_read_key(long key)
 {
     char path[600], b[32];
     long fd, n, v = 0;
-    int i, any = 0;
     shm_path(path, "/key-", key);
-    fd = SVC(NR_OPENAT, K_AT_FDCWD, path, K_O_CLOEXEC);
+    fd = SVC(NR_OPENAT, bxroot_sysvshm_anchor_fd(), path, K_O_CLOEXEC | K_O_NOFOLLOW | K_O_NONBLOCK);
     if (fd < 0)
         return fd;
-    n = SVC(NR_READ, fd, b, sizeof b - 1);
-    SVC(NR_CLOSE, fd, 0, 0);
-    if (n <= 0)
+    if (!shm_fd_is_private_file(fd)) {
+        SVC(NR_CLOSE, fd, 0, 0);
         return -ERR_NOENT;
-    for (i = 0; i < n && b[i] >= '0' && b[i] <= '9'; i++) {
-        v = v * 10 + (b[i] - '0');
-        any = 1;
     }
-    return any ? v : -ERR_NOENT;
+    n = SVC(NR_READ, fd, b, sizeof b);
+    SVC(NR_CLOSE, fd, 0, 0);
+    if (n <= 0 || n >= (long)sizeof b || shm_parse_id(b, n, &v) != 0)
+        return -ERR_NOENT;
+    return v;
 }
 
-/*
- * 原子发布 key → id：先写临时文件，再 renameat2(NOREPLACE)。
- * 两个进程同时 CREAT 同一 key 时只有一个 rename 成功，输家读回赢家的 id。
- */
+static long shm_claim_key(long key)
+{
+    char path[600];
+    long fd;
+    shm_path(path, "/.claim-key-", key);
+    fd = shm_svc6(NR_OPENAT, bxroot_sysvshm_anchor_fd(), (long)path,
+                  K_O_WRONLY | K_O_CREAT | K_O_EXCL | K_O_CLOEXEC | K_O_NOFOLLOW,
+                  0600, 0, 0);
+    if (fd == -K_EEXIST)
+        return -ERR_AGAIN;
+    return fd;
+}
+
+static void shm_release_claim(long fd, long key)
+{
+    char path[600];
+    if (fd >= 0)
+        SVC(NR_CLOSE, fd, 0, 0);
+    shm_path(path, "/.claim-key-", key);
+    SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), path, 0);
+}
+
+/* bxroot claim 持有期间发布 key，官方 decimal key 内容保持不变。 */
 static long shm_publish_key(long key, long id)
 {
     char tmp[600], path[600], b[24], *p;
     long fd, r;
     unsigned int rnd = 0;
     SVC(NR_GETRANDOM, &rnd, sizeof rnd, 0);
-    p = shm_puts(tmp, g_shm_dir);
-    p = shm_puts(p, "/.tmp-key-");
+    p = shm_puts(tmp, ".tmp-key-");
     p = shm_putl(p, id);
     p = shm_puts(p, "-");
     shm_putl(p, (long)rnd);
-    fd = shm_svc6(NR_OPENAT, K_AT_FDCWD, (long)tmp,
-                  K_O_WRONLY | K_O_CREAT | K_O_EXCL | K_O_CLOEXEC, 0600, 0, 0);
+    fd = shm_svc6(NR_OPENAT, bxroot_sysvshm_anchor_fd(), (long)tmp,
+                  K_O_WRONLY | K_O_CREAT | K_O_EXCL | K_O_CLOEXEC | K_O_NOFOLLOW,
+                  0600, 0, 0);
     if (fd < 0)
         return fd;
     p = shm_putl(b, id);
     *p++ = '\n';
-    SVC(NR_WRITE, fd, b, p - b);
+    {
+        long want = p - b;
+        long wrote = SVC(NR_WRITE, fd, b, want);
+        if (wrote != want) {
+            SVC(NR_CLOSE, fd, 0, 0);
+            SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), tmp, 0);
+            return wrote < 0 ? wrote : -ERR_INVAL;
+        }
+    }
     SVC(NR_CLOSE, fd, 0, 0);
     shm_path(path, "/key-", key);
-    r = shm_svc6(NR_RENAMEAT2, K_AT_FDCWD, (long)tmp, K_AT_FDCWD, (long)path,
+    r = shm_svc6(NR_RENAMEAT2, bxroot_sysvshm_anchor_fd(), (long)tmp, bxroot_sysvshm_anchor_fd(), (long)path,
                  K_RENAME_NOREPLACE, 0);
     if (r < 0)
-        SVC(NR_UNLINKAT, K_AT_FDCWD, tmp, 0);
+        SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), tmp, 0);
     return r;
 }
 
@@ -255,61 +396,105 @@ static long shm_publish_key(long key, long id)
  * 删除所有内容为 "<id>\n" 的 key-* 文件。用 getdents64 扫目录（处理器里
  * 不能用 opendir/readdir —— 它们会 malloc）。
  */
-static void shm_unlink_keys_of(long id)
+static long shm_unlink_keys_of(long id)
 {
     char dbuf[2048], path[600];
     long dfd, n;
-    dfd = shm_svc6(NR_OPENAT, K_AT_FDCWD, (long)g_shm_dir,
-                   K_O_DIRECTORY | K_O_CLOEXEC, 0, 0, 0);
+    dfd = shm_svc6(NR_OPENAT, bxroot_sysvshm_anchor_fd(), (long)".",
+                   K_O_DIRECTORY | K_O_CLOEXEC | K_O_NOFOLLOW, 0, 0, 0);
     if (dfd < 0)
-        return;
+        return dfd;
     while ((n = SVC(NR_GETDENTS64, dfd, dbuf, sizeof dbuf)) > 0) {
         long off = 0;
         while (off < n) {
-            /* linux_dirent64: ino(8) off(8) reclen(2) type(1) name[] */
-            unsigned short reclen = *(unsigned short *)(dbuf + off + 16);
-            const char *name = dbuf + off + 19;
-            if (name[0] == 'k' && name[1] == 'e' && name[2] == 'y' && name[3] == '-') {
-                long key = 0, sign = 1;
-                const char *q = name + 4;
-                int ok = 0;
-                if (*q == '-') { sign = -1; q++; }
-                while (*q >= '0' && *q <= '9') { key = key * 10 + (*q - '0'); q++; ok = 1; }
-                if (ok && *q == 0 && shm_read_key(sign * key) == id) {
-                    shm_path(path, "/key-", sign * key);
-                    SVC(NR_UNLINKAT, K_AT_FDCWD, path, 0);
+            unsigned short reclen;
+            const char *name;
+            if (off < 0 || off + 19 > n)
+                break;
+            reclen = *(unsigned short *)(dbuf + off + 16);
+            if (reclen < 19 || off + reclen > n)
+                break;
+            name = dbuf + off + 19;
+            {
+                long key;
+                long name_len = 0;
+                long capacity = (long)reclen - 19;
+                while (name_len < capacity && name[name_len] != '\0')
+                    name_len++;
+                if (name_len != capacity && name_len >= 5 &&
+                    name[0] == 'k' && name[1] == 'e' && name[2] == 'y' && name[3] == '-' &&
+                    shm_parse_key_name(name + 4, name_len - 4, &key) == 0 &&
+                    shm_read_key(key) == id) {
+                    long claim = shm_claim_key(key);
+                    if (claim == -ERR_AGAIN) {
+                        SVC(NR_CLOSE, dfd, 0, 0);
+                        return -ERR_AGAIN;
+                    }
+                    if (claim < 0) {
+                        SVC(NR_CLOSE, dfd, 0, 0);
+                        return claim;
+                    }
+                    if (shm_read_key(key) == id) {
+                        shm_path(path, "/key-", key);
+                        SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), path, 0);
+                    }
+                    shm_release_claim(claim, key);
                 }
             }
-            if (reclen == 0)
-                break;
             off += reclen;
         }
     }
     SVC(NR_CLOSE, dfd, 0, 0);
+    return n < 0 ? n : 0;
 }
 
 /* ---------------- 本进程 attach 表 ---------------- */
 
 #define SHM_MAX_ATT 256
+#define ATT_FREE      0UL
+#define ATT_RESERVED  1UL
+#define ATT_ACTIVE    2UL
+#define ATT_DETACHING 3UL
+#define ATT_STATE_MASK 3UL
+#define ATT_GEN_SHIFT 2
+#define ATT_GEN_MAX   ((~0UL) >> ATT_GEN_SHIFT)
 struct shm_att {
-    volatile unsigned long addr;   /* 0 = 空槽；写入用 CAS 抢占 */
-    unsigned long len;
-    long id;
+    _Alignas(8) volatile unsigned long ctrl; /* state + generation */
+    volatile unsigned long addr;
+    volatile unsigned long len;
+    volatile long id;
 };
 static struct shm_att g_att[SHM_MAX_ATT];
+_Static_assert(__atomic_always_lock_free(sizeof(unsigned long), 0),
+               "SysV SHM attach table requires lock-free native atomics");
+
+static unsigned long shm_att_token(unsigned long gen, unsigned long state)
+{
+    return (gen << ATT_GEN_SHIFT) | state;
+}
 
 static int shm_att_add(unsigned long addr, unsigned long len, long id)
 {
     int i;
     for (i = 0; i < SHM_MAX_ATT; i++) {
-        unsigned long z = 0;
-        if (__atomic_compare_exchange_n(&g_att[i].addr, &z, 1UL, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            g_att[i].len = len;
-            g_att[i].id = id;
-            __atomic_store_n(&g_att[i].addr, addr, __ATOMIC_RELEASE);
-            return 0;
-        }
+        unsigned long old = __atomic_load_n(&g_att[i].ctrl, __ATOMIC_ACQUIRE);
+        unsigned long gen;
+        unsigned long next;
+        if ((old & ATT_STATE_MASK) != ATT_FREE)
+            continue;
+        gen = old >> ATT_GEN_SHIFT;
+        if (gen >= ATT_GEN_MAX)
+            continue; /* 饱和后退役槽位，避免代际回卷 */
+        next = shm_att_token(gen + 1, ATT_RESERVED);
+        if (!__atomic_compare_exchange_n(&g_att[i].ctrl, &old, next, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        __atomic_store_n(&g_att[i].addr, addr, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_att[i].len, len, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_att[i].id, id, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_att[i].ctrl, shm_att_token(gen + 1, ATT_ACTIVE),
+                         __ATOMIC_RELEASE);
+        return 0;
     }
     return -1;
 }
@@ -317,16 +502,24 @@ static int shm_att_add(unsigned long addr, unsigned long len, long id)
 static int shm_att_take(unsigned long addr, unsigned long *len)
 {
     int i;
-    if (addr <= 1)
+    if (addr <= 1 || len == NULL)
         return -1;
     for (i = 0; i < SHM_MAX_ATT; i++) {
-        unsigned long a = addr;
-        if (__atomic_load_n(&g_att[i].addr, __ATOMIC_ACQUIRE) != addr)
+        unsigned long c = __atomic_load_n(&g_att[i].ctrl, __ATOMIC_ACQUIRE);
+        unsigned long token;
+        unsigned long seen;
+        if ((c & ATT_STATE_MASK) != ATT_ACTIVE)
             continue;
-        *len = g_att[i].len;
-        if (__atomic_compare_exchange_n(&g_att[i].addr, &a, 0UL, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return 0;
+        seen = __atomic_load_n(&g_att[i].addr, __ATOMIC_ACQUIRE);
+        if (seen != addr)
+            continue;
+        token = c;
+        if (!__atomic_compare_exchange_n(&g_att[i].ctrl, &token,
+                                         (c & ~ATT_STATE_MASK) | ATT_DETACHING,
+                                         0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        *len = __atomic_load_n(&g_att[i].len, __ATOMIC_RELAXED);
+        return i;
     }
     return -1;
 }
@@ -336,8 +529,14 @@ static unsigned long shm_att_count(long id)
     unsigned long n = 0;
     int i;
     for (i = 0; i < SHM_MAX_ATT; i++) {
-        unsigned long a = __atomic_load_n(&g_att[i].addr, __ATOMIC_ACQUIRE);
-        if (a > 1 && g_att[i].id == id)
+        unsigned long c1 = __atomic_load_n(&g_att[i].ctrl, __ATOMIC_ACQUIRE);
+        long seen;
+        unsigned long c2;
+        if ((c1 & ATT_STATE_MASK) != ATT_ACTIVE)
+            continue;
+        seen = __atomic_load_n(&g_att[i].id, __ATOMIC_ACQUIRE);
+        c2 = __atomic_load_n(&g_att[i].ctrl, __ATOMIC_ACQUIRE);
+        if (c1 == c2 && (c2 & ATT_STATE_MASK) == ATT_ACTIVE && seen == id)
             n++;
     }
     return n;
@@ -347,12 +546,13 @@ static unsigned long shm_att_count(long id)
 
 static long shm_do_get(long key, long size, long flg)
 {
-    long id;
+    long id, result;
+    long claim;
     int fd = -1;
 
-    key = (long)(int)key;   /* key_t 是 int；glibc 已 sxtw，这里再保险 */
-    shm_mkdir();
-
+    key = (long)(int)key;
+    if (shm_mkdir() != 0)
+        return -ERR_INVAL;
     if (key == K_IPC_PRIVATE) {
         id = shm_new_segment(size, &fd);
         if (id < 0)
@@ -360,43 +560,63 @@ static long shm_do_get(long key, long size, long flg)
         SVC(NR_CLOSE, fd, 0, 0);
         return id;
     }
+    claim = shm_claim_key(key);
+    if (claim < 0)
+        return claim;
 
     id = shm_read_key(key);
     if (id > 0) {
-        /* 键指向的段可能已被别的进程 RMID —— 那就当作不存在 */
         long sfd = shm_open_seg(id, 1);
         if (sfd >= 0) {
             SVC(NR_CLOSE, sfd, 0, 0);
-            if ((flg & K_IPC_CREAT) && (flg & K_IPC_EXCL))
-                return -ERR_EXIST;
-            return id;
+            result = ((flg & K_IPC_CREAT) && (flg & K_IPC_EXCL) ? -ERR_EXIST : id);
+            shm_release_claim(claim, key);
+            return result;
         }
+        /* stale key: safe against other bxroot mutators while claim is held. */
         {
             char path[600];
             shm_path(path, "/key-", key);
-            SVC(NR_UNLINKAT, K_AT_FDCWD, path, 0);
+            SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), path, 0);
         }
     }
-    if (!(flg & K_IPC_CREAT))
+    if (!(flg & K_IPC_CREAT)) {
+        shm_release_claim(claim, key);
         return -ERR_NOENT;
+    }
 
     id = shm_new_segment(size, &fd);
-    if (id < 0)
+    if (id < 0) {
+        shm_release_claim(claim, key);
         return id;
-    SVC(NR_CLOSE, fd, 0, 0);
-    if (shm_publish_key(key, id) < 0) {
-        /* 输了竞争：丢掉自己的段，用赢家的 */
-        char path[600];
-        long win;
-        shm_path(path, "/seg-", id);
-        SVC(NR_UNLINKAT, K_AT_FDCWD, path, 0);
-        win = shm_read_key(key);
-        if (win <= 0)
-            return -ERR_NOENT;
-        if (flg & K_IPC_EXCL)
-            return -ERR_EXIST;
-        return win;
     }
+    SVC(NR_CLOSE, fd, 0, 0);
+    result = shm_publish_key(key, id);
+    if (result < 0) {
+        char path[600];
+        long win, winner_fd;
+        shm_path(path, "/seg-", id);
+        SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), path, 0);
+        if (result != -K_EEXIST) {
+            shm_release_claim(claim, key);
+            return result;
+        }
+        win = shm_read_key(key);
+        if (win <= 0) {
+            shm_release_claim(claim, key);
+            return win < 0 ? win : -ERR_NOENT;
+        }
+        winner_fd = shm_open_seg(win, 1);
+        if (winner_fd < 0) {
+            shm_release_claim(claim, key);
+            return winner_fd;
+        }
+        SVC(NR_CLOSE, winner_fd, 0, 0);
+        result = (flg & K_IPC_EXCL) ? -ERR_EXIST : win;
+        shm_release_claim(claim, key);
+        return result;
+    }
+    shm_release_claim(claim, key);
     return id;
 }
 
@@ -410,7 +630,7 @@ static long shm_do_at(long id, long flg)
     fd = shm_open_seg(id, ro);
     if (fd < 0)
         return -ERR_INVAL;
-    r = SVC(NR_FSTAT, fd, &st, 0);
+    r = SVC(NR_FSTAT, fd, (long)&st, 0);
     if (r < 0) {
         SVC(NR_CLOSE, fd, 0, 0);
         return r;
@@ -435,14 +655,24 @@ static long shm_do_at(long id, long flg)
 static long shm_do_dt(unsigned long addr)
 {
     unsigned long len;
-    if (shm_att_take(addr, &len) < 0)
+    int slot = shm_att_take(addr, &len);
+    long r;
+    unsigned long c;
+    if (slot < 0)
         return -ERR_INVAL;
-    SVC(NR_MUNMAP, addr, len, 0);
-    return 0;
+    r = SVC(NR_MUNMAP, addr, len, 0);
+    c = __atomic_load_n(&g_att[slot].ctrl, __ATOMIC_ACQUIRE);
+    if (r == 0)
+        __atomic_store_n(&g_att[slot].ctrl, c & ~ATT_STATE_MASK, __ATOMIC_RELEASE);
+    else
+        __atomic_store_n(&g_att[slot].ctrl,
+                         (c & ~ATT_STATE_MASK) | ATT_ACTIVE, __ATOMIC_RELEASE);
+    return r; /* 内核约定：0 或 -errno */
 }
 
 static long shm_do_ctl(long id, long cmd, unsigned long buf)
 {
+    (void)buf;
     char path[600];
     struct stat st;
     long fd, r;
@@ -450,34 +680,27 @@ static long shm_do_ctl(long id, long cmd, unsigned long buf)
     cmd = (long)(int)cmd & ~0x100L;   /* 去掉可能的 IPC_64 */
 
     if (cmd == K_IPC_RMID) {
+        r = shm_unlink_keys_of(id);
+        if (r < 0)
+            return r;
         shm_path(path, "/seg-", id);
-        SVC(NR_UNLINKAT, K_AT_FDCWD, path, 0);
-        /*
-         * ★ 指向该 id 的 key 文件必须一起删 ★
-         * 首版只删 seg、指望"下次 shmget 发现段不存在再清理"。bxroot 自己
-         * 确实会清理，但**官方不会**：它读到残留 key 就直接返回那个已删的
-         * id，随后 shmat 失败（2026-09-25 互通实测：bxroot RMID 后，官方
-         * 进程 shmget(key) 拿到旧 id、attach fail）。共用目录就得守对方的约定。
-         */
-        shm_unlink_keys_of(id);
+        SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), (long)path, 0);
         return 0;   /* 官方：对不存在的 id 也回 0 */
     }
     if (cmd == K_IPC_STAT) {
-        struct shmid_ds *ds = (struct shmid_ds *)buf;
+        struct shmid_ds ds;
         fd = shm_open_seg(id, 1);
         if (fd < 0)
             return -ERR_INVAL;
-        r = SVC(NR_FSTAT, fd, &st, 0);
+        r = SVC(NR_FSTAT, fd, (long)&st, 0);
         SVC(NR_CLOSE, fd, 0, 0);
         if (r < 0)
             return r;
-        if (ds == NULL)
-            return -14; /* EFAULT */
-        memset(ds, 0, sizeof *ds);
-        ds->shm_perm.mode = 0600;
-        ds->shm_segsz = (size_t)st.st_size;
-        ds->shm_nattch = shm_att_count(id);
-        return 0;
+        memset(&ds, 0, sizeof ds);
+        ds.shm_perm.mode = 0600;
+        ds.shm_segsz = (size_t)st.st_size;
+        ds.shm_nattch = shm_att_count(id);
+        return -14; /* EFAULT until process_vm_writev is gated and integrated */
     }
     return -ERR_INVAL;
 }
@@ -489,6 +712,11 @@ int bxroot_sysvshm_emulate(long sc, unsigned long a0, unsigned long a1,
         return 0;
     if (!__atomic_load_n(&g_shm_ready, __ATOMIC_ACQUIRE))
         return 0;   /* 未初始化：保持 ENOSYS，不假装 */
+
+    if (sc != SHM_NR_DT && !shm_anchor_valid()) {
+        *x0 = -9; /* EBADF: never reopen an invalid anchor in handler context */
+        return 1;
+    }
 
     switch (sc) {
     case SHM_NR_GET: *x0 = shm_do_get((long)a0, (long)a1, (long)a2); break;

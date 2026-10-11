@@ -719,6 +719,9 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# Copyout 构建始终检查；能力探测独立子进程，不代表最终APK过滤链。
+run_step "copyout probe compile" sh test/RUN_COPYOUT_FAULT.sh --compile-only
+run_step "copyout syscall capability" sh test/RUN_COPYOUT_FAULT.sh
 # SysV 共享内存模拟（sysvshm.c）：语义对照官方 + 双向互通 + 并发
 # ---------------------------------------------------------------------
 if [ -f test/RUN_SYSVSHM.sh ]; then
