@@ -27,6 +27,12 @@ Termux clang通过stdin syntax-only与record layout输出bionic shmid64_ds：siz
 
 Ubuntu AArch64 glibc独立编译probe：sizeof(shmid_ds)=112，ipc_perm48，mode20，segsz48，atime56，cpid80，nattch88。以上已检查字段的大小/偏移相同。仍不声称全类型/不同Android版本布局通用一致。
 
+## 真实 SIGSYS 上下文能力
+
+不落设备文件的ctypes子进程探针安装SA_SIGINFO处理器，只TRAP getppid(173)，其他调用保留继承策略。8秒alarm兜底。实测si_code=1、保存x8=173、regs起点184；handler写x0=4242，syscall返回4242。handler内getpid成功、process_vm_writev正常复制16字节、已有普通文件OFD读锁/解锁成功，child退出0，TERMUX_SIGNAL_CONTEXT_CAPABILITY_PASS。
+
+该探针仅证明Termux UID下信号帧和调用可达，Python/ctypes回调不是生产异步信号安全实现；没有执行bxroot完整SHM handler，也没有验证DSHA UID最终filter。bionic sigaction sizeof32（flags0/handler8/mask16/restorer24），ucontext.mcontext176、regs184均通过clang stdin layout核对。
+
 ## 后续范围
 
 Termux入口解决了可访问原生应用UID和无PRoot追踪的验证条件，未解决DSHA应用UID策略、完整runtime加载或新建普通文件fixture写入路径。Android设备文件写入仍必须使用受保护设备shell；不能用SSH/SCP/远程Python文件写入绕过设备文件策略。
