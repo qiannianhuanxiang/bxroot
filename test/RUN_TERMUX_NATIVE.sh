@@ -6,18 +6,27 @@ cd "$ROOT"
 [ "$(uname -m)" = aarch64 ] || { echo 'REFUSED: AArch64 required'; exit 1; }
 [ -n "${PREFIX:-}" ] && [ -x "$PREFIX/bin/clang" ] || { echo 'REFUSED: native Termux clang required'; exit 1; }
 python - <<'PY'
-import pathlib,re,os
-pid=os.getpid();seen=set()
+import pathlib,re,os,sys
+pid=os.getpid();seen=set();chain=[];me=None
 while pid>0 and pid not in seen:
  seen.add(pid);root=pathlib.Path('/proc')/str(pid)
  try:
   s=(root/'status').read_text();cmd=(root/'cmdline').read_bytes()
- except OSError as e:raise SystemExit('REFUSED: process ancestry unreadable '+str(e))
+ except OSError as e:
+  # /proc is mounted hidepid=invisible: other UIDs' processes (zygote, init)
+  # do not exist for us. A PRoot/ptrace parent is the SAME uid and stays
+  # visible, so an invisible ancestor is the Android UID boundary only when
+  # we have already walked at least one readable same-uid ancestor.
+  if chain and getattr(e,'errno',None) in (2,13):
+   print('ANCESTRY_BOUNDARY pid=%d (%s); readable same-uid chain=%s'%(pid,e.strerror,chain),file=sys.stderr);break
+  raise SystemExit('REFUSED: process ancestry unreadable '+str(e))
+ uid=int(re.search(r'^Uid:\s*(\d+)',s,re.M).group(1))
+ if me is None:me=uid
+ if uid!=me:raise SystemExit('REFUSED: ancestor pid %d has different uid %d'%(pid,uid))
  tracer=int(re.search(r'^TracerPid:\s*(\d+)',s,re.M).group(1))
  if tracer or b'proot' in cmd:raise SystemExit('REFUSED: traced/PRoot process')
+ chain.append(pid)
  parent=int(re.search(r'^PPid:\s*(\d+)',s,re.M).group(1))
- # Android may deny another application's parent status. Our SSH/interactive
- # shell chain remains same UID; stop at init instead of reading protected PID1.
  if parent==1:break
  pid=parent
 PY
