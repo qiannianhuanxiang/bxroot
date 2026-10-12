@@ -2,6 +2,40 @@
 
 本项目遵循语义化版本。日期为 UTC。
 
+## v0.2.3 — 2026-10-12
+
+**主题：SHM 生命周期硬化 + 静态 ELF 进程内执行 + SIGSYS 影子槽 + native session v3 回入口。**
+
+本仓库发行物是源码、测试与运行库。不含 DSHA APK / DSHA 源码。
+
+### 运行时
+- **官方启动器配置块**：读取 `PROROOT_CFG_FD`（bind / `-0` / `--link2symlink`）。有配置块时不注入 `STUB_ROOTFS`。
+- **进程内执行静态 ELF**（`static_exec.c`）：mmap 无 `PT_INTERP` 的目标、把路径类 `svc` 接到跳板；跳板保全 v0–v31 / NZCV，入口 `bti c`。坏 ELF 在改状态前拒绝。多线程 / ET_EXEC 冲突回退 stub-loader。
+- **posix_spawn** 子进程不再继承父进程 `GUEST_EXE` / `ORIG_COMM`。
+- **livepatch**：收集 libc **全部** r-x 段再扫描；版本表补丁后复位 r-x，避免把 libc 劈碎后漏掉 99/293 站点。
+- **SIGSYS 影子槽**：guest 对 SIGSYS 的设置只记影子槽，runtime 处理器常驻；自发 SIGSYS 吞掉。交互 bash 不再 `rc=139/159`。
+- **native session v3**：只读封印 memfd（四 seal）；`BXROOT_REENTRY` / `BXROOT_SESSION_FD` / `BXROOT_ENTER`。拒绝未封印或可写 session fd。
+- **SysV SHM 硬化**：
+  - 默认 profile 两个 gate 强制 0：拒绝 keyed 与 `IPC_PRIVATE` 新建；copyout 不盲发 `process_vm_writev(271)`。
+  - verified profile 要求两个 gate 显式为 1，产物在 `build/verified/`，不覆盖默认 so。
+  - 持久 `.claim-lock` + OFD `F_OFD_SETLK`；持久 `.id-ID` 防分配器 ABA。
+  - 非等待 fork 事务门：SHM 活动时 fork 返回 `-EAGAIN`，反之亦然。raw `clone` / `_Fork` 不在保证内。
+  - 官方 proroot 混合并发不协调；不是完整 Linux 延迟 `IPC_RMID`。
+
+### 验证
+- 22 编译单元零告警。
+- 原生 Termux（UID 10399，`TracerPid: 0`）：copyout / claim / ID ABA / fork gate / static reset / static SHM trap（`nr=194`）/ l2s mock / l2s native 153 checks / fakeroot 协同 47 checks。
+- 共存测试包（独立 applicationId，**不在本仓库**）真机：`BXROOT_REENTRY=1`、`ldconfig.real` 无 EROFS、node v24 + 4 worker、`exit 7` 透传。可与官方包同时安装运行。两个 App 都能开 ≠ SHM 混合并发已协调。
+
+### 已知仍不宣称
+- verified runtime 未作为默认 APK 部署（guest 完整过滤矩阵未用 `run-as` 扫完）。
+- Docker 隔离审计环境当前不可用。
+- bxroot 不是安全沙箱。
+
+## v0.2.2 / v0.2.1 / v0.2.0
+
+native session v3 系列（tag `v0.2.2-native-v3.2` 等）。只读封印 session fd、guest 回入口、Android arm64 核心矩阵。详见 [`docs/RELEASE-v0.2.2-native-v3.2.md`](docs/RELEASE-v0.2.2-native-v3.2.md) 与 [`docs/ANDROID-NATIVE-V3-RELEASE.md`](docs/ANDROID-NATIVE-V3-RELEASE.md)。
+
 ## v0.1.4
 
 **主题：爆破压测驱动的一轮缺陷收敛（7 类真缺陷）+ 真实项目端到端验证**

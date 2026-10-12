@@ -41,4 +41,4 @@ sh BUILD_RUNTIME.sh -O1
 BXROOT_BUILD_PROFILE=verified BXROOT_BUILD_SHM_COPYOUT_VERIFIED=1 BXROOT_BUILD_SHM_CLAIM_VERIFIED=1 sh BUILD_RUNTIME.sh -O1
 ```
 
-默认输出build/libbxroot-runtime.so；verified输出build/verified/libbxroot-runtime.so。verified仅为已确认环境准备，不默认部署到共存APK。本轮源码和测试保存为本地提交；没有创建正式tag、上传release或更新APK，也没有上传任何DSHA文件。
+默认输出build/libbxroot-runtime.so；verified输出build/verified/libbxroot-runtime.so。verified仅为已确认环境准备，不默认部署到共存APK。bxroot 源码发行见 tag `v0.2.3` 与 [`RELEASE-v0.2.3.md`](RELEASE-v0.2.3.md)。本仓库不包含、不上传任何 DSHA APK 或 DSHA 源码。

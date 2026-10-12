@@ -144,29 +144,15 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 
 ## 当前状态
 
-**v0.1.3 可用**（已在 Android 真机容器内对照官方 proroot 实测，并在 vivo Android 16 / kernel 6.1 / app seccomp 沙箱上用 launcher+LD_PRELOAD 真机验证）：
+**v0.2.3 可用**（Android arm64；native session v3 + SHM 硬化 + 静态 ELF 进程内执行）。
 
-> v0.1.2 → v0.1.3：**Android app 沙箱打通 + DNS/网络可用 + 功能扩展**。真机
-> 爆破测试（Termux）驱动的一轮收敛，31 项真机用例全绿：
+> 相对 v0.1.x：**guest → host → guest 回入口**、官方启动器 `PROROOT_CFG_FD`、进程内执行无 `PT_INTERP` 的静态 ELF、SIGSYS 影子槽、livepatch 扫 libc 全部 r-x 段、SysV SHM 生命周期硬化。详细条目见 [`CHANGELOG.md`](CHANGELOG.md) 与 [`docs/RELEASE-v0.2.3.md`](docs/RELEASE-v0.2.3.md)。
 >
-> - **DNS/网络解析修复**（path-relay）：glibc resolver 经 `_IO_fopen→__open`
->   最终**内联 svc openat** 发出未翻译的 guest 路径 `/etc/resolv.conf`，符号钩子
->   与 syscall 钩子都拦不到。新增 livepatch 第四部分，把 libc 里 openat 的内联
->   svc 改写成 `bl` 到翻译桩（重入守卫 + fail-open + 独立开关 `BXROOT_NO_PATHRELAY`）。
->   `getaddrinfo`/`gethostbyname`/`getent -s dns` 现全部可用，`apt`/`pip` 联网通。
-> - **Android app 沙箱启动链**：用户态 exec 加载器 `ulx` + 早期 SIGSYS 处理器，
->   在 app seccomp（TRAP set_robust_list/rseq）下打通 launcher+LD_PRELOAD 启动。
-> - **livepatch 运行期指令扫描**：中和 set_robust_list(99)/rseq(293)，覆盖任意
->   glibc 版本（不再依赖版本表），含静态链接 guest 主映像扫描 + 对抗性审计。
-> - **/dev/shm POSIX 共享内存**：shm_open/sem_open/named-sem，Python `multiprocessing` 可用。
-> - **fakeroot 收敛**：chown 按 inode 记账（stat 家族读得回属主，BXR-FR-1）；
->   降权族语义对齐官方基线（BXR-FR-2，146 组 setter 序列，51→0 mismatch）。
-> - **沙箱逃逸修复**：相对 `..` 与 `*at` dirfd 相对 `..`（BXR-ESC-4）逐组件夹紧。
-> - **新特性**：任意 `-i <uid>:<gid>` 身份映射；只读 bind `-b host:guest:ro`（写入 EROFS）。
-> - **statx 修复**：`AT_EMPTY_PATH` 空路径不再被误导到 CWD。
-> - 已作为**第三运行时接入 [DSHA](https://github.com/DSH-APP/DSHA)**
->   （契约见 [`docs/DSHA-适配说明.md`](docs/DSHA-适配说明.md)）
-> - 竞品对标见 [`docs/竞品对标分析.md`](docs/竞品对标分析.md)。
+> 真机（共存测试包，独立 applicationId，不在本仓库发行）：guest `BXROOT_REENTRY=1`、`TracerPid: 0`、`ldconfig.real` 无 EROFS、`node v24` 单进程与 4 worker+pbkdf2、`exit 7` 透传。原生 Termux 源码回归覆盖 SHM copyout/claim/ABA/fork/static trap 与 l2s。
+>
+> 已作为第三运行时接入 DSHA 类启动器（契约见 [`docs/DSHA-适配说明.md`](docs/DSHA-适配说明.md)）。**本仓库发行物不含任何 DSHA APK 或 DSHA 源码。**
+>
+> 更早的 v0.1.3 沙箱打通 / DNS path-relay / fakeroot 收敛见 CHANGELOG。竞品对标见 [`docs/竞品对标分析.md`](docs/竞品对标分析.md)。
 
 | 能力 | 状态 |
 |---|---|
@@ -190,9 +176,12 @@ Ubuntu 用户态（apt / dpkg / Node / pnpm / git），只能靠**用户态路�
 | `--kill-on-exit` 覆盖任何退出方式（`_exit`/exit_group/信号致死；launcher 作 subreaper 监督者） | ✅ |
 | `execveat`/`fexecve`（含 AT_EMPTY_PATH、dirfd 相对、#! 脚本 fd）经 trampoline 执行 | ✅ |
 | exec 失败给出具体原因（缺解释器/CRLF/无执行位/外部架构…），退出码 127/126 | ✅ |
-| 静态链接 / static-PIE 程序、`ld.so` 直接调用、`ldd`（经 stub-loader，含非默认 rootfs 路径翻译） | ✅ |
+| 静态链接 / static-PIE 程序、`ld.so` 直接调用、`ldd` | ✅ 优先进程内 `static_exec`（路径类 svc 翻译）；失败回退 stub-loader。多线程 / ET_EXEC 冲突回退 |
 | 降权族内联 svc（glibc `initgroups()`、nptl setxid 广播）→ SIGSYS 层接 fakeroot 账本 | ✅ |
-| SysV 共享内存（shmget/shmat/shmctl/shmdt；SIGSYS 层模拟，与官方共用 `/tmp/.proroot-shm` 格式，双向互通） | ✅ |
+| SIGSYS 影子槽（guest `sigaction(SIGSYS)` 不顶掉 runtime；自发 SIGSYS 吞掉） | ✅ 真机交互 bash `exit` 码透传 |
+| livepatch 扫 libc **全部** r-x 段，版本表补丁后复位 r-x | ✅ node worker / rseq / set_robust_list |
+| native session v3（只读封印 memfd，`BXROOT_REENTRY` / `BXROOT_ENTER`） | ✅ |
+| SysV 共享内存（shmget/shmat/shmctl/shmdt；文件式模拟） | ⚠️ 默认构建 **gate 关闭**：拒绝 keyed 与 `IPC_PRIVATE` 新建，copyout 不盲发 `process_vm_writev`。verified profile 才打开。官方 proroot 混合并发**不协调**；不是完整 Linux 延迟 `IPC_RMID` |
 
 **导出符号 385 个**（对照闭源 proroot 的 259 个）。
 
@@ -235,24 +224,29 @@ PASS  14    FAIL  0    NOCTL 7    SKIP 4
 ## 构建
 
 ```sh
-./BUILD_RUNTIME.sh          # 构建 libbxroot-runtime.so（自带 ICE 重试）
-make                        # 构建全部 5 个组件
+./BUILD_RUNTIME.sh          # 默认 profile：两个 SHM gate 强制为 0
+make                        # 构建组件
 make test                   # 跑测试
+# 仅在目标 guest 过滤链已核过时：
+# BXROOT_BUILD_PROFILE=verified \
+# BXROOT_BUILD_SHM_COPYOUT_VERIFIED=1 BXROOT_BUILD_SHM_CLAIM_VERIFIED=1 \
+# ./BUILD_RUNTIME.sh -O1
 ```
 
 ★ 全部产物带 **16KB 页对齐**（`-Wl,-z,max-page-size=16384`）——
 Android 15+ 的 16KB 内存页内核设备硬要求，且 DSHA 集成要求 jniLibs
 内的原生库满足此对齐。交叉编译时链接 flag 已内置，无需手工加。
 
-产出 5 个文件（名字沿用原 proroot 的布局，便于替换）：
+产出文件（名字沿用原 proroot 的布局，便于替换）：
 
 | 文件 | 作用 |
 |---|---|
 | `libbxroot.so` | 启动器（静态可执行，伪装成 `.so`） |
-| `libbxroot-runtime.so` | 运行时：全部 `LD_PRELOAD` 钩子 |
+| `libbxroot-runtime.so` | 运行时：全部 `LD_PRELOAD` 钩子。默认 profile 与 `build/verified/` 隔离 |
 | `libbxroot-linker.so` | 自研 ELF 加载器 |
 | `libbxroot-bridge.so` | 宿主/客户桥接 |
 | `libbxroot-stub-loader.so` | 静态二进制的 `PT_INTERP` 修补器（**非独立 ELF 加载器**：为静态二进制补上 PT_INTERP 后 `execve`，交给内核加载；不做 mmap/段加载/跳 `_start`。定位见 `src/stub-loader/stub-loader.c` 注释） |
+| `libbxroot-enter.so` | native v3 guest 回入口 |
 
 ## 架构
 
@@ -298,6 +292,8 @@ Node 全部 `ENOENT`。
 | `BXROOT_SCG` | `syscall` 层追踪 |
 | `BXROOT_RAW_SYSCALL` | 置 1 时对「因 Android 策略而中和」的调用（io_uring 家族 425/426/427）**真透传**，不再恒定回 `ENOSYS`，由真实内核/宿主 seccomp 给出答案 —— 适用于非 Android 环境（如通用 seccomp profile 的普通容器）。身份/降权伪装与路径翻译不受影响；`0` 或未设时行为不变 |
 | `BXROOT_NO_AUTORUN` | 置 1 跳过 runtime 构造链（源码级单元测试专用，正常使用勿设） |
+| `BXROOT_REENTRY` / `BXROOT_ENTER` / `BXROOT_SESSION_FD` | native session v3：guest 回宿主入口与封印 session fd |
+| `PROROOT_CFG_FD` | 官方启动器配置块路径；有此文件时不注入 `STUB_ROOTFS`。显式 `BXROOT_ROOTFS` / `BXROOT_BINDS` 仍优先 |
 | `BXROOT_NO_CRASH` | 置 1 不安装崩溃处理器，由客户程序自管 SIGSEGV/SIGBUS |
 | `BXROOT_CRASH_CHAIN` | 置 1 打印现场后链式调用更早注册的 handler（默认关，开启会有双方各一段输出） |
 | `BXROOT_NO_LIVEPATCH` | 置 1 跳过 libc 站点活体补丁（非 Android 环境兜底；正常有 `PR_GET_SECCOMP` 自动门控） |

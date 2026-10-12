@@ -26,4 +26,4 @@ Verified 产物位于 `build/verified/`；默认产物仍位于历史兼容路�
 
 当前设备上的 shell 通道可用，但 `run-as` 受设备策略拦截，UI 读屏目标也不可用。因而尚未完成 APK guest 的 syscall/seccomp/bionic ABI 验证，不能把 verified runtime 作为已验证 DSHA APK 发布。
 
-本轮不提交、不打 tag、不创建 release、不上传 DSHA APK 或 DSHA 源码。
+v0.2.3 源码发行使用默认 gate=0。verified runtime 仍不作为默认 APK 部署。本仓库不上传 DSHA APK 或 DSHA 源码。
