@@ -23,12 +23,12 @@
 
 原生 Termux（UID 10399，TracerPid=0，无 PRoot）用户执行 `RUN_TERMUX_NATIVE.sh`：copyout/claim/id_aba/fork_gate/static_reset/static_trap/l2s_mock/l2s_native 共 8 项 PASS。`static_trap` 实测 `FRAME ready=1 code=1 nr=194 offset=184` 且四组 gate `STATIC_SHM_SYSCALL_PASS`，这是 bxroot SHM SIGSYS 在原生环境的第一次通过。`l2s_native` 18 cases / 153 checks PASS。integration 首次因测试写死 real_uid=2000 失败；改为 `getuid()` 后单独重跑 7 cases / 47 checks PASS。
 
-共存 APK `com.dsh.bxroot` 用户安装后 guest 终端：`BXROOT_REENTRY=1`，`TracerPid: 0`，`ldconfig.real -v` 无 EROFS，`node v24.19.0` 通过；`exit 7` 透传码 7；4 worker + pbkdf2Sync 正常返回。
+共存 APK `com.dsh.bxroot` 用户安装后 guest 终端：`BXROOT_REENTRY=1`，`TracerPid: 0`，`ldconfig.real -v` 无 EROFS，`node v24.19.0` 通过；`exit 7` 透传码 7；4 worker + pbkdf2Sync 正常返回。用户反馈可与官方 `com.dsh.client` 同时运行。
 
 ## 明确未通过
 
 1. 外层 PRoot 容器内真实静态 SHM TRAP 仍是 `TRAP_UNREACHED`（raw 194 → ENOSYS）。该项已由原生 Termux `STATIC_SHM_SYSCALL_PASS` 覆盖，容器结果不再当作该项的失败证据。
-2. 共存 APK `com.dsh.bxroot` 已由用户安装：`BXROOT_REENTRY=1`、`BXROOT_ENTER` 指向该包 `libbxroot-enter.so`、`TracerPid: 0`、guest fakeroot `id` 为 0、`ldconfig.real -v` 无 EROFS、`node v24.19.0` 单进程与 4 worker+pbkdf2 通过、`exit 7` 透传。未覆盖 dpkg 新装、Web UI、官方混合并发；`run-as` 仍可能 POLICY_BLOCKED，不能据此宣称完整 guest 过滤矩阵。
+2. 共存包冷启动/reentry/ldconfig/node/worker/`exit 7` 已过。未覆盖：dpkg 新装、两边实际 3080/3090 绑定、完整 guest syscall 过滤矩阵。`run-as com.dsh.bxroot` 仍可能 POLICY_BLOCKED。两个 App 都能开 ≠ 官方 proroot 与 bxroot 的 SysV SHM 混合并发已协调。
 3. 高风险mount/chroot/pivot_root/全号扫描/逃逸测试未在共享文件系统执行。namespace创建能力探测成功不等于已建立完整可丢弃rootfs。Docker 当前不可用。
 4. 官方proroot不采用锁/token，任意混合并发不保证；共用decimal格式只保证文件格式互通。
 5. 保持官方文件式RMID、本进程nattch的兼容模式；完整Linux延迟删除/全局计数是不同协议，尚未实现，不能声称相同语义。
