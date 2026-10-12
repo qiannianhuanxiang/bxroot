@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../../src/runtime/shm-fork.h"
+#include "../bx_tmpdir.h"
 
 static int claim_fd=-1, child_seen, parent_seen, prepare_seen;
 static void prepare(void) { prepare_seen++; /* no wait, no unlock */ }
@@ -17,7 +18,7 @@ static int lock_fd(int fd) {
     return fcntl(fd,F_OFD_SETLK,&l);
 }
 int main(void) {
-    char path[]="/tmp/bxroot-fork-handoff-XXXXXX";
+    char path[PATH_MAX]; if(bx_tmppath(path,sizeof path,"bxroot-fork-handoff-XXXXXX"))return 1;
     int a=mkstemp(path), b, st; pid_t p;
     if(a<0)return 1;
     if(lock_fd(a)!=0)return 1;

@@ -41,6 +41,7 @@ static void release_window(int phase)
 }
 #define FAIL(stage) do { fprintf(stderr,"FAIL:%s errno=%d\n",stage,errno); return 1; } while (0)
 #include "sysvshm_gate_impl.c"
+#include "../bx_tmpdir.h"
 
 struct worker_arg { long id; unsigned long addr; long result; int op; long syscall_return; };
 static void *worker(void *vp)
@@ -63,7 +64,7 @@ static int make_seg(int anchor, long id)
 }
 int main(void)
 {
-    char dir[] = "/tmp/bxroot-shm-fork-gate-XXXXXX";
+    char dir[PATH_MAX]; if (bx_tmppath(dir, sizeof dir, "bxroot-shm-fork-gate-XXXXXX")) return 1;
     pthread_t th; struct worker_arg a = {77, 0, -1, 1, -1};
     long x0 = 0; int anchor, st; pid_t child; unsigned long addr;
     if (!mkdtemp(dir) || bxroot_sysvshm_init(dir) != 0) FAIL("init");

@@ -31,6 +31,9 @@ while pid>0 and pid not in seen:
  pid=parent
 PY
 export CC=clang
+# Termux has no writable /tmp; keep every fixture under $PREFIX/tmp.
+TMPDIR=${TMPDIR:-$PREFIX/tmp}; export TMPDIR
+mkdir -p "$TMPDIR" || { echo "REFUSED: cannot create TMPDIR=$TMPDIR"; exit 1; }
 W=$(mktemp -d "$ROOT/termux-results-XXXXXX")
 FAIL=0
 printf 'uid=%s\nprefix=%s\n' "$(id -u)" "$PREFIX" >"$W/environment.txt"

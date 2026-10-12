@@ -9,8 +9,9 @@
 #include <unistd.h>
 #include <dirent.h>
 #include "../../src/runtime/sysvshm.c"
+#include "../bx_tmpdir.h"
 static int test_anchor = -1;
-static char test_dir[128];
+static char test_dir[PATH_MAX];
 static void cleanup_fixture(void) {
     char buf[2048];
     long dfd, n;
@@ -39,7 +40,7 @@ static void cleanup_fixture(void) {
 static int check(int ok, const char *s) { if (!ok) fprintf(stderr,"FAIL %s errno=%d\n",s,errno); return ok ? 0 : 1; }
 #endif
 int main(void) {
-    char d[]="/tmp/bxclaim-XXXXXX";
+    char d[PATH_MAX]; if(bx_tmppath(d,sizeof d,"bxclaim-XXXXXX"))return 1;
 #if !BXROOT_SHM_CLAIM_VERIFIED
     if(!mkdtemp(d) || bxroot_sysvshm_init(d)!=0) return 1;
     snprintf(test_dir,sizeof test_dir,"%s",d); test_anchor=bxroot_sysvshm_anchor_fd();

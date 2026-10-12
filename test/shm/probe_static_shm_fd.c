@@ -12,6 +12,7 @@
  * and real reset, without redefining the C static keyword. */
 #include "../../src/runtime/static_exec.c"
 #include "../../src/runtime/sysvshm.c"
+#include "../bx_tmpdir.h"
 
 static int cloexec_file(void) {
     int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -24,7 +25,7 @@ int main(int argc, char **argv) {
         int fd = atoi(argv[2]);
         return fcntl(fd, F_GETFD) < 0 && errno == EBADF ? 0 : 1;
     }
-    char dir[] = "/tmp/bxroot-static-anchor-XXXXXX";
+    char dir[PATH_MAX]; if (bx_tmppath(dir, sizeof dir, "bxroot-static-anchor-XXXXXX")) return 1;
     int anchor;
     int ordinary, reused;
     if (!mkdtemp(dir) || bxroot_sysvshm_init(dir) != 0) { perror("anchor init"); return 1; }

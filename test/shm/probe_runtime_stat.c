@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../../src/runtime/sysvshm.c"
+#include "../bx_tmpdir.h"
 
 static int one(int which, long id)
 {
@@ -50,7 +51,7 @@ static int one(int which, long id)
 }
 int main(void)
 {
-    char dir[]="/tmp/bxroot-runtime-stat-XXXXXX";
+    char dir[PATH_MAX]; if(bx_tmppath(dir,sizeof dir,"bxroot-runtime-stat-XXXXXX"))return 1;
     if(!mkdtemp(dir)||bxroot_sysvshm_init(dir))return 1;
     /* Fixture setup is deliberately separate from shmget/RMID capability. */
     const long id=77;

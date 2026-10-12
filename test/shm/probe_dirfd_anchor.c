@@ -11,11 +11,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../../src/runtime/sysvshm.c"
+#include "../bx_tmpdir.h"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %s line=%d errno=%d\n", #x, __LINE__, errno); return 1; } } while (0)
 int main(int argc, char **argv)
 {
-    char path[] = "/tmp/bxroot-anchor-XXXXXX", moved[128];
+    char path[PATH_MAX], moved[PATH_MAX + 16];
+    if (bx_tmppath(path, sizeof path, "bxroot-anchor-XXXXXX")) return 1;
     int anchor, fd, status;
     long result;
     pid_t child;

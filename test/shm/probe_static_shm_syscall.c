@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include "../../src/runtime/static_exec.c"
 #include "../../src/runtime/sysvshm.c"
+#include "../bx_tmpdir.h"
 _Static_assert(offsetof(ucontext_t,uc_mcontext.regs)==184,"AArch64 signal register ABI changed");
 static long raw(long nr,long a,long b,long c){return shm_svc6(nr,a,b,c,0,0,0);}
 static int frame_check(void) {
@@ -57,7 +58,7 @@ static int fork_window_check(void) {
 #endif
  return 0;
 }
-static char fixture_dir[]="/tmp/bxroot-static-syscall-XXXXXX";
+static char fixture_dir[PATH_MAX];
 static int fixture_created;
 static int cleanup_fixture(void) {
  if(!fixture_created)return 0;
@@ -86,6 +87,7 @@ static void observed_early_sigsys(int sig,siginfo_t *info,void *ctx) {
 }
 static int run(void){
  long id=-1,r; struct shmid_ds ds;
+ if(bx_tmppath(fixture_dir,sizeof fixture_dir,"bxroot-static-syscall-XXXXXX"))return 1;
  if(!mkdtemp(fixture_dir))return 1;
  fixture_created=1;
  if(bxroot_sysvshm_init(fixture_dir))return 1;

@@ -27,6 +27,7 @@
 
 #include "fakeroot.h"
 #include "l2s-runtime.h"
+#include "bx_tmpdir.h"
 
 static int g_cases, g_failed, g_checks;
 
@@ -122,7 +123,7 @@ static void rm_tree(const char *path)
 
 static void sandbox(const char *tag)
 {
-    snprintf(g_root, sizeof(g_root), "/tmp/integ-%s-%d", tag, (int)getpid());
+    { char tmpl[64]; snprintf(tmpl, sizeof tmpl, "integ-%s-%d", tag, (int)getpid()); char tb[PATH_MAX]; if (bx_tmppath(tb, sizeof tb, tmpl) != 0) { fputs("TMPDIR too long\n", stderr); exit(2); } snprintf(g_root, sizeof(g_root), "%s", tb); }
     rm_tree(g_root);
     if (mkdir(g_root, 0700) != 0) {
         fprintf(stderr, "无法建沙箱 %s: %s\n", g_root, strerror(errno));

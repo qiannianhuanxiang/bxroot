@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "l2s-runtime.h"
+#include "bx_tmpdir.h"
 
 /* ------------------------------------------------------------------ */
 /* 断言框架                                                            */
@@ -135,7 +136,7 @@ static void rm_tree(const char *path)
 
 static void sandbox_make(const char *tag)
 {
-    snprintf(g_root, sizeof(g_root), "/tmp/l2srt-%s-%d", tag, (int)getpid());
+    { char tmpl[64]; snprintf(tmpl, sizeof tmpl, "l2srt-%s-%d", tag, (int)getpid()); char tb[PATH_MAX]; if (bx_tmppath(tb, sizeof tb, tmpl) != 0) { fputs("TMPDIR too long\n", stderr); exit(2); } snprintf(g_root, sizeof(g_root), "%s", tb); }
     rm_tree(g_root);
     if (mkdir(g_root, 0700) != 0) {
         fprintf(stderr, "cannot create sandbox %s: %s\n", g_root, strerror(errno));

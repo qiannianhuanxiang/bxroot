@@ -15,13 +15,14 @@ static long fixed_random(void *buf, size_t len) {
 }
 /* Runner changes only the allocator's getrandom expression in a private copy. */
 #include "sysvshm-id-test.c"
+#include "../bx_tmpdir.h"
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line=%d %s\n",__LINE__,#x); return 1; } } while (0)
 static void sequence(unsigned int first, unsigned int second, int change) {
     candidates[0]=first;candidates[1]=second;transition=change;calls=0;
 }
 static long allocate(void) { int fd=-1; long id=shm_new_segment(4096,&fd); if(fd>=0)CHECK(close(fd)==0); return id; }
 int main(void) {
-    char dir[]="/tmp/bxroot-id-aba-XXXXXX", path[64];
+    char dir[PATH_MAX], path[PATH_MAX+32]; if(bx_tmppath(dir,sizeof dir,"bxroot-id-aba-XXXXXX"))return 1;
     struct stat st;
     CHECK(mkdtemp(dir));CHECK(bxroot_sysvshm_init(dir)==0);
     int anchor=bxroot_sysvshm_anchor_fd();CHECK(anchor>=0);
