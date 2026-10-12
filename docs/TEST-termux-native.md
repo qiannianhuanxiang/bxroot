@@ -55,7 +55,7 @@ Ubuntu AArch64 glibc独立编译probe：sizeof(shmid_ds)=112，ipc_perm48，mode
 
 `l2s_native` 在真实可写文件系统上 153 项检查通过，替代外层 PRoot 下的原生 l2s FAIL。
 
-`integration` 四项失败都是 `st.st_uid=10399` 期望 `0`。测试把 fakeroot 的 `real_uid` 写死为 2000（旧 shell UID），启发式只在 `st_uid == real_uid` 时改写，Termux 文件属主是 10399，所以不改。l2s 链长断言未失败。已改为 `getuid()`/`getgid()`，待用户再跑一次该测试确认。
+`integration` 首次失败是测试把 fakeroot 的 `real_uid` 写死为 2000，Termux 文件属主是 10399，启发式不改写。改为 `getuid()`/`getgid()` 后，用户在同一原生 Termux 上单独重跑：7 cases / 47 checks，`RESULT: PASS`。
 
 ## 后续范围
 
