@@ -21,14 +21,17 @@
 
 快速回归快照：/root/work/bxroot-regression-results/quick-AQaHBb/results.txt，44 PASS、2 FAIL、15 SKIP、23 BLOCKED、0基础设施ERROR。真实 mmap 完成到 attach 发布前、DETACHING 到 munmap 前两个暂停窗口均 fork_begin=-EAGAIN，恢复后 fork child 可 detach ACTIVE 映射，SHM_FORK_GATE_PASS；handler handled标志与detach实际返回码分开断言。两个FAIL是原生l2s与fakeroot协同，在外层PRoot --link2symlink下有独立FS前提失败证据；保留FAIL而非修改断言。mock PASS不替代原生FS验证。
 
+原生 Termux（UID 10399，TracerPid=0，无 PRoot）用户执行 `RUN_TERMUX_NATIVE.sh`：copyout/claim/id_aba/fork_gate/static_reset/static_trap/l2s_mock/l2s_native 共 8 项 PASS。`static_trap` 实测 `FRAME ready=1 code=1 nr=194 offset=184` 且四组 gate `STATIC_SHM_SYSCALL_PASS`，这是 bxroot SHM SIGSYS 在原生环境的第一次通过。`l2s_native` 18 cases / 153 checks PASS。integration 因测试把真实 UID 写死为 2000、Termux 文件属主是 10399 而 4 项 FAIL；已改为 `getuid()`，待再跑。
+
 ## 明确未通过
 
-1. 真实静态SHM seccomp TRAP：四gate组合的ucontext frame分发通过，但真实raw194被当前外层PRoot返回ENOSYS，runner rc2；不是静态ELF端到端成功。
-2. 共存APK最终guest过滤链和结构ABI：设备shell uid2000可用；run-as被POLICY_BLOCKED，读屏SCREEN_TARGET_UNAVAILABLE，没有绕过策略。普通容器/bridge证据不替代实际APK。
-3. 高风险mount/chroot/pivot_root/全号扫描/逃逸测试未在共享文件系统执行。namespace创建能力探测成功不等于已建立完整可丢弃rootfs。
+1. 外层 PRoot 容器内真实静态 SHM TRAP 仍是 `TRAP_UNREACHED`（raw 194 → ENOSYS）。该项已由原生 Termux `STATIC_SHM_SYSCALL_PASS` 覆盖，容器结果不再当作该项的失败证据。
+2. 共存APK最终guest过滤链和结构ABI：设备shell uid2000可用；run-as被POLICY_BLOCKED，读屏SCREEN_TARGET_UNAVAILABLE，没有绕过策略。普通容器/bridge/Termux UID 证据不替代实际 APK。
+3. 高风险mount/chroot/pivot_root/全号扫描/逃逸测试未在共享文件系统执行。namespace创建能力探测成功不等于已建立完整可丢弃rootfs。Docker 当前不可用。
 4. 官方proroot不采用锁/token，任意混合并发不保证；共用decimal格式只保证文件格式互通。
 5. 保持官方文件式RMID、本进程nattch的兼容模式；完整Linux延迟删除/全局计数是不同协议，尚未实现，不能声称相同语义。
 6. 并发guest主动close/reuse内部fd、直接munmap/MAP_FIXED、raw clone等绕过运行时接口不构成沙箱保证。
+7. integration 在原生 Termux 上的 fakeroot 启发式改写尚未用修正后的 `getuid()` 复跑确认。
 
 ## 构建
 

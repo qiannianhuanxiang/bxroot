@@ -33,6 +33,30 @@ Ubuntu AArch64 glibc独立编译probe：sizeof(shmid_ds)=112，ipc_perm48，mode
 
 该探针仅证明Termux UID下信号帧和调用可达，Python/ctypes回调不是生产异步信号安全实现；没有执行bxroot完整SHM handler，也没有验证DSHA UID最终filter。bionic sigaction sizeof32（flags0/handler8/mask16/restorer24），ucontext.mcontext176、regs184均通过clang stdin layout核对。
 
+## 源码回归 runner（用户在原生 Termux 执行）
+
+用户在原生 Termux 执行 `test/RUN_TERMUX_NATIVE.sh`。祖先链因 `hidepid=invisible` 停在 UID 边界（`ANCESTRY_BOUNDARY pid=1890`），同 UID 链 TracerPid=0。TMPDIR 使用 `$PREFIX/tmp`。
+
+结果目录：`~/bxroot-native-run-0r16TE/bxroot-termux-native/termux-results-ZAuNuO`，`uid=10399`。
+
+| 项 | rc | 标记 |
+|---|---|---|
+| copyout | 0 | `RUNTIME_IPC_STAT_PASS`（gate 0/1 各 8 地址） |
+| claim | 0 | `RESULT: SHM claim PASS` |
+| id_aba | 0 | `SHM_ID_ABA_PASS` |
+| fork_gate | 0 | `SHM_FORK_GATE_PASS` |
+| static_reset | 0 | `STATIC_SHM_FD_PASS` |
+| static_trap | 0 | `RESULT: static SHM syscall PASS` |
+| l2s_mock | 0 | `RESULT: L2S mock closure PASS`（5/28） |
+| l2s_native | 0 | `RESULT: PASS`（18 cases / 153 checks） |
+| integration | 1 | `RESULT: FAIL`（7 cases 中 4 失败 / 47 checks 中 4 失败） |
+
+`static_trap` 在原生 Termux 上第一次走到 bxroot SHM SIGSYS：`FRAME ready=1 code=1 nr=194 offset=184`，四组 gate 均 `STATIC_SHM_SYSCALL_PASS`。这替代了外层 PRoot 下的 `TRAP_UNREACHED`。它仍不是 DSHA UID 下的最终过滤器。
+
+`l2s_native` 在真实可写文件系统上 153 项检查通过，替代外层 PRoot 下的原生 l2s FAIL。
+
+`integration` 四项失败都是 `st.st_uid=10399` 期望 `0`。测试把 fakeroot 的 `real_uid` 写死为 2000（旧 shell UID），启发式只在 `st_uid == real_uid` 时改写，Termux 文件属主是 10399，所以不改。l2s 链长断言未失败。已改为 `getuid()`/`getgid()`，待用户再跑一次该测试确认。
+
 ## 后续范围
 
-Termux入口解决了可访问原生应用UID和无PRoot追踪的验证条件，未解决DSHA应用UID策略、完整runtime加载或新建普通文件fixture写入路径。Android设备文件写入仍必须使用受保护设备shell；不能用SSH/SCP/远程Python文件写入绕过设备文件策略。
+Termux 源码回归覆盖了 SHM copyout/claim/ABA/fork/static trap 与原生 l2s。未解决：共存 APK 的 DSHA UID 过滤链、完整 LD_PRELOAD runtime 加载、官方 proroot 混合并发、高风险 mount/chroot 审计。Android 设备文件写入仍必须使用受保护设备 shell；不能用 SSH/SCP/远程 Python 文件写入绕过设备文件策略。

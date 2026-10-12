@@ -164,7 +164,13 @@ static l2s_config enable_both(fakeroot_state *fs)
     l2s_rt_init(&OPS, &cfg);
 
     fakeroot_state_init(fs);
-    fakeroot_state_set_real_ids(fs, 2000, 2000, 2000, 2000);
+    /* 启发式只在 st_uid == real_uid 时改写。真实属主随宿主变化
+     * （shell 2000、Termux app 10399），不能写死。 */
+    {
+        uid_t u = getuid();
+        gid_t g = getgid();
+        fakeroot_state_set_real_ids(fs, u, u, g, g);
+    }
     fakeroot_state_set_enabled(fs, true);
     fs->by_path  = fakeroot_map_create(256);
     fs->by_inode = fakeroot_map_create(256);
@@ -213,7 +219,7 @@ static void t_both_layers(void)
     fakeroot_patch_stat(&st, &fs);
 
     CHECK_EQ_I(st.st_nlink, 3);                    /* l2s 的账 */
-    CHECK_EQ_I(st.st_uid, 0);                      /* fakeroot 的账（真实 2000 被改写） */
+    CHECK_EQ_I(st.st_uid, 0);                      /* fakeroot 的账（真实属主被改写） */
     CHECK(S_ISREG(st.st_mode));                    /* l2s 抹掉了 S_IFLNK */
 
     disable_both(&fs);
@@ -348,7 +354,11 @@ static void t_independent_disable(void)
     /* 只启用 fakeroot */
     l2s_rt_shutdown();
     fakeroot_state_init(&fs);
-    fakeroot_state_set_real_ids(&fs, 2000, 2000, 2000, 2000);
+    {
+        uid_t u = getuid();
+        gid_t g = getgid();
+        fakeroot_state_set_real_ids(&fs, u, u, g, g);
+    }
     fakeroot_state_set_enabled(&fs, true);
 
     sp(a, sizeof(a), "plain");
