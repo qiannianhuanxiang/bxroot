@@ -15,7 +15,19 @@ HOME = os.path.expanduser('~')
 L = os.environ.get('BENCH_LIBDIR', HOME + '/bxoff')
 OFF = os.environ.get('BENCH_OFFDIR', L + '/offdir')
 ROOTFS = os.environ.get('BENCH_ROOTFS', HOME + '/dsharf')
-BX_RT = os.environ.get('BENCH_BX_RUNTIME', L + '/runtime-v3.so')
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _default_runtime():
+    # 优先包内 lib/（发行打包放这里），其次本地 build/，最后才是设备上遗留的旧文件
+    for c in (REPO + '/lib/libbxroot-runtime.so', REPO + '/build/libbxroot-runtime.so',
+              L + '/runtime-v3.so'):
+        if os.path.exists(c):
+            return c
+    return L + '/runtime-v3.so'
+
+
+BX_RT = os.environ.get('BENCH_BX_RUNTIME') or _default_runtime()
 ROUNDS = int(os.environ.get('BENCH_ROUNDS', '5'))
 TMP = os.environ.get('TMPDIR', os.environ.get('PREFIX', '') + '/tmp')
 
@@ -41,6 +53,28 @@ def _libpath():
     return ROOTFS + '/usr/lib/aarch64-linux-gnu:' + ROOTFS + '/lib/aarch64-linux-gnu'
 
 
+def _make_cfg_blob():
+    """官方 runtime 读 launcher 写的配置块，不读 PROROOT_* 环境变量里的 bind。
+    偏移取自 src/runtime/preload.c 的 PRCFG_*（反汇编交叉验证）。"""
+    import struct
+    b = bytearray(0x43130)
+    raw = ROOTFS.encode()[:4095]
+    b[0:len(raw)] = raw
+    binds = [('/dev', '/dev'), ('/proc', '/proc'), ('/sys', '/sys')]
+    struct.pack_into('<I', b, 0x42108, len(binds))
+    for i, (host, guest) in enumerate(binds):
+        o = 0x2008 + i * 0x2008
+        b[o:o + len(guest)] = guest.encode()
+        b[o + 0x1000:o + 0x1000 + len(host)] = host.encode()
+    struct.pack_into('<I', b, 0x4210c, 1)   # -0
+    struct.pack_into('<I', b, 0x42110, 1)   # --link2symlink
+    os.makedirs(TMP, exist_ok=True)
+    path = os.path.join(TMP, f'.bench-proroot-config-{os.getpid()}')
+    with open(path, 'wb') as f:
+        f.write(b)
+    return path
+
+
 def backend_official(cmd):
     d = OFF
     for f in ('libproroot-bridge.so', 'libproroot-linker.so', 'libproroot-runtime.so'):
@@ -54,6 +88,7 @@ def backend_official(cmd):
         'PROROOT_TRAMPOLINE_PATH': f'{d}/libproroot-bridge.so',
         'PROROOT_ROOTFS': ROOTFS, 'PROROOT_WORKDIR': '/root', 'PROROOT_FAKEROOT': '1',
         'PROROOT_BINDS': '/dev:/dev;/proc:/proc;/sys:/sys',
+        'PROROOT_CFG_FD': _make_cfg_blob(),
         'LD_LIBRARY_PATH': _libpath(),
     })
     return [f'{d}/libproroot-bridge.so', f'{d}/libproroot-linker.so', '--argv0', cmd[0],
@@ -71,6 +106,7 @@ def backend_bxroot(cmd):
         'PROROOT_TRAMPOLINE_PATH': L + '/libproroot-bridge.so',
         'BXROOT_ROOTFS': ROOTFS, 'BXROOT_WORKDIR': '/root', 'BXROOT_FAKEROOT': '1',
         'BXROOT_BINDS': '/dev:/dev;/proc:/proc;/sys:/sys',
+        'BXROOT_LINK2SYMLINK': '1',
         'LD_LIBRARY_PATH': _libpath(),
     })
     return [L + '/libproroot-bridge.so', L + '/libproroot-linker.so', '--argv0', cmd[0],
@@ -104,7 +140,7 @@ WORKLOADS = {
                        'while [ $i -lt 300 ]; do echo "v$i" >"$d/f$i" || exit 8; '
                        '[ "$(cat "$d/f$i")" = "v$i" ] || exit 7; i=$((i+1)); done; rm -rf "$d"; echo DONE', 'DONE'),
     # 目录遍历：/usr 下 find 计数，必须大于 0
-    'find_usr': ('n=$(find /usr -xdev 2>/dev/null | wc -l); [ "$n" -gt 100 ] || exit 8; echo DONE', 'DONE'),
+    'find_usr': ('n=$(find /usr -xdev 2>/dev/null | wc -l); [ "$n" -gt 1000 ] || exit 8; echo DONE', 'DONE'),
     # 硬链接模拟（l2s 路径）：建链后 nlink 必须为 2
     'link_x200': ('d=$(mktemp -d /tmp/bl.XXXXXX) || exit 9; echo x >"$d/a"; i=0; '
                   'while [ $i -lt 200 ]; do ln "$d/a" "$d/l$i" || exit 8; i=$((i+1)); done; '
@@ -112,9 +148,19 @@ WORKLOADS = {
 }
 
 
+def prepare_guest_tmp():
+    d = os.path.join(ROOTFS, 'tmp')
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.chmod(d, 0o1777)
+    except OSError:
+        pass
+
+
 def selfcheck():
     """每个后端先自检：能跑通 echo；proot 还必须有 tracer。"""
     ok = {}
+    counts = {}
     for n in BACKENDS:
         r = run(n, ['/bin/bash', '-c',
                     'echo SELF; while IFS= read -r l; do case $l in TracerPid:*) echo "$l";; esac; '
@@ -135,8 +181,26 @@ def selfcheck():
             if tr in ('0', '?'):
                 print(f'[FAIL] proot: guest TracerPid={tr}，对照组没在 ptrace，作废', flush=True)
                 continue
-        print(f'[ok]   {n}: 自检通过 TracerPid={tr}', flush=True)
+        # 路径翻译探针：/usr 下必须有足够条目，否则这个后端看到的不是 rootfs
+        pr = run(n, ['/bin/bash', '-c', 'find /usr -xdev 2>/dev/null | wc -l'])
+        cnt = -1
+        if pr and pr[1] == 0 and pr[2].strip().isdigit():
+            cnt = int(pr[2].strip())
+        if cnt < 1000:
+            print(f'[FAIL] {n}: 路径翻译探针失败，find /usr 只有 {cnt} 项，作废', flush=True)
+            continue
+        counts[n] = cnt
+        print(f'[ok]   {n}: 自检通过 TracerPid={tr} find_usr={cnt}', flush=True)
         ok[n] = True
+    # 各后端 find 条目数必须一致，否则它们遍历的不是同一棵树，比较无意义
+    if len(set(counts.values())) > 1:
+        print(f'[WARN] 各后端 find /usr 条目数不一致: {counts}，只保留与多数一致者', flush=True)
+        from collections import Counter
+        major = Counter(counts.values()).most_common(1)[0][0]
+        for n in list(ok):
+            if counts.get(n) != major:
+                print(f'[void] {n}: 条目数 {counts.get(n)} != {major}', flush=True)
+                ok.pop(n)
     return ok
 
 
@@ -147,6 +211,7 @@ def main():
                 sys.exit('REFUSED: 本进程被 ptrace，不能在 PRoot 容器内跑基准')
     if not os.path.isdir(ROOTFS):
         sys.exit(f'REFUSED: rootfs 不存在 {ROOTFS}')
+    prepare_guest_tmp()
     alive = selfcheck()
     if len(alive) < 2:
         sys.exit('REFUSED: 可用后端不足 2 个，无法对照')
@@ -175,7 +240,12 @@ def main():
                           'min_s': round(min(v), 3), 'max_s': round(max(v), 3), 'n': len(v)}
                       for n, v in valid.items() if v}
         print(json.dumps({w: results[w]}, ensure_ascii=False), flush=True)
-    out = {'rootfs': ROOTFS, 'rounds': ROUNDS, 'backends': sorted(alive), 'results': results}
+    import hashlib
+    sha = lambda f: hashlib.sha256(open(f, 'rb').read()).hexdigest() if os.path.exists(f) else None
+    out = {'rootfs': ROOTFS, 'rounds': ROUNDS, 'backends': sorted(alive), 'results': results,
+           'bxroot_runtime': BX_RT, 'bxroot_runtime_sha256': sha(BX_RT),
+           'official_runtime_sha256': sha(OFF + '/libproroot-runtime.so')}
+    print('bxroot runtime:', BX_RT, out['bxroot_runtime_sha256'], flush=True)
     path = os.path.join(TMP, 'bench-backends.json')
     json.dump(out, open(path, 'w'), ensure_ascii=False, indent=1)
     print('BENCH_RESULT_FILE', path)

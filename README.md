@@ -2,7 +2,7 @@
 
 用 `LD_PRELOAD` 在用户态做路径翻译的开源容器运行时。主战场是 **Android arm64**：不依赖 root、`chroot`、`mount` 或 `ptrace`，在应用私有目录里跑完整的 Ubuntu 用户态（apt / dpkg / node / pnpm / git）。
 
-当前版本 **v0.2.3**，MIT 许可。[更新日志](CHANGELOG.md) · [发行说明](docs/RELEASE-v0.2.3.md) · [架构](docs/ARCHITECTURE.md)
+当前版本 **v0.2.4**，MIT 许可。[更新日志](CHANGELOG.md) · [发行说明](docs/RELEASE-v0.2.4.md) · [架构](docs/ARCHITECTURE.md)
 
 > **先读这条：bxroot 是兼容性运行时，不是安全沙箱，也不是 Android root。**
 > fakeroot 只改变 guest 看到的 uid/gid；静态 ELF、裸 syscall 和未覆盖的内核接口可能绕过部分视图；bind 的源路径由启动参数决定。不要把不可信代码或敏感宿主目录交给 bxroot。详见 [安全边界](#安全边界)。
@@ -119,7 +119,7 @@ fd/dirfd 形态的 exec 用它。所以最低门槛由 `statx` 决定 = **4.11**
 
 ## 当前状态
 
-**v0.2.3 可用**（Android arm64；native session v3 + SHM 硬化 + 静态 ELF 进程内执行）。
+**v0.2.4 可用**（Android arm64；native session v3 + SHM 硬化 + 静态 ELF 进程内执行）。
 
 > 相对 v0.1.x：**guest → host → guest 回入口**、官方启动器 `PROROOT_CFG_FD`、进程内执行无 `PT_INTERP` 的静态 ELF、SIGSYS 影子槽、livepatch 扫 libc 全部 r-x 段、SysV SHM 生命周期硬化。详细条目见 [`CHANGELOG.md`](CHANGELOG.md) 与 [`docs/RELEASE-v0.2.3.md`](docs/RELEASE-v0.2.3.md)。
 >
@@ -437,7 +437,7 @@ bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 | 想了解 | 看这里 |
 |---|---|
 | 整体设计 | [ARCHITECTURE](docs/ARCHITECTURE.md) · [已知限制与架构能力边界](docs/已知限制与架构能力边界.md) |
-| 本版本发行与变更 | [CHANGELOG](CHANGELOG.md) · [RELEASE-v0.2.3](docs/RELEASE-v0.2.3.md) · [RELEASE-runtime-gates](docs/RELEASE-runtime-gates.md) · [当前收口状态](docs/CLOSEOUT-current.md) |
+| 本版本发行与变更 | [CHANGELOG](CHANGELOG.md) · [RELEASE-v0.2.4](docs/RELEASE-v0.2.4.md) · [RELEASE-runtime-gates](docs/RELEASE-runtime-gates.md) · [当前收口状态](docs/CLOSEOUT-current.md) |
 | Android 集成 | [ANDROID-INTEGRATION](docs/ANDROID-INTEGRATION.md) · [DSHA 适配说明](docs/DSHA-适配说明.md) · [真机验证清单](docs/真机验证清单.md) |
 | native v3 / bx-host | [第一版](docs/bx-host-第一版.md) · [第二版](docs/bx-host-第二版.md) · [第三版](docs/bx-host-第三版.md) · [ANDROID-NATIVE-V3-RELEASE](docs/ANDROID-NATIVE-V3-RELEASE.md) |
 | SysV SHM | [TEST-shm-final-closure](docs/TEST-shm-final-closure.md) · [TEST-shm-closeout](docs/TEST-shm-closeout.md) · [BUILD-runtime-capability-matrix](docs/BUILD-runtime-capability-matrix.md) |

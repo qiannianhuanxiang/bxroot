@@ -2,6 +2,15 @@
 
 本项目遵循语义化版本。日期为 UTC。
 
+## v0.2.4 — 2026-10-13
+
+**主题：文档与可验证性修正，运行库行为不变。**
+
+- `libbxroot.so -V` 此前仍打印 `0.1.4`，现与发行版本一致。v0.2.3 的 tag 与附件里的 launcher 仍显示 `0.1.4`，那是已发布产物，不改写。
+- README 重构：新增快速开始（选项取自 launcher `--help`）、环境要求、安全边界、Android 集成、文档索引；长篇开发笔记迁到 [`docs/DEVELOPMENT-NOTES.md`](docs/DEVELOPMENT-NOTES.md)，内容未删减。
+- 更正 README 里过时的数字：runtime 导出符号为 460 个（此前写 385）；上游 issue 回归标注为 2026-10-02 快照，未重跑。
+- 新增 `test/host/bench_backends.py`：proot(ptrace) / 官方 proroot / bxroot 三后端对照基准。每项先校验操作成功，proot 须自证有 tracer，各后端 `find /usr` 条目数须一致，否则该项作废。**本版本不发布任何性能倍数**：首轮实测只有 `find /usr` 一项可信，其余因官方后端配置不对等或 runtime 版本不符而作废，修正后的脚本尚未复跑。
+
 ## v0.2.3 — 2026-10-12
 
 **主题：SHM 生命周期硬化 + 静态 ELF 进程内执行 + SIGSYS 影子槽 + native session v3 回入口。**
