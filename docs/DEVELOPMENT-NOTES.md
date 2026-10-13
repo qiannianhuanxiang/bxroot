@@ -4,6 +4,8 @@
 
 ## 性能说法的复核记录
 
+> 2026-10-13 起已有一组可信的对照结果，见 [BENCH-2026-10-13](BENCH-2026-10-13.md)。下面保留当初作废数字的复核过程。
+
 
 架构上成立：bxroot 在客户进程内直接改写路径参数，**不产生额外的内核往返**；
 ptrace 方案（proot）要让每个系统调用停两次。
@@ -54,7 +56,7 @@ ptrace 方案（proot）要让每个系统调用停两次。
    自研加载器接管了 `execve`，`LD_PRELOAD` 会**静默失效**（连空构造函数
    都不执行），测试会显示假绿。用官方四件套
    （`bridge + linker + --argv0 + --preload`）。详见
-   [`docs/调查-LD_PRELOAD在proroot容器内失效.md`](docs/调查-LD_PRELOAD在proroot容器内失效.md)。
+   [`docs/调查-LD_PRELOAD在proroot容器内失效.md`](调查-LD_PRELOAD在proroot容器内失效.md)。
 
 
 ## 非 Android 环境的修复历史
