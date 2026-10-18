@@ -50,6 +50,7 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+#include <stdlib.h>   /* malloc/free：每线程备用栈 */
 #include "crash.h"
 
 /* ------------------------------------------------------------------ */
@@ -249,6 +250,26 @@ static volatile sig_atomic_t g_in_handler = 0;
  */
 #define CW_ALTSTACK_SIZE (16 * 1024)
 static char g_altstack[CW_ALTSTACK_SIZE];
+
+/*
+ * ★ 每线程备用栈（缺陷修复，2026-10-18）★
+ *
+ * 【缺陷】sigaltstack 是**每线程**属性，而原实现只在构造函数里装了一次
+ * （即只有初始线程有）。pthread_create 出来的线程没有备用栈，于是
+ * SA_ONSTACK 对它们**退化为普通栈**——一旦崩因是栈溢出，处理器自己
+ * 都起不来，进程静默死掉，拿不到任何现场。对 node/pnpm 这类多线程
+ * guest，这是常态场景而非边角。
+ *
+ * 【修法】给"当前线程"按需分配一块私有备用栈，指针存 TLS，线程退出时
+ * 由 pthread_create 包装 thunk 负责释放。初始线程继续用上面那块静态
+ * 缓冲（它不会退出，没必要 malloc）。
+ *
+ * 为什么用 __thread 而不是 pthread_getspecific：crash.c 刻意不依赖
+ * pthread（它要在构造函数早期就能工作），而 __thread 是编译器内建，
+ * 没有库初始化时序问题。
+ */
+static __thread char *t_altstack;      /* 本线程私有备用栈（NULL=未装） */
+static __thread int   t_altstack_orig; /* 1=本线程确实是自己装的（可释放） */
 
 /* 崩溃原因的可读名（不用 strsignal，它非异步信号安全） */
 static const char *cw_signame(int sig)
@@ -523,6 +544,69 @@ int bxroot_crash_install(const char *tag)
 
     g_installed = 1;
     return 0;
+}
+
+/*
+ * 给**当前线程**安装私有备用栈（供 pthread_create 包装在新线程入口调用）。
+ *
+ * 返回 0 = 已装好（或本来就有）；-1 = 装不上（不影响进程继续运行）。
+ *
+ * 幂等：同一线程重复调用直接返回 0。若本线程已有别人装的备用栈
+ * （例如调用方自己装了），这里**不覆盖** —— sigaltstack 覆盖别人的
+ * 设置会破坏调用方的意图。
+ */
+int bxroot_crash_install_altstack(void)
+{
+    stack_t cur;
+    stack_t ss;
+
+    /* 本线程已经有备用栈（不管是谁装的）→ 不动 */
+    if (sigaltstack(NULL, &cur) == 0 &&
+        !(cur.ss_flags & SS_DISABLE) && cur.ss_sp != NULL)
+        return 0;
+
+    if (t_altstack != NULL)
+        return 0;                       /* 本线程已装过 */
+
+    t_altstack = (char *)malloc(CW_ALTSTACK_SIZE);
+    if (t_altstack == NULL)
+        return -1;
+
+    memset(&ss, 0, sizeof ss);
+    ss.ss_sp    = t_altstack;
+    ss.ss_size  = CW_ALTSTACK_SIZE;
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, NULL) != 0) {
+        free(t_altstack);
+        t_altstack = NULL;
+        return -1;
+    }
+    t_altstack_orig = 1;
+    return 0;
+}
+
+/*
+ * 线程退出前释放私有备用栈（由 pthread_create 包装调用）。
+ *
+ * 只释放**我们自己装的**：若调用方后来自己换过备用栈，这块内存不该被
+ * 我们 free（否则会 dangling）。判据是 ss_sp 仍等于 t_altstack。
+ */
+void bxroot_crash_uninstall_altstack(void)
+{
+    stack_t cur;
+
+    if (t_altstack == NULL || !t_altstack_orig)
+        return;
+
+    if (sigaltstack(NULL, &cur) == 0 && cur.ss_sp == t_altstack) {
+        stack_t off;
+        memset(&off, 0, sizeof off);
+        off.ss_flags = SS_DISABLE;
+        (void)sigaltstack(&off, NULL);
+    }
+    free(t_altstack);
+    t_altstack = NULL;
+    t_altstack_orig = 0;
 }
 
 void bxroot_crash_uninstall(void)

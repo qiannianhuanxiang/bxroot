@@ -39,6 +39,7 @@
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
+#include <sys/stat.h>   /* fstat：校验 p_offset+p_filesz <= 文件大小 */
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -65,12 +66,24 @@ static int load_elf(const char *path, ulx_image *img)
     Elf64_Ehdr eh;
     Elf64_Phdr ph[ULX_MAX_PHDR];
     unsigned long lo = ~0UL, hi = 0, align = 4096, ps = (unsigned long)getpagesize();
+    unsigned long fsize = 0;
+    struct stat fst;
     int fd, i;
     char *res;
 
     fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return -1;
+    /*
+     * ★ 取文件大小：后面要校验 p_offset+p_filesz <= fsize（缺陷修复，2026-10-18）★
+     * 截断的 ELF 若映射越过 EOF，首次访问就是 SIGBUS —— 必须在映射前拒绝。
+     */
+    if (fstat(fd, &fst) != 0 || fst.st_size < 0) {
+        close(fd);
+        errno = ENOEXEC;
+        return -1;
+    }
+    fsize = (unsigned long)fst.st_size;
     if (pread(fd, &eh, sizeof eh, 0) != (ssize_t)sizeof eh ||
         memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
         eh.e_machine != EM_AARCH64 || (eh.e_type != ET_DYN && eh.e_type != ET_EXEC) ||
@@ -89,6 +102,36 @@ static int load_elf(const char *path, ulx_image *img)
         }
         if (ph[i].p_type != PT_LOAD)
             continue;
+        /*
+         * ★ 坏/恶意 ELF 一律在**任何映射之前**拒绝（缺陷修复，2026-10-18）★
+         *
+         * 本文件原先只校验 ELF 头，直接按 p_memsz 算预留区、按 p_filesz
+         * 做 MAP_FIXED。三条后果（与 static_exec.c:485-491 同源，那边
+         * 早已加固，这里漏了）：
+         *
+         *   ① p_filesz > p_memsz → 映射长度越过 PROT_NONE 预留区，
+         *      MAP_FIXED 会把**相邻映射**直接撕掉（不是失败，是静默破坏）；
+         *   ② p_vaddr + p_memsz 回绕 → hi 被算小，`hi <= lo` 兜不住，
+         *      段内偏移 me-a 再回绕 → 从 base-0x1000 起映射；
+         *   ③ p_offset + p_filesz 越过文件末尾 → 映射成功但首次访问
+         *      SIGBUS；p_offset < 页内偏移时 off-d 下溢成负 offset →
+         *      好 ELF 被误判失败。
+         *
+         * 判据与 static_exec.c 保持一致，便于两处同改同测。
+         */
+        if (ph[i].p_filesz > ph[i].p_memsz ||
+            ph[i].p_vaddr + ph[i].p_memsz < ph[i].p_vaddr ||
+            ph[i].p_offset + ph[i].p_filesz < ph[i].p_offset ||
+            ph[i].p_offset + ph[i].p_filesz > fsize ||
+            (ph[i].p_align != 0 &&
+             (ph[i].p_align & (ph[i].p_align - 1)) != 0) ||
+            ph[i].p_align > (1UL << 30) ||
+            (ph[i].p_align > 1 &&
+             (ph[i].p_vaddr % ph[i].p_align) != (ph[i].p_offset % ph[i].p_align))) {
+            close(fd);
+            errno = ENOEXEC;
+            return -1;
+        }
         if (ph[i].p_align > align)
             align = ph[i].p_align;
         if ((ph[i].p_vaddr & ~(ps - 1)) < lo)
@@ -96,7 +139,7 @@ static int load_elf(const char *path, ulx_image *img)
         if (ph[i].p_vaddr + ph[i].p_memsz > hi)
             hi = ph[i].p_vaddr + ph[i].p_memsz;
     }
-    if (hi <= lo) {
+    if (hi <= lo || hi + ps < hi) {   /* ps 取整后可能回绕，一并查 */
         close(fd);
         errno = ENOEXEC;
         return -1;

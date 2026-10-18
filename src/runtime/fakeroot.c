@@ -270,6 +270,94 @@ static void fr_unlock(const fakeroot_map *m)
     __atomic_store_n(&mm->lock, 0, __ATOMIC_RELEASE);
 }
 
+/*
+ * ★ fork 之后子进程里的锁状态复位（缺陷修复，2026-10-18）★
+ *
+ * 【缺陷】线程 A 正在 fr_lock 的临界区里（锁位 = 1、A 的
+ * fr_lock_depth_of_thread = 1）时，线程 B 调 fork()。子进程里只留下 B
+ * 一个线程，但：
+ *   - `mm->lock` 是**进程内共享**的普通内存，被完整复制过来，仍是 1；
+ *   - `fr_lock_depth_of_thread` 是 _Thread_local —— 子进程里这个 TLS 块
+ *     来自 B 自己，值是 0（A 的持锁标记随 A 一起消失了）。
+ * 于是 B 既不会走「本线程已持有 ⇒ 重入」的快路径，又看到锁位已占用，
+ * 只能进 fr_lock 里那个**没有超时**的 __atomic_compare_exchange 自旋 ——
+ * 永久卡死。持锁的 A 不在子进程里，谁也不会来解锁。
+ *
+ * 【为什么复位是无条件做的，而不是只在本线程持有过锁时做】
+ *   `fr_lock_depth_of_thread` 只能证明「**本线程**手里有锁」，无法证明
+ *   「**别的线程**有没有把锁位留在 1」：上述死锁场景里子进程的 B
+ *   恰恰是 depth == 0 而锁位 == 1。按 depth 判断恰好漏掉唯一真正会
+ *   死锁的那种情况，等于没做。
+ *
+ * 【无条件清 0 为什么安全】
+ *   锁只被 fakeroot_map_* 的公开入口持有，而这些入口是「加锁 → 调
+ *   _unlocked 版 → 解锁」的无状态薄封装：不存在「前后两次调用共享
+ *   同一段临界区」的用法。所以子进程里把锁位清 0 之后，B 之后每个
+ *   入口都会自己重新加锁再解锁，不会出现两个线程同时在临界区
+ *   （子进程本来也只有一个线程）。父进程的锁位、父进程里 A 的 depth
+ *   各自独立，完全不受影响 —— 多进程 fork 时锁位在各进程里被复制，
+ *   每个进程自己有持锁的写者，本来就互不相干。
+ *   唯一多付的代价是：若 B 恰好在持锁的临界区里调了 fork()（临界区
+ *   内除表自身的 malloc 无阻塞调用，正常路径不会走到 fork），子进程
+ *   里 B 之后第一次 fr_lock 会再拿一次锁 —— 即「多拿一次」，而不是
+ *   死锁。两害相权，这是唯一能保证不复现缺陷的选择。
+ *
+ * 【为什么必须在子进程里、而不是在 fork prepare/parent 里做】
+ *   这是唯一不存在并发写者的地方：prepare 时父进程的其他线程照常
+ *   运行，擅自清 0 会让别人同时进入临界区（堆破坏）；parent 里清 0
+ *   会抢掉 A 的锁。只有子进程里「持有者已不存在」这一前提才成立。
+ *
+ * 【为什么清两张表】锁位是**每张表各一把**（mm->lock 在结构体里），
+ *   不是进程级全局锁。只清一张，另一张遗留的「已占用」照样让子进程
+ *   永久自旋。`mm->lock` 是 `volatile int`，复位就是一次普通 store。
+ *
+ * 【关于 g_fakeroot 的位置】函数体接在 §2 末尾、与 fr_lock 相邻；
+ *   而 g_fakeroot 的定义在 §6（纯逻辑模式下整段跳过）。测试把本文件
+ *   与 test/test_fakeroot.c 一起编（-DFAKEROOT_PURE_LOGIC），那边没有
+ *   也**不应该**有 g_fakeroot，所以这里用 **weak 引用**：链接期由
+ *   preload.c 提供强定义（或本文件 §6 自己提供），纯逻辑单测里解析成
+ *   NULL，函数直接返回一个「没做什么」的状态码，测试二进制仍能链接。
+ *   这不是绕过检查，而是本文件已经建立的做法（§6 的 real_* 全部
+ *   判 NULL，红线「每次调用前都查 NULL」）。
+ *
+ * 【返回值】返回实际复位了几张表（0..2）。0 表示子进程里没有可复位
+ *   的记账表（fakeroot 从未初始化，或处于纯逻辑链接场景）—— 此时
+ *   锁位本来就不存在，任何线程都不可能在上面自旋。调用方（
+ *   preload.c 的 bxroot_preload_fork_child）只用它做诊断。
+ *
+ * 【调用约定】导出为普通符号，preload.c 在 bxroot_preload_fork_child
+ *   里以 weak 引用调用（与已有的 bxroot_sysvshm_fork_child 同款写法）。
+ */
+#ifndef FAKEROOT_NO_FORK_RESET
+
+extern fakeroot_state g_fakeroot __attribute__((weak));
+
+int bxroot_fakeroot_atfork_child(void)
+{
+    fakeroot_state *fs = &g_fakeroot;
+    int reset = 0;
+
+    /* 先复位本线程的重入计数：否则即使锁位被清掉，后续 fr_lock 也会
+     * 走「重入」快路径（depth++ 后返回），fr_unlock 时只减计数、
+     * 不释放锁位 —— 等于在一个没锁上的表上做无锁访问。 */
+    fr_lock_depth_of_thread = 0;
+
+    if (fs == NULL) {
+        return 0;   /* 没有单例：没有表，也就没有锁位可留 */
+    }
+    if (fs->by_path != NULL) {
+        ((fakeroot_map *)fs->by_path)->lock = 0;
+        reset++;
+    }
+    if (fs->by_inode != NULL) {
+        ((fakeroot_map *)fs->by_inode)->lock = 0;
+        reset++;
+    }
+    return reset;
+}
+
+#endif /* !FAKEROOT_NO_FORK_RESET */
+
 /* 向上取整到 2 的幂；0 与 1 都返回 1。溢出返回 0。 */
 static size_t fr_round_pow2(size_t v)
 {

@@ -98,7 +98,8 @@ static int real_write_small(const char *p, const char *buf, size_t len)
 static const l2s_rt_ops REAL_OPS = {
     real_lstat, real_symlink, real_rename, real_unlink,
     real_readlink, real_access,
-    real_read_small, real_write_small
+    real_read_small, real_write_small,
+    NULL    /* update_small：本测试固定走"进程内锁 + 读/写"回退路径 */
 };
 
 /* ------------------------------------------------------------------ */
@@ -1193,7 +1194,8 @@ static int mfs_write_small(const char *p, const char *buf, size_t len)
 
 static const l2s_rt_ops MFS_OPS = {
     mfs_lstat, mfs_symlink, mfs_rename, mfs_unlink, mfs_readlink, mfs_access,
-    mfs_read_small, mfs_write_small
+    mfs_read_small, mfs_write_small,
+    NULL    /* update_small：保持既有断言（回退路径）不变 */
 };
 
 static void mfs_reset(void)

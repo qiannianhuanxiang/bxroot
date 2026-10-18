@@ -67,7 +67,23 @@
  * 这是"兼容性不能只加选项名、还要够容量"的一个实例 ——
  * 只把 `-R` 认下来却让它因容量不足而半途报错，比不支持更糟。
  */
-#define MAX_BINDS 48
+/*
+ * ★ 必须与 runtime 的 MAX_BINDS 一致（缺陷修复，2026-10-18）★
+ *
+ * 原值是 48，而 runtime（src/runtime/preload.c:434）是 16，且它的
+ * binds 数组按该常量静态分配。于是 `-b` 累计到 17..48 条时：
+ *   · launcher **全盘接受**（报错文案还写着"上限 48"）；
+ *   · runtime 解析到第 16 条就停，**剩余条目静默丢弃**；
+ *   · 缺的往往正是 `-R` 清单末尾的 `$HOME` / `*path*`；
+ *   · 任何 verbose 级别都没有提示。
+ *
+ * 改成 16 之后，超限会在 **launcher 就明确报错**，而不是让用户以为
+ * 挂载生效了。
+ *
+ * 注意：这个数字是两侧的硬约束。若将来要放宽，必须同时改
+ * runtime 的数组分配方式（它是静态 calloc(MAX_BINDS)）。
+ */
+#define MAX_BINDS 16
 
 /* 默认 rootfs */
 #ifndef BXROOT_DEFAULT_ROOTFS
@@ -253,6 +269,104 @@ static void free_config(launcher_config_t *cfg) {
 
 /* 前向声明：辅助函数定义在 parse_args 之后（那里的注释更连贯，
  * 且它们依赖 PATH_MAX 等已就位的头文件）。 */
+/*
+ * ★ 宿主侧路径绝对化（缺陷修复，2026-10-18）★
+ *
+ * `-r` 与 `-b` 的**宿主段**原先直接 strdup，不做任何规范化。相对值会
+ * 一路带到 runtime，而 runtime 的 translate_path 是"前缀拼接"：
+ *
+ *     -r rootfs   →  translate("/bin/sh") = "rootfs/bin/sh"（**不再以 / 开头**）
+ *     → 缺省 workdir 时 chdir(translate("/")) = "rootfs/"
+ *     → cwd 已在 rootfs/ 内 → 内核再拼一次 cwd
+ *     → "rootfs/rootfs/bin/sh" → **全路径 ENOENT**
+ *
+ * 现象是"命令明明存在，容器里却什么都打不开"，极难联想到是相对路径导致。
+ * `-b <相对宿主>:<guest>` 同理：相对 source 会随 guest cwd 漂移，甚至
+ * 指回 rootfs 内部。
+ *
+ * 这里统一用宿主 getcwd 把相对路径补成绝对路径。失败（cwd 已被删）时
+ * 返回 NULL，由调用方决定报错还是保留原值。
+ *
+ * 返回 malloc 出来的新串（调用方 free），或 NULL。
+ */
+static char *host_abspath(const char *p)
+{
+    char hcwd[4096];
+    char joined[4096];
+    size_t n;
+    int w;
+
+    if (p == NULL)
+        return NULL;
+    if (p[0] == '/')
+        return strdup(p);               /* 已是绝对路径 */
+    if (getcwd(hcwd, sizeof(hcwd)) == NULL)
+        return NULL;
+
+    n = strlen(hcwd);
+    while (n > 1 && hcwd[n - 1] == '/')
+        hcwd[--n] = '\0';
+
+    w = snprintf(joined, sizeof(joined), "%s/%s",
+                 strcmp(hcwd, "/") == 0 ? "" : hcwd, p);
+    if (w < 0 || (size_t)w >= sizeof(joined))
+        return NULL;                    /* 超长：交给调用方处理 */
+    return strdup(joined);
+}
+
+/*
+ * ★ 启动期分配失败统一处理（缺陷修复，2026-10-18）★
+ *
+ * 【问题】launcher 里有二十来处 `strdup`/`malloc` 直接解引用返回值。
+ * 平时看不出问题（启动期几个字节的分配不会失败），但这不是"不会发生"
+ * 而是"没人测过"：
+ *   - `cfg->guest_argv = malloc(...)` 为 NULL 时，下一行就写
+ *     `cfg->guest_argv[cfg->guest_argc] = NULL` → **NULL+偏移写入**，
+ *     崩溃点与实际原因（内存不足）完全脱节；
+ *   - `cfg->rootfs = strdup(...)` 为 NULL 时，后面每条路径都拿 NULL
+ *     去做 `strlen`/前缀拼接 → 段错误；
+ *   - 更糟的是 `cfg->workdir` 为 NULL 时可能被当成"未设置"而静默
+ *     回落到 "/" —— 用户指定的目录被忽略且无任何提示。
+ *
+ * 【修法】启动期分配失败本就无法继续（进程还没有任何可回滚的状态），
+ * 用统一的 x* 包装：失败即打印明确原因并退出。这样既消灭了 20 处
+ * 漏检，也保证错误信息里有"内存不足"和申请字节数，而不是一个裸的
+ * 段错误栈。
+ *
+ * 【为什么不返回 NULL 交给调用方】调用方大多在深层表达式中（如
+ * `cfg->rootfs = strdup(x)`），逐处改成带错误分支的写法会把启动流程
+ * 切成一片 if，而收益为零：这条路径上没有任何资源需要按顺序释放。
+ * 注意：**runtime（preload.c）不适用**，它是被注入进程的库，绝不能
+ * 因为一次分配失败就 exit()；那边继续用逐处判空。
+ */
+static void bx_oom(size_t n, const char *what)
+{
+    fprintf(stderr, "错误: 内存不足（%s 需要 %zu 字节）\n", what, n);
+    exit(1);
+}
+
+static void *xmalloc(size_t n)
+{
+    void *p = malloc(n);
+    if (p == NULL && n != 0)
+        bx_oom(n, "分配");
+    return p;
+}
+
+static char *xstrdup(const char *s)
+{
+    char *p;
+    size_t n;
+    if (s == NULL)
+        return NULL;
+    n = strlen(s) + 1;
+    p = malloc(n);
+    if (p == NULL)
+        bx_oom(n, "字符串");
+    memcpy(p, s, n);
+    return p;
+}
+
 static int add_bind(launcher_config_t *cfg, const char *host, const char *guest);
 static int add_bind_ro(launcher_config_t *cfg, const char *host,
                        const char *guest, int readonly);
@@ -353,7 +467,7 @@ static int resolve_guest_symlinks(char *resolved, const char *rootfs)
 }
 
 static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
-    cfg->rootfs = strdup(BXROOT_DEFAULT_ROOTFS);
+    cfg->rootfs = xstrdup(BXROOT_DEFAULT_ROOTFS);
 
     /*
      * ★ workdir 默认值：继承宿主 cwd（上游语义，评估报告 D2）★
@@ -375,9 +489,9 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
     {
         char hcwd[4096];
         if (getcwd(hcwd, sizeof(hcwd)) != NULL)
-            cfg->workdir = strdup(hcwd);
+            cfg->workdir = xstrdup(hcwd);
         else
-            cfg->workdir = strdup("/");
+            cfg->workdir = xstrdup("/");
     }
     cfg->bind_count = 0;
     cfg->fakeroot = 0;
@@ -425,7 +539,30 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                 return -1;
             }
             free(cfg->rootfs);
-            cfg->rootfs = strdup(argv[++i]);
+            {
+                /*
+                 * 相对 rootfs 绝对化（缺陷修复，2026-10-18）。
+                 * 理由见 host_abspath() 的注释：相对前缀会让所有翻译路径
+                 * 变成相对名，进而在 cwd 上被二次拼接 → 全面 ENOENT。
+                 * 绝对化失败时保留原值（与修前一致），但至少发出告警：
+                 * 这种情况后面必然一片 ENOENT，静默只会浪费时间。
+                 */
+                const char *raw = argv[++i];
+                char *abs = host_abspath(raw);
+                if (abs != NULL) {
+                    if (raw[0] != '/')
+                        fprintf(stderr,
+                                "[bxroot] 提示: -r 相对路径已绝对化: %s -> %s\n",
+                                raw, abs);
+                    cfg->rootfs = abs;
+                } else {
+                    fprintf(stderr,
+                            "[bxroot] 警告: 无法绝对化 -r 路径 \"%s\""
+                            "（getcwd 失败或超长），可能导致所有路径 ENOENT\n",
+                            raw);
+                    cfg->rootfs = xstrdup(raw);
+                }
+            }
         } else if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--cwd") == 0 ||
                    strcmp(argv[i], "--pwd") == 0) {
             /* --cwd 是 proot 的规范名；--pwd 是它的**旧名**（proot 仍接受）。
@@ -435,7 +572,48 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                 return -1;
             }
             free(cfg->workdir);
-            cfg->workdir = strdup(argv[++i]);
+            /*
+             * ★ 显式 -w 也必须规范化（缺陷修复，2026-10-18）★
+             *
+             * 原写法直接 strdup 客户给的串，不做任何校验：
+             *
+             *   · `-w ""`  → runtime 侧 `env[0]` 判空 → workdir=NULL
+             *                → 构造函数里整段 chdir 被**跳过**
+             *   · `-w .`   → `chdir(".")` 必然成功，也不触发
+             *                "失败回退 /" 的保护
+             *
+             * 两种情况 guest 的 cwd 都停在**启动 launcher 的宿主目录**
+             * （rootfs 之外）。随后 `open("x")`、`> out` 这类相对路径在
+             * translate_path 里按设计"相对名不翻译"直接透传，内核从宿主
+             * cwd 解析 → 直接读写宿主目录（写穿 rootfs）；`getcwd` 也会
+             * 回显宿主绝对路径。
+             *
+             * 修法：相对/空值一律用宿主 getcwd 解析成绝对路径；空串等价
+             * 于"没给 -w"，走默认逻辑。与上面默认分支的处理保持一致。
+             */
+            {
+                const char *wd = argv[++i];
+                if (wd == NULL || wd[0] == '\0') {
+                    /* 空值 → 视为未指定，保留默认（已由上面的默认分支设置） */
+                } else if (wd[0] == '/') {
+                    cfg->workdir = xstrdup(wd);
+                } else {
+                    /* 相对路径：按**宿主** cwd 绝对化（与默认分支同源） */
+                    char hcwd[4096];
+                    char joined[4096];
+
+                    if (getcwd(hcwd, sizeof(hcwd)) != NULL) {
+                        if (snprintf(joined, sizeof(joined), "%s/%s",
+                                     strcmp(hcwd, "/") == 0 ? "" : hcwd, wd)
+                            < (int)sizeof(joined))
+                            cfg->workdir = xstrdup(joined);
+                        else
+                            cfg->workdir = xstrdup(hcwd);   /* 超长：退回 cwd */
+                    } else {
+                        cfg->workdir = xstrdup("/");
+                    }
+                }
+            }
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0 ||
                    strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mount") == 0) {
             int is_bind_opt = strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0;
@@ -444,45 +622,117 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                 fprintf(stderr, "错误: %s 需要参数\n", optname);
                 return -1;
             }
-            char *spec = strdup(argv[++i]);
-            if (spec == NULL) {
-                return -1;
-            }
+            /*
+             * ★ 畸形 bind 规格必须**报错**，不能静默接受（缺陷修复，2026-10-18）★
+             *
+             * 【原先的行为，逐条】
+             *   1. `-b :/dst`（空 host）→ 存进表里，runtime 侧
+             *      "跳过空条目"，于是用户给了 N 条 bind 实际只有 N-1 条
+             *      生效，**launcher 不吭声**；
+             *   2. `-b /src:`（空 guest）→ 同上，静默丢弃；
+             *   3. `-b /src:/dst:unsupported` → 无条件在第二个冒号处
+             *      截断，guest 变成 `/dst`，第三段**直接扔掉**；
+             *   4. `-b /src:/d;st` → guest 里含 `;`。这一条最隐蔽：
+             *      `;` 是 BXROOT_BINDS 的**条目分隔符**，编码后
+             *      runtime 会把 `/src:/d` 和 `st` 解析成**两条** bind，
+             *      于是真正生效的目的地是 `/d`（错），还多出一条
+             *      source=`st`、target=`st` 的幽灵 bind（可被用来
+             *      把任意相对路径映射到 rootfs 内同名位置）。
+             *
+             * 【为什么选报错而不是修正】这四种输入都**无法**猜出用户
+             * 意图：空路径没有合法语义；含 `;`/`:` 的路径在本项目的
+             * 编码里没有转义机制（官方 proroot 的格式同样没有）。
+             * 静默降级会让人以为已生效 —— 而那正是这类 bug 最难查的
+             * 原因。明确报错、把规格原样打出来，用户改一次就好了。
+             */
+            char *spec = xstrdup(argv[++i]);
+            const char *bhost = spec;
+            const char *bguest;
+            int ro = 0;
             char *colon = strchr(spec, ':');
+
             if (colon == NULL) {
                 /*
                  * 上游 proot 对「不带冒号的单路径」的语义是
                  * `-b <path>` == `-b <path>:<path>`（同一来源路径按
                  * 原样映射到 rootfs 内相同位置）。保持一致，不再报错。
                  */
-                if (add_bind(cfg, spec, spec) != 0) {
-                    fprintf(stderr, "错误: bind 数量已达上限 %d\n", MAX_BINDS);
-                    free(spec);
-                    return -1;
-                }
+                bguest = spec;
             } else {
                 *colon = '\0';
+                bguest = colon + 1;
                 /*
                  * 只读 bind：第三段显式 `:ro` 表示该挂载点在 guest 内
                  * 只读（写返回 EROFS）。语法 `-b host:guest:ro`。
-                 * 只有字面量 "ro" 才置只读；无第三段或其它值 = 可写
-                 * （向后兼容旧的两段格式）。
                  *
-                 * ★ 只切第三段的冒号，不影响 guest 路径 ★ 在 guest
-                 * 部分再找一个冒号；找到且尾段为 "ro" 才截断并置标志。
+                 * ★ 只读标志大小写不敏感（缺陷修复，2026-10-18）★
+                 * 原按字面量 "ro" 精确比较，`:RO`/`:Ro` 一律**不**置
+                 * 只读，而无论认不认都照样在冒号处截断 guest —— 结果
+                 * 是"用户明确要求只读、实际拿到可写"，release 构建里
+                 * LOG 还是空宏，零提示。方向危险的静默降级。
+                 *
+                 * ★ 第三段只接受 ro / rw ★ 其它值一律报错：
+                 * 无法区分"未知修饰符"和"guest 路径里真的有冒号"，
+                 * 而两者都会让 guest 路径被悄悄改掉。
                  */
-                int ro = 0;
-                char *guest = colon + 1;
-                char *colon2 = strchr(guest, ':');
-                if (colon2 != NULL && strcmp(colon2 + 1, "ro") == 0) {
+                char *colon2 = strchr(bguest, ':');
+                if (colon2 != NULL) {
+                    const char *mod = colon2 + 1;
+                    if (mod[0] == '\0') {
+                        fprintf(stderr,
+                                "错误: %s 规格 \"%s\" 的 guest 路径后有多余的 ':'\n",
+                                optname, argv[i]);
+                        free(spec);
+                        return -1;
+                    }
+                    if ((mod[0] == 'r' || mod[0] == 'R') &&
+                        (mod[1] == 'o' || mod[1] == 'O') && mod[2] == '\0') {
+                        ro = 1;
+                    } else if ((mod[0] == 'r' || mod[0] == 'R') &&
+                               (mod[1] == 'w' || mod[1] == 'W') && mod[2] == '\0') {
+                        ro = 0;              /* 显式可写 = 默认值 */
+                    } else {
+                        fprintf(stderr,
+                                "错误: %s 规格 \"%s\" 的第三段 \"%s\" 不是 ro/rw\n"
+                                "      本项目不支持 guest 路径含 ':'（官方格式同样不支持）；\n"
+                                "      若确实需要，请改写挂载点。\n",
+                                optname, argv[i], mod);
+                        free(spec);
+                        return -1;
+                    }
                     *colon2 = '\0';
-                    ro = 1;
                 }
-                if (add_bind_ro(cfg, spec, guest, ro) != 0) {
-                    fprintf(stderr, "错误: bind 数量已达上限 %d\n", MAX_BINDS);
-                    free(spec);
-                    return -1;
-                }
+            }
+
+            /* 空路径：没有任何合法语义，且 runtime 会把它当"匹配一切" */
+            if (bhost[0] == '\0' || bguest[0] == '\0') {
+                fprintf(stderr,
+                        "错误: %s 规格 \"%s\" 的%s为空\n"
+                        "      正确写法: %s <宿主路径>:<guest 路径>[:ro]\n",
+                        optname, argv[i],
+                        bhost[0] == '\0' ? "宿主路径" : "guest 路径",
+                        optname);
+                free(spec);
+                return -1;
+            }
+
+            /*
+             * `;` 是 BXROOT_BINDS 的条目分隔符，没有转义机制。
+             * 放过去 = 一条 bind 被切成两条（见上方注释 4）。
+             */
+            if (strchr(bhost, ';') != NULL || strchr(bguest, ';') != NULL) {
+                fprintf(stderr,
+                        "错误: %s 规格 \"%s\" 的路径含 ';'\n"
+                        "      ';' 是 bind 列表的分隔符，本实现不支持含 ';' 的路径。\n",
+                        optname, argv[i]);
+                free(spec);
+                return -1;
+            }
+
+            if (add_bind_ro(cfg, bhost, bguest, ro) != 0) {
+                fprintf(stderr, "错误: bind 数量已达上限 %d\n", MAX_BINDS);
+                free(spec);
+                return -1;
             }
             free(spec);
         } else if (strcmp(argv[i], "-0") == 0 ||
@@ -596,7 +846,7 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                 return -1;
             }
             free(cfg->rootfs);
-            cfg->rootfs = strdup(argv[++i]);
+            cfg->rootfs = xstrdup(argv[++i]);
             if (!cfg->rootfs) {
                 return -1;
             }
@@ -621,7 +871,7 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                 return -1;
             }
             free(cfg->rootfs);
-            cfg->rootfs = strdup(argv[++i]);
+            cfg->rootfs = xstrdup(argv[++i]);
             if (!cfg->rootfs) {
                 return -1;
             }
@@ -712,6 +962,42 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                     return -1;
                 }
 
+                /*
+                 * ★ 必须校验取值范围与符号（缺陷修复，2026-10-18）★
+                 *
+                 * strtoul 有两个陷阱，上面那些格式检查全都挡不住：
+                 *
+                 *   · "-1"          → 返回 ULONG_MAX，**errno 不变**。
+                 *                     末尾 end_u == colon 也成立（'-' 被
+                 *                     当作合法前导符号吃掉）。
+                 *   · "4294967296"  → 64 位 unsigned long 装得下，同样
+                 *                     不置 ERANGE。
+                 *
+                 * 而 runtime 侧是直接截断成 32 位：
+                 *     fakeroot.c:2282  g_fakeroot.euid = (uid_t)strtoul(...)
+                 * 于是：
+                 *     -i 4294967296:0  → uid_t 0    → guest 里**变成了 root**
+                 *     -i -1:0          → 4294967295
+                 *
+                 * 用户以为映射成了某个普通身份，实际拿到 root —— 后面
+                 * 所有基于身份的判断都跟着错。这与本处注释"严格校验而非
+                 * atoi 静默吞错"的初衷直接矛盾。
+                 *
+                 * 修法：显式拒绝负号，并要求落在 uid_t/gid_t 的取值域内。
+                 */
+                if (spec[0] == '-' || colon[1] == '-') {
+                    fprintf(stderr,
+                            "错误: -i/--change-id 不接受负数：\"%s\"。\n",
+                            spec);
+                    return -1;
+                }
+                if (uid_v > 0xffffffffUL || gid_v > 0xffffffffUL) {
+                    fprintf(stderr,
+                            "错误: -i/--change-id 超出范围（uid/gid 最大 "
+                            "4294967295）：\"%s\"。\n", spec);
+                    return -1;
+                }
+
                 cfg->fakeroot = 1;          /* 任意映射都启用身份伪装 */
                 cfg->change_id_set = 1;
                 cfg->fake_uid = uid_v;
@@ -738,7 +1024,7 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                 return -1;
             }
             free(cfg->kernel_release);
-            cfg->kernel_release = strdup(argv[++i]);
+            cfg->kernel_release = xstrdup(argv[++i]);
         } else if (strcmp(argv[i], "-H") == 0) {
             fprintf(stderr,
                     "错误: -H 未实现。\n"
@@ -828,11 +1114,18 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
             }
 
             /* 第一个非选项参数就是 guest 命令 */
-            cfg->guest_exe = strdup(argv[i]);
+            /*
+             * ★ 这一段的 malloc 必须判空（缺陷修复，2026-10-18）★
+             * 原写法 `malloc` 之后**紧接着**就写
+             * `guest_argv[guest_argc] = NULL`，分配失败时是
+             * "NULL + 偏移" 的写入 —— 崩溃点与真实原因（内存不足）
+             * 完全脱节。改用 xmalloc/xstrdup：失败时打印原因并退出。
+             */
+            cfg->guest_exe = xstrdup(argv[i]);
             cfg->guest_argc = argc - i;
-            cfg->guest_argv = malloc(sizeof(char *) * (cfg->guest_argc + 1));
+            cfg->guest_argv = xmalloc(sizeof(char *) * (size_t)(cfg->guest_argc + 1));
             for (int j = i; j < argc; j++)
-                cfg->guest_argv[j - i] = strdup(argv[j]);
+                cfg->guest_argv[j - i] = xstrdup(argv[j]);
             cfg->guest_argv[cfg->guest_argc] = NULL;  // NULL 终止
             break;
         }
@@ -871,8 +1164,30 @@ static int add_bind_ro(launcher_config_t *cfg, const char *host,
     if (cfg->bind_count >= MAX_BINDS) {
         return -1;
     }
-    cfg->binds[cfg->bind_count * 2] = strdup(host);
-    cfg->binds[cfg->bind_count * 2 + 1] = strdup(guest);
+    /*
+     * ★ host 段必须绝对化（缺陷修复，2026-10-18）★
+     *
+     * `-b rel:/dst` 的相对 source 会被 runtime 直接当作前缀替换，
+     * 于是同一条 bind 会随 guest 的 cwd 指向**不同**宿主文件，甚至
+     * 指回 rootfs 内部。绝对化后行为才确定。
+     * 绝对化失败时保留原值（与修前一致），不因此拒绝整条 bind ——
+     * 那会把本来能用的场景弄坏。
+     */
+    {
+        char *abs = host_abspath(host);
+        if (abs != NULL) {
+            cfg->binds[cfg->bind_count * 2] = abs;
+        } else {
+            cfg->binds[cfg->bind_count * 2] = xstrdup(host);
+        }
+    }
+    cfg->binds[cfg->bind_count * 2 + 1] = xstrdup(guest);
+    /*
+     * host_abspath() 是唯一仍会返回 NULL 的分配点（它在超长/取不到
+     * cwd 时按设计返回 NULL，由调用方回落）。xstrdup 不会返回 NULL，
+     * 因此这里只剩下 host 侧一种可能 —— 保留判断，避免以后改动
+     * host_abspath 的语义时静默写出空指针。
+     */
     if (cfg->binds[cfg->bind_count * 2] == NULL ||
         cfg->binds[cfg->bind_count * 2 + 1] == NULL) {
         return -1;
@@ -1261,17 +1576,46 @@ static int read_elf_interp(const char *path, char *out, size_t outsz)
     memcpy(&phoff, buf + 32, 8);
     phentsize = buf[54] | (buf[55] << 8);
     phnum = buf[56] | (buf[57] << 8);
-    for (k = 0; k < phnum && phentsize >= 56; k++) {
-        unsigned long off = phoff + (unsigned long)k * phentsize, poff, psz;
+    /*
+     * ★ 所有边界判断都用**减法**，不用加法（缺陷修复，2026-10-18）★
+     *
+     * 【问题】`phoff` / `poff` / `psz` 全部是**从文件里读出来的
+     *        64 位值**，可以是任意数。原写法有三个可溢出的加法：
+     *          off = phoff + k * phentsize      → 回绕成小值
+     *          off + 56 > m                     → 回绕后判为"在范围内"
+     *          poff + psz > m                   → 同上
+     *        三者都溢出时，下一步就是 `memcpy(&type, buf + off, 4)`
+     *        或 `memcpy(out, buf + poff, psz)`，**从栈缓冲区外的任意
+     *        地址读**，然后把内容当路径用。构造一个 phoff=ULONG_MAX-8
+     *        的 ELF 即可稳定触发（读到的内容再交给 stat/execve）。
+     *
+     * 【修法】把 `a + b <= m` 改写成 `a <= m && b <= m - a`：
+     * 先确保 `a` 不越界，再做减法，减法本身不可能下溢。乘法
+     * `k * phentsize` 同理改写成"除法先行"。
+     *
+     * 这些都是**只读诊断路径**（解释 exec 失败原因时才会跑），
+     * 所以修法只需保证不越界，不需要兼容任何畸形输入。
+     */
+    if (phoff > (unsigned long)m || phentsize < 56)
+        return 0;
+    for (k = 0; k < phnum; k++) {
+        unsigned long off, poff, psz;
         unsigned type;
-        if (off + 56 > (unsigned long)m)
+
+        /* k * phentsize 的溢出前置判断：k > 剩余空间 / 步长 即越界 */
+        if ((unsigned long)k > ((unsigned long)m - phoff) / phentsize)
+            break;
+        off = phoff + (unsigned long)k * phentsize;
+        if (off > (unsigned long)m || (unsigned long)m - off < 56)
             break;
         memcpy(&type, buf + off, 4);
         if (type != 3 /* PT_INTERP */)
             continue;
         memcpy(&poff, buf + off + 8, 8);
         memcpy(&psz, buf + off + 32, 8);
-        if (psz == 0 || psz > outsz || poff + psz > (unsigned long)m)
+        if (psz == 0 || psz > outsz)
+            return 0;
+        if (poff > (unsigned long)m || psz > (unsigned long)m - poff)
             return 0;
         memcpy(out, buf + poff, psz);
         out[psz - 1] = '\0';
@@ -1500,17 +1844,29 @@ static void explain_exec_failure(const char *exe, const char *rootfs, int err)
                 memcpy(&phoff, buf + 32, 8);
                 phentsize = buf[54] | (buf[55] << 8);
                 phnum = buf[56] | (buf[57] << 8);
-                for (k = 0; k < phnum && phentsize >= 56; k++) {
-                    unsigned long off = phoff + (unsigned long)k * phentsize;
+                /*
+                 * 同样的减法式边界判断，理由见 read_elf_interp()
+                 * 的注释：phoff/poff/psz 是文件里的任意 64 位值，
+                 * 加法会回绕，减法不会。
+                 */
+                if (phoff > (unsigned long)m || phentsize < 56)
+                    phnum = 0;
+                for (k = 0; k < phnum; k++) {
+                    unsigned long off;
                     unsigned type; unsigned long poff, psz;
-                    if (off + 56 > (unsigned long)m)
+                    if ((unsigned long)k > ((unsigned long)m - phoff) / phentsize)
+                        break;
+                    off = phoff + (unsigned long)k * phentsize;
+                    if (off > (unsigned long)m || (unsigned long)m - off < 56)
                         break;
                     memcpy(&type, buf + off, 4);
                     if (type != 3 /* PT_INTERP */)
                         continue;
                     memcpy(&poff, buf + off + 8, 8);
                     memcpy(&psz, buf + off + 32, 8);
-                    if (psz > 0 && psz < PATH_MAX && poff + psz <= (unsigned long)m) {
+                    if (psz > 0 && psz < PATH_MAX &&
+                        poff <= (unsigned long)m &&
+                        psz <= (unsigned long)m - poff) {
                         char interp[PATH_MAX], host[PATH_MAX * 2];
                         memcpy(interp, buf + poff, psz);
                         interp[psz - 1] = '\0';
@@ -1622,7 +1978,7 @@ int main(int argc, char **argv) {
     char runtime_lib[PATH_MAX];
     if (env_lib_path && env_lib_path[0] && access(env_lib_path, F_OK) == 0) {
         snprintf(runtime_lib, sizeof(runtime_lib), "%s", env_lib_path);
-        cfg.runtime_lib = strdup(runtime_lib);
+        cfg.runtime_lib = xstrdup(runtime_lib);
     } else {
         if (join_dir_name(runtime_lib, sizeof(runtime_lib),
                           lib_dir, LIBBXROOT_RUNTIME) != 0) {
@@ -1630,7 +1986,7 @@ int main(int argc, char **argv) {
                     lib_dir, LIBBXROOT_RUNTIME, (int)sizeof(runtime_lib));
             return 1;
         }
-        cfg.runtime_lib = strdup(runtime_lib);
+        cfg.runtime_lib = xstrdup(runtime_lib);
     }
 
     /* 构建 linker 和 stub-loader 路径（如果存在） */
@@ -1642,7 +1998,7 @@ int main(int argc, char **argv) {
     if (join_dir_name(linker_lib, sizeof(linker_lib),
                       lib_dir, LIBBXROOT_LINKER) == 0) {
         if (access(linker_lib, F_OK) == 0)
-            cfg.linker_lib = strdup(linker_lib);
+            cfg.linker_lib = xstrdup(linker_lib);
     } else {
         fprintf(stderr, "[bxroot-launcher] 跳过 linker：路径过长\n");
     }
@@ -1650,7 +2006,7 @@ int main(int argc, char **argv) {
     if (join_dir_name(stub_lib, sizeof(stub_lib),
                       lib_dir, LIBBXROOT_STUB_LOADER) == 0) {
         if (access(stub_lib, F_OK) == 0)
-            cfg.stub_loader = strdup(stub_lib);
+            cfg.stub_loader = xstrdup(stub_lib);
     } else {
         fprintf(stderr, "[bxroot-launcher] 跳过 stub-loader：路径过长\n");
     }
@@ -1906,6 +2262,29 @@ int main(int argc, char **argv) {
 
         setenv("BXROOT_BINDS", bind_env, 1);
         free(bind_env);
+    } else {
+        /*
+         * ★ 未传 -b 时必须**清空**继承的 BXROOT_BINDS（缺陷修复，2026-10-18）★
+         *
+         * 【问题】本项目自己的约定是"配置类环境变量成对 setenv/unsetenv"
+         * （见 FR_CRITICAL_ENV 与 proc.c 的清理名单），但这里只有
+         * `if (bind_count > 0) setenv(...)`，**没有 else**。
+         *
+         * 【后果】嵌套启动时父进程的 bind 表会被子进程原样继承：
+         *     bxroot -r A -b /x:/y  bxroot -r B sh
+         * 内层只想要 `-r B`（无 bind），实际却带着父进程的 `/x:/y` 进
+         * 入 guest —— 于是**不该可见的宿主目录出现在新容器里**。方向
+         * 上是"隔离失效"，比"少一条 bind"危险得多。
+         *
+         * 而且这条与环境变量继承无关的**一次性**清理也无法靠"反正
+         * 用户会显式传 -b"来回避：用户恰恰是通过"不传"来表达"不要
+         * 任何 bind"。
+         *
+         * 【为什么可以安全清空】launcher 解析出的 cfg 是这次启动的
+         * **唯一权威**配置；它没有 -b 就是"无 bind"。父进程的表属于
+         * 父进程的 guest 语义，不该泄漏进子进程。
+         */
+        unsetenv("BXROOT_BINDS");
     }
 
     /*
@@ -1963,8 +2342,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[bxroot-launcher] guest=%s\n", cfg.guest_exe);
         fprintf(stderr, "[bxroot-launcher] runtime_lib=%s\n", cfg.runtime_lib);
         fprintf(stderr, "[bxroot-launcher] LD_PRELOAD=%s\n", getenv("LD_PRELOAD"));
-        if (cfg.bind_count > 0)
-            fprintf(stderr, "[bxroot-launcher] binds=%s\n", getenv("BXROOT_BINDS"));
+        /*
+         * ★ 无 bind 时也要打印，且要能区分"没给"与"给了但空了" ★
+         *
+         * 原先这里是 `if (bind_count > 0)` 才打印，于是"继承了父进程的
+         * BXROOT_BINDS、本次又没传 -b"这种情况在 -v 输出里**完全看不
+         * 出来** —— 用户看到容器里多出宿主目录，却没有任何线索指向
+         * 继承的 bind 表。现在改成无条件打印有效值（无则为 `(none)`），
+         * 让"当前生效的 bind 配置"在调试输出里始终可见。
+         */
+        {
+            const char *eff = getenv("BXROOT_BINDS");
+            fprintf(stderr, "[bxroot-launcher] binds=%s\n",
+                    (eff == NULL || eff[0] == '\0') ? "(none)" : eff);
+        }
         if (cfg.link2symlink)
             fprintf(stderr, "[bxroot-launcher] link2symlink=1 l2s_dir=%s\n",
                     getenv("BXROOT_L2S_DIR") ? getenv("BXROOT_L2S_DIR") : "(none)");
@@ -2026,14 +2417,14 @@ int main(int argc, char **argv) {
             free_config(&cfg);
             return 127;     /* shell 约定：命令不存在 = 127 */
         }
-        cfg.guest_exe = strdup(resolved_path);
+        cfg.guest_exe = xstrdup(resolved_path);
         snprintf(caller_guest_path, sizeof(caller_guest_path), "%s", cmd);
     } else {
         /* 相对路径：搜索 rootfs 内的 PATH */
         const char *path_env = getenv("PATH");
         if (!path_env) path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-        char *path_copy = strdup(path_env);
+        char *path_copy = xstrdup(path_env);
         char *saveptr = NULL;
         char *dir = strtok_r(path_copy, ":", &saveptr);
         int found = 0;
@@ -2042,7 +2433,7 @@ int main(int argc, char **argv) {
             snprintf(resolved_path, sizeof(resolved_path), "%s%s/%s", cfg.rootfs, dir, cmd);
             if (access(resolved_path, X_OK) == 0) {
                 found = 1;
-                cfg.guest_exe = strdup(resolved_path);
+                cfg.guest_exe = xstrdup(resolved_path);
                 snprintf(caller_guest_path, sizeof(caller_guest_path),
                          "%s/%s", dir, cmd);
             }
@@ -2067,7 +2458,7 @@ int main(int argc, char **argv) {
      */
     if (resolve_guest_symlinks(resolved_path, cfg.rootfs) == 0) {
         free(cfg.guest_exe);
-        cfg.guest_exe = strdup(resolved_path);
+        cfg.guest_exe = xstrdup(resolved_path);
     } else if (cfg.verbose) {
         fprintf(stderr,
                 "[bxroot-launcher] symlink 解析失败，保留原路径继续: %s\n",

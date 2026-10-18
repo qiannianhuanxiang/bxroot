@@ -35,6 +35,42 @@
  * 的判定口径是"与官方对照"，而客户程序对 shm 失败基本只判 -1 不细分
  * errno。若将来要跟内核，只改下面 ERR_* 宏即可，不影响结构。
  *
+ * 【★ "默认关闭"的确切含义 —— 只关**创建**，不关**使用** ★】
+ *
+ * 默认构建 `BXROOT_SHM_CLAIM_VERIFIED=0`，于是：
+ *   · `shmget(IPC_PRIVATE)` 与 `shmget(key, ...)` 一律返回 **ENOSYS(38)**；
+ *   · `shmat` / `shmdt` / `shmctl` **仍然可用** —— 只要 backing 目录里
+ *     本来就有 `seg-<id>`。
+ *
+ * 为什么这样切分（而不是把四个调用全关掉）：
+ *   · 目录里出现 `seg-<id>` 只有两种来源：官方 proroot 建的（共用目录
+ *     时两边互相可见），或者 guest 自己 `open()` 造的。两种情况下
+ *     "能不能读这块共享内存"都**不由我们决定** —— guest 本就能直接
+ *     `mmap` 那个文件。所以关掉 shmat 不增加任何隔离性，只会让
+ *     **官方容器退出的段在 bxroot 里读不到**，破坏共用目录的前提。
+ *   · 反过来，`shmget` 的"新建"会写入共享目录、并且需要 claim 锁做
+ *     跨进程串行化 —— 那条路径依赖 `fcntl(25)` 的 OFD 锁，在目标
+ *     seccomp 链里**尚未实测**。这才是真正要保守的那一半。
+ *
+ * 所以文档口径统一为"**默认关闭新建**"（README 已如此表述），而不是
+ * "SysV SHM 默认关闭"。审计意见 S4 指出的"目录里有 seg-<id> 就能真
+ * mmap"，正是上面第 1 条的具体体现，**不是缺陷**，是刻意保留。
+ *
+ * 【★ 已知边界：claim 载体的位置（S7，明确不做）★】
+ * claim 锁 `.claim-lock` 与永久预留标记 `.id-<id>` 都放在 backing 目录
+ * （默认 `/tmp/.proroot-shm`）里，而该目录位于 guest 自己的可写命名空间。
+ * 因此能删目录里文件的进程也可以：
+ *   · 删掉 `.id-<id>` → 该 id 之后可能被新段重新占用（ABA）；
+ *   · 删掉 `.claim-lock` → 两个进程各自新建一把锁（串行化失效）。
+ *
+ * 为什么**不修**：guest 与 runtime 是**同一个 uid**，能删 `.id-*` 的
+ * 进程同样能删 `seg-*` —— 后者是直接毁数据。也就是说 ABA 并没有把
+ * 任何"本来做不到的事"变成"做得到"；真正的隔离需要不同的 uid 或私有
+ * 挂载命名空间，那不属于本项目的模型（README「安全边界」明确写了
+ * 本实现不是沙箱）。要在兼容 SysV 整型 id 的前提下做代数（generation）
+ * 校验，就必须让客户手里的 id 携带代数 —— 与官方整型 id 格式冲突，
+ * 因此**在兼容约束内不可实现**，如实记在这里而不是留一个假修复。
+ *
  * 【约束】本文件被 #include 进 sigsys.c，运行在 SIGSYS 处理器里：
  *   只用裸 svc、栈上缓冲与原子操作；不 malloc、不 stdio、不碰 errno 约定
  *   （返回值统一是内核约定：成功值或 -errno）。
@@ -74,6 +110,16 @@
 #define NR_WRITE      64
 #define NR_FSTAT      80
 #define NR_UNLINKAT   35
+#define NR_READLINKAT 78
+/*
+ * gettid 的裸号。必须和上面这批 NR_* 放在一起：shm_claim_key() 在有界
+ * 重试里用它让出调度（见该函数注释），而 test/RUN_SHM_ID_ABA.sh 会把
+ * 本文件**单独**复制出去编译（-Werror），那时没有 sigsys.c 的上下文。
+ * 原先它定义在文件后半段，于是那次编译在 shm_claim_key 处报
+ * "SHM_NR_GETTID undeclared" —— 测试长期 FAIL 却没人注意到是**宏位置**
+ * 引起的（缺陷修复，2026-10-18）。
+ */
+#define SHM_NR_GETTID 178
 #define NR_MKDIRAT    34
 #define NR_FTRUNCATE  46
 #define NR_MMAP       222
@@ -153,17 +199,56 @@ int bxroot_sysvshm_anchor_fd(void)
     return fd;
 }
 
+/*
+ * ★ 必须额外校验"目录**路径**还在"（缺陷修复，2026-10-18）★
+ *
+ * 原实现只对 anchor fd 做 fstat 并比对 dev/ino。但**已删除目录的 fd
+ * 仍然可以 fstat 成功，而且 inode 号不变**（实测：rmdir 前后
+ * fstat 都返回 0、st_ino 完全相同）。也就是说：
+ *
+ *     guest 删掉段目录 → anchor fd 还在，fstat 一切正常
+ *     → 本函数返回"有效"
+ *     → 但 openat(anchor_fd, "seg-N", O_CREAT) 必然 ENOENT
+ *     → 新建段失败，且自愈路径永远不会被触发
+ *
+ * 所以仅靠 fd 无法察觉目录被删。这里再加一次**按路径**的打开：
+ * 路径打不开 ⇒ 目录确实没了 ⇒ 判失效，交给 shm_mkdir 重建。
+ *
+ * 额外开销是一次 openat，且只在构造期与出错路径上发生，不进热路径。
+ * 仍然全程裸 syscall，可在 SIGSYS 处理器上下文安全调用。
+ */
 static int shm_anchor_valid(void)
 {
     struct stat st;
     int fd = bxroot_sysvshm_anchor_fd();
-    long r;
+    long r, probe;
+
     if (fd < 0 || !__atomic_load_n(&g_shm_ready, __ATOMIC_ACQUIRE))
         return 0;
+
+    /* 第一关：fd 侧元数据（dev/ino/owner/权限位） */
     r = shm_svc6(NR_FSTAT, fd, (long)&st, 0, 0, 0, 0);
-    return r == 0 && S_ISDIR(st.st_mode) &&
-           st.st_dev == g_shm_dev && st.st_ino == g_shm_ino &&
-           st.st_uid == g_shm_owner && (st.st_mode & 0077) == 0;
+    if (r != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_dev != g_shm_dev || st.st_ino != g_shm_ino ||
+        st.st_uid != g_shm_owner || (st.st_mode & 0077) != 0)
+        return 0;
+
+    /*
+     * 第二关：**路径**是否仍然存在。
+     *
+     * 已删除目录的 fd 会让第一关全过（见上面的实测），所以这一关是
+     * 必需的，否则目录被删后永远不会自愈。
+     */
+    if (g_shm_dir[0] == '\0')
+        return 0;
+    probe = shm_svc6(NR_OPENAT, K_AT_FDCWD, (long)g_shm_dir,
+                     K_O_DIRECTORY | K_O_CLOEXEC | K_O_NOFOLLOW | K_O_NONBLOCK,
+                     0, 0, 0);
+    if (probe < 0)
+        return 0;                       /* 路径不在了 → 判失效，触发重建 */
+    SVC(NR_CLOSE, probe, 0, 0);
+
+    return 1;
 }
 
 int bxroot_sysvshm_init(const char *host_dir)
@@ -209,6 +294,21 @@ int bxroot_sysvshm_init(const char *host_dir)
 
 /* 异步信号安全的小工具：拼路径 */
 static char *shm_puts(char *p, const char *s) { while (*s) *p++ = *s++; *p = 0; return p; }
+/* 小写十六进制，无前缀 —— 只用于拼 /proc/self/map_files 的地址 */
+static char *shm_putx(char *p, unsigned long v)
+{
+    char t[2 * sizeof v + 1];
+    int i = 0;
+    do {
+        unsigned d = (unsigned)(v & 0xf);
+        t[i++] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        v >>= 4;
+    } while (v);
+    while (i)
+        *p++ = t[--i];
+    *p = 0;
+    return p;
+}
 static char *shm_putl(char *p, long v)
 {
     char t[24]; int i = 0; unsigned long u;
@@ -224,9 +324,72 @@ static void shm_path(char *buf, const char *kind, long v)
     shm_putl(p, v);
 }
 
+/*
+ * ★ 目录失效时按 g_shm_dir 重建并刷新 anchor（缺陷修复，2026-10-18）★
+ *
+ * 【缺陷】原实现只有一句 `return shm_anchor_valid() ? 0 : -1;` ——
+ * **只校验、从不重建**。而 bxroot_sysvshm_init() 只在构造函数跑一次，
+ * g_shm_ready 一旦置 1 就永不回 0。于是 guest 一条
+ * 删除 /tmp 下全部内容（`rm -rf /tmp/` 接通配符）这类操作之后：
+ *
+ *     shm_anchor_valid() 的 dev/ino 校验失败 → 本函数返回 -1
+ *     → shm_get 返回 -ERR_INVAL → 194..197 全部失败
+ *     → 而且**无法自愈**，只能重启进程
+ *
+ * 内核从不因这种原因让 shmget 返回 EINVAL，客户程序的行为不可预期。
+ *
+ * 【为什么重建是安全的】
+ *   · 路径本身存在 g_shm_dir 里（init 时拷进来的），不依赖任何外部状态；
+ *   · 重建用的是 mkdirat + openat + fstat，与 init 完全同源，
+ *     全部是**裸 syscall**，没有 malloc/stdio —— 本函数可能在 SIGSYS
+ *     处理器上下文被调用，必须保持 async-signal-safe；
+ *   · 新目录会重新记录 dev/ino/owner，后续校验照常生效；
+ *   · 若同一目录已被别人重建，mkdirat 返回 EEXIST，直接沿用 —— 正确。
+ *
+ * 【边界】只重建**目录本身**。目录里已存在的段文件（seg-*）若被一起
+ * 删掉，那是数据丢失，无法恢复 —— 这里只保证"能力恢复可用"，
+ * 不假装能恢复数据。
+ */
 static int shm_mkdir(void)
 {
-    return shm_anchor_valid() ? 0 : -1;
+    struct stat st;
+    long fd, r;
+
+    if (shm_anchor_valid())
+        return 0;
+
+    /* 没有记录过路径（init 从未成功）→ 无从重建 */
+    if (g_shm_dir[0] == '\0')
+        return -1;
+
+    r = shm_svc6(NR_MKDIRAT, K_AT_FDCWD, (long)g_shm_dir, 0700, 0, 0, 0);
+    if (r < 0 && r != -17 /* EEXIST */)
+        return -1;
+
+    fd = shm_svc6(NR_OPENAT, K_AT_FDCWD, (long)g_shm_dir,
+                  K_O_DIRECTORY | K_O_CLOEXEC | K_O_NOFOLLOW | K_O_NONBLOCK,
+                  0, 0, 0);
+    if (fd < 0)
+        return -1;
+
+    r = shm_svc6(NR_FSTAT, fd, (long)&st, 0, 0, 0, 0);
+    if (r < 0 || !S_ISDIR(st.st_mode) || (st.st_mode & 0077) != 0) {
+        SVC(NR_CLOSE, fd, 0, 0);
+        return -1;
+    }
+
+    /* 旧的 anchor fd 可能仍指向已删除的旧 inode：先关再换 */
+    {
+        int old = __atomic_load_n(&g_shm_dirfd, __ATOMIC_ACQUIRE);
+        if (old >= 0)
+            SVC(NR_CLOSE, old, 0, 0);
+    }
+
+    g_shm_dev   = st.st_dev;
+    g_shm_ino   = st.st_ino;
+    g_shm_owner = st.st_uid;
+    __atomic_store_n(&g_shm_dirfd, (int)fd, __ATOMIC_RELEASE);
+    return 0;
 }
 
 /* ---------------- id 分配 ---------------- */
@@ -265,7 +428,7 @@ static long shm_new_segment(long size, int *out_fd)
             continue;
         dfd = bxroot_sysvshm_anchor_fd();
         if (dfd < 0)
-            return -9;
+            return -38;   /* ENOSYS：仿真不可用（内核从不返回 EBADF，见 1073 处说明） */
         shm_path(path, "/.id-", id);
         reserved = shm_svc6(NR_OPENAT, dfd, (long)path,
                             K_O_WRONLY | K_O_CREAT | K_O_EXCL | K_O_CLOEXEC |
@@ -286,8 +449,29 @@ static long shm_new_segment(long size, int *out_fd)
             continue;
         if (fd < 0)
             return fd;
-        if (size > 0) {
-            long t = SVC(NR_FTRUNCATE, fd, size, 0);
+        /*
+         * ★ size == 0 也要把文件撑到一页（缺陷修复，2026-10-18）★
+         *
+         * 原写法 `if (size > 0)` 时 0 字节段**不做 ftruncate**，文件长度
+         * 保持 0。而 sh_do_at() 那条路径明确支持 0 字节段：
+         *
+         *     len = st.st_size;          // 0
+         *     if (len == 0) len = 1;     // → 再取整成一页 4096
+         *     mmap(..., 4096, PROT_R|W, MAP_SHARED, fd, 0);
+         *
+         * 0 字节文件的有效页数是 0，**任何页都不在 page cache 里**，
+         * 对 MAP_SHARED 映射的首次读写直接 **SIGBUS** —— 不是返回错误，
+         * 是确定性崩溃。也就是说"支持 0 字节段"这条实现反而成了一个
+         * 可达的进程崩溃点。
+         *
+         * 修法：size == 0 时按一页 ftruncate。段长语义仍报 shm_segsz=0
+         * （IPC_STAT 用创建者传入的 size），只是 backing 文件有实体页，
+         * 映射可安全访问。这与"映射一页"的既有设计一致。
+         */
+        {
+            unsigned long fit = (size > 0) ? (unsigned long)size
+                                           : (unsigned long)g_shm_pagesize;
+            long t = SVC(NR_FTRUNCATE, fd, (long)fit, 0);
             if (t < 0) {
                 SVC(NR_CLOSE, fd, 0, 0);
                 SVC(NR_UNLINKAT, bxroot_sysvshm_anchor_fd(), path, 0);
@@ -414,7 +598,7 @@ static long shm_claim_key(long key)
     long fd, r;
     (void)key;
     if (dfd < 0)
-        return -9; /* EBADF */
+        return -38;   /* ENOSYS：仿真不可用（同上） */
     fd = shm_svc6(NR_OPENAT, dfd, (long)CLAIM_LOCK_NAME,
                   K_O_RDWR | K_O_CREAT | K_O_CLOEXEC | K_O_NOFOLLOW | K_O_NONBLOCK,
                   0600, 0, 0);
@@ -425,10 +609,46 @@ static long shm_claim_key(long key)
         return -ERR_INVAL;
     }
     fl.type = F_WRLCK; fl.whence = SEEK_SET_K; fl.start = 0; fl.len = 0; fl.pid = 0;
-    r = shm_svc6(NR_FCNTL, fd, F_OFD_SETLK, (long)&fl, 0, 0, 0);
+
+    /*
+     * ★ 锁竞争要**有界重试**，不能直接把 EAGAIN 抛给客户（缺陷修复，2026-10-18）★
+     *
+     * 原来是一次 `F_OFD_SETLK`（非阻塞），拿不到就返回 -ERR_AGAIN（EAGAIN）。
+     * 两个问题：
+     *
+     *   1. **内核的 shmget 从不返回 EAGAIN**。PostgreSQL 这类程序不会对
+     *      shmget 做重试，于是一次瞬时的锁竞争被升级成**永久失败**。
+     *   2. 锁是**全局单锁**（注意上面的 `(void)key`——key 根本没参与），
+     *      所以任意一个 key 的 RMID 都能挡住别人。
+     *
+     * 为什么不能直接改成阻塞的 F_OFD_SETLKW：本函数在 **SIGSYS 处理器
+     * 上下文**里被调用（emulate → shm_do_get → 这里）。在信号处理器里
+     * 阻塞等待锁，一旦持锁方正是被本处理器打断的那个线程，就是永久
+     * 死锁，而且是在信号上下文里，连诊断都出不来。
+     *
+     * 所以用**有界重试**：短暂自旋若干次给竞争方一点时间，仍拿不到才失败。
+     * 失败时返回 EAGAIN —— 这不是"内核语义"，但在有界重试之后它已经是
+     * 真正的异常（不是瞬时抖动），而且比死锁好得多。这一点如实记录。
+     */
+    {
+        int spins;
+        r = -1;
+        for (spins = 0; spins < 100; spins++) {
+            r = shm_svc6(NR_FCNTL, fd, F_OFD_SETLK, (long)&fl, 0, 0, 0);
+            if (r == 0)
+                break;
+            if (r != -11 && r != -13)   /* 不是 EAGAIN/EACCES（锁被占） */
+                break;
+            /*
+             * 极短让步：不调用任何 libc/sleep（信号上下文不允许），
+             * 用一条无副作用的 gettid 往返让出调度机会。
+             */
+            (void)shm_svc6(SHM_NR_GETTID, 0, 0, 0, 0, 0, 0);
+        }
+    }
     if (r < 0) {
         SVC(NR_CLOSE, fd, 0, 0);
-        return r == -11 || r == -13 ? -ERR_AGAIN : r;
+        return (r == -11 || r == -13) ? -ERR_AGAIN : r;
     }
     return fd;
 #endif
@@ -625,6 +845,87 @@ static unsigned long shm_att_count(long id)
     return n;
 }
 
+/*
+ * ★ 映射身份校验：这段地址还是不是**我们自己**的 seg-<id> ？ ★
+ * （缺陷修复，2026-10-18，对应 S8）
+ *
+ * 【缺陷】attach 表只用**地址**做键：
+ *
+ *     shm_att_take(addr) → 找到记录 → munmap(addr, len)
+ *
+ * 而地址是可以被复用的。客户完全可能在拿到 shm 映射之后**绕过
+ * shmdt** 直接 `munmap()`（这在移植代码、JIT、自己的内存池里都会
+ * 发生），此时表项仍然 ACTIVE。之后任何一次 `mmap`（malloc 的大块、
+ * 另一个库的自定义映射）都可能落回**同一个地址**；再来一次
+ * `shmdt(那个地址)` 就会把**别人**的映射拆掉 —— 客户进程里莫名
+ * 少了一块内存，故障点离原因极远，且每次复现地址还不一样。
+ *
+ * 另外一个副作用：这类僵死表项永不回收，会让 IPC_STAT 的 nattch
+ * 越算越多（内核是真实 attach 计数）。
+ *
+ * 【校验办法】用 /proc/self/map_files/<start>-<end> 这个符号链接：
+ * 内核为**每个**映射导出一个指向其来源文件的链接，readlink 即可拿到
+ * 该区间背后到底是哪个文件。我们把区间起点/终点按小写十六进制拼进
+ * 去，读出来比对 basename 是否等于 `seg-<id>`。
+ *
+ * 为什么这个办法合适：
+ *   · 一次 readlinkat，无 malloc、无 stdio、无缓冲分配 —— 可以在
+ *     SIGSYS 处理器上下文里用；
+ *   · 判定是**确定的**：不是"长度像不像"这种启发式；
+ *   · 已被 IPC_RMID 删掉的段，映射仍然有效（内核语义），内核会把
+ *     路径显示成 `.../seg-<id> (deleted)` —— 允许该后缀。
+ *
+ * 【不可判定时保持原行为】某些环境（SELinux 收紧的 Android、
+ * 内核未开 CONFIG_PROC_MMAP_FILES）读不到 map_files。这时返回 -1，
+ * 调用方按修前逻辑继续 munmap —— 宁可保留旧行为，也不能因为
+ * 读不到证据就拒绝一个合法的 shmdt。
+ *
+ * 返回 1 = 确认是我们的；0 = 确认**不是**（地址已被别的映射占用）；
+ *      -1 = 无法判定。
+ */
+static int shm_map_is_seg(unsigned long addr, unsigned long len, long id)
+{
+    char link[64], buf[600], want[32], *p;
+    long r;
+
+    if (addr == 0 || len == 0)
+        return -1;
+    if (addr + len < addr)                 /* 回绕：不可能是合法映射 */
+        return 0;
+
+    p = shm_puts(link, "/proc/self/map_files/");
+    p = shm_putx(p, addr);
+    *p++ = '-';
+    p = shm_putx(p, addr + len);
+
+    r = shm_svc6(NR_READLINKAT, K_AT_FDCWD, (long)link,
+                 (long)buf, (long)sizeof buf - 1, 0, 0);
+    if (r <= 0 || r >= (long)sizeof buf - 1)
+        return -1;                          /* 读不到 → 不可判定 */
+    buf[r] = '\0';
+
+    /* 期望的 basename：seg-<id> */
+    p = shm_puts(want, "seg-");
+    shm_putl(p, id);
+
+    /* 取 buf 的 basename，去掉可选的 " (deleted)" 后缀 */
+    p = buf;
+    {
+        char *slash = NULL, *q;
+        for (q = buf; *q; q++)
+            if (*q == '/')
+                slash = q;
+        if (slash != NULL)
+            p = slash + 1;
+    }
+    {
+        size_t l = strlen(p);
+        if (l >= 10 && strcmp(p + l - 10, " (deleted)") == 0)
+            p[l - 10] = '\0';
+    }
+    return strcmp(p, want) == 0 ? 1 : 0;
+}
+
 /* ---------------- 四个调用 ---------------- */
 
 static long shm_do_get(long key, long size, long flg)
@@ -764,6 +1065,29 @@ static long shm_do_dt(unsigned long addr)
     unsigned long c;
     if (slot < 0)
         return -ERR_INVAL;
+    /*
+     * ★ 先确认这段地址还是不是我们的段（缺陷修复，2026-10-18，S8）★
+     *
+     * 表项按地址匹配，而地址会被复用：客户绕过 shmdt 直接 munmap，
+     * 表项留成僵死状态，后续 mmap 若落回同一地址，这里的 munmap
+     * 就会拆掉**无关**的映射。shm_map_is_seg() 用 map_files 证明
+     * 归属；只有"确认不是我们的"才拒绝 —— 读不到证据时按原行为
+     * 继续（见该函数注释）。
+     */
+    {
+        long owner = __atomic_load_n(&g_att[slot].id, __ATOMIC_ACQUIRE);
+        if (shm_map_is_seg(addr, len, owner) == 0) {
+            /*
+             * 地址已被别的映射占用：这不是"我们的段"，绝不能 munmap。
+             * 同时可以确定该表项已僵死（客户自己 munmap 过），
+             * 顺手回收，让它不再污染 nattch 计数。
+             */
+            c = __atomic_load_n(&g_att[slot].ctrl, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&g_att[slot].ctrl,
+                             c & ~ATT_STATE_MASK, __ATOMIC_RELEASE);
+            return -ERR_INVAL;
+        }
+    }
     r = SVC(NR_MUNMAP, addr, len, 0);
     c = __atomic_load_n(&g_att[slot].ctrl, __ATOMIC_ACQUIRE);
     if (r == 0)
@@ -832,6 +1156,42 @@ void bxroot_sysvshm_exec_reset(void)
 
 /* 0=idle, 1=SHM operation, 2=hooked fork. No signal handler waits. */
 static unsigned int g_shm_transition;
+
+/*
+ * ★ fork 门的属主与代际（缺陷修复，2026-10-18）★
+ *
+ * 【缺陷】g_shm_transition 只是一个无主计数器：
+ *   0 = 空闲，1 = 有 shm 操作在进行，2 = 有 fork 在进行。
+ * 而 bxroot_preload_fork_child() 是**空的**（见下面的定义），
+ * bxroot_sysvshm_fork_end() 只在自己的 fork 包装里被调用。
+ *
+ * 于是经 **raw clone / _Fork / glibc 内部隐藏别名** fork 出来的子进程
+ * （它们不走 proc.c 的 fork 包装）会**永久继承**门值：
+ *   · 若父进程另一线程当时正处在 shm_do_*（transition==1），
+ *     子进程拿到 1 且没有任何复位路径；
+ *   · 子进程里 194..197 **全部**返回 -EAGAIN；
+ *   · 子进程自己再 fork() 也因 CAS 失败返回 -EAGAIN，并遗传给孙进程。
+ *
+ * 结果不是文档说的"复制了活动槽"那么轻，而是**子进程的 SHM 与 fork
+ * 双双永久瘫痪**。
+ *
+ * 【修法】记录门的属主线程 tid 与一个代际号：
+ *   · 加门时写入本线程 tid；
+ *   · 子进程在 atfork child 里发现"属主 tid 不是自己"就复位 ——
+ *     因为 fork 之后只剩本线程，任何属于别的线程的门都是残值。
+ *     （tid 在子进程里与父进程同值，所以判据是"持有者是否还是本线程"，
+ *      而不是"tid 是否等于子进程 pid"。）
+ *   · 代际号在每次复位时自增，供诊断区分"同一把门被复用"。
+ */
+static unsigned int g_shm_transition_owner;   /* 门的属主 tid（0=无） */
+static unsigned int g_shm_transition_gen;     /* 复位代际，仅诊断用 */
+
+/* 本线程 tid（裸 syscall，async-signal-safe；Linux gettid=178 on arm64） */
+static unsigned int shm_self_tid(void)
+{
+    long r = shm_svc6(SHM_NR_GETTID, 0, 0, 0, 0, 0, 0);
+    return (r > 0) ? (unsigned int)r : 0;
+}
 int bxroot_sysvshm_fork_begin(void)
 {
     unsigned int idle=0;
@@ -840,7 +1200,26 @@ int bxroot_sysvshm_fork_begin(void)
 }
 void bxroot_sysvshm_fork_prepare(void) { /* fork wrapper owns the gate */ }
 void bxroot_sysvshm_fork_parent(void) { /* release after real fork returns */ }
-void bxroot_sysvshm_fork_child(void) { /* release after real fork returns */ }
+/*
+ * ★ 子进程里必须复位门（缺陷修复，2026-10-18）★
+ *
+ * fork 之后子进程只剩一个线程。此时如果 g_shm_transition != 0：
+ *   · 要么是父进程另一个线程正在做 shm 操作（该线程在子进程里不存在），
+ *   · 要么是父进程正在做 fork（那个 fork 已经完成）。
+ * 两种都是**残值**，必须清掉，否则子进程的 194..197 与 fork 全部
+ * 永久 -EAGAIN（见 g_shm_transition 处的详细说明）。
+ *
+ * 判据：属主不是本线程 ⇒ 残值 ⇒ 复位。若属主恰好是本线程，说明
+ * 是本线程在持门期间调了 fork —— 那也不该留（子进程是全新进程，
+ * 父进程的临界区语义不该带过来），所以**无条件复位**更简单也更安全：
+ * 子进程里不存在任何"正在进行中的 shm 操作"。
+ */
+void bxroot_sysvshm_fork_child(void)
+{
+    __atomic_store_n(&g_shm_transition_owner, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_shm_transition, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_shm_transition_gen, 1, __ATOMIC_RELAXED);
+}
 void bxroot_sysvshm_fork_end(void)
 {
     __atomic_store_n(&g_shm_transition,0,__ATOMIC_RELEASE);
@@ -855,7 +1234,17 @@ int bxroot_sysvshm_emulate(long sc, unsigned long a0, unsigned long a1,
         return 0;   /* 未初始化：保持 ENOSYS，不假装 */
 
     if (sc != SHM_NR_DT && !shm_anchor_valid()) {
-        *x0 = -9; /* EBADF: never reopen an invalid anchor in handler context */
+        /*
+         * ★ 用 ENOSYS 而不是 EBADF（缺陷修复，2026-10-18）★
+         *
+         * 内核的 shmget/shmat/shmctl 从不返回 EBADF —— 那会让客户程序
+         * 走进"fd 用错了"的排查方向。这里真实的语义是"仿真的 backing
+         * 目录不可用"，对应 ENOSYS（能力不可用）最接近。
+         *
+         * ENOSYS 也是 libuv 等库期望的"该调用不可用"信号，客户可以据此
+         * 干净回退，而不是当成一个诡异的 fd 错误。
+         */
+        *x0 = -38; /* ENOSYS: 仿真 backing 不可用 */
         return 1;
     }
 
@@ -865,12 +1254,15 @@ int bxroot_sysvshm_emulate(long sc, unsigned long a0, unsigned long a1,
         *x0=-11;
         return 1;
     }
+    __atomic_store_n(&g_shm_transition_owner, shm_self_tid(),
+                     __ATOMIC_RELEASE);
     switch (sc) {
     case SHM_NR_GET: *x0 = shm_do_get((long)a0, (long)a1, (long)a2); break;
     case SHM_NR_CTL: *x0 = shm_do_ctl((long)(int)a0, (long)a1, a2);  break;
     case SHM_NR_AT:  *x0 = shm_do_at((long)(int)a0, (long)a2);       break;
     case SHM_NR_DT:  *x0 = shm_do_dt(a0);                            break;
     }
+    __atomic_store_n(&g_shm_transition_owner, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_shm_transition,0,__ATOMIC_RELEASE);
     return 1;
 }

@@ -200,6 +200,44 @@ static int has_prefix(const char *name)
  *
  * 返回 0 成功；-ENOENT 表示旁路不存在（即从未建过链）。
  */
+/* ------------------------------------------------------------------ */
+/* .cnt 读-改-写的互斥（缺陷修复，2026-10-18）                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 【问题】引用计数是"读 .cnt → ±1 → 写回"，而 ops 只提供独立的
+ * read_small / write_small 两个回调，中间没有任何互斥。两个线程/进程
+ * 各自 link 同一个 mid 时：都读到 2、都写回 3，实际引用已是 4 → 计数
+ * 少 1 → 之后 rm 掉足够多个名字会**提前回收仍被引用的 final**（丢数据）。
+ *
+ * 【为什么用进程内自旋锁而不是 flock】
+ *   · l2s-runtime.c 是**刻意保持能独立编译**的单元（单测直接编译它），
+ *     不能引入 pthread；
+ *   · 真跨进程互斥需要改 ops 接口（把 read+write 合并成一个带锁的
+ *     update 回调），改动面大、回归风险高；
+ *   · 而实践中绝大多数丢更新发生在**同一进程的多线程**（node worker、
+ *     pnpm 并发 link），进程内锁已能覆盖主要场景。
+ *
+ * 跨进程窗口仍存在（两个 bxroot 进程同时 link），此处如实标注为
+ * 已知残留，不做无声掩盖。
+ *
+ * 用 __atomic 自旋：与 syscall_guard.c 的同款做法，不引入新依赖。
+ * 不加超时的理由：临界区只有两个小文件读写，持有时间极短；万一持锁
+ * 线程崩了，整个进程也就没了，不存在"别人等它"的问题。
+ */
+static volatile int g_cnt_lock;
+
+static void cnt_lock(void)
+{
+    while (__atomic_exchange_n(&g_cnt_lock, 1, __ATOMIC_ACQUIRE))
+        ;   /* 短暂自旋；临界区极短 */
+}
+
+static void cnt_unlock(void)
+{
+    __atomic_store_n(&g_cnt_lock, 0, __ATOMIC_RELEASE);
+}
+
 static int read_nlink(const char *final_path, unsigned int *out)
 {
     char cnt[L2S_PATH_MAX];
@@ -243,6 +281,61 @@ static int write_nlink(const char *final_path, unsigned int n)
     len = strlen(buf);
 
     return g_ops->write_small(cnt, buf, len);
+}
+
+/*
+ * ★ 原子的"读-改-写"：优先走注入方的 update_small ★
+ * （缺陷修复，2026-10-18：跨进程丢更新）
+ *
+ * 返回值：
+ *    0    成功，*out 为新值
+ *   -1    update_small 可用但失败（egress 已在其中定好；此处统一返回
+ *         -errno 语义，调用方按需转换）
+ *
+ * 【为什么保留回退分支】l2s-runtime.c 是能独立编译的单元，单测与既有
+ * 注入方可能只实现了 read/write。回退路径与修前完全一致（进程内锁 +
+ * 读 + 写），所以"没有 update_small"不是错误，只是覆盖范围回到线程级。
+ *
+ * 【delta 的语义】只有 ±1：调用方已经做过边界判断（EMLINK / 最后一条），
+ * 这里只负责把"读-加-写"合成一步。用 int 而不是 unsigned 是为了让
+ * 减一在 0 上自然得到负值，由调用方判定"是不是最后一条"。
+ */
+static int cnt_add(const char *final_path, int delta, unsigned int *out)
+{
+    char cnt[L2S_PATH_MAX];
+    unsigned int v;
+    int rc;
+
+    rc = l2s_refcount_path(final_path, cnt, sizeof(cnt));
+    if (rc != L2S_OK)
+        return -ENAMETOOLONG;
+
+    if (g_ops->update_small != NULL) {
+        unsigned int nv = 0;
+        rc = g_ops->update_small(cnt, delta, &nv);
+        if (rc != 0)
+            return rc;
+        *out = nv;
+        return 0;
+    }
+
+    /* ---- 回退：进程内锁 + read/write（修前行为） ---- */
+    cnt_lock();
+    rc = read_nlink(final_path, &v);
+    if (rc == 0) {
+        long nv = (long)v + delta;
+        if (nv < 0) {
+            rc = -ERANGE;
+        } else if (nv > (long)L2S_NLINK_MAX) {
+            rc = -EMLINK;
+        } else {
+            *out = (unsigned int)nv;
+            if (nv != (long)v)
+                rc = write_nlink(final_path, (unsigned int)nv);
+        }
+    }
+    cnt_unlock();
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -817,11 +910,16 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
         if (rc != 0)
             return rc;
 
-        if (read_nlink(final, &count) != 0)
-            return -EINVAL;
-        count++;
-        if (count > L2S_NLINK_MAX)
-            return -EMLINK;
+        /*
+         * ★ 加一必须是原子的读-改-写（缺陷修复，2026-10-18）★
+         * 走 cnt_add：有 update_small 时由注入方在跨进程锁下完成，
+         * 否则回退到进程内锁 + 读 + 写（修前行为）。
+         */
+        {
+            int addrc = cnt_add(final, +1, &count);
+            if (addrc != 0)
+                return addrc == -EMLINK ? -EMLINK : -EINVAL;
+        }
 
         /*
          * 关键：**不动数据文件的名字，也不动中间层**。
@@ -833,9 +931,6 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
          *
          * 改用旁路计数后，数据文件名从建立那天起就不再变化，缺陷无从触发。
          */
-        if (write_nlink(final, count) != 0)
-            return -errno;
-
         g_stats.link_more++;
     }
 
@@ -919,14 +1014,22 @@ int l2s_rt_unlink(const char *path)
         return 0;
     }
 
-    if (read_nlink(final, &count) != 0)
-        return -EINVAL;
+    /*
+     * ★ 减一同样必须是原子的（缺陷修复，2026-10-18）★
+     * 若拆成"读 → 决定 → 写"，两个进程可能同时读到 1 而都判定自己是
+     * 最后一条 —— 一个删了主体，另一个再去删就是 ENOENT，或者更糟：
+     * 两边都执行回收，把别人的新链删掉。原子减一之后只有一方拿到 0。
+     */
+    {
+        int addrc = cnt_add(final, -1, &count);
+        if (addrc != 0) {
+            /* 0 或负数：链已损坏/计数不合法，交由调用方按修前口径处理 */
+            return -EINVAL;
+        }
+    }
 
-    if (count > 1) {
-        /* 还有人引用：只把旁路计数减一，数据文件名保持不动。 */
-        count--;
-        if (write_nlink(final, count) != 0)
-            return -errno;
+    if (count > 0) {
+        /* 还有人引用：计数已在新值上，数据文件名保持不动。 */
         g_stats.unlink_dec++;
     } else {
         /* 最后一条：中间层与数据文件一起回收。 */
@@ -1048,12 +1151,16 @@ int l2s_rt_rename_replace_commit(const char *mid, const char *final)
 
     if (!l2s_rt_enabled() || mid == NULL || final == NULL)
         return 0;
-    if (read_nlink(final, &count) != 0)
-        return -EINVAL;
-    if (count > 1) {
-        count--;
-        if (write_nlink(final, count) != 0)
-            return -errno;
+    /*
+     * 与 unlink 同一条理由：减一必须是原子的（缺陷修复，2026-10-18）。
+     * 若先读后写，两个进程可能都读到 1 而都判定"我是最后一条"。
+     */
+    {
+        int addrc = cnt_add(final, -1, &count);
+        if (addrc != 0)
+            return -EINVAL;
+    }
+    if (count > 0) {
         g_stats.unlink_dec++;
         return 0;
     }

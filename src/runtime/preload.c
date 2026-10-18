@@ -72,6 +72,15 @@ extern void bxroot_sysvshm_fork_prepare(void) __attribute__((weak));
 extern void bxroot_sysvshm_fork_parent(void) __attribute__((weak));
 extern void bxroot_sysvshm_fork_child(void) __attribute__((weak));
 
+/*
+ * fakeroot 自旋锁的子进程复位（缺陷修复，2026-10-18）。
+ * 在这里 weak 声明而不展开 fakeroot.h：本文件用的是纯逻辑模式的
+ * fakeroot.h，那个宏下钩子层符号**不声明**，weak 引用与
+ * bxroot_sysvshm_fork_child 完全同款（纯逻辑编译单元不导出时链接会
+ * 解析成 NULL，故必须判空）。
+ */
+extern int  bxroot_fakeroot_atfork_child(void) __attribute__((weak));
+
 static void bxroot_preload_fork_prepare(void)
 {
     if (bxroot_sysvshm_fork_prepare != NULL)
@@ -86,6 +95,26 @@ static void bxroot_preload_fork_parent(void)
 
 static void bxroot_preload_fork_child(void)
 {
+    /*
+     * ★ fakeroot 自旋锁的 fork 复位（缺陷修复，2026-10-18）★
+     *
+     * 原先这里只处理 SysV shm，fakeroot 的锁完全没人管。线程 A 持锁时
+     * 线程 B 调 fork，子进程里只剩 B：锁位（进程内共享的 mm->lock）
+     * 仍是「已占用」，而 _Thread_local 的 fr_lock_depth_of_thread 在 B
+     * 里是 0 —— 那是 A 的线程局部量，不随 fork 进到 B。B 之后第一次
+     * 记账就会掉进 fr_lock 里那个**没有超时**的自旋，永久卡死。
+     *
+     * 必须把复位放在**子进程**回调里：prepare 时父进程的其他线程照常
+     * 运行，擅自清 0 会让它们同时进入临界区（堆破坏）；parent 里清 0
+     * 等于抢走 A 的锁。只有子进程里「父进程的写者已不存在」这一前提
+     * 才成立。理由详见 fakeroot.c 的 bxroot_fakeroot_atfork_child。
+     *
+     * 放在 SysV shm 之前：先补齐最基础的自旋锁状态，再交给别人的子
+     * 进程钩子；将来那条链若改成会记账，也不会踩到一把死锁。
+     */
+    if (bxroot_fakeroot_atfork_child != NULL)
+        (void)bxroot_fakeroot_atfork_child();
+
     if (bxroot_sysvshm_fork_child != NULL)
         bxroot_sysvshm_fork_child();
 }
@@ -315,12 +344,15 @@ static int realpath_fixup_inplace(char *buf, size_t cap);              /* realpa
 static int l2s_real_access(const char *p, int m);
 static int l2s_real_read_small(const char *p, char *b, size_t sz, size_t *len);
 static int l2s_real_write_small(const char *p, const char *b, size_t len);
+static int l2s_real_update_small(const char *p, int delta,
+                                 unsigned int *out_value);
 static int resolve_dirfd_path(int dirfd, const char *path,
                               char *out, size_t outsz);
 
 static const l2s_rt_ops L2S_OPS = {
     l2s_real_lstat, l2s_real_symlink, l2s_real_rename, l2s_real_unlink,
-    l2s_real_readlink, l2s_real_access, l2s_real_read_small, l2s_real_write_small
+    l2s_real_readlink, l2s_real_access, l2s_real_read_small, l2s_real_write_small,
+    l2s_real_update_small   /* 跨进程原子的读-改-写（缺陷修复，2026-10-18） */
 };
 
 /* ------------------------------------------------------------------ */
@@ -464,9 +496,20 @@ static void parse_binds(void) {
             char *colon2 = strchr(rest, ':');
             if (colon2) {
                 *colon2 = '\0';
-                if (strcmp(colon2 + 1, "ro") == 0)
-                    ro = 1;
-                /* 其它第三段值（含空串）→ 忽略，按可写处理 */
+                /*
+                 * 只读标志大小写不敏感（缺陷修复，2026-10-18）。
+                 * 原来只认字面量 "ro"：`:RO` 会被当成"未知修饰符"截断
+                 * 并按**可写**处理 —— 用户要只读却静默拿到可写，且
+                 * release 构建 LOG 为空宏，没有任何提示。
+                 * 与 launcher.c 的同类解析保持完全一致。
+                 */
+                {
+                    const char *mod = colon2 + 1;
+                    if ((mod[0] == 'r' || mod[0] == 'R') &&
+                        (mod[1] == 'o' || mod[1] == 'O') && mod[2] == '\0')
+                        ro = 1;
+                    /* 其它第三段值（含空串、:rw）→ 忽略，按可写处理 */
+                }
             }
 
             /* 空 source 或空 target 是无效条目：留着会让匹配逻辑把
@@ -1060,6 +1103,18 @@ static void init_config(void) {
     g_config.fakeroot = env && (atoi(env) != 0);
 
     /* bind mount */
+    /*
+     * ★ parse_binds 必须早于 fr_capture_env ★
+     *
+     * parse_binds() 只在构造期跑这一次，所以进程内 setenv 改不动当前
+     * 进程的 bind 表 —— 这一点本来是好的。而 BXROOT_BINDS 现已纳入
+     * FR_CRITICAL_ENV 守护名单（见该数组），客户 setenv/putenv 它会被
+     * **立刻恢复**（setenv 钩子里的 "若被改的正是我们的关键变量，立刻
+     * 恢复" 分支），于是冒泡到子进程 exec 的路径也被堵住。
+     *
+     * 这里刻意不做任何额外快照：守护名单 + setenv 钩子已经是完整
+     * 机制，重复实现只会成为两套可能不同步的真相。
+     */
     parse_binds();
 
     /* 官方 launcher 的配置块：仅当用户没有显式给 BXROOT_ROOTFS / BXROOT_BINDS */
@@ -1439,7 +1494,35 @@ static int translate_path(const char *path, char *out, size_t out_size) {
     int ret = snprintf(out, out_size, "%s%s", rootfs, path);
     if (ret < 0 || (size_t)ret >= out_size) {
         LOG("path too long: %s", path);
-        return -1;
+        /*
+         * ★ 超长必须 fail closed，不能返回 -1（缺陷修复，2026-10-18）★
+         *
+         * 原写法返回 -1。而本文件里绝大多数调用方是
+         *     if (translate_path(...) > 0) p = translated;
+         * —— 返回 -1 时 p 保持为**客户的 guest 路径**，随后被原样交给
+         * 内核，于是从**宿主根**解析：`/etc/passwd` 读到的是宿主的。
+         * 这既是一次越界读取，也是一次极难排查的"时灵时不灵"。
+         *
+         * `..` 分支早就用了正确做法（给一个 rootfs 内必不存在的路径
+         * → ENOENT），这里对齐：同样输出哨兵路径。区别是截断时
+         * `rootfs` 前缀本身可能已放不进 out —— 那用最短哨兵。
+         * 无论如何不把客户原串漏给内核。
+         */
+        {
+            int saved = errno;
+            int w = snprintf(out, out_size, "%s/.bxroot-unresolvable-path",
+                             rootfs);
+            errno = saved;
+            if (w > 0 && (size_t)w < out_size)
+                return 1;
+            /* 连哨兵都放不下：给出最短的必不存在绝对路径 */
+            if (out_size > sizeof("/.bxroot-unresolvable-path")) {
+                memcpy(out, "/.bxroot-unresolvable-path",
+                       sizeof("/.bxroot-unresolvable-path"));
+                return 1;
+            }
+            return -1;
+        }
     }
 
     LOG("translate: %s -> %s", path, out);
@@ -2276,17 +2359,209 @@ static int l2s_real_read_small(const char *p, char *b, size_t sz, size_t *len)
 
 static int l2s_real_write_small(const char *p, const char *b, size_t len)
 {
-    long fd = syscall(SYS_openat, AT_FDCWD, p,
-                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    long n;
+    /*
+     * ★ .cnt 的写入必须成对加锁（缺陷修复，2026-10-18）★
+     *
+     * l2s 的引用计数是"读 .cnt → +1 → 写回"的**读-改-写**，而
+     * l2s_real_write_small 原来是 O_TRUNC 覆盖写、全程无锁。两个线程/
+     * 进程各自 link 同一个 mid 时：都读到 2、都写回 3，实际引用已是 4
+     * → 计数少 1。之后 rm 掉足够多个名字就会提前回收仍被引用的
+     * final → **丢数据**。
+     *
+     * 这里用 **OFD 字节锁**（F_OFD_SETLKW，Linux 3.15+）在 .cnt 文件
+     * 自身上做互斥：
+     *   · 锁绑在 open 出来的 fd 上，不涉及进程身份，不会因 fork 变成
+     *     "同一进程重入"而失效（flock/F_SETLK 在 fork 后语义不同）；
+     *   · 内核在 close 时自动释放，没有泄漏路径；
+     *   · 阻塞式（SETLKW），不会像 SETLK 那样在竞争时返回 EAGAIN 把
+     *     一次正常的 link 变成失败。
+     *
+     * 注意：这里只保护**写入**。完整的读-改-写原子性还要求 read 与
+     * write 在同一把锁下完成 —— 那需要改 ops 接口（把 read/write 合并
+     * 成一个 update 回调），改动面大且有回归风险，故本轮只堵住"覆盖写
+     * 撕裂 .cnt 导致读到半截/空文件"这一半；跨进程丢更新的根治见
+     * docs 里的待办。
+     */
+    struct flock fl;
+    long fd, n;
+    int rc;
 
+    fd = syscall(SYS_openat, AT_FDCWD, p,
+                 O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0)
         return -(int)errno;
-    n = syscall(SYS_write, (int)fd, b, len);
+
+    memset(&fl, 0, sizeof fl);
+    fl.l_type   = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start  = 0;
+    fl.l_len    = 0;              /* 到 EOF：整文件 */
+    fl.l_pid    = 0;              /* OFD 锁必须为 0 */
+    (void)syscall(SYS_fcntl, (int)fd, F_OFD_SETLKW, &fl);
+
+    /* 截断必须在取到锁之后，否则会把别人正在写的 .cnt 清掉 */
+    rc = (int)syscall(SYS_ftruncate, (int)fd, 0);
+    if (rc == 0) {
+        n = syscall(SYS_write, (int)fd, b, len);
+        if (n < 0)
+            rc = -(int)errno;
+        else if ((size_t)n != len)
+            rc = -EIO;
+    } else {
+        rc = -(int)errno;
+    }
+
+    fl.l_type = F_UNLCK;
+    (void)syscall(SYS_fcntl, (int)fd, F_OFD_SETLK, &fl);
     syscall(SYS_close, (int)fd);
-    if (n < 0)
+    return rc;
+}
+
+/*
+ * ★ .cnt 的原子读-改-写（缺陷修复，2026-10-18：跨进程丢更新）★
+ *
+ * 【为什么必须是一个函数，而不是给 read/write 各加一把锁】
+ * 引用计数的语义是"读当前值 → ±1 → 写回"。read_small 与 write_small 是
+ * 两次独立调用，锁不可能跨过它们：加在 read 上会在 write 之前就释放，
+ * 加在 write 上则读已经过期。两个 bxroot 进程同时 link 同一个 mid 时：
+ *
+ *     P1 读 2 → P2 读 2 → P1 写 3 → P2 写 3      实际引用 4，计数 3
+ *
+ * 之后 rm 掉足够多个名字，l2s 会认为"没人引用了"而回收 final ——
+ * **仍被引用的数据被删掉**。这是丢数据，不是显示错误。
+ *
+ * 【实现】打开 .cnt，用 **OFD 字节锁**（F_OFD_SETLKW）锁整个文件，
+ * 在锁内完成"读 → 算新值 → 截断 → 写回"，然后解锁关闭。
+ *   · OFD 锁绑在 fd 上，与进程身份无关：fork 出来的子进程各自 open
+ *     各自的 fd，不会因为"同一个进程重复加锁"而直接成功（F_SETLK
+ *     的经典陷阱）；
+ *   · 内核在 close 时自动释放，没有泄漏路径；
+ *   · 阻塞式（SETLKW）：竞争时等待而不是把一次正常 link 变成失败。
+ *
+ * 【为什么不用 flock】flock 的锁属于"打开的文件描述"，语义与 OFD 接近，
+ * 但它与 fcntl 锁**互不互斥**；本文件其它地方（write_small）已统一用
+ * OFD，保持一致才能保证同一条 .cnt 上两种路径互相看得见。
+ *
+ * 【空/损坏内容的处理】读到非数字或越界时按 ERANGE/EIO 失败，不猜。
+ * 调用方（l2s-runtime 的 cnt_add）会把它变成 -EINVAL —— 与修前
+ * read_nlink 的口径一致。
+ */
+static int l2s_real_update_small(const char *p, int delta,
+                                 unsigned int *out_value)
+{
+    struct flock fl;
+    char buf[32];
+    long fd, n;
+    int rc = 0;
+    unsigned long v = 0;
+    unsigned int i;
+    int digits = 0;
+
+    if (p == NULL || out_value == NULL)
+        return -EINVAL;
+
+    fd = syscall(SYS_openat, AT_FDCWD, p,
+                 O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0)
         return -(int)errno;
-    return (size_t)n == len ? 0 : -EIO;
+
+    memset(&fl, 0, sizeof fl);
+    fl.l_type   = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start  = 0;
+    fl.l_len    = 0;              /* 到 EOF：整文件 */
+    fl.l_pid    = 0;              /* OFD 锁必须为 0 */
+    if (syscall(SYS_fcntl, (int)fd, F_OFD_SETLKW, &fl) != 0) {
+        rc = -(int)errno;
+        goto out;
+    }
+
+    /* ---- 锁内：读 ---- */
+    n = syscall(SYS_read, (int)fd, buf, sizeof buf);
+    if (n < 0) {
+        rc = -(int)errno;
+        goto unlock;
+    }
+    for (i = 0; i < (unsigned int)n; i++) {
+        if (buf[i] >= '0' && buf[i] <= '9') {
+            /* 先判溢出再乘：v*10+d 一定放得进 unsigned long */
+            if (v > 0xFFFFFFFFul / 10ul) {
+                rc = -ERANGE;
+                goto unlock;
+            }
+            v = v * 10ul + (unsigned long)(buf[i] - '0');
+            if (v > 0xFFFFFFFFul) {
+                rc = -ERANGE;
+                goto unlock;
+            }
+            digits = 1;
+        } else if (buf[i] == '\n' || buf[i] == ' ') {
+            continue;             /* 容忍尾部换行/空格 */
+        } else {
+            rc = -EIO;            /* 不是计数文件 */
+            goto unlock;
+        }
+    }
+    if (!digits)
+        v = 0;                    /* 空文件 = 从未计数，按 0 起算 */
+
+    /* ---- 锁内：算新值 ---- */
+    {
+        long nv = (long)v + (long)delta;
+        if (nv < 0) {
+            rc = -ERANGE;
+            goto unlock;
+        }
+        if (nv > 0xFFFFFFFFL) {
+            rc = -EMLINK;
+            goto unlock;
+        }
+        v = (unsigned long)nv;
+    }
+
+    /*
+     * ★ 必须先把文件偏移复位再截断/写回 ★
+     *
+     * read() 之后偏移停在读到的位置；ftruncate 只改文件长度、**不动
+     * 偏移**。若直接 write，内容会从旧偏移处开始写，前面留一串 NUL
+     * 空洞 —— 下次读到的就是 "\0\0"，计数彻底坏掉。
+     *
+     * 这个坑是**探针先踩到的**：探针里同样的写法先崩在 -EIO 上，
+     * 才发现产品代码这一处也漏了。记在这里，避免以后有人"简化"掉。
+     */
+    if (syscall(SYS_lseek, (int)fd, 0, SEEK_SET) != 0) {
+        rc = -(int)errno;
+        goto unlock;
+    }
+    /* ---- 锁内：截断后写回（截断必须在锁内、写之前） ---- */
+    if (syscall(SYS_ftruncate, (int)fd, 0) != 0) {
+        rc = -(int)errno;
+        goto unlock;
+    }
+    {
+        char ob[16];
+        size_t len = 0;
+        unsigned long t = v;
+        char tmp[16];
+        int k = 0;
+        do { tmp[k++] = (char)('0' + (t % 10)); t /= 10; } while (t);
+        while (k)
+            ob[len++] = tmp[--k];
+        n = syscall(SYS_write, (int)fd, ob, len);
+        if (n < 0)
+            rc = -(int)errno;
+        else if ((size_t)n != len)
+            rc = -EIO;
+    }
+
+unlock:
+    fl.l_type = F_UNLCK;
+    (void)syscall(SYS_fcntl, (int)fd, F_OFD_SETLK, &fl);
+out:
+    syscall(SYS_close, (int)fd);
+    if (rc == 0)
+        *out_value = (unsigned int)v;
+    return rc;
 }
 
 /* 懒加载真实函数指针 */
@@ -4046,6 +4321,7 @@ static int resolve_dirfd_path(int dirfd, const char *path,
     char dir[MAX_PATH_LEN];
     ssize_t n;
     size_t dlen;
+    int w;
 
     if (dirfd == AT_FDCWD || path == NULL || path[0] == '\0')
         return 0;
@@ -4063,12 +4339,25 @@ static int resolve_dirfd_path(int dirfd, const char *path,
 
     /*
      * 去重斜杠：dir 以 '/' 结尾（根目录）时不要再插一个。
+     *
+     * ★ 截断必须被察觉（缺陷修复，2026-10-18）★
+     *
+     * 原写法丢弃了 snprintf 的返回值并无条件 return 1 —— 超长拼接被
+     * **静默截断**后仍被当成"成功拼好的绝对路径"返回，调用方据此去做
+     * l2s probe / 只读判定，得到的是一条错误（被截短）的路径。
+     * 孪生函数 bxroot_absolutize_at() 对同一场景返回 -ENAMETOOLONG，
+     * 两者对同一错误给出了相反策略。这里对齐：截断即视为不可解析，
+     * 返回 -ENAMETOOLONG，由调用方按其既有约定处理（见 resolve_host_path
+     * 与各 *at 钩子对负返回值的判断）。
      */
     dlen = (size_t)n;
     if (dlen > 0 && dir[dlen - 1] == '/')
-        snprintf(out, outsz, "%s%s", dir, path);
+        w = snprintf(out, outsz, "%s%s", dir, path);
     else
-        snprintf(out, outsz, "%s/%s", dir, path);
+        w = snprintf(out, outsz, "%s/%s", dir, path);
+
+    if (w < 0 || (size_t)w >= outsz)
+        return -ENAMETOOLONG;
 
     return 1;
 }
@@ -4110,11 +4399,51 @@ static const char *resolve_host_path(int dirfd, const char *path,
      * 【为什么放在这里】本函数是 `openat`/`newfstatat`/`fstatat`/
      * `unlinkat`/`mkdirat` 等**所有 *at 入口**的共享路径解析点。
      * 在这里修一次，全部受益 —— 比逐个钩子改更不容易漏。
+     *
+     * ★ 缓冲必须轮转，不能只有一块（缺陷修复，2026-10-18）★
+     *
+     * 原写法是 `static __thread char cwd_abs[MAX_PATH_LEN];` —— 每线程
+     * **只有一块**。但本函数返回的指针被调用方**长期持有**（20 个 *at
+     * 钩子拿到后要一路传给 call_real_*），而同线程的下一次
+     * resolve_host_path() 调用会把它整块覆盖。典型危险链：
+     *
+     *     openat(D1,"a/b") → 返回 cwd_abs
+     *       → 调用方继续做中间组件展开 / l2s probe，其中任一步若再次
+     *         进来（例如 probe 内部要 stat 一条相对路径）
+     *       → cwd_abs 被改成别的路径
+     *       → 调用方拿着已被改写的指针去 open → **打开另一个文件**
+     *
+     * 修法：改成 N 槽轮转（本线程内取号），使"持有一个指针期间又发生
+     * 一次调用"不再覆盖；并加一个重入深度守卫：当嵌套深度超过槽数时
+     * **退回"不绝对化"**（即维持修前行为），而不是去覆盖仍被外层持有的
+     * 槽位 —— 宁可少修一次，也绝不给出被污染的路径。
+     *
+     * 对照：同文件 openat() 用的是**函数作用域**缓冲（joined/translated/
+     * resolved），天然没有这个问题。但那要求改 20 个调用点的签名，
+     * 风险远大于收益，故此处用轮转。
      */
     if (abs != NULL && abs[0] != '/') {
-        static __thread char cwd_abs[MAX_PATH_LEN];
-        if (bxroot_absolutize(abs, cwd_abs, sizeof(cwd_abs)) > 0)
-            abs = cwd_abs;
+        /*
+         * 槽数取 4：这是"防覆盖深度"与"每线程静态 TLS 占用"的折中。
+         * 每槽 MAX_PATH_LEN(8 KB)，4 槽 = 32 KB/线程（原方案 8 KB）。
+         * 实际嵌套很少超过 2 层，4 槽已覆盖真实调用链；再多会按线程数
+         * 线性吃内存（node 的 worker、pthread 池都会各占一份）。
+         */
+        enum { CWD_ABS_SLOTS = 4 };
+        static __thread char cwd_abs_pool[CWD_ABS_SLOTS][MAX_PATH_LEN];
+        static __thread unsigned int cwd_abs_seq;
+        static __thread int cwd_abs_depth;
+
+        if (cwd_abs_depth < CWD_ABS_SLOTS) {
+            unsigned int slot = cwd_abs_seq++ % CWD_ABS_SLOTS;
+            char *cwd_abs = cwd_abs_pool[slot];
+
+            cwd_abs_depth++;
+            if (bxroot_absolutize(abs, cwd_abs, MAX_PATH_LEN) > 0)
+                abs = cwd_abs;
+            cwd_abs_depth--;
+        }
+        /* 否则：嵌套过深，保持 abs 原样（不绝对化），不冒覆盖风险 */
     }
 
     if (abs != NULL && translate_path(abs, out_host, out_hostsz) > 0)
@@ -5295,9 +5624,34 @@ ssize_t readlink(const char *path, char *buf, size_t buf_size) {
      * probe 不到，readlink 于是原样漏出内部名 ".l2s.a0001"。
      *
      * 这与 stat/lstat 钩子处的做法一致（那里传的也是 p）。
+     *
+     * ★ 相对路径必须先绝对化（缺陷修复，2026-10-18）★
+     *
+     * translate_path() 对**相对路径返回 0**（设计如此：交内核按已翻译
+     * 的 cwd 解析）。这一策略对 open/stat 成立——它们最终仍由内核按 cwd
+     * 落盘。但 readlink 在这里的用途不同：它把结果**当作宿主绝对路径**
+     * 交给 l2s 的 probe_fake_link()，以及 rsym 的中间组件解析。
+     * 相对名在这些消费者眼里不是一个合法输入：
+     *
+     *     readlink("R")            R 是相对名 → translate 返回 0 → probe 失败
+     *                              → 漏出内部名 ".l2s.a0001"
+     *     readlinkat(AT_FDCWD,"R") 走 resolve_host_path → 正确翻译
+     *
+     * 于是同一路径在两个入口给出**互相矛盾**的结果。修法与 realpath/
+     * chdir/eaccess 等 6 个兄弟入口一致：先绝对化，再翻译。
+     * 绝对化失败（超长等）时保持原行为，不乱猜。
      */
-    if (translate_path(path, translated, sizeof(translated)) > 0)
-        p = translated;
+    {
+        char absbuf[MAX_PATH_LEN];
+        const char *eff = path;
+
+        if (path != NULL && path[0] != '/' &&
+            bxroot_absolutize(path, absbuf, sizeof(absbuf)) > 0)
+            eff = absbuf;
+
+        if (translate_path(eff, translated, sizeof(translated)) > 0)
+            p = translated;
+    }
     /*
      * ★ 只解析**中间组件**，绝不碰叶子 ★
      *
@@ -7128,17 +7482,48 @@ sem_t *sem_open(const char *name, int oflag, ...)
     posix_shm_ensure_dir();
     posix_shm_backing(guest, sizeof(guest), name, "sem.");
 
-    /* 先按调用方的 O_CREAT/O_EXCL 语义尝试创建 */
+    /* 先按调用方的 O_CREAT/O_EXCL 语义尝试创建
+     *
+     * ★ created 必须在"确实由我创建"时为 1（缺陷修复，2026-10-18）★
+     *
+     * 原写法是 `O_RDWR|O_CLOEXEC|(oflag & (O_CREAT|O_EXCL))`，然后
+     * `fd >= 0 → created = 1`。两个致命后果：
+     *
+     *   ① oflag==0（**打开**已存在的信号量，不创建）时，flags 里只有
+     *      O_RDWR，打开成功 → created=1 → 下面 ftruncate + sem_init，
+     *      把**活的**命名信号量的计数重置成 value（oflag 无 O_CREAT 时
+     *      value 取 0）。
+     *   ② oflag==O_CREAT（无 O_EXCL）且文件已存在时同理 —— 而
+     *      `sem_open("/x", O_CREAT, 0600, 1)` 是**最常见**的写法，
+     *      每个进程都调一次，后到者把先到者刚设的值重置。
+     *
+     * 后果：并发互斥被静默破坏（临界区可同时进两个进程）、计数信号量
+     * 被清零导致死锁；失败分支还会 unlink 掉**别人的**信号量。
+     *
+     * 正确做法：open(O_CREAT|O_EXCL) 才代表"我创建的"；EEXIST 时如果
+     * 调用方没要求 O_EXCL，就**不带 O_CREAT** 重开并置 created=0。
+     * 这与 POSIX sem_open 的语义一致。
+     */
     {
-        int cflags = O_RDWR | O_CLOEXEC | (oflag & (O_CREAT | O_EXCL));
-        fd = open(guest, cflags, mode);
-        if (fd >= 0) {
-            created = 1;
-        } else if ((oflag & O_EXCL) && (oflag & O_CREAT)) {
-            /* O_CREAT|O_EXCL 且已存在 → 保留 EEXIST 语义 */
-            return SEM_FAILED;
+        if (oflag & O_CREAT) {
+            fd = open(guest, O_RDWR | O_CLOEXEC | O_CREAT | O_EXCL, mode);
+            if (fd >= 0) {
+                created = 1;                 /* 确实由本进程创建 */
+            } else if (errno == EEXIST) {
+                if (oflag & O_EXCL) {
+                    /* O_CREAT|O_EXCL 且已存在 → 保留 EEXIST 语义 */
+                    return SEM_FAILED;
+                }
+                /* 已存在且未要求独占 → 复用，**不得**重新初始化 */
+                fd = open(guest, O_RDWR | O_CLOEXEC);
+                if (fd < 0)
+                    return SEM_FAILED;
+                created = 0;
+            } else {
+                return SEM_FAILED;
+            }
         } else {
-            /* 复用已存在的信号量 */
+            /* 不创建：只打开已存在的 */
             fd = open(guest, O_RDWR | O_CLOEXEC);
             if (fd < 0)
                 return SEM_FAILED;
@@ -10892,11 +11277,67 @@ static const char *const FR_CRITICAL_ENV[] = {
     "BXROOT_LINK2SYMLINK",
     "BXROOT_L2S_DIR",
     "BXROOT_FAKEROOT",
+    /*
+     * ★ BXROOT_BINDS 必须加入（缺陷修复，2026-10-18）★
+     *
+     * bind 列表（含 `:ro` 只读标记）原本**不在**守护名单里。而 setenv /
+     * putenv / unsetenv 三个钩子对名单内的变量有"改完立刻恢复"的逻辑，
+     * 名单外的则被放行 —— 于是客户可以：
+     *
+     *     setenv("BXROOT_BINDS", "<自己挑的源>:<guest 路径>")
+     *
+     * 当前进程的 bind 表在构造期已解析、不受影响；但该变量会被子进程
+     * 继承，子进程 exec 后重新解析，就多出一条调用方从未声明的挂载。
+     * 这不是提权（bind 源路径本就由启动参数决定，见 README「安全边界」），
+     * 但它让"父进程声明的挂载表"被子进程代码悄悄改写，而进程内代码
+     * 正是本层唯一能约束的对象。
+     */
+    "BXROOT_BINDS",
+    /*
+     * ★ BXROOT_KILL_ON_EXIT 必须加入（缺陷修复，2026-10-18，P6）★
+     *
+     * 【为什么】kill-on-exit 的唯一开关就是这个环境变量：runtime 的
+     * 构造函数读它，为 1 才注册 atexit 清理（px_killonexit_ctor）。
+     * 而它原先**不在**守护名单里 —— 于是 guest 进程只要执行
+     *
+     *     unsetenv("BXROOT_KILL_ON_EXIT");
+     *     execve(...);
+     *
+     * 就能让**后继镜像**不再挂清理钩子。这条链路是静默的：没有任何
+     * 报错，用户只会在"容器退出后进程还在"时才发现保护没了。
+     *
+     * 【exec 之后到底丢什么（把 P6 的口径改准确）】
+     * 审计原话是"execve 后账本与 atexit 全丢"。核实结果是：
+     *   · atexit **没有**全丢 —— 新镜像重新加载 LD_PRELOAD，构造函数
+     *     再跑一次，px_killonexit_ctor 会重新注册（幂等）。前提是环境
+     *     变量还在 —— 这正是把它加入守护名单的理由；
+     *   · 真正丢失的是**账本内容**（进程私有内存，exec 必然清空）。
+     *     影响面很窄：只有"先 fork 出子进程、再 exec"的进程会失去对
+     *     那些已有子进程的追踪。这一面由 launcher 的
+     *     PR_SET_CHILD_SUBREAPER + 退出后清后代树覆盖（RUN_KILL_ON_EXIT）。
+     *
+     * 所以这里修的是"可以被人为关掉"，而不是"exec 必然丢"。
+     *
+     * ★ 实测局限（如实记录，2026-10-18）★
+     * 本容器里 LD_PRELOAD 是**嵌套**的（外层 proroot 自研加载器 +
+     * 本库），实测 setenv 钩子对名单**前 5 条**生效（用
+     * BXROOT_LINK2SYMLINK / BXROOT_L2S_DIR 验证：改完立刻恢复），
+     * 对后加的 BXROOT_BINDS / BXROOT_KILL_ON_EXIT **没有观察到生效**；
+     * 而 .so 里的数组确实有 7 条（objdump 已核对），所以问题在加载器
+     * 层而非本文件的逻辑。
+     *
+     * 正因为这条机制在本环境里不可依赖，P6 的保证**没有**建立在它
+     * 身上：proc.c 的 px_build_forced() 在**每次 exec** 时，只要本进程
+     * 已武装过 kill-on-exit，就主动把 BXROOT_KILL_ON_EXIT=1 写进子进程
+     * 环境。那条路是确定性的，不依赖任何钩子。
+     * 本条目保留作纵深防御：在加载器行为正常的平台上它仍然有用。
+     */
+    "BXROOT_KILL_ON_EXIT",
     NULL
 };
 
 /* 记住我们被加载时这几个变量的值，用于重注入 */
-static char *g_env_saved[6] = { NULL, NULL, NULL, NULL, NULL, NULL };
+static char *g_env_saved[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 static int   g_env_captured = 0;
 
 static void fr_capture_env(void)
@@ -11402,6 +11843,82 @@ int prlimit64(pid_t pid, __rlimit_resource_t resource,
  * 必须在文件作用域导出（LD_PRELOAD 靠动态符号表插入），所以这里没有
  * 加 static。参数签名与 <pthread.h> 逐字一致，否则符号对不上。
  */
+/*
+ * ★ 新线程入口的包装 thunk（缺陷修复，2026-10-18）★
+ *
+ * sigaltstack 是**每线程**属性，而崩溃处理器只在构造函数里给我装过
+ * 一次（初始线程）。pthread_create 出来的线程没有备用栈 → SA_ONSTACK
+ * 对它们退化为普通栈 → 栈溢出时处理器自己起不来，进程静默死掉，
+ * 拿不到任何现场。node/pnpm 这类多线程 guest 是常态场景。
+ *
+ * 所以在这里统一包一层：新线程一进来先装私有备用栈，退出前释放。
+ * 只有一条路径，避免"某个 return 分支漏装"。
+ */
+extern int  bxroot_crash_install_altstack(void) __attribute__((weak));
+extern void bxroot_crash_uninstall_altstack(void) __attribute__((weak));
+
+typedef struct {
+    void *(*fn)(void *);
+    void *arg;
+} px_thread_boot;
+
+static void *px_thread_boot_fn(void *p)
+{
+    px_thread_boot b = *(px_thread_boot *)p;
+    void *ret;
+
+    /* p 是调用方栈/堆上的临时结构；拷出来后立刻释放，别让它泄漏 */
+    free(p);
+
+    if (bxroot_crash_install_altstack != NULL)
+        (void)bxroot_crash_install_altstack();
+
+    ret = b.fn(b.arg);
+
+    if (bxroot_crash_uninstall_altstack != NULL)
+        bxroot_crash_uninstall_altstack();
+    return ret;
+}
+
+/*
+ * 把 (start_routine, arg) 包成一个新线程入口。
+ *
+ * 返回 NULL = 包装失败（malloc 不到），调用方按原样直通 —— 宁可少装
+ * 一个备用栈，也不能让 pthread_create 因为我们的包装而失败。
+ * 成功时把"要传给新入口的参数"写回 *new_arg（那个 px_thread_boot 结构体）。
+ */
+static void *(*px_wrap_start(void *(*fn)(void *), void *arg,
+                            void **new_arg))(void *)
+{
+    px_thread_boot *b = (px_thread_boot *)malloc(sizeof *b);
+
+    if (b == NULL)
+        return NULL;
+    b->fn  = fn;
+    b->arg = arg;
+    *new_arg = b;
+    return px_thread_boot_fn;
+}
+
+/*
+ * 统一的 pthread_create 调用点：自动给新线程装备用栈。
+ *
+ * 包装失败时直通（不因为我们的附加功能让创建线程失败）。
+ */
+static int px_create_wrapped(int (*real_fn)(pthread_t *, const pthread_attr_t *,
+                                            void *(*)(void *), void *),
+                             pthread_t *thread, const pthread_attr_t *attr,
+                             void *(*start_routine)(void *), void *arg)
+{
+    void *new_arg = NULL;
+    void *(*new_fn)(void *) = px_wrap_start(start_routine, arg, &new_arg);
+
+    if (new_fn == NULL)
+        return real_fn(thread, attr, start_routine, arg);
+    return real_fn(thread, attr, new_fn, new_arg);
+}
+
+
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                    void *(*start_routine)(void *), void *arg)
 {
@@ -11457,16 +11974,16 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 
     /* attr == NULL：默认属性（stacksize 由 libc 给 8M），无事可做 */
     if (attr == NULL)
-        return real_fn(thread, attr, start_routine, arg);
+        return px_create_wrapped(real_fn, thread, attr, start_routine, arg);
 
     /*
      * 读 attr。两者任一失败就直通 —— 读不到就不该猜。
      * 注意 pthread_attr_getstacksize 的返回值是错误码（不设 errno）。
      */
     if (pthread_attr_getstacksize(attr, &size) != 0)
-        return real_fn(thread, attr, start_routine, arg);
+        return px_create_wrapped(real_fn, thread, attr, start_routine, arg);
     if (pthread_attr_getstack(attr, &addr, &region) != 0)
-        return real_fn(thread, attr, start_routine, arg);
+        return px_create_wrapped(real_fn, thread, attr, start_routine, arg);
 
     /*
      * ★ 判据：区分"只设了 stacksize"与"真的带了显式栈区"。
@@ -11489,7 +12006,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
      * 我们替它换栈会破坏它的语义（它可能已经把栈指针/映射交给别处）。
      */
     if (region != 0 && (uintptr_t)addr + region != 0)
-        return real_fn(thread, attr, start_routine, arg);
+        return px_create_wrapped(real_fn, thread, attr, start_routine, arg);
 
     /*
      * 下限 = max(2 × PTHREAD_STACK_MIN, 256K)，与官方 10650~10668 一致。
@@ -11502,7 +12019,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 
     /* 已经够大 → 直通（官方 10674 的 b.ls 就是这条） */
     if (size >= want)
-        return real_fn(thread, attr, start_routine, arg);
+        return px_create_wrapped(real_fn, thread, attr, start_routine, arg);
 
     /*
      * ★ 用**副本**，不能就地改调用方的 attr ★
@@ -11529,10 +12046,10 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     memcpy(&clean, attr, sizeof(clean));
     if (pthread_attr_setstacksize(&clean, want) != 0) {
         /* setstacksize 失败：clean 是副本，无资源可释放，直通即可 */
-        return real_fn(thread, attr, start_routine, arg);   /* 保守直通 */
+        return px_create_wrapped(real_fn, thread, attr, start_routine, arg);   /* 保守直通 */
     }
 
-    rc = real_fn(thread, &clean, start_routine, arg);
+    rc = px_create_wrapped(real_fn, thread, &clean, start_routine, arg);
     return rc;
 }
 
@@ -13692,6 +14209,50 @@ static void constructor(void) {
 
         /* 使用 syscall 直接调用 chdir（ctor 中 dlsym 不可用） */
         long ret = syscall(SYS_chdir, target);
+
+        /*
+         * ★ chdir 成功也要校验落点（缺陷修复，2026-10-18）★
+         *
+         * 上面的失败分支只覆盖"chdir 失败"。但还有一类更隐蔽的情形：
+         * **chdir 成功、目标却在 rootfs 之外**。触发条件：
+         *
+         *   · BXROOT_WORKDIR 是相对路径（经环境变量直接传入，绕过
+         *     launcher 的规范化）→ translate_path 对相对名返回 0 →
+         *     target 保持原串 → 内核按**宿主 cwd** 解析 → 落在 rootfs 外；
+         *   · 或 workdir 恰好指向 rootfs 之外的宿主目录。
+         *
+         * 一旦 cwd 在 rootfs 外，"相对路径不翻译直接透传"这条设计就会
+         * 让 `open("x")` / `> out` 直接读写**宿主**目录（写穿 rootfs），
+         * 且 getcwd 回显宿主路径。
+         *
+         * 这里补一道不变量：chdir 成功后用 getcwd 反查，若结果不以
+         * rootfs 前缀开头，就当作失败，走下面同一套回退逻辑。
+         */
+        if (ret >= 0) {
+            char cwdchk[MAX_PATH_LEN];
+            long n = syscall(SYS_getcwd, cwdchk, sizeof(cwdchk) - 1);
+            int outside = 0;
+
+            if (n > 0) {
+                size_t rl;
+
+                cwdchk[n] = '\0';
+                rl = strlen(g_config.rootfs);
+                /* rootfs 为 "/" 时任何绝对路径都在其内，跳过比较 */
+                if (rl > 1) {
+                    if (strncmp(cwdchk, g_config.rootfs, rl) != 0 ||
+                        (cwdchk[rl] != '/' && cwdchk[rl] != '\0'))
+                        outside = 1;
+                }
+            }
+            if (outside) {
+                LOG("workdir 落在 rootfs 之外（%s），按 chdir 失败处理",
+                    cwdchk);
+                ret = -1;
+                errno = ENOENT;
+            }
+        }
+
         if (ret < 0) {
             /*
              * ============================================================

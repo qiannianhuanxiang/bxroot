@@ -113,7 +113,8 @@ static int o_write_small(const char *p, const char *b, size_t len)
 
 static const l2s_rt_ops OPS = {
     o_lstat, o_symlink, o_rename, o_unlink,
-    o_readlink, o_access, o_read_small, o_write_small
+    o_readlink, o_access, o_read_small, o_write_small,
+    NULL    /* update_small：本测试走回退路径 */
 };
 
 /* ------------------------------------------------------------------ */
