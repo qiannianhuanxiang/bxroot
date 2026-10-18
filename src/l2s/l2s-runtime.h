@@ -71,6 +71,32 @@ typedef struct {
     int     (*read_small)(const char *path, char *buf, size_t bufsz,
                           size_t *out_len);
     int     (*write_small)(const char *path, const char *buf, size_t len);
+
+    /*
+     * ★ update_small：带锁的"读-改-写"（可选项，可为 NULL）★
+     * （缺陷修复，2026-10-18：跨进程丢更新）
+     *
+     * 【为什么必须新增这个回调，而不是给 read/write 加锁】
+     * 引用计数的语义是"读当前值 → ±1 → 写回"，是一个**原子的读-改-写**。
+     * 而 read_small / write_small 是两次独立调用，中间无法持有锁：
+     *   · 进程内自旋锁只能挡本进程的线程；
+     *   · 两个 bxroot 进程同时 link 同一个 mid 时，都读到 2、都写回 3，
+     *     实际引用已是 4 → 计数少 1 → 之后 rm 掉足够多名字会**提前回收
+     *     仍被引用的 final**（丢数据）。
+     * 只有把"读-改-写"整体交给注入方，锁才可能跨越这两步 —— 因为只有
+     * 注入方知道怎么打开那个文件、怎么在它上面加锁。
+     *
+     * 【语义】对 <path> 中的十进制计数应用 delta：
+     *   成功返回 0，并把**新值**写进 *out_value；
+     *   文件不存在时按 0 起算（等价于旧路径"读到 ENOENT 就失败"的调用
+     *   点自行决定，见 l2s-runtime.c 的 cnt_add）；
+     *   结果超出 [0, L2S_NLINK_MAX] 返回 -ERANGE / -EMLINK；
+     *   其它失败返回负 errno。
+     *
+     * 【为 NULL 时】runtime 回退到"进程内锁 + read_small + write_small"，
+     * 即修复前的行为 —— 单测与旧注入方不需要改动就能编译运行。
+     */
+    int     (*update_small)(const char *path, int delta, unsigned int *out_value);
 } l2s_rt_ops;
 
 /* ------------------------------------------------------------------ */

@@ -92,7 +92,8 @@ static int r_write_small(const char *p, const char *b, size_t len)
 
 static const l2s_rt_ops OPS = {
     r_lstat, r_symlink, r_rename, r_unlink, r_readlink, r_access,
-    r_read_small, r_write_small
+    r_read_small, r_write_small,
+    NULL    /* update_small：本集成测试走回退路径 */
 };
 
 /* ------------------------------------------------------------------ */

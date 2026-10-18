@@ -465,6 +465,7 @@ static int lp_is_scan_barrier(uint32_t ins)
 static int       g_applied;
 static int       g_hits;
 static int       g_scan_hits;
+static int       g_form_mismatch;   /* 版本表落点形态不符，已跳过（2026-10-18） */
 static int       g_skip_reason;
 static uintptr_t g_base;
 
@@ -650,10 +651,68 @@ static uintptr_t find_libc_base(void)
 /* 应用                                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * ★ 从 svc 往前找 `mov x8, #imm`，取出系统调用号 ★
+ *
+ * 返回 >=0 = 找到的号；-1 = 没找到（窗口内遇到障碍或到边界）。
+ *
+ * 为什么需要它：版本表补丁原先只校验"这个字是 svc #0"。而 libc 的
+ * 可执行段里 svc **极其密集**（每个系统调用封装都有一条），偏移一旦
+ * 因 glibc 补丁版本差异漂移，落点照样是某条 svc —— 于是会把这**无关**
+ * 系统调用改写成站点指定的 patch 指令（147/149 是 `mov x0,#0`，即
+ * "恒成功"）。那是一条 fail-open 的安全失效路径，比"不生效"糟得多。
+ *
+ * 判据与扫描器 lp_scan_and_patch 同一套（lp_is_scan_barrier），
+ * 保证两条路径对"形态"的理解一致。
+ */
+#define LP_FIND_NR_WINDOW 8
+static long lp_find_syscall_nr_before(const uint32_t *svc)
+{
+    int i;
+
+    for (i = 1; i <= LP_FIND_NR_WINDOW; i++) {
+        uint32_t ins = svc[-i];
+
+        /* movz x8, #imm  （hw 必须为 0：一次性装载） */
+        if ((ins & 0xff80001fu) == 0xd2800008u) {
+            /* Rt==8 已在掩码里保证；imm16 在 bits[20:5] */
+            return (long)((ins >> 5) & 0xffffu);
+        }
+        /* movk x8：说明号是多段拼的，这里不展开，判为"形态不明" */
+        if ((ins & 0xff80001fu) == 0xf2800008u)
+            return -1;
+        /* 其它会改写 x8 或改变控制流的指令 → 判据失效 */
+        if (lp_is_scan_barrier(ins))
+            return -1;
+    }
+    return -1;
+}
+
 static int patch_one(uint32_t *p, const lp_site *s)
 {
+    long found;
+
     if (*p != SVC_INSN)
         return 0;               /* 不是 svc，跳过（版本不同/已打过） */
+
+    /*
+     * ★ 形态校验：落点必须确实是**该号**的 svc（缺陷修复，2026-10-18）★
+     *
+     * 只判 "== svc #0" 不够：版本表的偏移是版本精确绑定的（文件头
+     * 自己记过"表按 2.39-8.9 登记、真机是 8.5"的偏移错位）。错位后
+     * 落点往往仍是某条 svc，于是会把无关调用改成 `mov x0,#0`（恒成功）
+     * —— 静默的安全失效，且完全看不出症状。
+     *
+     * 这里做双向确认：往前找 `mov x8,#imm`，号必须与本站点声明的
+     * s->nr 一致才动手。找不到（形态不明）就**不补** ——
+     * 宁可少打一个站点，也不能打错位置。
+     */
+    found = lp_find_syscall_nr_before(p);
+    if (found != s->nr) {
+        /* 形态不符：不动它。计数供诊断。 */
+        g_form_mismatch++;
+        return 0;
+    }
 
     *p = s->patch;              /* svc #0 → 站点指定的指令 */
     __builtin___clear_cache((char *)p, (char *)p + 4);
@@ -1380,6 +1439,19 @@ int bxroot_livepatch_apply(void)
      * 那是"看起来干了活"的假象，正是本项目反复吃过亏的静默失效形态。
      * 现在 applied 与 hits 同源，调用方可以信任它。
      */
+    /*
+     * ★ 形态不符的站点必须报出来（缺陷修复，2026-10-18）★
+     *
+     * 这些站点是"版本表说在这里，但那里的指令形态不是这个号"——
+     * 说明偏移漂移了。不补它们是对的（宁缺勿错），但**不能静默**：
+     * 静默的话用户只会看到"某些调用没被中和"的莫名症状。
+     * 这条告警不受 VERBOSE 控制，与"版本不符"那条同样重要。
+     */
+    if (g_form_mismatch > 0)
+        fprintf(stderr, "[bxroot] livepatch: 跳过 %d 个站点（落点形态不符，"
+                "疑似 glibc 偏移漂移；未打补丁以免误伤）\n",
+                g_form_mismatch);
+
     if (g_hits > 0) {
         g_applied = 1;
         if (lp_verbose())

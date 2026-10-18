@@ -402,6 +402,132 @@ static long raw_syscall6(long nr, long a0, long a1, long a2,
 }
 
 /* ------------------------------------------------------------------ */
+/* 客户指针可写性探测（缺陷修复，2026-10-18）                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ------------------------------------------------------------------
+ * 为什么需要这个函数
+ * ------------------------------------------------------------------
+ *
+ * 本层在 fakeroot 模式下代客户**填写输出参数**（getresuid / getresgid /
+ * getgroups）。原实现是：
+ *
+ *     if (a0 != 0) *(volatile unsigned int *)(uintptr_t)a0 = fr;
+ *
+ * 只判了 NULL，**没判这个地址是否可写**。而内核对本应失败的指针写
+ * （如 syscall(148, (void*)1, 0, 0)）会返回 -EFAULT；我们却直接解引用，
+ * 结果把一次"内核会优雅拒绝"的调用变成了**本进程 SIGSEGV** —— 而且
+ * 是发生在 syscall() 内部，客户的错误处理代码根本来不及跑。
+ *
+ * 同项目 shm-copyout.h 对同一问题的处理是防御式的：走
+ * process_vm_writev(271) 写目标进程，**从不直接解引用**
+ * （见该文件头注）。本层与它安全等级不一致，这里补齐。
+ *
+ * ------------------------------------------------------------------
+ * 为什么不直接用 process_vm_writev
+ * ------------------------------------------------------------------
+ *
+ * 1. 本层是**独立编译单元**（单测无 preload.c），拿不到 shm-copyout.h
+ *    的封装；直接展开又会与该封装形成两套实现。
+ * 2. 271 在部分 Android 宿主 seccomp 配置下被 KILL_PROCESS 拦截
+ *    —— 见本文件头"问题一"的实测说明。用它会引入新的崩溃风险。
+ *
+ * 因此改用 /proc/self/maps 查权限位：成本可控、无新系统调用依赖，
+ * 且"查不到就判不可写"是 fail-safe 方向（内核语义该失败时我们
+ * 也失败，而不是崩溃）。
+ *
+ * ------------------------------------------------------------------
+ * 局限（如实声明）
+ * ------------------------------------------------------------------
+ *
+ * · 只覆盖**本进程**的映射（这里正是 self，够用）。
+ * · 按页粒度判定：跨越可写/只读边界的多页写入，只校验首页所在段。
+ *   调用方均为单字段/小数组写，实际不触发。
+ * · 读 /proc/self/maps 失败时返回 0（不可写）→ 走 EFAULT，不崩溃。
+ */
+static int ptr_writable_or_default(const void *p, size_t len)
+{
+    char mapsbuf[4096];
+    unsigned long addr, end;
+    long fd, n, off, total = 0;
+    unsigned long lo, hi;
+    int ok = 0;
+
+    if (p == NULL)
+        return 0;
+    addr = (unsigned long)(uintptr_t)p;
+    if (len == 0)
+        len = 1;
+    end = addr + len - 1;
+    if (end < addr)              /* 溢出 */
+        return 0;
+
+    /* O_RDONLY == 0（Linux 各架构一致）；本文件不含 <fcntl.h>，故写字面量 */
+    fd = raw_syscall6(56 /*openat*/, SG_AT_FDCWD,
+                      (long)(uintptr_t)"/proc/self/maps",
+                      0 /*O_RDONLY*/, 0, 0, 0);
+    if (fd < 0)
+        return 0;
+
+    for (;;) {
+        n = raw_syscall6(63 /*read*/, fd, (long)(uintptr_t)mapsbuf,
+                         (long)sizeof(mapsbuf) - 1, 0, 0, 0);
+        if (n <= 0)
+            break;
+        mapsbuf[n] = '\0';
+        off = 0;
+        while (off < n) {
+            /* 逐行解析：<start>-<end> <perms> ... */
+            unsigned long s = 0, e = 0;
+            int i = (int)off;
+            while (i < n && mapsbuf[i] != '\n') {
+                i++;
+            }
+            if (i >= n)
+                break;
+            {
+                int j = (int)off;
+                int d;
+                /* 解析十六进制 start */
+                for (s = 0, d = 0;
+                     j < i && mapsbuf[j] != '-'; j++, d++)
+                    s = s * 16 + (unsigned long)((mapsbuf[j] <= '9')
+                                     ? mapsbuf[j] - '0'
+                                     : (mapsbuf[j] | 32) - 'a' + 10);
+                if (d > 0 && j < i && mapsbuf[j] == '-') {
+                    j++;
+                    for (e = 0, d = 0; j < i && mapsbuf[j] != ' '; j++, d++)
+                        e = e * 16 + (unsigned long)((mapsbuf[j] <= '9')
+                                         ? mapsbuf[j] - '0'
+                                         : (mapsbuf[j] | 32) - 'a' + 10);
+                    /* perms 紧跟在空格之后，第 2 个字符是 'w' 即可写 */
+                    if (d > 0 && j + 1 < i && mapsbuf[j] == ' ' &&
+                        mapsbuf[j + 1] == 'r' && mapsbuf[j + 2] == 'w') {
+                        lo = s;
+                        hi = e;
+                        if (addr >= lo && addr < hi) {
+                            ok = 1;
+                            off = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            off = i + 1;
+            total++;
+            if (total > 4096)    /* 防御：地图异常巨大时放弃 */
+                break;
+        }
+        if (ok)
+            break;
+    }
+
+    raw_syscall6(57 /*close*/, fd, 0, 0, 0, 0, 0);
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
 /* 诊断输出（不用 stdio，避免早期构造阶段不可用）                       */
 /* ------------------------------------------------------------------ */
 
@@ -1045,6 +1171,24 @@ long syscall(long number, ...)
      */
     const char *leaf_pre = NULL;   /* 叶子解析前的路径（l2s 补丁 probe 用） */
 
+    /*
+     * ★ 裸 unlinkat(35) 的宿主视角路径（缺陷修复，2026-10-18）★
+     *
+     * 翻译循环里改的是 `*args[i]`，而本函数后半段的 l2s 记账读的是
+     * **局部副本 a1** —— 两者不会同步。原记账段直接用 a1 去 probe，
+     * 只有 tr > 0 时才对得上（见记账段注释）。这里由一个**位置绑定**
+     * 的标志捕获"a1 已被翻译成宿主路径"这一事实：
+     *
+     *   0  = 未翻译（要么没进翻译门，要么 tr <= 0）→ 记账段跳过；
+     *   1  = args[1] 已是宿主视角路径 → 记账段用 *args[1]。
+     *
+     * 为什么不是"记账段自己再翻译一次"：再翻一次得到的是同一份结果，
+     * 但会**自行判断** tr 的取值，而 tr <= 0 的两种情形含义完全不同
+     * （guest 绝对路径的"特殊路径透传" vs 相对路径）—— 判据只该有一处，
+     * 就是翻译循环。这里只搬运事实。
+     */
+    int sg_unlinkat_host = 0;
+
 
 
     /*
@@ -1054,10 +1198,33 @@ long syscall(long number, ...)
      * raw_syscall6 之后的补丁段（必须在 l2s 结果补丁之后，见那里
      * 的注释），补丁段也要从池里取槽 —— 块作用域够不着。
      * 只挪位置，尺寸与语义一字不改。
+     *
+     * ★ SG_SLOT_SIZE 必须 >= MAX_PATH_LEN（缺陷修复，2026-10-18）★
+     *
+     * 原先 SG_SLOT_SIZE = 4096，而翻译层单条路径的上限是
+     * MAX_PATH_LEN = PATH_MAX * 2 = 8192（src/runtime/config.h）。
+     * bxroot_translate_path(src, tbuf, need) 的 need 传的就是
+     * SG_SLOT_SIZE，于是**任何长于 4096 的翻译结果都会返回 -1**，
+     * 而调用侧是 `if (tr > 0) *args[i] = tbuf;` —— 返回 -1 时静默
+     * 跳过翻译，把**客户的 guest 路径原样交给内核**。
+     *
+     * 后果是静默的、且方向危险（fail-open）：
+     *   · Android app 私有目录前缀本身就有 ~60 字节；
+     *   · 深层 node_modules / 长包名极易越过 4096；
+     *   · 表现为"某些路径莫名读到了宿主文件"，极难排查。
+     *
+     * 现在把槽位尺寸对齐到翻译层的路径上限。
+     *
+     * 【为什么写成 PATH_MAX * 2 而不是 include config.h】
+     * 本文件是**刻意独立编译**的单元（见文件头："本文件刻意不含
+     * <fcntl.h>（单测独立编译）"），不引入项目的 config.h 以保持
+     * 可单测。PATH_MAX 已由本文件第 48 行引入，故直接按 config.h
+     * 里 MAX_PATH_LEN 的定义式（PATH_MAX * 2）取值，并在此注明
+     * 与源头的对应关系；若 config.h 的定义变了，这行要同步。
      */
-#define SG_POOL_SIZE (64 * 1024)
-#define SG_SLOT_SIZE 4096
-#define SG_SLOT_COUNT (SG_POOL_SIZE / SG_SLOT_SIZE)
+#define SG_SLOT_SIZE (PATH_MAX * 2)   /* == MAX_PATH_LEN（src/runtime/config.h） */
+#define SG_SLOT_COUNT 16
+#define SG_POOL_SIZE (SG_SLOT_SIZE * SG_SLOT_COUNT)
     static char sg_pool[SG_POOL_SIZE];
     /*
      * ★ 全部取槽点共用**一个**取号器（审计 SG-2）★
@@ -1450,7 +1617,10 @@ long syscall(long number, ...)
              *    无锁、可重入、在信号处理器里安全。
              *
              * 【槽位与轮转】
-             * 固定 4 KB 槽位（翻译结果最长 4096，与调用方给的 need 一致）。
+             * 固定 SG_SLOT_SIZE 槽位（= PATH_MAX*2 = 翻译层路径上限
+             * MAX_PATH_LEN，与调用方给的 need 一致）。此前该值是 4096，
+             * 小于翻译上限 8192，导致长路径翻译返回 -1 后被**静默跳过**
+             * —— 见文件内 SG_SLOT_SIZE 处的修复说明（2026-10-18）。
              * 取号对槽位数取模实现轮转 —— 16 个槽位意味着要过 16 次调用
              * 才回到同一块，而调用方持有路径指针的时间远短于此。
              */
@@ -1618,6 +1788,22 @@ long syscall(long number, ...)
                     log_str(tbuf);
                     log_str("\n");
                 }
+
+                /*
+                 * ★ 把"a1 已翻译"这一事实带给下面的 l2s 记账（缺陷修复，
+                 *   2026-10-18）★
+                 *
+                 * 记账段读的是局部副本 a1，而这里改的是 *args[1] ——
+                 * 不同步。原记账段假定"走到那里 a1 已是宿主路径"，
+                 * 只有 tr > 0 成立；tr == 0 时 a1 仍是客户 guest 路径。
+                 * 这里在**同一处判据**（tr > 0）上记下事实，记账段据此
+                 * 决定用 *args[1] 还是干脆不做（判据只有一个来源）。
+                 *
+                 * 只对 unlinkat 的 a1 置位：这是记账段唯一的消费方，
+                 * 别的调用/槽位置位只会误导。
+                 */
+                if (number == SCG_NR_unlinkat && i == 1)
+                    sg_unlinkat_host = 1;
             }
 
             if (need_leaf == 1) {
@@ -1660,22 +1846,74 @@ long syscall(long number, ...)
      * 语义（见文件头 SCG_NR_unlinkat 处的实测记录）
      * ================================================================
      *
-     * 放在翻译**之后**：a1 此时已是宿主视角路径（中间层与数据文件都在
-     * 宿主侧，l2s 层只认这种形态）；放在 svc **之前**：这是"接管"而不是
-     * "结果补丁"—— 一旦 l2s 认领，内核不再看到这次调用。
+     * 放在翻译**之后**：中间层与数据文件都在宿主侧，l2s 层只认宿主视角
+     * 路径；放在 svc **之前**：这是"接管"而不是"结果补丁"—— 一旦 l2s
+     * 认领，内核不再看到这次调用。
+     *
+     * ★ 缺陷修复（2026-10-18）：记账必须用**宿主路径**，不是 a1 ★
+     *
+     * 原写法把 "a1 此时已是宿主视角路径" 当成既成事实 —— 它是局部副本
+     * （函数开头 va_arg 读出），翻译循环改的是 `*args[1]`，二者并不同步。
+     * 翻译层是 `if (tr > 0) *args[i] = tbuf;`，所以：
+     *
+     *   tr > 0   a1 仍是 **guest** 路径，*args[1] 才是宿主路径；
+     *   tr == 0  没有翻译（/proc /sys /dev 特殊路径透传、bind 源、
+     *            相对名、已带 rootfs 前缀）—— a1 与 *args[1] **相同**，
+     *            都是 guest 路径。
+     *
+     * `tr > 0 ⇔ a1 != *args[1]` 在两个分支上恒成立，这就是绑定标志
+     * `sg_unlinkat_host` 的来源（它在 tr > 0 处置位，判据不复制一份）。
+     *
+     * 【tr == 0 时原写法的危害】l2s 层的一切 FS 操作都在宿主侧
+     * （l2s_rt_unlink → probe_fake_link → g_ops->lstat），拿 guest 路径
+     * 去 lstat 会落到**宿主根**下的同名路径：
+     *
+     *   · 落空 → PASSTHRU → 内核照常发 svc，看的是**翻译后**的路径
+     *     （相对名按已翻译的 cwd 落在 rootfs 内；/proc /sys /dev 本来就
+     *     透传）→ 删掉的是磁盘上的**符号链接本体**，而不是递减伪造链接
+     *     的引用计数 —— `.cnt` 漂移、中间层/数据文件/`.cnt` 永久残留；
+     *   · 落到**宿主的另一个同名文件**上 → 不但错误地递减甚至回收
+     *     l2s 文件，更糟的是紧接着的 `urc == 0` 分支会**直接 return 0**
+     *     把这次调用吃掉：内核 svc 根本不发，客户本该删掉的那个文件
+     *     **留在原地**，而 unlinkat 报成功 —— 静默的假成功，比残留更坏。
+     *
+     * 原注释把第二种情形当成"必然落空"。这不是必然：rootfs 之外的
+     * 路径（bind 源、`/sdcard` 类）在宿主与 guest 视角下是同一个位置，
+     * 那里 l2s 可能真有文件。
+     *
+     * 【修法：tr == 0 就不记账，交给内核】本层在 tr == 0 时**拿不到**
+     * "内核将要对之操作的那个字符串" —— 它可能是宿主 cwd 的翻译结果，
+     * 取决于本次进程的 cwd；凭 guest 串去猜，要么猜错（假成功），要么
+     * 引入 cwd 依赖的不可预期行为。与其猜，不如按 libc 钩子的**同一
+     * 分歧**处理：preload.c 的 unlink 在 translate_path 返回 0 时同样
+     * 不做 l2s 记账（`if (translate_path(...) > 0) p = translated;`
+     * 之后直接调 l2s_rt_unlink），两条入口对同一情形必须给同一答案。
+     *
+     * 残留风险评估：tr == 0 且确实是 l2s 伪造链接只有一条现实路径 ——
+     * guest 路径落在 rootfs 之外（bind 源），而 l2s 的产物就在那里。
+     * 该场景下 libc 入口同样不记账，客户用 `rm` 删也一样残留；两入口
+     * 一致比"裸 svc 比 libc 多记一笔（而且记错）"安全得多。要真正覆盖
+     * 它，得让翻译循环把"该发出去的最终路径"暴露给消费方（相对名按
+     * cwd 翻译那次的结果），那是另一件事，不在本次缺陷范围。
      *
      * 门控：
      *   flags 带 AT_REMOVEDIR 的是 rmdir 语义，与硬链接无关，不碰；
-     *   a1 为 0 时上面的 EFAULT 分支已经返回，这里再判一次是防御。
+     *   a1 为 0 时上面的 EFAULT 分支已经返回，这里再判一次是防御；
+     *   sg_unlinkat_host 为 0 时不记账（见上，交内核）。
      * 懒启用：纯读进程（从未 link 过）里 l2s 可能尚未启用，而它删的
      * 可能正是别的进程留下的伪造链接 —— 与 O_NOFOLLOW / statx 补丁同款。
      */
     if (number == SCG_NR_unlinkat && a1 != 0 &&
         (a2 & SCG_AT_REMOVEDIR) == 0 && l2s_rt_unlink != NULL &&
+        sg_unlinkat_host &&
         /* 真 dirfd + 相对名：本层无法还原目录，交给内核（与修前一致） */
         ((int)a0 == SG_AT_FDCWD ||
          ((const char *)(uintptr_t)a1)[0] == '/')) {
-        const char *up = (const char *)(uintptr_t)a1;
+        /*
+         * 用 *args[1]（翻译后的宿主路径），不用 a1 —— 见上。l2s 只认
+         * 宿主视角形态，guest 串 probe 不到乃至误中宿主同名文件。
+         */
+        const char *up = (const char *)(uintptr_t)*args[1];
         int urc;
 
         if (bxroot_l2s_lazy_enable != NULL &&
@@ -2270,7 +2508,37 @@ long syscall(long number, ...)
                      * 逐个写：指针来自客户，可能是 NULL 表达"不关心这一项"。
                      * 用 volatile 让编译器**不要**把"解引用客户指针"优化掉
                      * （它是可观测副作用），也不要合并多次写。
+                     *
+                     * ★ 写之前必须探测可写性（缺陷修复，2026-10-18）★
+                     *
+                     * 原实现只判 NULL。客户若传入不可写地址
+                     * （如 syscall(148, (void*)1, 0, 0)），内核对本应
+                     * 失败的指针写会返回 -EFAULT，而我们直接解引用会
+                     * 让**本进程 SIGSEGV**。现在先探测，任一不可写就整体
+                     * 按内核语义失败，绝不崩溃。
+                     * 探测函数见文件上部 ptr_writable_or_default()。
+                     *
+                     * 【★ errno 约定：必须 ret = -1 而不是 -EFAULT ★】
+                     * syscall() 是 libc 符号，不是裸入口 —— 出错时**返回
+                     * -1 并把错误码放 errno**。直接 ret = -EFAULT 会把
+                     * 原始内核值 -14 当返回值抛给客户，而调用方普遍写
+                     * `if (syscall(...) < 0) {... perror ...}`，拿到 -14
+                     * 也判负、看似无事，但任何比较具体值的代码（如
+                     * `== -1`）都会走错分支。
+                     * 实测（真机探针 probe_fakeroot_ptr_safety.c）：
+                     * 写 -EFAULT 时返回 -14；写 -1 时返回 -1 且
+                     * errno=EFAULT —— 与同函数 getgroups 分支一致。
                      */
+                    if ((a0 != 0 && !ptr_writable_or_default(
+                             (const void *)(uintptr_t)a0, sizeof(unsigned int))) ||
+                        (a1 != 0 && !ptr_writable_or_default(
+                             (const void *)(uintptr_t)a1, sizeof(unsigned int))) ||
+                        (a2 != 0 && !ptr_writable_or_default(
+                             (const void *)(uintptr_t)a2, sizeof(unsigned int)))) {
+                        errno = EFAULT;
+                        ret = -1;
+                        break;
+                    }
                     if (a0 != 0) *(volatile unsigned int *)(uintptr_t)a0 = fr;
                     if (a1 != 0) *(volatile unsigned int *)(uintptr_t)a1 = fe;
                     if (a2 != 0) *(volatile unsigned int *)(uintptr_t)a2 = fs;
@@ -2349,12 +2617,41 @@ long syscall(long number, ...)
                         ret = -1;
                     } else {
                         int filled = 0;
+                        /*
+                         * ★ 两处修复（2026-10-18）★
+                         *
+                         * ① 原判据是 `a1 != 0`，但 getgroups 的 ABI 是
+                         *    getgroups(int gidsetsize, gid_t *list)：
+                         *    a0 = 容量，**a1 = 缓冲指针**。这里判 a1
+                         *    是把它当成了"指针非空"的守卫，语义碰巧
+                         *    对得上（缓冲确实在 a1），保留但写清；
+                         *    真正的隐患在下一条。
+                         *
+                         * ② `filled == gcount` 这个严格相等要求会让
+                         *    **绝大多数情况静默不填充**：伪造组数是 1，
+                         *    而 bxroot_fakeroot_groups 回填的 filled 与
+                         *    它并不总是相等。此时函数仍返回 gcount
+                         *    (=1)，客户于是拿到"成功返回 1 个组，但
+                         *    数组里是未初始化数据"——正是本文件反复
+                         *    强调要消灭的那类不一致。
+                         *    改为：按实际能填多少填多少（min(filled,
+                         *    gcount)），并在写入前做可写性探测。
+                         */
                         if (bxroot_fakeroot_groups(gbuf, 64, &filled) &&
-                            filled == gcount && a1 != 0) {
+                            filled > 0 && a1 != 0) {
+                            int k;
+                            int nfill = (filled < gcount) ? filled : gcount;
                             unsigned int *dst =
                                 (unsigned int *)(uintptr_t)a1;
-                            int k;
-                            for (k = 0; k < gcount; k++)
+
+                            if (!ptr_writable_or_default(
+                                    (const void *)dst,
+                                    (size_t)nfill * sizeof(unsigned int))) {
+                                errno = EFAULT;
+                                ret = -1;
+                                break;
+                            }
+                            for (k = 0; k < nfill; k++)
                                 *(volatile unsigned int *)(dst + k) = gbuf[k];
                         }
                         ret = (long)gcount;

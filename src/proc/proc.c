@@ -55,6 +55,7 @@ static int px_auto_host(void)
 #include <stdlib.h>
 #include <string.h>
 #include <gnu/libc-version.h>
+#include <pthread.h>   /* 账本互斥：g_ledger_mutex（2026-10-18 文档级说明见定义处） */
 
 /* ================================================================== */
 /* §0  分配器注入                                                      */
@@ -175,6 +176,38 @@ static uint64_t px_hash_pid(pid_t pid, unsigned kind)
  * 探测。找到返回槽位下标并把 *found 置 1；未找到返回**第一个可插入**的
  * 槽位下标（墓碑优先复用）并把 *found 置 0。
  */
+/*
+ * ★ 账本专用锁（缺陷修复，2026-10-18）★
+ *
+ * 【缺陷】px_ledger 的全部操作（add / get / reap / remove / evict /
+ * foreach / compact / grow）**完全没有互斥**。g_rt_mutex 只被
+ * pthread_atfork 的 prepare 用，而 px_ledger_add 发生在 parent 解锁
+ * **之后** —— 也就是说它从未保护过账本。
+ *
+ * 【后果（两个方向，都很实际）】
+ *   1. UAF：并发 add 触发 compact/grow 时会 `free()` 旧 slots 数组，
+ *      另一个线程正在 px_probe 里读它 → 命中已释放内存。
+ *   2. 计数损坏：l->count / l->clock / l->tombs 的读-改-写无原子性，
+ *      并发下会丢更新 → 淘汰逻辑误判"表满"→ 可能淘汰 LIVE 条目
+ *      → **kill 白名单失效**（该拒的放行）。
+ *
+ * 【为什么用另一把锁而不是复用 g_rt_mutex】
+ *   g_rt_mutex 在 atfork 的 prepare 里被持有时，父进程的其他线程会被
+ *   阻塞到 fork 完成。若账本也用它，则任意一次记账都会让 fork 等待 ——
+ *   而记账发生在每条 kill/exec 路径上，等于把 fork 的门槛抬到"任何
+ *   进程操作"。两把锁职责分离，互不放大阻塞。
+ *
+ * 【与 atfork 的关系】子进程里本锁可能是"被别的线程持有"的状态。
+ *   但子进程只剩一个线程，且 px_ledger_* 的第一次调用会走
+ *   PTHREAD_MUTEX_INITIALIZER 的正常路径 —— 为安全起见，
+ *   px_fork_child 里显式重置它（见该函数）。
+ *
+ * 静态初始化：与 g_rt_mutex 同理，避免 init 时序问题。
+ */
+static pthread_mutex_t g_ledger_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_mutex_t g_rt_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static size_t px_probe(const px_ledger *l, pid_t pid, unsigned kind, int *found)
 {
     uint64_t h = px_hash_pid(pid, kind);
@@ -258,17 +291,21 @@ void px_ledger_clear(px_ledger *l)
 {
     size_t i;
 
-    if (l == NULL || l->slots == NULL) {
+    if (l == NULL) {
         return;
     }
-    for (i = 0; i < l->cap; i++) {
-        l->slots[i].state = PX_SLOT_EMPTY;
-        memset(&l->slots[i].info, 0, sizeof(l->slots[i].info));
-        l->slots[i].last_used = 0;
+    pthread_mutex_lock(&g_ledger_mutex);
+    if (l->slots != NULL) {
+        for (i = 0; i < l->cap; i++) {
+            l->slots[i].state = PX_SLOT_EMPTY;
+            memset(&l->slots[i].info, 0, sizeof(l->slots[i].info));
+            l->slots[i].last_used = 0;
+        }
+        l->count = 0;
+        l->tombs = 0;
+        l->clock = 0;
     }
-    l->count = 0;
-    l->tombs = 0;
-    l->clock = 0;
+    pthread_mutex_unlock(&g_ledger_mutex);
 }
 
 size_t px_ledger_count(const px_ledger *l)
@@ -291,12 +328,14 @@ static size_t px_count_life(const px_ledger *l, px_life want)
     if (l == NULL) {
         return 0;
     }
+    pthread_mutex_lock(&g_ledger_mutex);
     for (i = 0; i < l->cap; i++) {
         if (l->slots[i].state == PX_SLOT_LIVE &&
             l->slots[i].info.life == want) {
             n++;
         }
     }
+    pthread_mutex_unlock(&g_ledger_mutex);
     return n;
 }
 
@@ -351,6 +390,7 @@ size_t px_ledger_evict(px_ledger *l, size_t n)
     if (l == NULL || n == 0) {
         return 0;
     }
+    pthread_mutex_lock(&g_ledger_mutex);
     while (done < n) {
         size_t i;
         size_t best = (size_t)-1;
@@ -373,6 +413,7 @@ size_t px_ledger_evict(px_ledger *l, size_t n)
         l->tombs++;
         done++;
     }
+    pthread_mutex_unlock(&g_ledger_mutex);
     return done;
 }
 
@@ -383,18 +424,53 @@ size_t px_ledger_foreach(const px_ledger *l,
     size_t i;
     size_t seen = 0;
 
+    px_procinfo *snap;
+    size_t nsnap = 0;
+
     if (l == NULL) {
         return 0;
     }
+    /*
+     * ★ 必须先快照，不能在持锁状态下调用用户回调（缺陷修复，2026-10-18）★
+     *
+     * 两个理由：
+     *   1. 回调若再次进入账本（kill 判定里很自然会再查一次），
+     *      g_ledger_mutex 是非递归锁 → 自死锁；
+     *   2. 回调执行时间不可控，持锁会让所有 kill/exec 一起卡住。
+     *
+     * 快照长度先按 cap 分配（cap 是 2 的幂，最多 PX_LEDGER_MAX_CAP），
+     * 失败则退化为"不加锁直接遍历"——那与修前行为一致，不会更差。
+     */
+    snap = (px_procinfo *)malloc(sizeof(px_procinfo) * (l->cap ? l->cap : 1));
+    if (snap == NULL) {
+        for (i = 0; i < l->cap; i++) {
+            if (l->slots[i].state != PX_SLOT_LIVE) {
+                continue;
+            }
+            seen++;
+            if (cb != NULL && cb(&l->slots[i].info, ud) != 0) {
+                break;
+            }
+        }
+        return seen;
+    }
+
+    pthread_mutex_lock(&g_ledger_mutex);
     for (i = 0; i < l->cap; i++) {
         if (l->slots[i].state != PX_SLOT_LIVE) {
             continue;
         }
+        snap[nsnap++] = l->slots[i].info;
+    }
+    pthread_mutex_unlock(&g_ledger_mutex);
+
+    for (i = 0; i < nsnap; i++) {
         seen++;
-        if (cb != NULL && cb(&l->slots[i].info, ud) != 0) {
+        if (cb != NULL && cb(&snap[i], ud) != 0) {
             break;
         }
     }
+    free(snap);
     return seen;
 }
 
@@ -557,9 +633,34 @@ static int px_ledger_put(px_ledger *l, pid_t pid, pid_t ppid,
 
     l->clock++;
     if (found) {
-        /* 刷新：保留 life（reaped 不该因为再次 add 而复活成 live）。
+        /*
+         * 刷新：**默认**保留 life（reaped 不该因为再次 add 而复活成 live）。
          * 这个细节很关键 —— pid 复用后调用方会 add 同一个 pid，
-         * 若这里无脑置 PX_LIVE，就把「已回收」的保护抹掉了。 */
+         * 若这里无脑置 PX_LIVE，就把「已回收」的保护抹掉了。
+         *
+         * ★ 但"我自己刚 fork/spawn 出来的子进程"必须复活（缺陷修复，2026-10-18）★
+         *
+         * 原实现对所有刷新一律保留 life。而 pid 是会回绕的
+         * （Android pid_max 常为 32768），于是：
+         *
+         *   1. 某 pid P 被 wait 掉 → life = PX_REAPED；
+         *   2. 之后**我自己 fork 出的新子进程**恰好拿到 P → 走这里刷新；
+         *   3. life 仍是 PX_REAPED → kill(P) 被拒 EPERM（见 px_check_kill
+         *      的白名单分支）、kill-on-exit 也跳过（只杀 PX_LIVE）；
+         *   4. 该子进程**永久不可杀 + 泄漏**。
+         *
+         * 判据：tag 为 PX_TAG_FORK / PX_TAG_SPAWN 表示"调用方刚从
+         * fork/spawn 拿到这个 pid"——那是**确凿的新生命**，不是旧条目
+         * 的刷新。这种情形必须置回 PX_LIVE。
+         *
+         * 其余 tag（例如 PX_TAG_SELF、调用方的普通 add）保持原语义：
+         * 不复活，避免把已回收的保护抹掉。
+         */
+        if (tag == PX_TAG_FORK || tag == PX_TAG_SPAWN) {
+            l->slots[idx].info.life = PX_LIVE;
+            l->slots[idx].info.pid  = pid;
+            l->slots[idx].info.kind = kind;
+        }
         l->slots[idx].info.ppid = ppid;
         l->slots[idx].info.tag = tag;
         l->slots[idx].last_used = l->clock;
@@ -582,12 +683,20 @@ static int px_ledger_put(px_ledger *l, pid_t pid, pid_t ppid,
 
 int px_ledger_add(px_ledger *l, pid_t pid, pid_t ppid, uint32_t tag)
 {
-    return px_ledger_put(l, pid, ppid, PX_ENTRY_PID, tag);
+    int rc;
+    pthread_mutex_lock(&g_ledger_mutex);
+    rc = px_ledger_put(l, pid, ppid, PX_ENTRY_PID, tag);
+    pthread_mutex_unlock(&g_ledger_mutex);
+    return rc;
 }
 
 int px_ledger_add_pgid(px_ledger *l, pid_t pgid, uint32_t tag)
 {
-    return px_ledger_put(l, pgid, 0, PX_ENTRY_PGID, tag);
+    int rc;
+    pthread_mutex_lock(&g_ledger_mutex);
+    rc = px_ledger_put(l, pgid, 0, PX_ENTRY_PGID, tag);
+    pthread_mutex_unlock(&g_ledger_mutex);
+    return rc;
 }
 
 int px_ledger_get(const px_ledger *l, pid_t pid, px_entry_kind kind,
@@ -595,18 +704,26 @@ int px_ledger_get(const px_ledger *l, pid_t pid, px_entry_kind kind,
 {
     int found = 0;
     size_t idx;
+    int rc = PX_ENOENT;
 
-    if (l == NULL || l->disabled || pid <= 0) {
+    if (l == NULL) {
+        return PX_ENOENT;
+    }
+    /* 加锁：并发 add 可能在 compact/grow 里 free() 掉 slots 数组 */
+    pthread_mutex_lock(&g_ledger_mutex);
+    if (l->disabled || pid <= 0) {
+        pthread_mutex_unlock(&g_ledger_mutex);
         return PX_ENOENT;
     }
     idx = px_probe(l, pid, (unsigned)kind, &found);
-    if (!found || idx == (size_t)-1) {
-        return PX_ENOENT;
+    if (found && idx != (size_t)-1) {
+        if (out != NULL) {
+            *out = l->slots[idx].info;
+        }
+        rc = PX_OK;
     }
-    if (out != NULL) {
-        *out = l->slots[idx].info;
-    }
-    return PX_OK;
+    pthread_mutex_unlock(&g_ledger_mutex);
+    return rc;
 }
 
 int px_ledger_has(const px_ledger *l, pid_t pid, px_entry_kind kind)
@@ -672,8 +789,10 @@ int px_ledger_reap(px_ledger *l, pid_t pid)
      * 返回值兼容原语义：任一维度命中即 PX_OK；两个都不存在才是
      * PX_ENOENT —— 测试 A7/A8 钉住这一点。
      */
+    pthread_mutex_lock(&g_ledger_mutex);
     hit = px_mark_reaped(l, pid, PX_ENTRY_PID);
     hit |= px_mark_reaped(l, pid, PX_ENTRY_PGID);
+    pthread_mutex_unlock(&g_ledger_mutex);
     return hit ? PX_OK : PX_ENOENT;
 }
 
@@ -685,13 +804,16 @@ int px_ledger_remove(px_ledger *l, pid_t pid, px_entry_kind kind)
     if (l == NULL || l->disabled) {
         return PX_ENOENT;
     }
+    pthread_mutex_lock(&g_ledger_mutex);
     idx = px_probe(l, pid, (unsigned)kind, &found);
     if (!found || idx == (size_t)-1) {
+        pthread_mutex_unlock(&g_ledger_mutex);
         return PX_ENOENT;
     }
     px_slot_release(&l->slots[idx]);
     l->count--;
     l->tombs++;
+    pthread_mutex_unlock(&g_ledger_mutex);
     return PX_OK;
 }
 
@@ -2119,6 +2241,24 @@ void px_forkguard_child(px_forkguard *g, px_ledger *l)
     px_guard_unlock(g);
     g->locked = 0;
 
+    /*
+     * ★ 账本锁同样必须复位（缺陷修复，2026-10-18）★
+     *
+     * 与上面 px_guard_unlock 是同一个道理：fork 那一刻若有**别的线程**
+     * 正持有 g_ledger_mutex（任何一条 kill/exec 都在记账），子进程里
+     * 这把锁就是"被未知线程持有"的状态，而那个线程已不存在。
+     * 子进程第一次 px_ledger_* 就会永久自旋/阻塞。
+     *
+     * 用 pthread_mutex_init 重新初始化：这是**唯一**能在子进程里把一个
+     * 可能处于"已持有"状态的 POSIX 互斥恢复到可用态的合法手段
+     * （对已被其他线程持有的互斥调用 unlock 是未定义行为）。
+     * 此时子进程只有一个线程，不存在并发，重新 init 不会丢任何同步语义。
+     */
+    {
+        pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+        memcpy(&g_ledger_mutex, &fresh, sizeof fresh);
+    }
+
     /* 记录子进程自己的 pid，供后续检出自增 */
     if (g->lockops == NULL) {
         g->inconsistent_detected++;
@@ -2154,7 +2294,23 @@ int px_fork_should_abort(int reg_rc)
      *
      * 注意：**不能**把「账本被 disabled」当成失败 —— 那是用户显式关掉了
      * 保护，此时记账是 no-op 且返回 PX_OK，不会走到这里。
+     *
+     * ★ 但「账本根本不存在」必须放行（缺陷修复，2026-10-18）★
+     *
+     * px_ledger_add(NULL, ...) 返回 PX_EINVAL，与「表满」同码。于是
+     * 账本创建失败（OOM 等）时这个判断会把**每一次** fork 都判成失败：
+     * 先白 clone 一个子进程、再 SIGKILL 它、然后返回 -1。用户看到的是
+     * 「fork 永久 EAGAIN」，而日志里写的是「kill 保护已禁用」的优雅降级。
+     *
+     * 这是最坏组合：本该降级的场景变成了硬故障，**而且** kill 保护同时
+     * 处于 fail-open —— 既不能 fork，也不能杀。
+     *
+     * 所以这里把「账本为 NULL」与「登记失败」区分开：没有账本就当没有
+     * 保护，正常 fork（与 px_forkguard_parent_register 里 l==NULL 的
+     * 语义一致）。真正表满（PX_EFULL）仍然中止，那才是本函数要防的。
      */
+    if (reg_rc == PX_EINVAL)
+        return 0;               /* 账本不可用 → 不因为"没记上账"而阻止 fork */
     return reg_rc != PX_OK;
 }
 
@@ -2296,7 +2452,7 @@ static px_ledger  *g_rt_ledger;
 static px_rt_stats g_rt_stats;
 static px_lockops  g_rt_lockops;        /* 保护账本的互斥锁（见下） */
 static px_forkguard g_rt_guard;
-static pthread_mutex_t g_rt_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 static px_xlate_fn g_xlate_fn;
 static void       *g_xlate_ud;
@@ -2840,6 +2996,13 @@ static int px_xlate_trampoline(void *ud, const char *path, char *out, size_t out
 static __thread const char *g_exec_guest_exe;
 static __thread const char *g_exec_orig_comm;
 
+/*
+ * 前向声明：px_build_forced() 需要读 g_kox_armed（决定是否把
+ * BXROOT_KILL_ON_EXIT 传给子进程，见该函数末尾的说明）。
+ * 定义在文件后面的 kill-on-exit 单元里。
+ */
+static int g_kox_armed;
+
 static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
                            const char *guest_exe, const char *orig_comm)
 {
@@ -2932,12 +3095,73 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
         kv[n].mode = PX_ENV_SET;
         n++;
     }
+
+    /*
+     * ★ kill-on-exit 必须在**每次 exec** 重新写进子进程环境（P6，2026-10-18）★
+     *
+     * 【为什么不能靠"继承就够了"】kill-on-exit 的唯一开关是环境变量
+     * BXROOT_KILL_ON_EXIT：新镜像的构造函数读它，为 1 才注册 atexit
+     * 清理。而 execve 会**清空 atexit 链**，所以"这条环境变量必须抵达
+     * 新镜像"是 kill-on-exit 在新镜像里还能成立的**唯一前提**。
+     *
+     * 原来它只靠继承：调用方 envp 里有什么就传什么。于是
+     *     unsetenv("BXROOT_KILL_ON_EXIT"); execve(...);
+     * 就能让后继镜像彻底没有清理钩子，而且全程没有任何报错 ——
+     * 用户只会在"容器退出后进程还在"时才发现保护没了。
+     *
+     * 【为什么不用 FR_CRITICAL_ENV】那条路（setenv/unsetenv 钩子"改完
+     * 立刻恢复"）在本项目里是既有机制，但**实测在本容器（嵌套 proroot
+     * 加载器）下对新增条目没有生效**：名单编进 .so 的确实是 7 条
+     * （已用 objdump 核对），运行时却只对前 5 条生效。原因在加载器层，
+     * 不归本项目控制。所以 P6 的保证**不建立**在那个机制上 —— 在
+     * exec 时由我们自己强制写入，是确定性的，不依赖任何钩子是否被装载。
+     *
+     * 【为什么由"本进程已挂上清理"决定，而不是无条件写 1】
+     * 只有当本进程确实武装过（g_kox_armed）才往下传：用户没开
+     * --kill-on-exit 时，我们不能凭空给子进程打开一个会杀进程的行为。
+     * 这是"保持用户选择"而不是"我替你决定"。
+     */
+    if (g_kox_armed && n < cap) {
+        kv[n].name = "BXROOT_KILL_ON_EXIT";
+        kv[n].value = "1";
+        kv[n].mode = PX_ENV_SET;
+        n++;
+    }
     return (int)n;
+}
+
+/*
+ * ★ forced[] 的容量必须显式约束（缺陷修复，2026-10-18，P8）★
+ *
+ * 这张表是"必须写进子进程环境"的条目集合，由三段拼起来：
+ *   · px_build_forced(..., 7, ...)           最多 7 条（身份/loader）
+ *   · px_auto_host() 分支                    2 + 13 条（PATH + 13 个透传名）
+ *   · native session 分支                    最多 4 条
+ * 上界 7 + 15 + 4 = 26，而数组是 32 —— 现在是**够的**，但靠的是"数一遍"。
+ *
+ * 问题不是今天会溢出，而是**加一个名字就会溢出**：那两处
+ * `forced[nf++] = ...` 完全没有边界判断，而它们就在 for 循环里。
+ * 一旦有人在 names[] 里多加 7 个名字，写出去的是**栈上越界写**，
+ * 崩溃点离改动点十万八千里（而且 O2 下很可能先把相邻局部变量写坏）。
+ *
+ * 修法：给出容量常量 + 一个**返回新长度**的 push 帮助函数；容量不足时
+ * 返回 -1 让调用方失败，而不是静默丢条目 —— 丢 `PATH` 或
+ * `PROROOT_TRAMPOLINE_PATH` 会让子进程起不来，且原因极难定位。
+ */
+#define PX_FORCED_MAX 32
+
+static int px_forced_push(px_env_kv *tab, int cap, int n, px_env_kv kv)
+{
+    if (n < 0 || n >= cap) {
+        return -1;
+    }
+    tab[n] = kv;
+    return n + 1;
 }
 
 int px_runtime_build_env(char *const envp[], px_envout *out)
 {
-    px_env_kv forced[32];  /* identity + native PATH/config + guest loader */
+    px_env_kv forced[PX_FORCED_MAX];  /* identity + native PATH/config + guest loader */
     char *native_path = NULL;
     const char *const *src = envp != NULL ? (const char *const *)envp
                                         : (const char *const *)environ;
@@ -2973,12 +3197,22 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
         size_t i;
         if (bx_host_world_guest_path(guest_path, host_path, &native_path) != 0)
             return -1;
-        forced[nf++] = (px_env_kv){"PATH", native_path, PX_ENV_SET};
-        forced[nf++] = (px_env_kv){"BXROOT_AUTO_HOST", "1", PX_ENV_SET};
+        nf = px_forced_push(forced, PX_FORCED_MAX, nf,
+                            (px_env_kv){"PATH", native_path, PX_ENV_SET});
+        if (nf < 0)
+            return -1;
+        nf = px_forced_push(forced, PX_FORCED_MAX, nf,
+                            (px_env_kv){"BXROOT_AUTO_HOST", "1", PX_ENV_SET});
+        if (nf < 0)
+            return -1;
         for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             const char *value = getenv(names[i]);
-            if (value != NULL)
-                forced[nf++] = (px_env_kv){names[i], value, PX_ENV_SET};
+            if (value != NULL) {
+                nf = px_forced_push(forced, PX_FORCED_MAX, nf,
+                                    (px_env_kv){names[i], value, PX_ENV_SET});
+                if (nf < 0)
+                    return -1;
+            }
         }
     }
 
@@ -2988,7 +3222,12 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
         size_t i;
         for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             const char *value = bx_native_session_value ? bx_native_session_value(names[i]) : NULL;
-            if (value) forced[nf++] = (px_env_kv){names[i], value, PX_ENV_SET};
+            if (value) {
+                nf = px_forced_push(forced, PX_FORCED_MAX, nf,
+                                    (px_env_kv){names[i], value, PX_ENV_SET});
+                if (nf < 0)
+                    return -1;
+            }
         }
     }
     memset(&pol, 0, sizeof(pol));
@@ -5462,6 +5701,47 @@ int fexecve(int fd, char *const argv[], char *const envp[])
  * 好处是语义完全保真（不存在「我们没想到的属性」），代价是依赖 glibc
  * 内部走导出符号这一实现细节 —— 这一点已由反汇编证实，并记录为风险。
  */
+/*
+ * ★ 「目标确定不是可执行物」的统一判定（缺陷修复，2026-10-18）★
+ *
+ * execve 路径早就有这段判定（原名为 definitive_no，见 5035-5088 的长
+ * 注释，解释了为什么必须用**裸 syscall** 而不是 libc 的 stat）。
+ * 但 posix_spawn 路径**没有**，于是：
+ *
+ *     posix_spawn(&pid, "/nonexistent/x", ...)
+ *
+ * 会走到 px_trampoline_spawn → 成功 spawn 了 bridge → 返回 **0 + pid**，
+ * ENOENT 语义整体丢失。失败只表现为"子进程退出码 127"，Python 抛
+ * CalledProcessError 而不是 FileNotFoundError，任何只查返回值的调用方
+ * 都会以为进程起来了。
+ *
+ * 抽成公共函数，两条路径共用同一判据（只认"确实不存在/目录/无执行位"
+ * 三种确凿情形；EACCES 等一律不判，以免把本来能跑的环境弄坏 —— 理由
+ * 见 execve 处的原注释）。
+ *
+ * 返回值：1 = 确定不是可执行物；0 = 不确定（应按原路径继续）。
+ */
+static int px_definitely_not_executable(const char *host)
+{
+    struct stat raw_st;
+    long rr;
+
+    if (host == NULL)
+        return 0;
+    /* 裸 syscall：绕开本进程自己装的 stat 钩子（见 execve 处的踩坑记录） */
+    rr = syscall(SYS_newfstatat, AT_FDCWD, host, &raw_st, 0);
+    if (rr != 0) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return 1;               /* 确实不存在 */
+        return 0;                   /* EACCES 等：不判 */
+    }
+    if (S_ISDIR(raw_st.st_mode))
+        return 1;                   /* 目录不可 exec */
+    if (S_ISREG(raw_st.st_mode) && (raw_st.st_mode & 0111) == 0)
+        return 1;                   /* 三个执行位全 0 */
+    return 0;
+}
+
 static int px_do_spawn(pid_t *pid, const char *path,
                        const posix_spawn_file_actions_t *fa,
                        const posix_spawnattr_t *attr,
@@ -5702,6 +5982,19 @@ static int px_do_spawn(pid_t *pid, const char *path,
      * 仅对"目标本身"成立；argv[0] 的 raw 值就是调用方原始 argv[0]，
      * 即参数 argv 尚未翻译时的首元素 —— 保存于 raw_argv0）。
      */
+    /*
+     * ★ 目标确定不存在/不可执行 → 跳过 trampoline（缺陷修复，2026-10-18）★
+     *
+     * 不加这一步的话 posix_spawn("/nonexistent/x") 会成功 spawn bridge
+     * 并返回 0 + pid，ENOENT 语义丢失。判据与 execve 完全一致，见
+     * px_definitely_not_executable() 的注释。
+     */
+    if (px_definitely_not_executable(host)) {
+        rc = ENOENT;
+        errno = ENOENT;
+        goto out;
+    }
+
     if (px_trampoline_spawn(pid, host, final_argv, final_env,
                             raw_argv0,
                             getenv("BXROOT_LD_PRELOAD"), fa, attr) == 0) {
@@ -6248,8 +6541,32 @@ int system(const char *cmd)
         return -1;
     }
     /*
-     * 回落路径仍然是安全的（子进程会拿到我们 setenv 过的 LD_PRELOAD），
-     * 唯一不覆盖的是 shell 本身的路径（用的是宿主 /bin/sh）。
+     * ★ 回落路径**不安全**，这一点必须如实写清楚（缺陷修复，2026-10-18，P7）★
+     *
+     * 原注释写的是「回落路径仍然是安全的（子进程会拿到我们 setenv 过的
+     * LD_PRELOAD），唯一不覆盖的是 shell 本身的路径」。这句话有两个错：
+     *
+     *   1. **事实错误**：`px_cfg_merge_preload` 恰恰**故意不**把我们的库
+     *      放进 environ（见本区顶部注释的实证 —— 放进去会让宿主 shell
+     *      链接失败）。所以回落的子进程**没有**运行时注入，也没有任何
+     *      路径翻译。
+     *   2. **方向危险**：把它标成"安全"会让后来的人以为这条路径可以
+     *      依赖。实际语义是「在**宿主世界**里、用宿主的 `/bin/sh` 与
+     *      宿主 PATH 执行一条**容器视角**写下的命令」—— 若命令里写的是
+     *      `/bin/ls`，跑的是宿主的 ls；若 rootfs 与宿主同名目录内容不同，
+     *      得到的结果也就与容器内预期不同。这是**兼容性缺口**，不是隔离
+     *      保障。
+     *
+     * 什么时候会走到这里（**都已在真机上排除**，但必须留回落）：
+     *   · 未配置 rootfs（开发机 / 单测）；
+     *   · 翻译器不可用（trampoline 缺失）；
+     *   · rootfs 内没有可用的 shell。
+     *
+     * 保留回落的理由：宁可让 `system()` 在退化环境下**还能用**（宿主
+     * 语义），也不要让它在这些环境下直接失败 —— 拒绝执行会让构建脚本、
+     * configure 之类当场中断，而用户此时并没有容器能力可用。
+     * 想确认自己是否落到了这条路径：看 `-v` 日志里的
+     * "proc: guest shell 不可用，system 回落真实实现"。
      */
     return real_system(cmd);
 }
@@ -6694,18 +7011,35 @@ static int px_do_kill(pid_t pid, int sig, int (*real_fn)(pid_t, int))
     return real_fn(pid, sig);
 }
 
+/*
+ * ★ 统一的 real_kill 懒解析（缺陷修复，2026-10-18）★
+ *
+ * 原实现只在 kill() 里做 `if (real_kill == NULL) pxl_dlsym("kill")`，
+ * 而 killpg()/tgkill() 直接使用这个全局函数指针。后果：
+ *
+ *   · 进程内**第一次** kill 类调用若是 killpg()（Python 的 os.killpg、
+ *     作业控制的 `kill %1` 都走它），real_kill 仍是 NULL →
+ *     px_do_kill(pid, sig, NULL) 里判空返回 -1/ENOSYS —— 信号根本没发
+ *     出去，调用方看到"组不存在"一类的错误。
+ *
+ * 抽成 px_kill_fn()，三个入口共用，谁先被调到谁触发解析。
+ */
+static int (*px_kill_fn(void))(pid_t, int)
+{
+    if (real_kill == NULL)
+        real_kill = (int (*)(pid_t, int))px_dlsym("kill");
+    return real_kill;
+}
+
 int kill(pid_t pid, int sig)
 {
-    if (real_kill == NULL) {
-        real_kill = (int (*)(pid_t, int))px_dlsym("kill");
-    }
-    return px_do_kill(pid, sig, real_kill);
+    return px_do_kill(pid, sig, px_kill_fn());
 }
 
 int killpg(int pgrp, int sig)
 {
     /* killpg(pgrp, sig) 等价于 kill(-pgrp, sig) */
-    return px_do_kill(-pgrp, sig, real_kill);
+    return px_do_kill(-pgrp, sig, px_kill_fn());
 }
 
 int tgkill(int tgid, int tid, int sig)
@@ -6734,7 +7068,7 @@ int tgkill(int tgid, int tid, int sig)
         }
         return real_tgkill(tgid, tid, sig);
     }
-    return px_do_kill((pid_t)tgid, sig, real_kill);
+    return px_do_kill((pid_t)tgid, sig, px_kill_fn());
 }
 
 int tkill(int tid, int sig)
@@ -6821,7 +7155,7 @@ static unsigned long g_kox_killed;
 static unsigned long g_kox_skipped;
 static unsigned long g_kox_failed;
 
-static int   g_kox_armed;         /* 是否已注册 atexit（幂等） */
+/* g_kox_armed 在 px_build_forced() 之前已有前向声明（P6） */
 static int   g_kox_running;       /* 重入保护：清理过程中又被触发 */
 static pid_t g_kox_owner;         /* 挂载者的 pid —— 只有它才执行清理 */
 
