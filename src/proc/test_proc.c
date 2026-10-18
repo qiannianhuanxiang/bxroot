@@ -246,12 +246,19 @@ static void test_ledger_basic(void)
     CHECK_EQ(px_ledger_live_count(l), 0);
     CHECK_EQ(px_ledger_reaped_count(l), 1);
 
-    /* ★ 关键语义：对已 reap 的 pid 再次 add 不得「复活」成 LIVE ★
+    /* ★ 关键语义：对已 reap 的 pid 做「普通」刷新不得复活成 LIVE ★
      * 复活会让 pid 复用防护失效 —— 宿主已把该 pid 分配给别的进程，
-     * 我们却以为自己还拥有它。 */
-    CHECK_EQ(px_ledger_add(l, 42, 1, PX_TAG_FORK), PX_OK);
+     * 我们却以为自己还拥有它。
+     *
+     * 例外（P5，2026-10-18）：tag 为 FORK/SPAWN 表示调用方刚从
+     * fork/spawn 拿到这个 pid，是确凿的新生命，必须复活，否则 pid
+     * 回绕后新子进程永久杀不掉。下面分别锁住两个方向。 */
+    CHECK_EQ(px_ledger_add(l, 42, 1, PX_TAG_SELF), PX_OK);
     CHECK_EQ(px_ledger_get(l, 42, PX_ENTRY_PID, &info), PX_OK);
     CHECK_EQ(info.life, PX_REAPED);
+    CHECK_EQ(px_ledger_add(l, 42, 1, PX_TAG_FORK), PX_OK);
+    CHECK_EQ(px_ledger_get(l, 42, PX_ENTRY_PID, &info), PX_OK);
+    CHECK_EQ(info.life, PX_LIVE);
     px_ledger_destroy(l);
 
     CASE("A8 disabled 后记账是 no-op，查询一律 ENOENT");
@@ -1946,7 +1953,9 @@ static void test_forkguard(void)
         CHECK_EQ(px_fork_should_abort(PX_OK), 0);
         CHECK_EQ(px_fork_should_abort(PX_ENOMEM), 1);
         CHECK_EQ(px_fork_should_abort(PX_EFULL), 1);
-        CHECK_EQ(px_fork_should_abort(PX_EINVAL), 1);
+        /* P2：账本不存在（add(NULL) → PX_EINVAL）≠ 表满，必须放行，
+         * 否则账本创建失败时每次 fork 都被白 clone 再 SIGKILL。 */
+        CHECK_EQ(px_fork_should_abort(PX_EINVAL), 0);
         px_ledger_destroy(tiny);
     }
 

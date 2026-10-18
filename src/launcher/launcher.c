@@ -571,7 +571,6 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
                 fprintf(stderr, "错误: -w 需要参数\n");
                 return -1;
             }
-            free(cfg->workdir);
             /*
              * ★ 显式 -w 也必须规范化（缺陷修复，2026-10-18）★
              *
@@ -593,25 +592,45 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
              */
             {
                 const char *wd = argv[++i];
-                if (wd == NULL || wd[0] == '\0') {
-                    /* 空值 → 视为未指定，保留默认（已由上面的默认分支设置） */
-                } else if (wd[0] == '/') {
-                    cfg->workdir = xstrdup(wd);
-                } else {
-                    /* 相对路径：按**宿主** cwd 绝对化（与默认分支同源） */
-                    char hcwd[4096];
-                    char joined[4096];
+                /*
+                 * ★ 先算新值、确有新值才 free 旧值（缺陷修复，2026-10-18 第五轮）★
+                 *
+                 * 原写法在本块**开头**无 koşullu free(cfg->workdir)，然后
+                 * 空值分支什么都不做 —— 于是 cfg->workdir 成了悬垂指针：
+                 * ① `-v` 仍会 printf("%s") 它（读已释放内存，实测打出垃圾
+                 *   字节，内容还可能被后续 strdup 复用成客户命令行）；
+                 * ② 退出时 free_config() 再 free 一次 → glibc
+                 *    "double free detected in tcache 2" + SIGABRT。
+                 *
+                 * 现在把释放挪到"确定要覆盖"的位置：空值分支保持默认值
+                 * 不动（语义仍是"等同于没给 -w"），非空分支才算新值。
+                 */
+                char *nw = NULL;
 
-                    if (getcwd(hcwd, sizeof(hcwd)) != NULL) {
-                        if (snprintf(joined, sizeof(joined), "%s/%s",
-                                     strcmp(hcwd, "/") == 0 ? "" : hcwd, wd)
-                            < (int)sizeof(joined))
-                            cfg->workdir = xstrdup(joined);
-                        else
-                            cfg->workdir = xstrdup(hcwd);   /* 超长：退回 cwd */
+                if (wd != NULL && wd[0] != '\0') {
+                    if (wd[0] == '/') {
+                        nw = xstrdup(wd);
                     } else {
-                        cfg->workdir = xstrdup("/");
+                        /* 相对路径：按**宿主** cwd 绝对化（与默认分支同源） */
+                        char hcwd[4096];
+                        char joined[4096];
+
+                        if (getcwd(hcwd, sizeof(hcwd)) != NULL) {
+                            if (snprintf(joined, sizeof(joined), "%s/%s",
+                                         strcmp(hcwd, "/") == 0 ? "" : hcwd, wd)
+                                < (int)sizeof(joined))
+                                nw = xstrdup(joined);
+                            else
+                                nw = xstrdup(hcwd);   /* 超长：退回 cwd */
+                        } else {
+                            nw = xstrdup("/");
+                        }
                     }
+                }
+
+                if (nw != NULL) {
+                    free(cfg->workdir);
+                    cfg->workdir = nw;
                 }
             }
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0 ||

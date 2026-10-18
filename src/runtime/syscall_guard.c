@@ -370,6 +370,7 @@ extern int l2s_rt_rename_replace_commit(const char *mid, const char *final)
 static long raw_syscall6(long nr, long a0, long a1, long a2,
                          long a3, long a4, long a5)
 {
+    int saved_errno = errno;
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a0;
     register long x1 __asm__("x1") = a1;
@@ -388,16 +389,21 @@ static long raw_syscall6(long nr, long a0, long a1, long a2,
         return -1;
     }
     /*
-     * ★ 成功路径必须清 errno ★
+     * ★ 成功路径恢复**调用方进入时**的 errno（缺陷修复，2026-10-18 第五轮）★
      *
-     * 【缺陷（实测，2026-09-20，v15 验收 D-2）】原先成功时不清理
-     * errno —— 但本函数可能被先行逻辑污染（例如路径翻译链上的
-     * 探测调用设了 EINVAL/EEXIST）。glibc 的 syscall 包装成功时
-     * 不碰 errno，而客户"成功后检查 errno"是合法且常见的写法，
-     * 残留值会被误读成失败。libc 路径实测 errno=0，裸路径必须
-     * 对齐。
+     * 前一版在成功时无条件 `errno = 0`。动机是对的（本层内部的路径
+     * 翻译/探测会污染 errno，不能让客户读到本层的中间态），但做法过头：
+     * glibc 的 syscall 包装成功时**完全不碰** errno，客户在调用前把
+     * errno 置成某个值、成功后仍读到原值，是合法且常见的写法（例如
+     * "先清 errno，调用后判 errno != 0" 的兼容层）。
+     *
+     * 实测（2026-10-18）：调用前 errno=16，getpid 成功后
+     *   libc 路径 errno=16，本层裸路径 errno=0  ← 可观测的 ABI 偏离。
+     *
+     * 正确语义 = "入口值原样恢复"：既抹掉本层内部的中间污染，又与
+     * glibc 逐位对齐。saved_errno 在函数入口捕获（svc 之前）。
      */
-    errno = 0;
+    errno = saved_errno;
     return x0;
 }
 
@@ -506,7 +512,20 @@ static int ptr_writable_or_default(const void *p, size_t len)
                         mapsbuf[j + 1] == 'r' && mapsbuf[j + 2] == 'w') {
                         lo = s;
                         hi = e;
-                        if (addr >= lo && addr < hi) {
+                        /*
+                         * ★ 必须整个 [addr,end] 都落在同一段 rw 映射里 ★
+                         *
+                         * 原判据只看首地址 addr，于是"指针在页尾、写出
+                         * 跨到下一页"时仍然判为可写：下一页即使只读或
+                         * 根本未映射，本层也会自己往里写 → SIGSEGV，
+                         * 而内核在同一参数下只返回 EFAULT（实测：
+                         * getgroups 传页尾 4 字节，页内地址 rc=1 正常，
+                         * 跨页地址整进程崩，裸 svc 返回 EFAULT）。
+                         *
+                         * 用 end 而不是 addr+len-1 的好处：溢出已在上面
+                         * 判过，且 end 就是最后一个字节的地址。
+                         */
+                        if (addr >= lo && end < hi) {
                             ok = 1;
                             off = i;
                             break;
@@ -1133,6 +1152,172 @@ extern int bxroot_exec_hook_execve(const char *, char *const[], char *const[])
 extern int bxroot_exec_hook_execveat(int, const char *, char *const[],
                                      char *const[], int) __attribute__((weak));
 
+/* ------------------------------------------------------------------ */
+/* 翻译槽位池：按线程归属分片（slab）                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ★ 为什么要有这一层（缺陷修复，2026-10-18）★
+ *
+ * 旧的全局轮转池只有 16 个槽位，取号器是**进程级**的一个计数器：
+ *
+ *     seq = __atomic_fetch_add(&sg_pool_seq_all, 1, RELAXED);
+ *     buf = pool + (seq % 16) * SLOT_SIZE;
+ *
+ * 任何两个线程只要取号相差 16 的整数倍，就拿到**同一块**缓冲：写路径
+ * 与随后的 svc 之间被别的线程插进 16 次取号，内核读到的就是别人的路径。
+ * 实测（8 线程 × 20000 次 openat）：wrong-content 25~33 次；中间组件解析
+ * 再取一号（每调用 2 个号）时撞车窗口砍半，错得更频繁。
+ *
+ * ★ 修法：线程归属分片 ★
+ *
+ * 每个 slab = SG_SLAB_SLOTS(16) 个槽位，用 gettid 认领，认领后**永不释放**：
+ *   · 同一 slab 只属于一个 tid → 槽位绝不跨线程串味；
+ *   · 分片内仍是过 16 次调用才回到同一块 → "缓冲不立即复用"的性质不变
+ *     （历史判决实验：4KB×8 槽的快速复用会段错误，因为调用方在内核返回
+ *     后仍持有该指针）；
+ *   · 线程结束后 slab 保持归属。tid 不会被两个**活**线程同时占用，所以
+ *     不会串味；新线程若复用旧 tid，接着用同一 slab 的计数器即可。
+ *
+ * ★ 为什么不释放 / 为什么不用 TLS、锁、malloc ★
+ *
+ *   · _Thread_local：本机加载器 TLS 不完整（rodata 里有 "tls: runtime
+ *     static TLS surplus exhausted"），实测写坏相邻数据；
+ *   · pthread_mutex：syscall() 会在信号处理器上下文被调用（SIGSYS 处理器
+ *     就会），加锁 = 自死锁；
+ *   · malloc/free：信号上下文里破坏堆，且"每次分配"实测泄漏（libuv 模块
+ *     探测连发数百次 statx，每次 4KB → 数 MB → OOM）；
+ *   · 故只在 .bss 里加静态数组 + __atomic_*，全程无锁、可重入。
+ *
+ * 内存：SG_SLAB_COUNT(64) × 128 KiB = 8 MiB .bss（另有 128 KiB 回退池）。
+ * 按需分页：只有被认领的 slab 会被写到，RSS ≈ 活跃线程数 × ≤128 KiB。
+ * 64 位地址空间下 8 MiB 虚拟占用可忽略 —— 这是"零锁零分配"的代价。
+ * 线程数超过 SG_SLAB_COUNT 时回退到旧的全局轮转（保底，不会失败）。
+ */
+
+#define SG_SLOT_SIZE (PATH_MAX * 2)   /* == MAX_PATH_LEN（src/runtime/config.h） */
+#define SG_SLAB_SLOTS 16              /* 每分片槽位数（保持旧的 16 次节奏） */
+#define SG_SLAB_SIZE  (SG_SLOT_SIZE * SG_SLAB_SLOTS)
+#define SG_SLAB_COUNT 64              /* 分片数 = 可无锁归属的线程数上限 */
+#define SG_FB_SLOTS 16                /* 回退池：gettid 不可用 / 分片耗尽时用 */
+
+static char sg_slab_mem[SG_SLAB_SIZE * SG_SLAB_COUNT];
+static unsigned int sg_slab_owner[SG_SLAB_COUNT];  /* 0 = 空闲，否则归属 tid */
+static unsigned int sg_slab_seq[SG_SLAB_COUNT];    /* 分片局部取号器 */
+static char sg_fb_pool[SG_SLOT_SIZE * SG_FB_SLOTS];
+static unsigned int sg_pool_seq_all;               /* 仅供回退路径 */
+
+/*
+ * 裸 gettid 的号码。用裸号而不是 SYS_gettid：本文件刻意独立编译
+ * （不引 <sys/syscall.h>），sigsys.c 里已有 178 的先例。
+ * 若在认不出的架构上编译，SG_NR_gettid 退化为 0 → 只用回退池，
+ * 行为回到"旧版全局轮转"，不会更糟。
+ */
+#if defined(__aarch64__)
+#  define SG_NR_gettid 178
+#elif defined(__x86_64__)
+#  define SG_NR_gettid 186
+#elif defined(__arm__) || defined(__i386__)
+#  define SG_NR_gettid 224
+#else
+#  define SG_NR_gettid 0
+#endif
+
+/* 本线程 tid；0 = 取不到（调用方据此走回退池）。 */
+static unsigned int sg_self_tid(void)
+{
+#if SG_NR_gettid == 0
+    return 0;
+#else
+    long r = raw_syscall6(SG_NR_gettid, 0, 0, 0, 0, 0, 0);
+
+    return (r > 0) ? (unsigned int)r : 0;
+#endif
+}
+
+/* 从分片 k 内取下一个槽位。只有归属线程（及其信号处理器）会走到这里。 */
+static char *sg_slab_take(unsigned int k)
+{
+    /*
+     * 仍然用 fetch_add：同一线程的**信号处理器**可以打断这里，普通
+     * `++` 的读-改-写会让两者拿到同一个槽。RELAXED 足够 —— 计数器只
+     * 用于选槽，槽与槽之间没有数据依赖。
+     */
+    unsigned int s = __atomic_fetch_add(&sg_slab_seq[k], 1, __ATOMIC_RELAXED);
+
+    return sg_slab_mem + (size_t)k * SG_SLAB_SIZE
+         + (size_t)(s % SG_SLAB_SLOTS) * SG_SLOT_SIZE;
+}
+
+/*
+ * 取一块翻译缓冲。
+ *
+ * tid_cache 指向**调用栈上的**缓存（0 = 本次调用还没取过 tid）：一次
+ * syscall() 里最多 4 处取号，gettid 只该发一次。不能用 static 变量缓存
+ * 它 —— 那是进程级共享，会把线程 A 的 tid 当成线程 B 的。
+ *
+ * 顺序：先线性探测找自己的分片（认领时优先占 tid % COUNT，多数情况
+ * 1 次命中）；找不到再认领空闲分片；都不行才回退到全局轮转。
+ */
+static char *sg_slot_alloc(unsigned int *tid_cache)
+{
+    unsigned int tid = *tid_cache;
+    unsigned int i, first_free = SG_SLAB_COUNT;
+
+    if (tid == 0) {
+        tid = sg_self_tid();
+        *tid_cache = tid;
+    }
+    if (tid != 0) {
+        unsigned int h = tid % SG_SLAB_COUNT;
+        unsigned int k;
+
+        for (i = 0; i < SG_SLAB_COUNT; i++) {
+            unsigned int owner;
+
+            k = h + i;
+            if (k >= SG_SLAB_COUNT)
+                k -= SG_SLAB_COUNT;
+            owner = __atomic_load_n(&sg_slab_owner[k], __ATOMIC_ACQUIRE);
+            if (owner == tid)
+                return sg_slab_take(k);
+            if (owner == 0 && first_free == SG_SLAB_COUNT)
+                first_free = k;
+        }
+        /*
+         * 本线程还没有分片：**先认领再取槽**。CAS 把 owner 从 0 改成自己
+         * 的 tid，失败说明别的线程先到，继续往后找 —— 全程无锁，在信号
+         * 处理器里也是"重试"而非"阻塞"，不会死锁。
+         */
+        if (first_free != SG_SLAB_COUNT) {
+            for (i = 0; i < SG_SLAB_COUNT; i++) {
+                unsigned int expect = 0;
+
+                k = first_free + i;
+                if (k >= SG_SLAB_COUNT)
+                    k -= SG_SLAB_COUNT;
+                if (__atomic_load_n(&sg_slab_owner[k], __ATOMIC_ACQUIRE) == tid)
+                    return sg_slab_take(k);
+                if (__atomic_compare_exchange_n(&sg_slab_owner[k], &expect, tid,
+                                                0, __ATOMIC_ACQ_REL,
+                                                __ATOMIC_ACQUIRE))
+                    return sg_slab_take(k);
+            }
+        }
+    }
+
+    /*
+     * 回退：分片用尽（线程数 > SG_SLAB_COUNT）或 gettid 不可用。这是**旧版
+     * 的全局轮转** —— 多线程下仍可能串味，但只作用于溢出线程；主路径
+     * （≤ SG_SLAB_COUNT 个线程）不受影响。
+     */
+    {
+        unsigned int seq = __atomic_fetch_add(&sg_pool_seq_all, 1, __ATOMIC_RELAXED);
+
+        return sg_fb_pool + (size_t)(seq % SG_FB_SLOTS) * SG_SLOT_SIZE;
+    }
+}
+
 long syscall(long number, ...)
 {
     va_list ap;
@@ -1140,6 +1325,8 @@ long syscall(long number, ...)
     long *args[6];
     unsigned pmask;
     int i;
+    /* 本次调用的线程分片缓存（0 = 还没取过 tid，见 sg_slot_alloc） */
+    unsigned int sg_tid = 0;
 
     /*
      * ★ stat 结果补丁的**重入守卫**（跨编译单元共享）★
@@ -1192,12 +1379,13 @@ long syscall(long number, ...)
 
 
     /*
-     * ★ 翻译槽位池：提升到函数作用域 ★
+     * ★ 翻译槽位池：提升到文件作用域（按线程分片）★
      *
      * 原先声明在 pmask 循环内的块里，后来"叶子解析"挪到了
      * raw_syscall6 之后的补丁段（必须在 l2s 结果补丁之后，见那里
      * 的注释），补丁段也要从池里取槽 —— 块作用域够不着。
-     * 只挪位置，尺寸与语义一字不改。
+     * 后来又改成按线程分片的分配器（sg_slot_alloc，见文件作用域段落）：
+     * 位置继续留在文件作用域，尺寸仍由 SG_SLOT_SIZE 给出。
      *
      * ★ SG_SLOT_SIZE 必须 >= MAX_PATH_LEN（缺陷修复，2026-10-18）★
      *
@@ -1222,17 +1410,16 @@ long syscall(long number, ...)
      * 里 MAX_PATH_LEN 的定义式（PATH_MAX * 2）取值，并在此注明
      * 与源头的对应关系；若 config.h 的定义变了，这行要同步。
      */
-#define SG_SLOT_SIZE (PATH_MAX * 2)   /* == MAX_PATH_LEN（src/runtime/config.h） */
-#define SG_SLOT_COUNT 16
-#define SG_POOL_SIZE (SG_SLOT_SIZE * SG_SLOT_COUNT)
-    static char sg_pool[SG_POOL_SIZE];
     /*
-     * ★ 全部取槽点共用**一个**取号器（审计 SG-2）★
-     * 原先 4 处各有独立计数器，都从 0 起步：同一次调用里翻译缓冲(tbuf)
-     * 与中间链接缓冲(rbuf)第一次就落在同一个槽 → 互相覆写已交给内核的
-     * 路径。单一计数器保证同一调用内各次取号拿到不同槽。
+     * 池的数组与取号器已改为**文件作用域 + 按线程分片**（见文件里的
+     * "翻译槽位池：按线程归属分片" 段落与 sg_slot_alloc）：
+     * 全局轮转下，任意两线程取号相差 16 的整数倍就会拿到同一块缓冲。
+     * 尺寸宏 SG_SLOT_SIZE 仍在文件作用域可见，下面的栈上缓冲继续用它。
+     *
+     * ★ 全部取槽点共**同一套**分配（审计 SG-2）★
+     * 同一次调用里 tbuf / rbuf / lbuf 依次取号，落在**不同槽**，不会
+     * 互相覆写已交给内核的路径。
      */
-    static unsigned int sg_pool_seq_all;
 
     init_trace();
 
@@ -1568,7 +1755,11 @@ long syscall(long number, ...)
 
         if (looks_like_guest_abs_path(src)) {
             /*
-             * 大环形池：64 KB，只在池内前进，到末尾回绕。
+             * 环形池：**每个线程一个分片**，只在本线程分片内前进，到末尾
+             * 回绕（分片 = 16 槽 × SG_SLOT_SIZE，见 sg_slot_alloc 段落）。
+             * 每次调用消耗 2 个号（tbuf/rbuf），所以同一块缓冲仍要过 8 次
+             * 调用才回到原处 —— 与旧全局池的复用节奏同量级，但**不再被
+             * 别的线程吃掉**，这才是"内核读到别人路径"的根因。
              *
              * 为什么不是小池（8 × 4KB）：实测表明**调用方会在内核返回后
              * 继续持有该指针**。判决实验（三种策略，其他条件完全相同）：
@@ -1625,8 +1816,7 @@ long syscall(long number, ...)
              * 才回到同一块，而调用方持有路径指针的时间远短于此。
              */
 
-            unsigned int seq = __atomic_fetch_add(&sg_pool_seq_all, 1, __ATOMIC_RELAXED);
-            char *tbuf = sg_pool + (size_t)(seq % SG_SLOT_COUNT) * SG_SLOT_SIZE;
+            char *tbuf = sg_slot_alloc(&sg_tid);
             size_t need = SG_SLOT_SIZE;
 
             int tr;
@@ -1679,9 +1869,7 @@ long syscall(long number, ...)
              * 解析结果仍放槽位池（与 tr 同款），保持无锁与信号安全。
              */
             if (tr > 0) {
-                unsigned int s2 = __atomic_fetch_add(&sg_pool_seq_all, 1,
-                                                     __ATOMIC_RELAXED);
-                char *rbuf = sg_pool + (size_t)(s2 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
+                char *rbuf = sg_slot_alloc(&sg_tid);
 
                 if (bxroot_resolve_intermediate_links != NULL &&
                     bxroot_resolve_intermediate_links(tbuf, rbuf,
@@ -1807,9 +1995,7 @@ long syscall(long number, ...)
             }
 
             if (need_leaf == 1) {
-                unsigned int s3 = __atomic_fetch_add(&sg_pool_seq_all, 1,
-                                                     __ATOMIC_RELAXED);
-                char *lbuf = sg_pool + (size_t)(s3 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
+                char *lbuf = sg_slot_alloc(&sg_tid);
 
                 if (bxroot_resolve_leaf_links(tbuf, lbuf, SG_SLOT_SIZE) > 0) {
                     *args[i] = (long)(uintptr_t)lbuf;   /* a) 内核见展开后 */
@@ -1825,9 +2011,7 @@ long syscall(long number, ...)
                  * 真符号链接不会被命中，保持 ELOOP。
                  */
                 if (l2s_rt_resolve_fake_link != NULL) {
-                    unsigned int s4 = __atomic_fetch_add(&sg_pool_seq_all, 1,
-                                                         __ATOMIC_RELAXED);
-                    char *lbuf = sg_pool + (size_t)(s4 % SG_SLOT_COUNT) * SG_SLOT_SIZE;
+                    char *lbuf = sg_slot_alloc(&sg_tid);
 
                     if (bxroot_l2s_lazy_enable != NULL)
                         (void)bxroot_l2s_lazy_enable(tbuf);
