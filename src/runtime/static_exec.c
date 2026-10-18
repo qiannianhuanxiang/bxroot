@@ -776,7 +776,6 @@ static void sx_reset_process_state(void)
     if (bxroot_sysvshm_exec_reset != NULL)
         bxroot_sysvshm_exec_reset();
     struct sx_ksigaction sa;
-    unsigned long unblock = 1UL << (31 - 1);
     int sig, fd;
 
     for (sig = 1; sig <= 64; sig++) {
@@ -796,7 +795,24 @@ static void sx_reset_process_state(void)
     sa.handler = (unsigned long)(void *)&sx_early_sigsys;
     sa.flags = 4 /* SA_SIGINFO */;
     SC(SYS_rt_sigaction, 31, &sa, 0, 8);
-    SC(SYS_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &unblock, 0, 8);
+    /*
+     * ★ 整体清空信号掩码（缺陷修复，2026-10-18 第五轮）★
+     *
+     * execve 会**丢弃**调用方的信号掩码（新进程从空集开始）。原写法只
+     * SIG_UNBLOCK 了 31（SIGSYS），父进程屏蔽的 SIGUSR1/SIGTERM 等全部
+     * 被继承下去：实测经 px_static_exec 启动的 guest 读到
+     * SIGUSR1=1 SIGTERM=1，而 shell 直接 exec 的是 0/0；决定性后果是
+     * guest 里 raise(SIGTERM) 被挂起、进程**杀不掉**（rc=0），依赖
+     * SIGCHLD/超时 kill 的监督逻辑会一起挂住。
+     *
+     * SIG_SETMASK(=2) 传全零集合等价于 execve 的清空语义，SIGSYS 自然
+     * 也在未阻塞集合里，无需再单独 UNBLOCK。
+     */
+    {
+        unsigned long empty_mask[2] = { 0, 0 };
+
+        SC(SYS_rt_sigprocmask, 2 /* SIG_SETMASK */, empty_mask, 0, 8);
+    }
 
     /* execve 会关闭备用信号栈；runtime 的 crash.c 装了 altstack，静态程序不该跑在它上面 */
     {

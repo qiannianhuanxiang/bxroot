@@ -329,7 +329,14 @@ static void cw_handler(int sig, siginfo_t *info, void *uctx)
      * 那样连一行输出都不会有。
      */
     if (g_in_handler) {
+        sigset_t e;
+
         signal(sig, SIG_DFL);
+        /* 必须先把 sig 从掩码里摘掉再重抛：处理器执行期间该信号是
+         * 被内核阻塞的，直接 raise() 只会把它挂起，return 回去继续
+         * 在已损坏的上下文里跑（原来就是这样，等于守卫无效）。 */
+        sigemptyset(&e);
+        sigprocmask(SIG_SETMASK, &e, NULL);
         raise(sig);
         return;
     }
@@ -466,6 +473,20 @@ static void cw_handler(int sig, siginfo_t *info, void *uctx)
         sigemptyset(&dfl.sa_mask);
         sigaction(sig, &dfl, NULL);
     }
+    {
+        /* ★ 重抛前必须解除本信号的阻塞（缺陷修复，2026-10-18 第五轮）★
+         *
+         * 处理器执行期间内核强制阻塞当前信号（与 sa_mask 无关）。
+         * 原写法 kill() 只把信号挂起，紧接着 _exit(128+sig) 终止进程，
+         * 挂起信号被丢弃 —— 进程是"正常退出码 139"，不是被 SIGSEGV
+         * 杀死：不出 core，用 WIFSIGNALED/WTERMSIG 判崩溃的监督进程
+         * 全部误判（与上面注释声称的行为正好相反）。清空掩码后重抛，
+         * 信号立即递送，内核按默认动作终止。 */
+        sigset_t e;
+
+        sigemptyset(&e);
+        sigprocmask(SIG_SETMASK, &e, NULL);
+    }
     kill(getpid(), sig);
 
     /* 走到这里说明连重抛都失败了（极不可能）。直接退出，避免返回后
@@ -522,16 +543,19 @@ int bxroot_crash_install(const char *tag)
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = cw_handler;
     /*
-     * 刻意**不加** SA_NODEFER。
+     * ★ 必须加 SA_NODEFER（缺陷修复，2026-10-18 第五轮）★
      *
-     * 它允许同一信号在处理期间再次递送 —— 于是处理器内部任何一次
-     * 误读内存（比如走损坏的帧指针链）都会递归进入自己。实测后果是
-     * 死循环刷屏，而不是留下一次干净现场。
+     * 不加它时，处理器执行期间同号信号被内核强制阻塞：处理器内部一旦
+     * 误读内存（cw_dump_window 读窗口、cw_dump_fp_chain 走坏帧指针链
+     * ——两者都只校验对齐不校验可读），二次故障被挂起 → 内核强制默认
+     * 动作 → 进程当场死，上面那段 `if (g_in_handler)` 重入守卫**永远
+     * 执行不到**（实测：现场输出断在行中间，reenter-guard=NO）。
      *
-     * 默认行为（信号在处理期间被阻塞）正是我们要的：处理器内部再崩，
-     * 该信号被挂起，等我们重新抛出时一次性终止。
+     * 加了之后二次故障进守卫分支，守卫做的是"恢复默认 + 清掩码 +
+     * 重抛"，本身就是终局动作，所以不会递归刷屏 —— 早年内联在
+     * 信号处理器里的旧版没有这道守卫，才有过死循环的记录。
      */
-    sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+    sa.sa_flags     = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
 
     if (sigaction(SIGSEGV, &sa, &g_prev_segv) != 0) {

@@ -141,7 +141,15 @@
 #define K_O_EXCL     0200
 #define K_O_WRONLY   01
 #define K_O_CLOEXEC  02000000
-#define K_O_NOFOLLOW 0400000
+/* O_NOFOLLOW 的 ABI 值**按架构不同**，不能照抄 asm-generic。
+ * aarch64（本机，内核实测）：0100000 —— 与 syscall_guard.c need_leaf
+ * 判据同一个值（那边也记着 0x800 / 00400000 两次写错的历史）。
+ * 写成 0400000 在本平台等于 O_DIRECT|O_LARGEFILE，真正的 NOFOLLOW
+ * 位是 0 —— 这一层"防符号链接"全部失效：shm 目录里放一个符号链接
+ * seg-<id>，shmat 就会映射到目录之外的文件（反证：改成 0100000 后
+ * 同一条 openat 得 ELOOP）。回归用 test/probe_shm_nofollow.c。
+ * 换架构必须重测。 */
+#define K_O_NOFOLLOW 0100000
 #define K_O_NONBLOCK 04000
 #define K_PROT_RW    3
 #define K_PROT_R     1

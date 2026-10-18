@@ -118,6 +118,20 @@ static int load_elf(const char *path, ulx_image *img)
          *      好 ELF 被误判失败。
          *
          * 判据与 static_exec.c 保持一致，便于两处同改同测。
+         *
+         * 【漏点（实测，2026-10-20）】下面这段只查了 `hi + ps < hi`，
+         * 漏了 **`hi - lo + align` 自身的回绕**（static_exec.c:494 早就有
+         * 后一条判据）。ET_DYN 分支用 `hi - lo + align` 做预留，构造
+         * p_vaddr 正常 + 一个 p_vaddr 贴近 2^64 的 PT_LOAD 就能让
+         * `hi - lo ≈ 2^64 - align + K`：
+         *
+         *     hi=0xFFFFFFFFFFFF1000, lo=0, align=0x10000
+         *     hi - lo + align = 0x1000        ← 只预留 1 页，mmap 成功
+         *
+         * 随后段按 `img->base + p_vaddr` 做 **MAP_FIXED**，落在预留区
+         * **之外**的相邻映射上 —— 不是失败，是静默覆盖别人的页
+         * （与 static_exec.c 修掉的是同一类缺陷）。判据补上后该 ELF
+         * 直接 ENOEXEC，不做任何映射。
          */
         if (ph[i].p_filesz > ph[i].p_memsz ||
             ph[i].p_vaddr + ph[i].p_memsz < ph[i].p_vaddr ||
@@ -139,7 +153,8 @@ static int load_elf(const char *path, ulx_image *img)
         if (ph[i].p_vaddr + ph[i].p_memsz > hi)
             hi = ph[i].p_vaddr + ph[i].p_memsz;
     }
-    if (hi <= lo || hi + ps < hi) {   /* ps 取整后可能回绕，一并查 */
+    if (hi <= lo || hi + ps < hi ||   /* ps 取整后可能回绕，一并查 */
+        hi - lo + align < hi - lo) {  /* ET_DYN 预留长度 = hi-lo+align 自身回绕 */
         close(fd);
         errno = ENOEXEC;
         return -1;

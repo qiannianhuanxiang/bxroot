@@ -58,6 +58,11 @@ static int fr_normalize_path(const char *in, char *out, size_t out_size)
     size_t oi = 0;
     size_t i = 0;
     bool   absolute;
+    /* 待写入的分隔符：只在真正要写下一个字符时才落盘。
+     * 这样结尾的 "/"、"/."、"/.//" 之类永远不占缓冲区——它们在语义上
+     * 本来就会被剔除，不该让"恰好装得下"的路径只因多带了尾巴而
+     * 被误报 ENAMETOOLONG。 */
+    bool   pending_sep = false;
 
     if (in == NULL || out == NULL || out_size == 0) {
         return FR_EINVAL;
@@ -71,21 +76,17 @@ static int fr_normalize_path(const char *in, char *out, size_t out_size)
             while (in[i] == '/') {
                 i++;
             }
-            /* 只有在「原路径本来就是绝对的」或「前面已经写过东西且写的不是 '/'」
-             * 时才补一个 '/'。否则 "./a" 会被悄悄写成 "/a"：相对路径被升级成
-             * 绝对路径，记账键就和后续用绝对路径发起的查询对不上了。 */
-            if (oi > 0) {
-                if (out[oi - 1] != '/') {
+            /* 绝对路径的开头 '/' 必须写出（根）；其余分隔符延迟到下个字符。
+             * 相对路径不能被升级成绝对路径（"./a" 不得写成 "/a"）。 */
+            if (oi == 0) {
+                if (absolute) {
                     if (oi + 1 >= out_size) {
                         return FR_ENAMETOOLONG;
                     }
                     out[oi++] = '/';
                 }
-            } else if (absolute) {
-                if (oi + 1 >= out_size) {
-                    return FR_ENAMETOOLONG;
-                }
-                out[oi++] = '/';
+            } else if (out[oi - 1] != '/') {
+                pending_sep = true;
             }
             continue;
         }
@@ -99,6 +100,13 @@ static int fr_normalize_path(const char *in, char *out, size_t out_size)
             }
         }
 
+        if (pending_sep) {
+            if (oi + 1 >= out_size) {
+                return FR_ENAMETOOLONG;
+            }
+            out[oi++] = '/';
+            pending_sep = false;
+        }
         if (oi + 1 >= out_size) {
             return FR_ENAMETOOLONG;
         }
@@ -1593,8 +1601,13 @@ void fakeroot_patch_statx_ex(struct statx *stx, fakeroot_state *fs,
         stx->stx_mask |= STATX_GID;
     }
 
-    /* ---- mode ---- */
-    if (have_rec && local.mode_faked) {
+    /* ---- mode ----
+     * 必须确认调用方要了 STATX_MODE 才写：stx_mask 是"哪些字段有效"的
+     * 契约，内核按 mask 裁剪时没要的字段是 0，此时 fr_compose_mode 会
+     * 只留下 07777 而丢掉 S_IFMT，等于凭空造出一个"无类型"的 mode。
+     * 本环境内核实测恒返回 0x17ff（STATX_BASIC_STATS），这条守卫现在
+     * 走不到，但换了内核对齐不变量是零成本的（见本函数头注释第 2 条）。 */
+    if (have_rec && local.mode_faked && (stx->stx_mask & STATX_MODE)) {
         mode_t composed = fr_compose_mode((mode_t)stx->stx_mode, local.mode);
         stx->stx_mode  = (uint16_t)(composed & 0xFFFFu);
         stx->stx_mask |= STATX_MODE;

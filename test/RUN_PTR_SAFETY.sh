@@ -19,7 +19,9 @@
 #  13. bind 畸形规格报错、继承的 BXROOT_BINDS 被清空（L6/L7）；
 #  14. launcher 解析畸形 ELF 程序头不越界（L8）；
 #  15. shmdt 不拆复用同地址的无关映射（S8）；
-#  16. l2s .cnt 的跨进程读-改-写不丢更新。
+#  16. l2s .cnt 的跨进程读-改-写不丢更新；
+#  17. fakeroot 路径归一化：恰好装下的路径不因尾部 "/" 被误报过长（F9）；
+#  18. translate_path 的四条安全性质：不漏宿主 / 不透传 guest / 幂等 / `..` 夹紧。
 #
 # 判别力（可复跑的对照实验）：
 #   用修复前的 syscall_guard.c 编同一探针 → 在 getresuid(0x1) 处 SIGSEGV，
@@ -334,6 +336,65 @@ else
     esac
 fi
 
+# ---------- 探针 17：fr_normalize_path 边界（F9）----------
+echo
+echo "--- P) fakeroot 路径归一化边界 ---"
+if ! $CC -O1 -Wall -Wno-unused-parameter -D_GNU_SOURCE -DFAKEROOT_PURE_LOGIC \
+        -I"$SRC/src/runtime" -o "$TMP/probe_fr_normalize" \
+        "$SRC/test/probe_fr_normalize.c" 2>"$TMP/probe_frn.err"; then
+    echo "  ❌ 编译失败"; sed -n '1,20p' "$TMP/probe_frn.err"
+    FAIL=1
+else
+    _out=$("$TMP/probe_fr_normalize" 2>&1); _rc=$?
+    printf '%s\n' "$_out" | sed 's/^/    /' | tail -12
+    case "$_rc" in
+    0) echo "  ✅ PASS" ;;
+    *) echo "  ❌ FAIL —— 恰好装下的路径因尾斜杠被误判过长，或归一化与参考不一致"; FAIL=1 ;;
+    esac
+fi
+
+# ---------- 探针 18：translate_path 安全性质 ----------
+echo
+echo "--- Q) translate_path 安全性质（不漏宿主 / 幂等 / .. 夹紧） ---"
+# 注意：本探针 #include preload.c 以测 static 函数，需链接全部运行时单元；
+# preload.c 自带 __dso_handle（生产构建用 -nostartfiles），探针里已改名避让。
+if ! $CC -O1 -w -D_GNU_SOURCE= -DFAKEROOT_PURE_LOGIC -DPX_PURE_LOGIC=0 \
+        -I"$SRC/src/runtime" -I"$SRC/src/l2s" -I"$SRC/src/proc" -I"$SRC/src/host" \
+        -o "$TMP/probe_translate_props" "$SRC/test/probe_translate_props.c" \
+        "$SRC/src/l2s/l2s.c" "$SRC/src/l2s/l2s-runtime.c" \
+        "$SRC/src/runtime/fakeroot.c" "$SRC/src/runtime/crash.c" \
+        "$SRC/src/runtime/sigsys.c" "$SRC/src/runtime/syscall_guard.c" \
+        "$SRC/src/runtime/livepatch.c" "$SRC/src/runtime/static_exec.c" \
+        "$SRC/src/host/host-world.c" "$SRC/src/host/session.c" \
+        "$SRC/src/host/native-session.c" "$SRC/src/proc/proc.c" \
+        -ldl -lpthread 2>"$TMP/probe_tr.err"; then
+    echo "  ❌ 编译失败"; sed -n '1,20p' "$TMP/probe_tr.err"
+    FAIL=1
+else
+    _out=$("$TMP/probe_translate_props" 2>&1); _rc=$?
+    printf '%s\n' "$_out" | sed 's/^/    /' | tail -12
+    case "$_rc" in
+    0) echo "  ✅ PASS" ;;
+    *) echo "  ❌ FAIL —— 翻译层出现漏宿主/非幂等/.. 逃逸"; FAIL=1 ;;
+    esac
+fi
+
+# ---------- 探针 19：SHM 段目录 O_NOFOLLOW 有效性 ----------
+echo
+echo "--- R) SHM 段目录 O_NOFOLLOW（符号链接不得穿透） ---"
+if ! $CC -O1 -w -D_GNU_SOURCE -o "$TMP/probe_shm_nofollow" \
+        "$SRC/test/probe_shm_nofollow.c" 2>"$TMP/probe_nof.err"; then
+    echo "  ❌ 编译失败"; sed -n '1,20p' "$TMP/probe_nof.err"
+    FAIL=1
+else
+    _out=$("$TMP/probe_shm_nofollow" 2>&1); _rc=$?
+    printf '%s\n' "$_out" | sed 's/^/    /' | tail -14
+    case "$_rc" in
+    0) echo "  ✅ PASS" ;;
+    *) echo "  ❌ FAIL —— 段目录的 O_NOFOLLOW 未生效，符号链接可写穿到目录外"; FAIL=1 ;;
+    esac
+fi
+
 rm -f "$TMP/probe_ptr_writable" "$TMP/probe_fakeroot_ptr_safety" \
       "$TMP/probe_longpath_translate" "$TMP/probe_bind_ro_case" \
       "$TMP/probe_ledger_concurrency" "$TMP/probe_livepatch_form" \
@@ -343,6 +404,9 @@ rm -f "$TMP/probe_ptr_writable" "$TMP/probe_fakeroot_ptr_safety" \
       "$TMP/probe_shm_errno" "$TMP/probe_launcher_elf" \
       "$TMP/probe_shm_attach_identity" "$TMP/probe_att.err" \
       "$TMP/probe_l2s_cnt_atomic" "$TMP/probe_cnt.err" \
+      "$TMP/probe_fr_normalize" "$TMP/probe_frn.err" \
+      "$TMP/probe_shm_nofollow" "$TMP/probe_nof.err" \
+      "$TMP/probe_translate_props" "$TMP/probe_tr.err" \
       "$TMP/probe_elf.err" "$TMP/probe_gate.err" "$TMP/probe_errno.err" \
       "$TMP/probe_fork_no_ledger.err" "$TMP/probe_pid_reuse_revive.err" \
       "$TMP/probe8.err" "$TMP/probe9.err" \

@@ -206,8 +206,6 @@ static uint64_t px_hash_pid(pid_t pid, unsigned kind)
  */
 static pthread_mutex_t g_ledger_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static pthread_mutex_t g_rt_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static size_t px_probe(const px_ledger *l, pid_t pid, unsigned kind, int *found)
 {
     uint64_t h = px_hash_pid(pid, kind);
@@ -2452,7 +2450,9 @@ static px_ledger  *g_rt_ledger;
 static px_rt_stats g_rt_stats;
 static px_lockops  g_rt_lockops;        /* 保护账本的互斥锁（见下） */
 static px_forkguard g_rt_guard;
-
+/* 仅钩子层使用（px_rt_lock/unlock），必须留在 #if !PX_PURE_LOGIC 内：
+ * 放到外面会让纯逻辑模式出现未使用变量告警 → 零警告门禁失败。 */
+static pthread_mutex_t g_rt_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static px_xlate_fn g_xlate_fn;
 static void       *g_xlate_ud;

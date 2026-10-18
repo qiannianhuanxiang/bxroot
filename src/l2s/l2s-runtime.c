@@ -719,6 +719,7 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
     struct stat st;
     unsigned int gen, count;
     int rc, is_fake;
+    int first_created = 0;   /* 本次调用是否新建了整条链（用于失败回滚） */
 
     if (!l2s_rt_enabled())
         return L2S_RT_PASSTHRU;
@@ -904,6 +905,7 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
         }
 
         g_stats.link_first++;
+        first_created = 1;
     } else {
         /* ---- 后续链接：只把旁路计数加一 ---- */
         rc = resolve_final(mid, final, sizeof(final));
@@ -976,9 +978,39 @@ int l2s_rt_link(const char *oldpath, const char *newpath)
         if (g_ops->symlink(mtarget, newpath) != 0) {
             int e = errno;
             /*
-             * 参考实现 在这里做 decrement_link_count() 回滚。本层不静默重放，
-             * 把错误如实上抛，由调用方决定（EXECUTION_UNKNOWN 原则）。
+             * ★ 失败必须回滚：这里不是"重放"，而是撤销本层自己的内部状态 ★
+             *
+             * 【缺陷（实测，2026-10-20）】此前这里直接 `return -e;`，注释写的
+             * 是"参考实现在这里做 decrement_link_count() 回滚，本层不静默重放"。
+             * 但把计数改回去**不是**重放客户操作：客户已经拿到错误返回、
+             * 认为什么都没发生，而旁路计数却已经被加过。
+             *
+             *     for i in 1 2 3; do ln a x; done   # x 已存在，三次都 EEXIST
+             *     stat -c %h b            ⇒ 5        （真实只有 2 个名字）
+             *     rm a; cat .l2s.a0001.cnt ⇒ 4       （真实应为 1）
+             *
+             * 后果：st_nlink 虚高、删到一半的数据文件永远留着；更糟的是
+             * 后续 unlink 会把计数减到与实际名字数不符，最终在还**有人引用**
+             * 时把数据文件删掉 → 另一个名字变成断链、数据丢失。
+             *
+             * 回滚分两种：
+             *  - 本次是新建链（first_created）：把刚建好的 mid/数据文件/计数
+             *    全部撤掉，数据文件原样改回 oldpath；
+             *  - 本次只是给已有链加名字：把刚加的计数减回去。
+             * 回滚本身失败也只保留原始 errno e —— 客户看到的仍是内核的
+             * 真实错误，不会被回滚错误覆盖。
              */
+            if (first_created) {
+                char cntp[L2S_PATH_MAX];
+                (void)g_ops->unlink(oldpath);   /* oldpath -> mid */
+                (void)g_ops->unlink(mid);
+                (void)g_ops->rename(final, oldpath);   /* 数据文件归还原名 */
+                if (l2s_refcount_path(final, cntp, sizeof(cntp)) == L2S_OK)
+                    (void)g_ops->unlink(cntp);
+            } else {
+                unsigned int nv = 0;
+                (void)cnt_add(final, -1, &nv);
+            }
             return -e;
         }
     }
