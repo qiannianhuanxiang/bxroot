@@ -123,14 +123,27 @@ src/launcher/launcher.c
 src/bridge/bridge.c
 src/stub-loader/stub-loader.c
 src/linker/linker.c
-src/ldr/ulx.c
 src/host/host-world.c
-src/host/bx-host.c
-src/host/bx-enter.c
 src/host/session.c
-src/host/enter-libc.c
 src/host/native-session.c
 src/runtime/static_exec.c"
+
+# AArch64-only executables, not portable components.
+#
+# ulx.c / bx-host.c / enter-libc.c are standalone AArch64 programs: they
+# emit raw svc, hand-rolled _start stack parsing or AArch64 machine code
+# as their entire reason to exist, and enter-libc.c even starts with
+# #error unless BX_ENTER_NATIVE && __aarch64__. Compiling them on an
+# x86_64 runner therefore cannot succeed by construction -- it is not a
+# warning we can (or should) silence. Gate them on the target arch so the
+# portability gate keeps checking everything that IS portable.
+if [ "$(uname -m)" = aarch64 ]; then
+    UNITS="$UNITS
+src/ldr/ulx.c
+src/host/bx-host.c
+src/host/bx-enter.c
+src/host/enter-libc.c"
+fi
 
 # ★ 最后两项是 2026-09-19 补进来的 ★
 #

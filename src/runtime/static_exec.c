@@ -1178,5 +1178,6 @@ int px_static_exec(const char *host, const char *argv0, char *const argv[], char
      * target, report the same failure the caller would get from any
      * other unsupported situation instead of emitting unknown asm. */
     (void)img;
+    return -1;
 #endif
 }

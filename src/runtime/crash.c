@@ -319,7 +319,17 @@ static int cw_env_flag(const char *name)
 
 static void cw_handler(int sig, siginfo_t *info, void *uctx)
 {
-    ucontext_t *uc = (ucontext_t *)uctx;    uint64_t pc = 0, lr = 0, sp = 0, fp = 0, pstate = 0;
+#if defined(__aarch64__)
+    ucontext_t *uc = (ucontext_t *)uctx;
+#else
+    /* uc is only dereferenced by the AArch64 block below. */
+    (void)uctx;
+#endif
+    uint64_t pc = 0, lr = 0, fp = 0;
+#if defined(__aarch64__)
+    uint64_t sp = 0, pstate = 0;   /* only filled and printed by the
+                                    * AArch64 block below */
+#endif
     uint64_t fault = 0;
     int code = 0;
 
