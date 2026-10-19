@@ -184,7 +184,18 @@ BUILT_CS=$(grep -hoE 'src/[a-z0-9_/-]+\.c' Makefile BUILD_RUNTIME.sh 2>/dev/null
 # 教训：这类"看起来在检查、实际恒为假"的断言比没有检查更危险，
 # 所以自检本身也要用"能区分正反例"的方式验证（见下面 NORM 用法 +
 # 结尾对空前缀的断言）。
+# Units that Makefile/BUILD_RUNTIME.sh compile but that cannot be
+# checked on this host by design: the AArch64-only standalone programs
+# listed above. They are absent from UNITS off AArch64 on purpose, so the
+# coverage self-check has to know about them, otherwise it reports them
+# as silently skipped on every non-AArch64 run. Keep in sync with the
+# arch gate right below the UNITS definition.
+ARCH_ONLY_UNITS="src/ldr/ulx.c src/host/bx-host.c src/host/bx-enter.c src/host/enter-libc.c"
+if [ "$(uname -m)" = aarch64 ]; then
+    ARCH_ONLY_UNITS=""   # on AArch64 they are already inside UNITS
+fi
 UNITS_NORM=$(printf '%s' "$UNITS" | tr '\n' ' ')
+UNITS_NORM="$UNITS_NORM $ARCH_ONLY_UNITS"
 MISSING=""
 for c in $BUILT_CS; do
     # 注意 src/preload.c 与 src/config.h 是**不参与构建**的死文件
