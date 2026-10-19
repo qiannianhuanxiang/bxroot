@@ -1277,7 +1277,14 @@ static int expand_bind_list(launcher_config_t *cfg,
                 continue;
             }
             if (add_bind(cfg, rootfs, rootfs) != 0) {
-                return -1;
+                /*
+                 * `*path*` is the last entry of PROOT_RECOMMENDED_BINDS, so
+                 * when the 16-slot budget is already used up this is where
+                 * the overflow lands. Same best-effort rule as the loop
+                 * body below: report it as skipped, do not abort.
+                 */
+                skipped++;
+                continue;
             }
             continue;
         }
