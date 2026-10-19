@@ -995,6 +995,8 @@ int bxroot_resolve_abs_symlink(const char *translated,
 static long lp_raw_svc6(long nr, long a0, long a1, long a2,
                         long a3, long a4, long a5)
 {
+#if defined(__aarch64__)
+
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a0;
     register long x1 __asm__("x1") = a1;
@@ -1008,6 +1010,14 @@ static long lp_raw_svc6(long nr, long a0, long a1, long a2,
         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
         : "memory", "cc");
     return x0;
+#else
+    /* Non-AArch64 fallback: the inline svc and the x0..x8 register
+     * constraints are AArch64-only. Return the raw kernel convention
+     * (negative == -errno), which is what every caller here expects. */
+    long r = syscall(nr, a0, a1, a2, a3, a4, a5);
+    return r < 0 ? -(long)errno : r;
+#endif
+
 }
 
 /*

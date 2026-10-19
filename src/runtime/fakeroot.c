@@ -259,7 +259,13 @@ static void fr_lock(const fakeroot_map *m)
                                         __ATOMIC_RELAXED))
             break;
         /* 让出 CPU 的提示：aarch64 上等价于一段自旋等待 */
+#if defined(__aarch64__)
         __asm__ __volatile__("yield" ::: "memory");
+#else
+        /* `yield` is AArch64-only; on other targets leave the spin loop
+         * to the scheduler instead of emitting an unknown instruction. */
+        __asm__ __volatile__("" ::: "memory");
+#endif
     }
     fr_lock_depth_of_thread = 1;
 }

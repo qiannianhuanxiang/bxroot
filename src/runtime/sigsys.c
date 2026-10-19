@@ -442,6 +442,26 @@ static void guest_sigsys_dispatch(int sig, siginfo_t *si, void *uc)
         g_guest_sa.sa_handler(sig);
 }
 
+/*
+ * uc_mcontext is arch-specific. AArch64 exposes the syscall registers as
+ * uc_mcontext.regs[0..30] (x0..x30); x86_64 calls the same array .gregs[]
+ * but indexes it by REG_Rxx, where the syscall number lives in RAX and the
+ * arguments start at RDI. One accessor keeps the emulation body readable and
+ * keeps this file compiling (and, on x86, still meaningful) off AArch64.
+ */
+#if defined(__aarch64__)
+#  define BX_UC_NR(uc)            ((uc)->uc_mcontext.regs[0])
+#  define BX_UC_SET_NR(uc, v)     ((uc)->uc_mcontext.regs[0] = (unsigned long)(v))
+#  define BX_UC_ARG(uc, n)        ((uc)->uc_mcontext.regs[1 + (n)])
+#  define BX_UC_RESULT(uc)        ((uc)->uc_mcontext.regs[0])
+#elif defined(__x86_64__)
+#  define BX_UC_NR(uc)            ((uc)->uc_mcontext.gregs[REG_RAX])
+#  define BX_UC_SET_NR(uc, v)     ((uc)->uc_mcontext.gregs[REG_RAX] = (long)(v))
+#  define BX_UC_ARG(uc, n)        ((uc)->uc_mcontext.gregs[REG_RDI + (n)])
+#  define BX_UC_RESULT(uc)        ((uc)->uc_mcontext.gregs[REG_RAX])
+#else
+#  error "sigsys emulation expects an AArch64 or x86_64 ucontext"
+#endif
 static void sigsys_handler(int sig, siginfo_t *si, void *uc)
 {
     struct raw_sigsys_info *rs;
@@ -499,21 +519,21 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
      * 而不是谎报 ENOSYS。理由与边界见 replay_faccessat2()。
      */
     if (sc == 439) {
-        u->uc_mcontext.regs[0] = (unsigned long)replay_faccessat2(
-            (long)u->uc_mcontext.regs[0],
-            (long)u->uc_mcontext.regs[1],
-            (long)u->uc_mcontext.regs[2],
-            (long)u->uc_mcontext.regs[3]);
+        BX_UC_RESULT(u) = (unsigned long)replay_faccessat2(
+            (long)BX_UC_RESULT(u),
+            (long)BX_UC_ARG(u, 0),
+            (long)BX_UC_ARG(u, 1),
+            (long)BX_UC_ARG(u, 2));
         return;
     }
 
     {
         long x0;
         int saved = errno;
-        if (emulate_identity(sc, u->uc_mcontext.regs[0],
-                             u->uc_mcontext.regs[1],
-                             u->uc_mcontext.regs[2], &x0)) {
-            u->uc_mcontext.regs[0] = (unsigned long)x0;
+        if (emulate_identity(sc, BX_UC_RESULT(u),
+                             BX_UC_ARG(u, 0),
+                             BX_UC_ARG(u, 1), &x0)) {
+            BX_UC_RESULT(u) = (unsigned long)x0;
             errno = saved;
             return;
         }
@@ -523,24 +543,24 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc)
     {
         long x0;
         int saved = errno;
-        if (bxroot_sysvshm_emulate(sc, u->uc_mcontext.regs[0],
-                                   u->uc_mcontext.regs[1],
-                                   u->uc_mcontext.regs[2], &x0)) {
-            u->uc_mcontext.regs[0] = (unsigned long)x0;
+        if (bxroot_sysvshm_emulate(sc, BX_UC_RESULT(u),
+                                   BX_UC_ARG(u, 0),
+                                   BX_UC_ARG(u, 1), &x0)) {
+            BX_UC_RESULT(u) = (unsigned long)x0;
             errno = saved;
             return;
         }
     }
 
     if (sc == 202) {
-        u->uc_mcontext.regs[0] = (unsigned long)replay_accept(
-            (long)u->uc_mcontext.regs[0],
-            (long)u->uc_mcontext.regs[1],
-            (long)u->uc_mcontext.regs[2]);
+        BX_UC_RESULT(u) = (unsigned long)replay_accept(
+            (long)BX_UC_RESULT(u),
+            (long)BX_UC_ARG(u, 0),
+            (long)BX_UC_ARG(u, 1));
         return;
     }
 
-    u->uc_mcontext.regs[0] = (unsigned long)(-emulate_errno(sc));
+    BX_UC_RESULT(u) = (unsigned long)(-emulate_errno(sc));
 }
 
 /* ------------------------------------------------------------------ */

@@ -1135,12 +1135,21 @@ int px_static_exec(const char *host, const char *argv0, char *const argv[], char
 
     sx_reset_process_state();
 
+#if defined(__aarch64__)
     __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls));
+#else
+    /* tpidr_el0 does not exist off AArch64. There is no portable
+     * equivalent for reading the static-TLS pointer, and this whole
+     * path (jumping into a static ELF inside the current process) is an
+     * AArch64-only feature anyway, so leave tls at its initial value. */
+    tls = 0;
+#endif
     px_static_dyn_tls = tls;
 
     if (verbose && bxroot_log != NULL)
         bxroot_log("static_exec: 即将跳转 entry=%lx sp=%lx tls=%lx", img->entry,
                    (unsigned long)sp, tls);
+#if defined(__aarch64__)
     {
         /*
          * ★ 操作数必须钉死在固定寄存器 ★ 若让编译器自选，entry 可能落进 x0，
@@ -1155,4 +1164,11 @@ int px_static_exec(const char *host, const char *argv0, char *const argv[], char
                          :: "r"(e), "r"(s) : "memory");
     }
     __builtin_unreachable();
+#else
+    /* The static-exec path is AArch64-only (it relies on hand-rolled
+     * switch-stack code and on the AArch64 entry convention). Off that
+     * target, report the same failure the caller would get from any
+     * other unsupported situation instead of emitting unknown asm. */
+    (void)img;
+#endif
 }
