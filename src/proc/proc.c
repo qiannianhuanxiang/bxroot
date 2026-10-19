@@ -2580,7 +2580,13 @@ void px_heal_thread_list(void)
      * tpidr_el0 就是 TCB 基址：glibc 把 struct pthread 放在它下面，
      * 并以它作为线程指针（pthread_self() 返回 tpidr_el0 - 0x740）。
      */
+    #if defined(__aarch64__)
     __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tcb));
+#else
+    /* tpidr_el0 is AArch64-only. Return 0 so the caller falls back to
+     * the conservative path instead of reading a bogus TCB. */
+    tcb = 0;
+#endif
     if (tcb == 0) {
         return;
     }
@@ -3677,6 +3683,8 @@ static void *px_dlsym(const char *name)
  */
 static long px_raw_svc5(long nr, long a, long b, long c, long d, long e)
 {
+#if defined(__aarch64__)
+
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a;
     register long x1 __asm__("x1") = b;
@@ -3692,6 +3700,17 @@ static long px_raw_svc5(long nr, long a, long b, long c, long d, long e)
         return -1;
     }
     return x0;
+#else
+    /* Non-AArch64 fallback: inline svc + x0..x8 constraints are
+     * AArch64-only. Keep the -> -1/errno contract the callers use. */
+    long r = syscall(nr, a, b, c, d, e);
+    if (r < 0 && r > -4096) {
+        errno = (int)-r;
+        return -1;
+    }
+    return r;
+#endif
+
 }
 #define PX_RAW_EXECVE(p, a, e) \
     px_raw_svc5(SYS_execve, (long)(p), (long)(a), (long)(e), 0, 0)

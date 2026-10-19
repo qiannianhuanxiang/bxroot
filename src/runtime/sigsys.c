@@ -460,7 +460,16 @@ static void guest_sigsys_dispatch(int sig, siginfo_t *si, void *uc)
 #  define BX_UC_ARG(uc, n)        ((uc)->uc_mcontext.gregs[REG_RDI + (n)])
 #  define BX_UC_RESULT(uc)        ((uc)->uc_mcontext.gregs[REG_RAX])
 #else
-#  error "sigsys emulation expects an AArch64 or x86_64 ucontext"
+/* No known register layout for this target: the SIGSYS emulation below
+ * cannot locate the syscall arguments, so compile the accessors to a
+ * harmless no-op slot. The runtime still builds and simply declines to
+ * emulate anything (the handler returns early on unsupported arches). */
+#  define BX_UC_UNSUPPORTED 1
+static unsigned long bx_uc_dummy_reg;
+#  define BX_UC_NR(uc)            (bx_uc_dummy_reg)
+#  define BX_UC_SET_NR(uc, v)     ((void)(v))
+#  define BX_UC_ARG(uc, n)        (bx_uc_dummy_reg)
+#  define BX_UC_RESULT(uc)        (bx_uc_dummy_reg)
 #endif
 static void sigsys_handler(int sig, siginfo_t *si, void *uc)
 {

@@ -336,6 +336,7 @@ extern void px_static_tramp(void);
  *
  * v0-v31 与 NZCV 则完整保存：C 的 dispatch 可以随意破坏它们，而真 syscall 不会。
  */
+#if defined(__aarch64__)
 __asm__(
     ".text\n"
     ".globl px_static_tramp\n"
@@ -415,6 +416,7 @@ __asm__(
     "    br   x16\n"                              /* x0 = 结果，回站点下一条 */
     ".size px_static_tramp, .-px_static_tramp\n"
 );
+#endif
 
 /* ------------------------------------------------------------------ */
 /* ELF 装载                                                            */
@@ -696,7 +698,13 @@ static size_t sx_scan(uint32_t *code, size_t n, uint32_t *pool, size_t pool_cap_
                     v[2] = 0xd61f0220u;         /* br  x17 */
                     v[3] = 0xd503201fu;         /* nop */
                     *(uint64_t *)(void *)&v[4] = (uint64_t)(uintptr_t)&code[j + 1];
+#if defined(__aarch64__)
                     *(uint64_t *)(void *)&v[6] = (uint64_t)(uintptr_t)&px_static_tramp;
+#else
+                    /* px_static_tramp is AArch64-only (see its #if). */
+                    (void)v;
+                    return -1;
+#endif
                     code[j] = 0x14000000u | ((uint32_t)(off >> 2) & 0x03ffffffu);  /* b v */
                 }
                 total++;

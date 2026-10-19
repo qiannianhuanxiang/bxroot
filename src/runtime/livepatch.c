@@ -1114,6 +1114,7 @@ long bxroot_pathrelay_dispatch(long a0, long a1, long a2,
  * 会自己保存它用到的 callee-saved 寄存器，桩无需代劳。
  */
 extern void lp_pathrelay_tramp(void);
+#if defined(__aarch64__)
 __asm__(
     ".text\n"
     ".globl lp_pathrelay_tramp\n"
@@ -1127,6 +1128,7 @@ __asm__(
     "    ret\n"                          /* 回站点下一条（cmn x0,...） */
     ".size lp_pathrelay_tramp, .-lp_pathrelay_tramp\n"
 );
+#endif
 
 /*
  * 扫描 [lo,hi)，把 openat(56) 的内联 svc 站点改成 `bl lp_pathrelay_tramp`。
@@ -1136,6 +1138,7 @@ __asm__(
  * 逐点安全：① 只认 mov x8,#56 近距离跟 svc#0；② 打补丁前校验 svc；
  * ③ bl 偏移超 ±128MB 则跳过该点（fail-open，不硬跳）。
  */
+#if defined(__aarch64__)
 static int lp_pathrelay_patch(uintptr_t lo, uintptr_t hi)
 {
     uint32_t *code = (uint32_t *)lo;
@@ -1175,6 +1178,15 @@ static int lp_pathrelay_patch(uintptr_t lo, uintptr_t hi)
     }
     return total;
 }
+#else
+/* lp_pathrelay_tramp is AArch64-only; there is no path-relay */
+/* patching to do on this target. */
+static int lp_pathrelay_patch(uintptr_t lo, uintptr_t hi)
+{
+    (void)lo; (void)hi;
+    return 0;
+}
+#endif
 
 static int g_pathrelay_hits;
 
