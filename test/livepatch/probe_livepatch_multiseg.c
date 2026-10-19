@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <unistd.h>
 
 int bxroot_livepatch_apply(void);
@@ -79,7 +82,85 @@ int main(void)
     }
     printf("段A=%p 段B=%p\n", (void *)a, (void *)b);
 
-    (void)bxroot_livepatch_apply();
+    /*
+     * ★ 本探针必须自己装一个 seccomp 过滤器（缺陷修复，2026-10-20）★
+     *
+     * bxroot_livepatch_apply() 的门控③是"有 seccomp 过滤器才干活"：没有
+     * 白名单要绕，这一层没有收益，直接返回 LP_SKIP_NO_SECCOMP。这对生产
+     * 是正确取舍（非 Android 环境不必改 libc 代码页）。
+     *
+     * 但本探针此前**假设运行环境自带过滤器**：开发容器里跑在外层 proroot
+     * 下，/proc/self/status 显示 Seccomp:2，于是恒 PASS；GitHub 的
+     * ubuntu-24.04-arm runner 没有过滤器（Seccomp:0），apply() 直接跳过，
+     * scan_hits=0，两段 svc 原样不动 → 测试红。同一份源码、同一架构，
+     * 结果却取决于宿主，这正是"测试泄漏了环境前提"的典型。
+     *
+     * 装一个什么都不拦的允许型过滤器即可满足门控，且不改变探针语义：
+     * 被测的是"扫描是否覆盖全部 r-x 段"，不是过滤器本身。
+     */
+    /*
+     * 只在确实没有过滤器时装：已有过滤器的宿主（如本仓库开发容器）保持
+     * 原状，测试结果不受这只探针干扰；没有的宿主补上，门控③才能通过。
+     */
+    if (prctl(PR_GET_SECCOMP, 0, 0, 0, 0) != 2) {
+        struct sock_filter allow_all[] = {
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        };
+        struct sock_fprog prog;
+        int ok = 1;
+
+        prog.len = (unsigned short)(sizeof allow_all / sizeof allow_all[0]);
+        prog.filter = allow_all;
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+            perror("PR_SET_NO_NEW_PRIVS");
+            ok = 0;
+        } else if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+            perror("PR_SET_SECCOMP");
+            ok = 0;
+        }
+        if (!ok) {
+            /*
+             * 装不上就**明确跳过**，不要报 FAIL。
+             *
+             * 判据：门控③在无过滤器时会直接跳过扫描，此时两段 svc 必然
+             * 原样不动 —— 那是环境不满足，不是产品缺陷。报 FAIL 会让
+             * 真正想看的"多段扫描"信号被环境噪声淹没。
+             * 退出码 2 是本仓库约定的"前置条件不满足"。
+             */
+            printf("SKIP: 无法安装 seccomp 过滤器，livepatch 门控③不会启用\n");
+            return 2;
+        }
+    }
+    printf("seccomp 就绪（Seccomp=%ld）\n", prctl(PR_GET_SECCOMP, 0, 0, 0, 0));
+
+    /*
+     * 先在失败机器上把判决依据打出来。
+     *
+     * 本探针在开发容器里稳定 PASS，但在 GitHub 的 ubuntu-24.04-arm runner
+     * 上 scan_hits=0 —— 同一份源码、同样 aarch64，差别只可能落在
+     * /proc/self/maps 的呈现（设备/路径/行内字段）或 mprotect 是否允许。
+     * 只报 "FAIL 段B ... 期望 0xd2800000" 无法区分这两类，所以这里把
+     * 解析器实际看到的 libc r-x 段数、以及 apply() 的返回值都打印出来。
+     */
+    {
+        FILE *mf = fopen("/proc/self/maps", "r");
+        int segs = 0, v6 = 0;
+        char ln[1024];
+        if (mf != NULL) {
+            while (fgets(ln, sizeof ln, mf) != NULL) {
+                if (strstr(ln, "libc.so.6") == NULL) continue;
+                v6++;
+                if (strstr(ln, " r-x") != NULL || strstr(ln, "-") == ln) segs++;
+            }
+            fclose(mf);
+        }
+        printf("maps: libc.so.6 行=%d r-x 行≈%d\n", v6, segs);
+    }
+
+    {
+        int rc = bxroot_livepatch_apply();
+        printf("livepatch_apply=%d\n", rc);
+    }
 
     expect("段B set_robust_list svc", b[3], MOV_X0_0);
     expect("段B rseq svc", b[9], MOV_X0_0);
