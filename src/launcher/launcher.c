@@ -1122,6 +1122,29 @@ static int parse_args(int argc, char **argv, launcher_config_t *cfg) {
              *
              * 例外：单独的 "-" 按惯例表示 stdin，仍当作 guest 命令处理。
              */
+            /*
+             * `--` is the conventional end-of-options marker: the next
+             * argument is the guest command even if it starts with '-'. proot
+             * supports it (`proot -r R -- ls -l`) and bxroot did not -- `--`
+             * used to be taken as the guest command name and reported as
+             * "command not found". Launcher scripts commonly do
+             * `exec bxroot -r R "$@"`, which needs it whenever $1 is an
+             * option-like string.
+             */
+            if (strcmp(argv[i], "--") == 0) {
+                i++;
+                if (i >= argc) {
+                    fprintf(stderr, "错误: -- 之后缺少要执行的命令\n");
+                    return -1;
+                }
+                cfg->guest_exe = xstrdup(argv[i]);
+                cfg->guest_argc = argc - i;
+                cfg->guest_argv = xmalloc(sizeof(char *) * (size_t)(cfg->guest_argc + 1));
+                for (int j = i; j < argc; j++)
+                    cfg->guest_argv[j - i] = xstrdup(argv[j]);
+                cfg->guest_argv[cfg->guest_argc] = NULL;
+                break;
+            }
             if (argv[i][0] == '-' && argv[i][1] != '\0') {
                 fprintf(stderr,
                         "错误: 未知选项 '%s'\n"
