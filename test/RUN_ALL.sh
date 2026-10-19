@@ -77,6 +77,9 @@ RUNNER_TAIL=$(command -v tail) || exit 1
 RUNNER_CUT=$(command -v cut) || exit 1
 RUNNER_RM=$(command -v rm) || exit 1
 RUNNER_TIMEOUT=$(command -v timeout) || exit 1
+# Per-step scratch space: use /tmp when it is usable, otherwise fall back to a
+# directory under the ledger so the runner also works on hosts without /tmp.
+if [ -d /tmp ] && [ -w /tmp ]; then STEP_TMP_BASE=${TMPDIR:-/tmp}; else STEP_TMP_BASE=$RESULT_BASE; fi
 # Default the ledger to a per-user cache directory instead of a hard-coded
 # /root/work. A fixed absolute default made every CI runner (non-root, no
 # /root/work) exit 1 on the very first mkdir, before a single test had run.
@@ -94,9 +97,6 @@ case "$RESULT_BASE" in /*) ;; *) echo "ERROR: result base must be absolute"; exi
 # The ledger must survive a guest that wipes /tmp, so /tmp is still rejected.
 case "$RESULT_BASE" in /tmp|/tmp/*) echo "ERROR: result ledger must be outside /tmp"; exit 1 ;; esac
 mkdir -p "$RESULT_BASE" || exit 1
-# Per-step scratch space: use /tmp when it is usable, otherwise fall back to a
-# directory under the ledger so the runner also works without /tmp.
-if [ -d /tmp ] && [ -w /tmp ]; then STEP_TMP_BASE=${TMPDIR:-/tmp}; else STEP_TMP_BASE=$RESULT_BASE; fi
 WORK_DIR=$(mktemp -d "$RESULT_BASE/quick-XXXXXX") || exit 1
 RESULT_FILE="$WORK_DIR/results.txt"
 : > "$RESULT_FILE" || exit 1
@@ -173,13 +173,93 @@ echo
 runner_reviewed() {
     [ "$RUNNER_SELFTEST" -eq 1 ] && return 0
     case "$1" in
-    "编译告警门禁"|"l2s 运行时"|"l2s×fakeroot 协同"|"fakeroot 纯逻辑"|    "fakeroot 账本并发"|"系统调用参数位置"|"rename/link 双路径"|    "身份 syscall 伪装"|"运行时构建"|"exec 家族与失败诊断"|    "native world 分类与环境"|"native exec/spawn 绑定语义"|    "native 会话与双向路径"|"native 会话后端生命周期"|    "native host 到 guest 回入口"|"native 回入口 ELF 契约"|    "proc fd 句柄解析"|"copyout probe compile"|"copyout syscall capability"|    "SHM anchor 生命周期"|"SHM claim 协议"|"SHM runtime copyout"|    "SysV 共享内存"|"最低内核依据"|"clone3 回退链"|    "livepatch 指令扫描"|"livepatch 审计"|"livepatch 多段 r-x 全扫描"|    "guest SIGSYS 影子槽 / 自发 SIGSYS") return 0 ;;
-    "bx-host 宿主 ELF 入口"|"D3 /proc 泄漏反向翻译"|"realpath 返回值反向翻译"|"RAW_SYSCALL 透传开关"|"sigsys 裸系统调用号/sigsetsize"|"ulx 早期 SIGSYS"|"livepatch 静态主映像"|"proot CLI 兼容"|"上游 proot 选项表覆盖"|"官方配置块 CFG_FD"|"workdir 回退") return 0 ;;
-    "DNS 解析"|"system/popen 子进程"|"pthread_create 栈"|"shebang 脚本 exec"|"降权族 chage"|"任意 -i uid:gid 映射"|"身份权限爆破"|"exec 参数边界"|"D4 进程管理"|"wait 家族钩子") return 0 ;;
-    "stub-loader PT_INTERP 补丁"|"l2s 中间文件清理"|"l2s 散落布局端到端") return 0 ;;
+    "编译告警门禁") return 0 ;;
+    "l2s 运行时") return 0 ;;
+    "l2s×fakeroot 协同") return 0 ;;
+    "fakeroot 纯逻辑") return 0 ;;
+    "fakeroot 账本并发") return 0 ;;
+    "系统调用参数位置") return 0 ;;
+    "路径参数表实测审计") return 0 ;;
+    "rename/link 双路径") return 0 ;;
+    "身份 syscall 伪装") return 0 ;;
+    "crash 崩溃处理器") return 0 ;;
+    "D4 进程管理") return 0 ;;
+    "运行时构建") return 0 ;;
+    "proot CLI 兼容") return 0 ;;
+    "上游 proot 选项表覆盖") return 0 ;;
+    "路径形态回归") return 0 ;;
+    "D3 /proc 泄漏反向翻译") return 0 ;;
+    "realpath 返回值反向翻译") return 0 ;;
+    "RAW_SYSCALL 透传开关") return 0 ;;
+    "sigsys 裸系统调用号/sigsetsize") return 0 ;;
+    "l2s 端到端契约") return 0 ;;
+    "l2s 散落布局端到端") return 0 ;;
+    "l2s × 真实 git") return 0 ;;
+    "kill-on-exit 监督") return 0 ;;
+    "exec 家族与失败诊断") return 0 ;;
+    "静态 ELF / ld.so / ldd") return 0 ;;
+    "bx-host 宿主 ELF 入口") return 0 ;;
+    "native world 分类与环境") return 0 ;;
+    "native exec/spawn 绑定语义") return 0 ;;
+    "native 会话与双向路径") return 0 ;;
+    "native 会话后端生命周期") return 0 ;;
+    "native host 到 guest 回入口") return 0 ;;
+    "native 回入口 ELF 契约") return 0 ;;
+    "proc fd 句柄解析") return 0 ;;
+    "最低内核依据") return 0 ;;
+    "clone3 回退链") return 0 ;;
+    "stub-loader PT_INTERP 补丁") return 0 ;;
+    "AF_UNIX 地址翻译") return 0 ;;
+    "TRAP 号官方对照审计") return 0 ;;
+    "非默认 rootfs") return 0 ;;
+    "官方配置块 CFG_FD") return 0 ;;
+    "copyout probe compile") return 0 ;;
+    "native fork/wait compile") return 0 ;;
+    "native fork/wait 自动插入") return 0 ;;
+    "copyout syscall capability") return 0 ;;
+    "SHM runtime copyout") return 0 ;;
+    "static SHM fd lifecycle") return 0 ;;
+    "SHM anchor 生命周期") return 0 ;;
+    "SHM claim 协议") return 0 ;;
+    "SHM ID ABA") return 0 ;;
+    "SHM fork gate") return 0 ;;
+    "static SHM syscall") return 0 ;;
+    "l2s mock 契约") return 0 ;;
+    "SysV 共享内存") return 0 ;;
     "/proc 视角") return 0 ;;
-    "native fork/wait compile"|"native fork/wait 自动插入"|"static SHM fd lifecycle") return 0 ;;
-    "SHM claim 协议"|"l2s mock 契约"|"SHM ID ABA"|"static SHM syscall"|"SHM fork gate") return 0 ;;
+    "wait 家族钩子") return 0 ;;
+    "dl 家族契约") return 0 ;;
+    "system/popen 子进程") return 0 ;;
+    "pthread_create 栈") return 0 ;;
+    "shebang 脚本 exec") return 0 ;;
+    "降权族 chage") return 0 ;;
+    "workdir 回退") return 0 ;;
+    "端到端 dsh") return 0 ;;
+    "l2s 中间文件清理") return 0 ;;
+    "ulx 早期 SIGSYS") return 0 ;;
+    "沙箱逃逸") return 0 ;;
+    "审计修复回归") return 0 ;;
+    "exec 参数边界") return 0 ;;
+    "fakeroot chown 读回") return 0 ;;
+    "身份权限爆破") return 0 ;;
+    "livepatch 指令扫描") return 0 ;;
+    "livepatch 多段 r-x 全扫描") return 0 ;;
+    "guest SIGSYS 影子槽 / 自发 SIGSYS") return 0 ;;
+    "livepatch 审计") return 0 ;;
+    "livepatch seccomp 端到端") return 0 ;;
+    "livepatch 静态主映像") return 0 ;;
+    "DNS 解析") return 0 ;;
+    "路径爆破边界") return 0 ;;
+    "POSIX /dev/shm") return 0 ;;
+    "任意 -i uid:gid 映射") return 0 ;;
+    "只读 bind") return 0 ;;
+    "statx 空路径") return 0 ;;
+    "statx NULL 不崩") return 0 ;;
+    "mkfifo/mknod/utime") return 0 ;;
+    "execve argv0") return 0 ;;
+    "裸 syscall stat 伪装") return 0 ;;
+    # Anything not registered above stays BLOCKED on purpose: an unregistered
+    # step is an unreviewed step, not a passing one.
     *) return 1 ;;
     esac
 }
