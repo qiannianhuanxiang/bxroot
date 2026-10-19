@@ -77,10 +77,26 @@ RUNNER_TAIL=$(command -v tail) || exit 1
 RUNNER_CUT=$(command -v cut) || exit 1
 RUNNER_RM=$(command -v rm) || exit 1
 RUNNER_TIMEOUT=$(command -v timeout) || exit 1
-RESULT_BASE=${BXROOT_RESULT_BASE:-/root/work/bxroot-regression-results}
+# Default the ledger to a per-user cache directory instead of a hard-coded
+# /root/work. A fixed absolute default made every CI runner (non-root, no
+# /root/work) exit 1 on the very first mkdir, before a single test had run.
+# The explicit override is still honoured verbatim.
+if [ -n "${BXROOT_RESULT_BASE:-}" ]; then
+    RESULT_BASE=$BXROOT_RESULT_BASE
+elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    RESULT_BASE=$XDG_CACHE_HOME/bxroot-regression-results
+elif [ -n "${HOME:-}" ]; then
+    RESULT_BASE=$HOME/.cache/bxroot-regression-results
+else
+    RESULT_BASE=$ROOT/.cache/bxroot-regression-results
+fi
 case "$RESULT_BASE" in /*) ;; *) echo "ERROR: result base must be absolute"; exit 1 ;; esac
+# The ledger must survive a guest that wipes /tmp, so /tmp is still rejected.
 case "$RESULT_BASE" in /tmp|/tmp/*) echo "ERROR: result ledger must be outside /tmp"; exit 1 ;; esac
 mkdir -p "$RESULT_BASE" || exit 1
+# Per-step scratch space: use /tmp when it is usable, otherwise fall back to a
+# directory under the ledger so the runner also works without /tmp.
+if [ -d /tmp ] && [ -w /tmp ]; then STEP_TMP_BASE=${TMPDIR:-/tmp}; else STEP_TMP_BASE=$RESULT_BASE; fi
 WORK_DIR=$(mktemp -d "$RESULT_BASE/quick-XXXXXX") || exit 1
 RESULT_FILE="$WORK_DIR/results.txt"
 : > "$RESULT_FILE" || exit 1
@@ -91,7 +107,7 @@ BLOCKED=0
 ERRORS=0
 runner_health() {
     [ -d "$ROOT" ] && [ -r "$ROOT/test/RUN_ALL.sh" ] &&
-    [ -d /tmp ] && [ -r "$WORK_DIR/root-sentinel" ] &&
+    [ -d "${STEP_TMP_BASE:-/tmp}" ] && [ -r "$WORK_DIR/root-sentinel" ] &&
     [ -x "$RUNNER_TAIL" ] && [ -x "$RUNNER_CUT" ] && [ -x "$RUNNER_RM" ] &&
     "$RUNNER_TAIL" -n 0 "$WORK_DIR/root-sentinel" >/dev/null 2>&1 &&
     "$RUNNER_PYTHON" -c 'import sys; f=open(sys.argv[1],"a"); f.close()' "$RESULT_FILE"
