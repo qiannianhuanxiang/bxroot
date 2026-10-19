@@ -1317,7 +1317,23 @@ static int expand_bind_list(launcher_config_t *cfg,
         }
 
         if (add_bind(cfg, item, item) != 0) {
-            return -1;
+            /*
+             * ★ 容量不足必须降级，不能整条命令失败（缺陷修复，2026-10-19）★
+             *
+             * PROOT_RECOMMENDED_BINDS 有 19 条，而 MAX_BINDS 是 16。
+             * 原先这里 return -1 → 调用方报 "错误: -R 的推荐 bind 超出上限"
+             * 并退出，于是 `-R` 在**推荐项恰好都存在**的宿主机上必然不可用；
+             * 在推荐项缺几条的机器上又恰好能跑。同一份代码随宿主环境时好时坏，
+             * 而 -R 是 proot 最常用的入口（`proot -R rootfs cmd`）。
+             *
+             * 实测：GitHub Actions ubuntu-24.04-arm 上 `-R /tmp /bin/true` 因此
+             * 被判为"未实现"（RUN_CLI_COMPAT 的 F 段失败）。
+             *
+             * proot 自身对推荐 bind 是尽力而为语义：装不上就跳过，不阻断启动。
+             * 这里对齐该语义 —— 记进 skipped 并在下面统一提示，命令照常执行。
+             */
+            skipped++;
+            continue;
         }
     }
     return skipped;
