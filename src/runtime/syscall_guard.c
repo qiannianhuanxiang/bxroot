@@ -370,6 +370,8 @@ extern int l2s_rt_rename_replace_commit(const char *mid, const char *final)
 static long raw_syscall6(long nr, long a0, long a1, long a2,
                          long a3, long a4, long a5)
 {
+
+#if defined(__aarch64__)
     int saved_errno = errno;
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a0;
@@ -405,6 +407,19 @@ static long raw_syscall6(long nr, long a0, long a1, long a2,
      */
     errno = saved_errno;
     return x0;
+#else
+    /* Non-AArch64 fallback: the inline svc and x0..x5 register constraints
+     * are AArch64-only. Route through libc and reproduce the same contract. */
+    int saved_errno = errno;
+    long r = syscall(nr, a0, a1, a2, a3, a4, a5);
+    if (r < 0) {
+        errno = (int)-r;
+        return -1;
+    }
+    errno = saved_errno;
+    return r;
+#endif
+
 }
 
 /* ------------------------------------------------------------------ */

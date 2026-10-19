@@ -76,6 +76,7 @@
  *   （返回值统一是内核约定：成功值或 -errno）。
  */
 
+#include <errno.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -167,6 +168,8 @@
 
 static long shm_svc6(long nr, long a, long b, long c, long d, long e, long f)
 {
+
+#if defined(__aarch64__)
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a;
     register long x1 __asm__("x1") = b;
@@ -179,6 +182,13 @@ static long shm_svc6(long nr, long a, long b, long c, long d, long e, long f)
         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
         : "memory", "cc");
     return x0;   /* 内核约定：负数即 -errno */
+#else
+    /* Non-AArch64 fallback: callers expect the raw kernel value
+     * (negative == -errno). */
+    long r = syscall(nr, a, b, c, d, e, f);
+    return r < 0 ? -(long)errno : r;
+#endif
+
 }
 #define SVC(nr, a, b, c) shm_svc6((nr), (long)(a), (long)(b), (long)(c), 0, 0, 0)
 

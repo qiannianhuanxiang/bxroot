@@ -122,6 +122,8 @@ unsigned long px_static_dyn_tls __attribute__((visibility("hidden")));
 
 static long sx_sc6(long nr, long a0, long a1, long a2, long a3, long a4, long a5)
 {
+
+#if defined(__aarch64__)
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a0;
     register long x1 __asm__("x1") = a1;
@@ -135,6 +137,13 @@ static long sx_sc6(long nr, long a0, long a1, long a2, long a3, long a4, long a5
         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
         : "memory", "cc");
     return x0;
+#else
+    /* Non-AArch64 fallback: callers expect the raw kernel value
+     * (negative == -errno). */
+    long r = syscall(nr, a0, a1, a2, a3, a4, a5);
+    return r < 0 ? -(long)errno : r;
+#endif
+
 }
 
 #define SC(nr, a, b, c, d) sx_sc6((nr), (long)(a), (long)(b), (long)(c), (long)(d), 0, 0)

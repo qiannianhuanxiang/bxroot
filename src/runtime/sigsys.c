@@ -163,6 +163,8 @@ static void em_num(long v)
 
 static long raw4(long nr, long a, long b, long c, long d)
 {
+
+#if defined(__aarch64__)
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a;
     register long x1 __asm__("x1") = b;
@@ -177,6 +179,16 @@ static long raw4(long nr, long a, long b, long c, long d)
         return -1;
     }
     return x0;
+#else
+    /* Non-AArch64 fallback: no inline svc; use libc, keep -1/errno. */
+    long r = syscall(nr, a, b, c, d);
+    if (r < 0 && r > -4096) {
+        errno = (int)-r;
+        return -1;
+    }
+    return r;
+#endif
+
 }
 
 /*
