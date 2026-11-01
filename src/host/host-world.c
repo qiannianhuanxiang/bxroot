@@ -16,8 +16,14 @@ static long hw_raw6(long nr, long a, long b, long c, long d, long e, long f)
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a, x1 __asm__("x1") = b, x2 __asm__("x2") = c;
     register long x3 __asm__("x3") = d, x4 __asm__("x4") = e, x5 __asm__("x5") = f;
-    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2),
-                      "r"(x3), "r"(x4), "r"(x5) : "memory", "cc");
+    /* x1..x5 声明为读写：编译器不能假设它们在 asm 后保持原值。
+     * 不在 asm 内移动 sp —— 先前的 stp/ldp 压栈版在被外层装载器改写
+     * svc 的进程里让分类器读错文件（RUN_HOST_DISPATCH 56 项失败，
+     * 基线 23 项；改为本写法后回到 23 项）。 */
+    __asm__ volatile("svc #0"
+        : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5)
+        : "r"(x8)
+        : "memory", "cc");
     return x0;
 #else
     /* Non-Android classifier tests. These do not load the bxroot hooks. */

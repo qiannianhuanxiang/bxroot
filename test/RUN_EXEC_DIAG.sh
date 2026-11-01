@@ -44,7 +44,23 @@ else
     "$W/pe" > "$W/off.txt" 2>&1
     timeout 60 "$ROOT/tools/bxroot-run" -- "$W/pe" > "$W/bx.txt" 2>&1
     offok=$(grep -c ' OK ' "$W/off.txt")
-    [ "$offok" -lt 5 ] || bad "对照组 fd 形态也全部成功 —— 本环境下缺口不可观测"
+    #
+    # The control group must be HEALTHY for this test to mean anything.
+    #
+    # Measured in a plain Ubuntu container with no execveat support in the
+    # sandbox: the probe only manages ONE ' OK ' on the HOST, never mind under
+    # bxroot. With a threshold of 5 the guard let that through and then blamed
+    # bxroot for all 7 execveat/fexecve rows, none of which were its fault --
+    # the same calls fail on the host.
+    #
+    # Require the control group to be essentially complete (11 of 12 rows
+    # succeed on a healthy host). Below that the environment cannot observe
+    # the difference, so skip instead of reporting false failures.
+    if [ "$offok" -lt 10 ]; then
+        echo "  ⏭️  跳过 A：对照组仅 $offok/12 成功，本环境无法观测 execveat 差异"
+        echo "SKIP: 对照组不健康"
+        exit 2
+    fi
     for k in 'execveat(AT_FDCWD,/usr/bin/echo,0)' 'execveat(dirfd(/usr/bin),"echo",0)' \
              'execveat(fd,"",AT_EMPTY_PATH)' 'fexecve(fd) ' ; do
         grep -F "$k" "$W/bx.txt" | grep -q 'OK out=hi' && good "$k 执行成功" \

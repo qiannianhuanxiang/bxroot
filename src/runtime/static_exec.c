@@ -52,8 +52,9 @@
  * ====================================================================
  *   - 只补 `mov x8/w8,#立即数` 近距离跟 `svc` 的站点。syscall 号来自寄存器的
  *     通用 syscall() 包装补不到。
- *   - 不拦 execve/execveat（静态程序再 exec 别的程序时内核看到的仍是 guest
- *     路径）。ldconfig 不 exec。
+ *   - execve/execveat 站点转交 runtime 的 exec 钩子（2026-10-31，见
+ *     px_static_dispatch）。此前不拦，guest 路径直达内核，真机上会跑到
+ *     宿主 /system/bin 的二进制或 ENOENT。
  *   - 多线程进程拒绝（真 execve 会杀其它线程，我们做不到）→ 调用方回退 stub。
  *   - TLS 切换只对单线程静态程序成立（动态 TLS 取 exec 线程的）。
  *   - ET_EXEC 的固定地址与 runtime/堆冲突时 MAP_FIXED_NOREPLACE 失败 → 回退。
@@ -64,6 +65,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <dlfcn.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -96,6 +98,16 @@ int bxroot_resolve_abs_symlink(const char *translated, char *out, size_t out_siz
 __attribute__((weak))
 void bxroot_log(const char *fmt, ...);
 
+/*
+ * exec 桥（proc.c）：与 syscall_guard 的 syscall(SYS_execve, …) 同一入口，
+ * 走完整的 exec 路径（路径翻译 + 环境注入 + trampoline/ULX 或再次 static_exec）。
+ * 返回 -1 + errno（成功不返回）。weak：单测里没有 proc.c。
+ */
+__attribute__((weak))
+int bxroot_exec_hook_execve(const char *path, char *const argv[], char *const envp[]);
+__attribute__((weak))
+int bxroot_exec_hook_execveat(int dirfd, const char *path, char *const argv[],
+                              char *const envp[], int flags);
 __attribute__((weak))
 int bxroot_sysvshm_anchor_fd(void);
 __attribute__((weak))
@@ -112,6 +124,69 @@ static int sx_preserve_internal_exec_fd(int fd)
 
 /* 新程序的 guest 视角可执行路径（来自 envp 的 BXROOT_GUEST_EXE），答 /proc/self/exe 用。 */
 static char sx_guest_exe[PATH_MAX];
+
+/*
+ * ★ runtime 自身的路径：路径翻译不碰它（2026-10-31，Fedora ld.so 复现）★
+ *
+ * 目标是另一个 rootfs 的 ld.so（`<fedora>/usr/lib/ld-linux-aarch64.so.1
+ * --library-path … prog`）时，exec 钩子给它的 envp 里带着 LD_PRELOAD=<本 runtime>。
+ * 这份 ld.so 的 openat 站点已被上面改写成走 px_static_dispatch，于是它打开
+ * LD_PRELOAD 时，路径也会被加上 rootfs 前缀。真机上 runtime 在 rootfs 之外
+ * （APK nativeLibraryDir，/data/app/…），加前缀后打不开：
+ *     ERROR: ld.so: object '…/libbxroot-runtime.so' from LD_PRELOAD cannot be
+ *     preloaded (cannot open shared object file): ignored.
+ * 后果：新命名空间里没有 runtime，livepatch 的构造函数不会执行，Fedora
+ * libc 的 _Fork 内联 svc set_robust_list 保持原样 → 子进程 SIGSYS。
+ *
+ * LD_PRELOAD 里的这个路径来自 dladdr（px_cfg_merge_preload），本身就是内核
+ * 视角，原样交给内核就对。只对**完全等于**本 runtime 路径的参数透传，
+ * 其余路径照常翻译。
+ */
+static char sx_self_lib[PATH_MAX];
+
+long px_static_dispatch(long a0, long a1, long a2, long a3, long a4, long a5,
+                        long nr);
+
+static void sx_record_self_lib(char *const envp[], size_t nenv)
+{
+    Dl_info di;
+    size_t k;
+
+    sx_self_lib[0] = '\0';
+    memset(&di, 0, sizeof di);
+    if (dladdr((void *)&px_static_dispatch, &di) != 0 && di.dli_fname != NULL &&
+        di.dli_fname[0] == '/' && strlen(di.dli_fname) < sizeof(sx_self_lib)) {
+        memcpy(sx_self_lib, di.dli_fname, strlen(di.dli_fname) + 1);
+        return;
+    }
+    /* dladdr 拿不到时退回 proc 层记下的 BXROOT_LD_PRELOAD（同为 dladdr 来源） */
+    for (k = 0; k < nenv; k++) {
+        const char *v;
+
+        if (strncmp(envp[k], "BXROOT_LD_PRELOAD=", 18) != 0)
+            continue;
+        v = envp[k] + 18;
+        if (v[0] == '/' && strchr(v, ':') == NULL && strchr(v, ' ') == NULL &&
+            strlen(v) < sizeof(sx_self_lib))
+            memcpy(sx_self_lib, v, strlen(v) + 1);
+        return;
+    }
+}
+
+static int sx_is_self_lib(const char *p)
+{
+    return sx_self_lib[0] == '/' && strcmp(p, sx_self_lib) == 0;
+}
+
+/*
+ * ★ 当前正在运行的静态映像（由本文件装载）的保留区（2026-10-31）★
+ *
+ * 静态程序再 exec 另一个 ET_EXEC 静态程序时，两者通常都要 0x400000。
+ * 旧映像还映射着，新映像的 MAP_FIXED_NOREPLACE 就 EEXIST → 回退 stub-loader，
+ * 而 stub 路径对静态目标的翻译不完整（见文件头）。真 execve 会先拆掉旧映像，
+ * 这里在**确认冲突只来自旧映像**后照做。跳转前登记，0 = 当前不是我们装的静态映像。
+ */
+static unsigned long sx_cur_base, sx_cur_len;
 
 /* 动态 libc 的 TPIDR_EL0（exec 前记下）。汇编跳板用 adrp 直接引用。 */
 unsigned long px_static_dyn_tls __attribute__((visibility("hidden")));
@@ -132,7 +207,14 @@ static long sx_sc6(long nr, long a0, long a1, long a2, long a3, long a4, long a5
     register long x4 __asm__("x4") = a4;
     register long x5 __asm__("x5") = a5;
 
-    __asm__ __volatile__("svc #0"
+    __asm__ volatile(""
+        "stp x1, x2, [sp, #-16]!\n\t"
+        "stp x3, x4, [sp, #-16]!\n\t"
+        "str x5,     [sp, #-16]!\n\t"
+        "svc #0\n\t"
+        "ldr x5,     [sp], #16\n\t"
+        "ldp x3, x4, [sp], #16\n\t"
+        "ldp x1, x2, [sp], #16\n"
         : "+r"(x0)
         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
         : "memory", "cc");
@@ -187,7 +269,8 @@ static unsigned sx_path_mask(long nr)
 /* 需要补丁的站点：入参有路径，或出参是路径（getcwd=17，内核写宿主路径回来）。 */
 static int sx_wants_site(long nr)
 {
-    return sx_path_mask(nr) != 0 || nr == 17 || (nr >= 194 && nr <= 197);
+    return sx_path_mask(nr) != 0 || nr == 17 || (nr >= 194 && nr <= 197) ||
+           nr == 221 /* execve */ || nr == 281 /* execveat */;
 }
 
 /* 反向翻译：把内核写回的宿主路径剥成 guest 视角（用 runtime 自己的剥离逻辑）。 */
@@ -259,6 +342,33 @@ long px_static_dispatch(long a0, long a1, long a2, long a3, long a4, long a5,
         return -38;
     }
 
+    /*
+     * ★ execve(221) / execveat(281)：交给 runtime 的 exec 钩子（2026-10-31）★
+     *
+     * 原先不拦（见文件头"边界"）：静态程序 exec 时 guest 路径直达内核。
+     * 真机宿主 /bin -> /system/bin，于是 execv("/bin/echo") 跑的是 Android
+     * toybox，bionic linker 再按 LD_PRELOAD 去加载 glibc 的 runtime：
+     *     CANNOT LINK EXECUTABLE "/bin/echo": library "libc.so.6" not found
+     * 其余 guest 路径（/usr/bin/…、/tmp/…）宿主上不存在 → ENOENT。
+     * 清掉 LD_PRELOAD 只会让前者"成功"跑宿主二进制（逃出容器），不是修复。
+     *
+     * 这里的上下文与动态进程调 execve 钩子等价：TLS 已切回动态 libc
+     * （errno / getenv / malloc 都是 runtime 那一份）。成功则不返回；
+     * 失败把 errno 按内核约定转成负值交回静态程序。
+     */
+    if (nr == 221 && bxroot_exec_hook_execve != NULL) {
+        int rc = bxroot_exec_hook_execve((const char *)(uintptr_t)a0,
+                                         (char *const *)(uintptr_t)a1,
+                                         (char *const *)(uintptr_t)a2);
+        return rc < 0 ? -(long)(errno ? errno : ENOEXEC) : (long)rc;
+    }
+    if (nr == 281 && bxroot_exec_hook_execveat != NULL) {
+        int rc = bxroot_exec_hook_execveat((int)a0, (const char *)(uintptr_t)a1,
+                                           (char *const *)(uintptr_t)a2,
+                                           (char *const *)(uintptr_t)a3, (int)a4);
+        return rc < 0 ? -(long)(errno ? errno : ENOEXEC) : (long)rc;
+    }
+
     if (nr == 78 && sx_guest_exe[0] == '/' &&
         sx_is_proc_self_exe((const char *)(uintptr_t)a1)) {
         size_t n = strlen(sx_guest_exe);
@@ -294,6 +404,8 @@ long px_static_dispatch(long a0, long a1, long a2, long a3, long a4, long a5,
         p = (const char *)(uintptr_t)a[i];
         if (p == NULL || p[0] != '/' || used >= 2)
             continue;               /* NULL / 相对路径：内核按 dirfd、cwd 解析 */
+        if (sx_is_self_lib(p))
+            continue;               /* 本 runtime 的内核视角路径（LD_PRELOAD），见 sx_self_lib */
         if (bxroot_translate_path(p, buf[used], sizeof(buf[used])) > 0)
             a[i] = (long)(uintptr_t)buf[used++];
     }
@@ -356,6 +468,7 @@ __asm__(
     "    stp  x13, x14, [sp, #112]\n"
     "    stp  x15, x16, [sp, #128]\n"
     "    str  x17,      [sp, #144]\n"
+    "    str  x18,      [sp, #168]\n"           /* x18：GCC 当普通临时寄存器用，内核跨 svc 保留它 */
     "    mrs  x9,  nzcv\n"
     "    str  x9,       [sp, #160]\n"
     "    stp  q0,  q1,  [sp, #176]\n"
@@ -411,10 +524,97 @@ __asm__(
     "    ldr  x15,      [sp, #128]\n"
     "    ldr  x16,      [sp, #136]\n"            /* 返回地址 */
     "    ldr  x17,      [sp, #144]\n"
+    "    ldr  x18,      [sp, #168]\n"
     "    ldp  x29, x30, [sp, #0]\n"
     "    add  sp, sp, #688\n"
     "    br   x16\n"                              /* x0 = 结果，回站点下一条 */
     ".size px_static_tramp, .-px_static_tramp\n"
+);
+#endif
+
+/*
+ * ★ 动态进程用的跳板（2026-10-31，D1）★
+ *
+ * 与 px_static_tramp 同一帧布局与保存集（x1..x18、NZCV、q0..q31），唯一区别：
+ * **不切 TPIDR_EL0**。动态进程里主程序 / 其它 .so 与 runtime 共用同一份 libc
+ * TLS，px_static_dyn_tls 也没被设置过（那是 static_exec 跳转前才记的），
+ * 切了反而会把 TLS 指到 0。
+ */
+extern void px_inline_tramp(void);
+#if defined(__aarch64__)
+__asm__(
+    ".text\n"
+    ".globl px_inline_tramp\n"
+    ".hidden px_inline_tramp\n"
+    ".type  px_inline_tramp,%function\n"
+    "px_inline_tramp:\n"
+    "    bti  c\n"
+    "    sub  sp, sp, #688\n"
+    "    stp  x29, x30, [sp, #0]\n"
+    "    mov  x29, sp\n"
+    "    stp  x1,  x2,  [sp, #16]\n"
+    "    stp  x3,  x4,  [sp, #32]\n"
+    "    stp  x5,  x6,  [sp, #48]\n"
+    "    stp  x7,  x8,  [sp, #64]\n"
+    "    stp  x9,  x10, [sp, #80]\n"
+    "    stp  x11, x12, [sp, #96]\n"
+    "    stp  x13, x14, [sp, #112]\n"
+    "    stp  x15, x16, [sp, #128]\n"
+    "    str  x17,      [sp, #144]\n"
+    "    str  x18,      [sp, #168]\n"           /* x18：GCC 当普通临时寄存器用，内核跨 svc 保留它 */
+    "    mrs  x9,  nzcv\n"
+    "    str  x9,       [sp, #160]\n"
+    "    stp  q0,  q1,  [sp, #176]\n"
+    "    stp  q2,  q3,  [sp, #208]\n"
+    "    stp  q4,  q5,  [sp, #240]\n"
+    "    stp  q6,  q7,  [sp, #272]\n"
+    "    stp  q8,  q9,  [sp, #304]\n"
+    "    stp  q10, q11, [sp, #336]\n"
+    "    stp  q12, q13, [sp, #368]\n"
+    "    stp  q14, q15, [sp, #400]\n"
+    "    stp  q16, q17, [sp, #432]\n"
+    "    stp  q18, q19, [sp, #464]\n"
+    "    stp  q20, q21, [sp, #496]\n"
+    "    stp  q22, q23, [sp, #528]\n"
+    "    stp  q24, q25, [sp, #560]\n"
+    "    stp  q26, q27, [sp, #592]\n"
+    "    stp  q28, q29, [sp, #624]\n"
+    "    stp  q30, q31, [sp, #656]\n"
+    "    mov  x6, x8\n"
+    "    bl   px_static_dispatch\n"
+    "    ldp  q30, q31, [sp, #656]\n"
+    "    ldp  q28, q29, [sp, #624]\n"
+    "    ldp  q26, q27, [sp, #592]\n"
+    "    ldp  q24, q25, [sp, #560]\n"
+    "    ldp  q22, q23, [sp, #528]\n"
+    "    ldp  q20, q21, [sp, #496]\n"
+    "    ldp  q18, q19, [sp, #464]\n"
+    "    ldp  q16, q17, [sp, #432]\n"
+    "    ldp  q14, q15, [sp, #400]\n"
+    "    ldp  q12, q13, [sp, #368]\n"
+    "    ldp  q10, q11, [sp, #336]\n"
+    "    ldp  q8,  q9,  [sp, #304]\n"
+    "    ldp  q6,  q7,  [sp, #272]\n"
+    "    ldp  q4,  q5,  [sp, #240]\n"
+    "    ldp  q2,  q3,  [sp, #208]\n"
+    "    ldp  q0,  q1,  [sp, #176]\n"
+    "    ldr  x9,       [sp, #160]\n"
+    "    msr  nzcv, x9\n"
+    "    ldp  x1,  x2,  [sp, #16]\n"
+    "    ldp  x3,  x4,  [sp, #32]\n"
+    "    ldp  x5,  x6,  [sp, #48]\n"
+    "    ldp  x7,  x8,  [sp, #64]\n"
+    "    ldp  x9,  x10, [sp, #80]\n"
+    "    ldp  x11, x12, [sp, #96]\n"
+    "    ldp  x13, x14, [sp, #112]\n"
+    "    ldr  x15,      [sp, #128]\n"
+    "    ldr  x16,      [sp, #136]\n"
+    "    ldr  x17,      [sp, #144]\n"
+    "    ldr  x18,      [sp, #168]\n"
+    "    ldp  x29, x30, [sp, #0]\n"
+    "    add  sp, sp, #688\n"
+    "    br   x16\n"
+    ".size px_inline_tramp, .-px_inline_tramp\n"
 );
 #endif
 
@@ -670,6 +870,14 @@ static long sx_movz_x8(uint32_t ins)
  * 扫描 [lo,hi)。pool 为 NULL 时只计数；否则写 veneer 并改写站点。
  * 返回站点数。
  */
+/*
+ * veneer 的跳转目标。静态映像用 px_static_tramp（要切 TLS）；
+ * 动态进程的内联 svc 扫描（bxroot_inline_svc_scan）临时换成 px_inline_tramp。
+ */
+#if defined(__aarch64__)
+static void (*sx_scan_tramp)(void) = px_static_tramp;
+#endif
+
 static size_t sx_scan(uint32_t *code, size_t n, uint32_t *pool, size_t pool_cap_bytes)
 {
     long nr = -1;
@@ -699,7 +907,7 @@ static size_t sx_scan(uint32_t *code, size_t n, uint32_t *pool, size_t pool_cap_
                     v[3] = 0xd503201fu;         /* nop */
                     *(uint64_t *)(void *)&v[4] = (uint64_t)(uintptr_t)&code[j + 1];
 #if defined(__aarch64__)
-                    *(uint64_t *)(void *)&v[6] = (uint64_t)(uintptr_t)&px_static_tramp;
+                    *(uint64_t *)(void *)&v[6] = (uint64_t)(uintptr_t)sx_scan_tramp;
 #else
                     /* px_static_tramp is AArch64-only (see its #if). */
                     (void)v;
@@ -737,6 +945,167 @@ static size_t sx_count_sites(const sx_image *img)
         total += sx_scan((uint32_t *)(img->base + p->p_vaddr), p->p_filesz / 4, NULL, 0);
     }
     return total;
+}
+
+/* ------------------------------------------------------------------ */
+/* 动态进程：主程序与非 libc 共享库里的内联 svc（D1，2026-10-31）       */
+/* ------------------------------------------------------------------ */
+/*
+ * 【缺口】动态程序只靠 LD_PRELOAD 符号钩子翻译路径。程序**绕过 libc**、
+ * 自己 `mov x8,#56 ; svc #0` 发 openat 时，不经任何导出符号，路径以 guest
+ * 视角直达内核 → ENOENT（真机复现：同一份探针静态编译返回 fd，动态编译
+ * 返回 -2）。静态程序没有这个问题，因为 static_exec 早就改写了这类站点。
+ *
+ * 【做法】在 runtime 构造函数里，对本进程**文件映射的 r-x 段**跑与静态
+ * 程序同一套站点识别（sx_scan：`mov x8,#立即数` 近距离跟 `svc`，号在
+ * sx_wants_site 的路径类 / getcwd / execve 集合里），站点改成
+ * `b veneer → px_inline_tramp → px_static_dispatch`。
+ *
+ * 【刻意不碰的映像】
+ *   - libc.so.6：runtime 自己的钩子会**有意**用宿主路径调 libc（host-world
+ *     等），libc 内部 svc 全改会把这些宿主路径误翻进 rootfs。libc 这条边界
+ *     继续由符号钩子 + livepatch 的 openat relay 负责。
+ *   - ld-linux*：在 runtime 之前就跑完了加载，dlopen 的路径由 dl 钩子翻译。
+ *   - libbxroot* / libproroot* / libdsha-*：本项目与外层容器的组件，里面的
+ *     裸 svc 是有意为之。
+ *   - 单段 > 64 MB：扫描成本与误配面都随代码量增长，大映像（如 node）
+ *     本身走 libc，不扫。
+ *
+ * 【安全边界】与静态程序同：只认确定形态、改写前逐字节校验、veneer 够不着
+ * 的站点跳过（fail-open）。先只读计数，0 命中的映像不改任何内存属性。
+ *
+ * 【仍覆盖不到】号来自寄存器的通用包装（Go 的 syscall.Syscall6 等）；
+ * 构造函数之后才 dlopen 进来的库。
+ *
+ * BXROOT_NO_INLINE_SVC=1 关闭。返回改写的站点总数。
+ */
+#define SX_INLINE_MAX_SEG   (64UL << 20)
+#define SX_INLINE_MAX_SEGS  64
+
+static int sx_inline_excluded(const char *path)
+{
+    static const char *const skip[] = {
+        "/libc.so.6", "/ld-linux", "/libbxroot", "libproroot", "/libdsha-",
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(skip) / sizeof(skip[0]); i++)
+        if (strstr(path, skip[i]) != NULL)
+            return 1;
+    return 0;
+}
+
+/* 在 [lo,hi) 附近找一块未占用的地址放 veneer 池，保证 `b`（±128MB）够得着。 */
+static unsigned long sx_inline_pool_near(unsigned long lo, unsigned long hi, size_t cap)
+{
+    unsigned long ps = (unsigned long)getpagesize();
+    unsigned long step = 2UL << 20;
+    int k;
+
+    for (k = 0; k < 48; k++) {
+        unsigned long cand[2];
+        int j;
+
+        cand[0] = ((hi + ps - 1) & ~(ps - 1)) + (unsigned long)k * step;
+        cand[1] = (lo > cap + (unsigned long)(k + 1) * step)
+                      ? ((lo - cap) & ~(ps - 1)) - (unsigned long)k * step : 0;
+        for (j = 0; j < 2; j++) {
+            long m;
+
+            if (cand[j] == 0)
+                continue;
+            m = sx_sc6(SYS_mmap, (long)cand[j], (long)cap, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if ((unsigned long)m >= (unsigned long)-4095L)
+                continue;
+            if ((unsigned long)m != cand[j]) {      /* 旧内核把 flag 当提示 */
+                (void)sx_sc6(SYS_munmap, m, (long)cap, 0, 0, 0, 0);
+                continue;
+            }
+            return (unsigned long)m;
+        }
+    }
+    return 0;
+}
+
+int bxroot_inline_svc_scan(void)
+{
+#if defined(__aarch64__)
+    struct { unsigned long lo, hi; char path[256]; } seg[SX_INLINE_MAX_SEGS];
+    int nseg = 0, i, total = 0;
+    unsigned long ps = (unsigned long)getpagesize();
+    const char *v = getenv("BXROOT_VERBOSE");
+    int verbose = (v != NULL && v[0] != '\0' && v[0] != '0');
+    char line[1024];
+    FILE *f;
+
+    if (getenv("BXROOT_NO_INLINE_SVC") != NULL)
+        return 0;
+    f = fopen("/proc/self/maps", "re");
+    if (f == NULL)
+        return 0;
+    while (nseg < SX_INLINE_MAX_SEGS && fgets(line, sizeof line, f) != NULL) {
+        unsigned long a, b, off;
+        char perms[8];
+        int pos = 0;
+        const char *p;
+        size_t pl;
+
+        if (sscanf(line, "%lx-%lx %7s %lx %*s %*s %n", &a, &b, perms, &off, &pos) < 4 || pos == 0)
+            continue;
+        if (perms[0] != 'r' || perms[2] != 'x' || b <= a || b - a > SX_INLINE_MAX_SEG)
+            continue;
+        p = line + pos;
+        if (p[0] != '/')
+            continue;                       /* 匿名 / [vdso] / JIT：不碰 */
+        pl = strcspn(p, "\n");
+        if (pl >= sizeof(seg[0].path) || sx_inline_excluded(p))
+            continue;
+        seg[nseg].lo = a;
+        seg[nseg].hi = b;
+        memcpy(seg[nseg].path, p, pl);
+        seg[nseg].path[pl] = '\0';
+        nseg++;
+    }
+    fclose(f);
+
+    sx_scan_tramp = px_inline_tramp;
+    for (i = 0; i < nseg; i++) {
+        uint32_t *code = (uint32_t *)seg[i].lo;
+        size_t words = (seg[i].hi - seg[i].lo) / 4;
+        size_t want = sx_scan(code, words, NULL, 0), got;
+        size_t cap;
+        unsigned long pool;
+        long pr;
+
+        if (want == 0)
+            continue;
+        cap = (want * SX_VENEER_SIZE + ps - 1) & ~(ps - 1);
+        pool = sx_inline_pool_near(seg[i].lo, seg[i].hi, cap);
+        if (pool == 0)
+            continue;                       /* 够不着：fail-open */
+        pr = SC(SYS_mprotect, seg[i].lo, seg[i].hi - seg[i].lo,
+                PROT_READ | PROT_WRITE | PROT_EXEC, 0);
+        if (pr != 0)
+            pr = SC(SYS_mprotect, seg[i].lo, seg[i].hi - seg[i].lo, PROT_READ | PROT_WRITE, 0);
+        if (pr != 0) {
+            (void)sx_sc6(SYS_munmap, (long)pool, (long)cap, 0, 0, 0, 0);
+            continue;
+        }
+        got = sx_scan(code, words, (uint32_t *)pool, cap);
+        SC(SYS_mprotect, seg[i].lo, seg[i].hi - seg[i].lo, PROT_READ | PROT_EXEC, 0);
+        __builtin___clear_cache((char *)seg[i].lo, (char *)seg[i].hi);
+        SC(SYS_mprotect, pool, cap, PROT_READ | PROT_EXEC, 0);
+        __builtin___clear_cache((char *)pool, (char *)(pool + cap));
+        total += (int)got;
+        if (verbose && bxroot_log != NULL)
+            bxroot_log("inline-svc: %s 补丁 %zu 个路径 svc 站点", seg[i].path, got);
+    }
+    sx_scan_tramp = px_static_tramp;
+    return total;
+#else
+    return 0;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -881,7 +1250,124 @@ static void sx_reset_process_state(void)
 /* 入口                                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 只读探测 ET_EXEC 目标的装载范围 [lo, hi)（页对齐），不映射任何东西。
+ * 返回 1 = 是 ET_EXEC 且范围有效；0 = 不是 / 读不出（调用方按原逻辑处理）。
+ */
+static int sx_probe_exec_range(const char *path, unsigned long *lo_out, unsigned long *hi_out)
+{
+    Elf64_Ehdr eh;
+    Elf64_Phdr ph[SX_MAX_PHDR];
+    unsigned long lo = ~0UL, hi = 0, ps = (unsigned long)getpagesize();
+    long fd = SC(SYS_openat, -100, path, O_RDONLY | O_CLOEXEC, 0);
+    unsigned i;
+    int ok = 0;
+
+    if (fd < 0)
+        return 0;
+    if (sx_sc6(SYS_pread64, fd, (long)&eh, sizeof eh, 0, 0, 0) == (long)sizeof eh &&
+        memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0 && eh.e_type == ET_EXEC &&
+        eh.e_phentsize == sizeof(Elf64_Phdr) && eh.e_phnum > 0 && eh.e_phnum <= SX_MAX_PHDR &&
+        sx_sc6(SYS_pread64, fd, (long)ph, sizeof(Elf64_Phdr) * eh.e_phnum,
+               (long)eh.e_phoff, 0, 0) == (long)(sizeof(Elf64_Phdr) * eh.e_phnum)) {
+        for (i = 0; i < eh.e_phnum; i++) {
+            if (ph[i].p_type != PT_LOAD)
+                continue;
+            if ((ph[i].p_vaddr & ~(ps - 1)) < lo)
+                lo = ph[i].p_vaddr & ~(ps - 1);
+            if (ph[i].p_vaddr + ph[i].p_memsz > hi)
+                hi = ph[i].p_vaddr + ph[i].p_memsz;
+        }
+        hi = (hi + ps - 1) & ~(ps - 1);
+        ok = (lo != ~0UL && hi > lo);
+    }
+    SC(SYS_close, fd, 0, 0, 0);
+    if (ok) {
+        *lo_out = lo;
+        *hi_out = hi;
+    }
+    return ok;
+}
+
+/*
+ * [lo, hi) 中除 [xlo, xhi) 外的每一页都**未映射**？用 mincore 逐页判：
+ * 未映射页返回 -ENOMEM。只要有一页被别的映射占着，就不能靠拆旧映像解决。
+ */
+static int sx_range_free_except(unsigned long lo, unsigned long hi,
+                                unsigned long xlo, unsigned long xhi)
+{
+    unsigned long ps = (unsigned long)getpagesize(), a;
+    unsigned char vec;
+
+    for (a = lo; a < hi; a += ps) {
+        if (a >= xlo && a < xhi)
+            continue;
+        if (sx_sc6(SYS_mincore, (long)a, (long)ps, (long)&vec, 0, 0, 0) != -ENOMEM)
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * 把 host/argv0/argv/envp 整体深拷贝进一块新 mmap（拆旧映像前必须做：
+ * 字符串常量可能就在旧映像的 .rodata 里）。这块内存交给新程序，不回收。
+ */
+static int sx_deep_copy_args(const char **host, const char **argv0,
+                             char *const **argv, char *const **envp)
+{
+    size_t na = 0, ne = 0, bytes, i;
+    char **nv, **nenv, *s;
+    char *const *av = *argv, *const *ev = *envp;
+    long m;
+
+    while (av[na] != NULL) na++;
+    if (ev != NULL) while (ev[ne] != NULL) ne++;
+    bytes = (na + 1 + ne + 1) * sizeof(char *) + strlen(*host) + 1 +
+            (*argv0 != NULL ? strlen(*argv0) + 1 : 0);
+    for (i = 0; i < na; i++) bytes += strlen(av[i]) + 1;
+    for (i = 0; i < ne; i++) bytes += strlen(ev[i]) + 1;
+    m = sx_sc6(SYS_mmap, 0, (long)bytes, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((unsigned long)m >= (unsigned long)-4095L)
+        return -1;
+    nv = (char **)(uintptr_t)m;
+    nenv = nv + na + 1;
+    s = (char *)(nenv + ne + 1);
+#define SX_DUP(dst, src) do { size_t _l = strlen(src) + 1; memcpy(s, (src), _l); (dst) = s; s += _l; } while (0)
+    for (i = 0; i < na; i++) SX_DUP(nv[i], av[i]);
+    nv[na] = NULL;
+    for (i = 0; i < ne; i++) SX_DUP(nenv[i], ev[i]);
+    nenv[ne] = NULL;
+    { char *h; SX_DUP(h, *host); *host = h; }
+    if (*argv0 != NULL) { char *a0; SX_DUP(a0, *argv0); *argv0 = a0; }
+#undef SX_DUP
+    *argv = nv;
+    *envp = (ev != NULL) ? nenv : NULL;
+    return 0;
+}
+
+static int px_static_exec_inner(const char *host, const char *argv0, char *const argv[],
+                                char *const envp[], int *past_ponr);
+
+/*
+ * 拆掉旧映像之后再失败就回不去了（调用者的代码已经没了）——与内核 execve
+ * 过了不可回头点之后的语义一致：进程只能死。裸 svc 写一句再 exit_group。
+ */
 int px_static_exec(const char *host, const char *argv0, char *const argv[], char *const envp[])
+{
+    int past_ponr = 0;
+    int rc = px_static_exec_inner(host, argv0, argv, envp, &past_ponr);
+
+    if (rc != 0 && past_ponr) {
+        static const char msg[] = "bxroot: static_exec failed after replacing the old image\n";
+        (void)sx_sc6(SYS_write, 2, (long)msg, sizeof msg - 1, 0, 0, 0);
+        (void)sx_sc6(SYS_exit_group, 127, 0, 0, 0, 0, 0);
+    }
+    return rc;
+}
+
+static int px_static_exec_inner(const char *host, const char *argv0, char *const argv[],
+                                char *const envp[], int *past_ponr)
 {
     sx_image *img;
     size_t sites, nargc = 0, nenv = 0, i;
@@ -914,10 +1400,38 @@ int px_static_exec(const char *host, const char *argv0, char *const argv[], char
     /* 先按最大站点数估个 veneer 区：第一遍装载后才知道，所以保守取 4096 个 */
     if (sx_load(host, img, 4096 * SX_VENEER_SIZE) != 0) {
         int e = errno;
+        unsigned long tlo, thi, ps = (unsigned long)getpagesize();
+        unsigned long vz = ((unsigned long)(4096 * SX_VENEER_SIZE) + ps - 1) & ~(ps - 1);
+
         sx_unload(img);
-        free(img);
-        errno = e;
-        return -1;
+        /*
+         * 静态程序 exec 静态程序：冲突**只**来自我们自己装的旧映像时，像内核
+         * execve 一样拆掉它再装。先探测目标范围，再确认除旧映像外全空，
+         * 然后深拷贝参数、屏蔽全部信号（旧处理器指向旧映像，
+         * sx_reset_process_state 复位处理器后才清空掩码），最后 munmap。
+         */
+        if (e == EEXIST && sx_cur_len != 0 &&
+            sx_probe_exec_range(host, &tlo, &thi) &&
+            tlo < sx_cur_base + sx_cur_len && thi + vz > sx_cur_base &&
+            sx_range_free_except(tlo, thi + vz, sx_cur_base, sx_cur_base + sx_cur_len) &&
+            sx_deep_copy_args(&host, &argv0, &argv, &envp) == 0) {
+            unsigned long all[2] = { ~0UL, ~0UL };
+
+            SC(SYS_rt_sigprocmask, 2 /* SIG_SETMASK */, all, 0, 8);
+            (void)sx_sc6(SYS_munmap, (long)sx_cur_base, (long)sx_cur_len, 0, 0, 0, 0);
+            sx_cur_base = sx_cur_len = 0;
+            *past_ponr = 1;
+            if (verbose && bxroot_log != NULL)
+                bxroot_log("static_exec: 已拆除旧静态映像，重装 %s", host);
+            if (sx_load(host, img, 4096 * SX_VENEER_SIZE) != 0) {
+                free(img);
+                return -1;
+            }
+        } else {
+            free(img);
+            errno = e;
+            return -1;
+        }
     }
 
     sites = sx_count_sites(img);
@@ -1141,6 +1655,7 @@ int px_static_exec(const char *host, const char *argv0, char *const argv[], char
         (void)sx_sc6(167 /* prctl */, 15 /* PR_SET_NAME */, (long)nm, 0, 0, 0, 0);
     }
 
+    sx_record_self_lib(envp, nenv);
     sx_reset_process_state();
 
 #if defined(__aarch64__)
@@ -1153,6 +1668,8 @@ int px_static_exec(const char *host, const char *argv0, char *const argv[], char
     tls = 0;
 #endif
     px_static_dyn_tls = tls;
+    sx_cur_base = img->rsv_base;
+    sx_cur_len = img->rsv_len;
 
     if (verbose && bxroot_log != NULL)
         bxroot_log("static_exec: 即将跳转 entry=%lx sp=%lx tls=%lx", img->entry,

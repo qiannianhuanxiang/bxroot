@@ -108,6 +108,11 @@ echo notelf > "$W/txt"
 [ $r -eq 0 ] || [ $r -eq 126 ] && ok "静态 ET_EXEC 可装载或明确拒绝 rc=$r" || bad "静态 ET_EXEC rc=$r"
 
 echo "== U4/U5 源码钉 =="
+if build -O1 -Wall -Wextra -Werror -D_GNU_SOURCE -o "$W/ulx-libpath" "$ROOT/test/test_ulx_libpath.c"; then
+    "$W/ulx-libpath" | grep -q "^ULX_LIBPATH_OK$" && ok "ULX guest 库路径翻译/去重契约" || bad "ULX guest 库路径翻译/去重契约失败"
+else
+    bad "ULX 库路径契约编译失败"
+fi
 awk '/^int dladdr\(/,/^}/' "$ROOT/src/runtime/preload.c" > "$W/dladdr.c"
 grep -q 'bxroot_next_symbol("dladdr")' "$W/dladdr.c" && ok "dladdr 无服务时转发 libc" \
     || bad "dladdr 无 ldso 服务时仍恒返回 0（真机 envp 注入会被禁用）"

@@ -47,6 +47,7 @@ cat > "$PROBE_C" <<'EOF'
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/mman.h>
 
 /* 接收必须带超时：sendto 未翻译时报文根本没发出，阻塞 recv 会永久挂起
  * （2026-09-25 实测：官方 proroot 基线就这样卡死） */
@@ -71,6 +72,29 @@ int main(int argc, char **argv) {
     int s, c, l, p, acc; ssize_t n;
     struct stat st;
 
+    /* Overlong input must reach the kernel without a user-space overread. */
+    {
+        long ps = sysconf(_SC_PAGESIZE);
+        char *map = mmap(NULL, (size_t)ps * 2, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int badsock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (map == MAP_FAILED || badsock < 0) {
+            CHECK(0, "oversized sockaddr setup");
+        } else if (mprotect(map + ps, (size_t)ps, PROT_NONE) != 0) {
+            CHECK(0, "oversized sockaddr guard page");
+        } else {
+            struct sockaddr_un *bad = (struct sockaddr_un *)(map + ps - sizeof(*bad));
+            memset(bad, 'A', sizeof(*bad));
+            bad->sun_family = AF_UNIX;
+            errno = 0;
+            int br = bind(badsock, (struct sockaddr *)bad, 4096);
+            CHECK(br == -1 && errno == EINVAL,
+                  "oversized sockaddr kernel rejection (rc=%d errno=%d)", br, errno);
+        }
+        if (badsock >= 0) close(badsock);
+        if (map != MAP_FAILED) munmap(map, (size_t)ps * 2);
+    }
+
     snprintf(srv, sizeof(srv), "%s/srv.sock", dir);
     snprintf(cli, sizeof(cli), "%s/cli.sock", dir);
     snprintf(stm, sizeof(stm), "%s/stm.sock", dir);
@@ -81,6 +105,23 @@ int main(int argc, char **argv) {
     rcvtimeo(s);
     mkaddr(&a, srv);
     CHECK(bind(s, (struct sockaddr *)&a, sizeof(a)) == 0, "dgram bind(%s)", srv);
+
+    /* Kernel may report a full sockaddr length larger than the short output buffer. */
+    {
+        long ps = sysconf(_SC_PAGESIZE);
+        char *map = mmap(NULL, (size_t)ps * 2, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (map == MAP_FAILED || mprotect(map + ps, (size_t)ps, PROT_NONE) != 0) {
+            CHECK(0, "short sockaddr output setup");
+        } else {
+            socklen_t short_len = 8;
+            int sr = getsockname(s, (struct sockaddr *)(map + ps - short_len), &short_len);
+            CHECK(sr == 0 && short_len > 8,
+                  "short sockaddr output remains bounded (rc=%d returned_len=%u)", sr, (unsigned)short_len);
+        }
+        if (map != MAP_FAILED) munmap(map, (size_t)ps * 2);
+    }
+
     bl = sizeof(back); memset(&back, 0, sizeof(back));
     CHECK(getsockname(s, (struct sockaddr *)&back, &bl) == 0 &&
           strcmp(back.sun_path, srv) == 0,

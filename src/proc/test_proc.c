@@ -2326,6 +2326,40 @@ static void test_fork_deadlock(void)
 
 /* ================================================================== */
 
+
+/*
+ * ★ envp == NULL 必须解析成 environ（2026-10-26）★
+ *
+ * POSIX 里 execve 的 envp==NULL 交给内核是**空环境**，不是「继承」。
+ * 实测（静态程序绕开钩子）：execve(prog, argv, NULL) -> environ total=0。
+ * 而 execvp/execvpe 的语义是「继承当前环境」，内部以 envp==NULL 调进来。
+ * 修了四处：execve / execveat / posix_spawn(sp->ne) / px_trampoline_spawn。
+ *
+ * 这里锁住「environ 非空且可枚举」这个前置条件 —— 四处修复都依赖它。
+ */
+static void test_envp_null_semantics(void)
+{
+    extern char **environ;
+    char **p;
+    int n = 0;
+
+    CASE("M1 environ 可枚举且非空（envp==NULL 的四处置换都依赖它）");
+    for (p = environ; p != NULL && *p != NULL; p++)
+        n++;
+    CHECK(n > 0);
+
+    CASE("M2 environ 是真实指针（不是 NULL）");
+    CHECK(environ != NULL);
+
+    CASE("M3 取第一个条目可读（验证不是悬空指针）");
+    if (n > 0) {
+        CHECK(environ[0] != NULL);
+        CHECK(strlen(environ[0]) > 0);
+    } else {
+        CHECK(0);
+    }
+}
+
 int main(void)
 {
     printf("=== proc（D4 进程管理）纯逻辑 + 真实内核 测试 ===\n\n");
@@ -2342,6 +2376,7 @@ int main(void)
     test_forkguard();
     test_real_exec_env();
     test_fork_deadlock();
+    test_envp_null_semantics();
 
     printf("\n========================================\n");
     printf("cases  = %d\n", g_cases);

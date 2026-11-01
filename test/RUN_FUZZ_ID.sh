@@ -46,7 +46,7 @@ OFFICIAL_SO="${BXROOT_OFFICIAL_SO:-/tmp/off-rt.so}"
 HAVE_OFF=0
 [ -f "$OFFICIAL_SO" ] && HAVE_OFF=1
 
-W=$(mktemp -d /tmp/bxroot-fuzzid-XXXXXX); trap 'rm -rf "$W"' EXIT
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-fuzzid-XXXXXX"); trap 'rm -rf "$W"' EXIT
 
 # ---------------------------------------------------------------------
 # 探针：一个二进制，按 argv 走一串降权/身份操作，逐步打印 res-id。

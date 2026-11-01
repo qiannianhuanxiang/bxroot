@@ -344,7 +344,8 @@ Node 全部 `ENOENT`。
 | `BXROOT_VERBOSE` | 排障日志（**部分日志为 debug 构建编译期开关**：release 包中仅 proc 等运行期日志生效，`preload.c` 的 LOG 需 `make debug`/`-DBXROOT_VERBOSE=1` 重编才完整） |
 | `BXROOT_SCG` | `syscall` 层追踪 |
 | `BXROOT_RAW_SYSCALL` | 置 1 时对「因 Android 策略而中和」的调用（io_uring 家族 425/426/427）**真透传**，不再恒定回 `ENOSYS`，由真实内核/宿主 seccomp 给出答案 —— 适用于非 Android 环境（如通用 seccomp profile 的普通容器）。身份/降权伪装与路径翻译不受影响；`0` 或未设时行为不变 |
-| `BXROOT_NO_AUTORUN` | 置 1 跳过 runtime 构造链（源码级单元测试专用，正常使用勿设） |
+| `BXROOT_NO_AUTORUN` | 置 1 跳过 runtime 构造链（源码级单元测试专用，正常使用勿设）。**不是隔离开关**：`LD_PRELOAD` 仍在、库仍被加载、导出符号的钩子仍生效，只是不做初始化 —— 进程处在半初始化状态，测出的数字不能当"无 bxroot"基线。见 [已知限制 §2.13](docs/已知限制与架构能力边界.md) |
+| `LD_PRELOAD` / `BXROOT_ROOTFS`（容器内） | **每次 exec 都被强制写回**子进程（`env -u`、`env -i`、置空均无效）。这是设计：子进程不带 runtime 就会直接 exec app 私有目录里的文件（Android 拒绝，EACCES），或跑到宿主 `/system/bin` 上。容器内显式改 `BXROOT_ROOTFS` 会打印一行告警；要用别的 rootfs 请嵌套启动 `libbxroot.so -r <rootfs> <cmd>` |
 | `BXROOT_REENTRY` / `BXROOT_ENTER` / `BXROOT_SESSION_FD` | native session v3：guest 回宿主入口与封印 session fd |
 | `PROROOT_CFG_FD` | 官方启动器配置块路径；有此文件时不注入 `STUB_ROOTFS`。显式 `BXROOT_ROOTFS` / `BXROOT_BINDS` 仍优先 |
 | `BXROOT_NO_CRASH` | 置 1 不安装崩溃处理器，由客户程序自管 SIGSEGV/SIGBUS |

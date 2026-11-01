@@ -17,7 +17,7 @@ grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || {
     echo "⏭️  跳过：需要外层 proroot 注入链路"; exit 2; }
 [ -f "$ROOT/build/libbxroot-runtime.so" ] || { echo "⏭️  跳过：没有 build/libbxroot-runtime.so"; exit 2; }
 
-W=$(mktemp -d /tmp/bxroot-statx-XXXXXX)
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-statx-XXXXXX")
 trap 'rm -rf "$W"' EXIT
 RF="$W/rf"
 mkdir -p "$RF/etc" "$RF/tmp"

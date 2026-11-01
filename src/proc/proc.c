@@ -14,6 +14,7 @@
 /* 纯逻辑/钩子层的开关由 proc.h 统一定义（默认 PX_PURE_LOGIC=1）。
  * 这里刻意**不**再定义一次 —— 两处各写一套必然漂移。 */
 #include "proc.h"
+#include "tramp-config.h"
 #if !PX_PURE_LOGIC
 #include "../host/host-world.h"
 /* Standalone proc hook tests may omit the optional native backend. A partial
@@ -2408,12 +2409,66 @@ static long px_nraw(long nr, long a, long b, long c, long d)
     register long x1 __asm__("x1") = b;
     register long x2 __asm__("x2") = c;
     register long x3 __asm__("x3") = d;
-    __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : "memory", "cc");
+    /* The svc passes a,b,c,d in x1..x3, so this asm writes all three; they
+     * can only be declared "r" inputs (named-register bindings rule out also
+     * listing them as clobbers), which tells GCC they are untouched. Save and
+     * restore so the declaration is actually true. See src/host/session.c for
+     * the measured details and the A/B that caught the resulting corruption. */
+    __asm__ __volatile__(
+        "stp x1, x2, [sp, #-16]!\n\t"
+        "str x3,     [sp, #-16]!\n\t"
+        "svc #0\n\t"
+        "ldr x3,     [sp], #16\n\t"
+        "ldp x1, x2, [sp], #16"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+        : "memory", "cc");
     return x0;
 #else
     long r = syscall(nr, a, b, c, d);
     return r < 0 ? -(long)errno : r;
 #endif
+}
+
+/* 定义在本文件中段；此处前向声明，供 px_host_access_ok 判别 fork child。 */
+static volatile int g_after_fork_child;
+
+/*
+ * 宿主视角的存在性/可执行性校验（2026-10-29，PTC worker 无 trampoline 配置）。
+ *
+ * 为什么不能用裸 access()：本库自己 hook 了 access（preload.c:5355），
+ * 对 /data/app/... 这类**宿主**路径会再拼一次 rootfs → 假 ENOENT。
+ * PTC worker 的环境被上层剥空后只能靠这里的 dladdr 推导，若校验用 access()
+ * 则候选全部"不存在"，缓存留空 → px_trampoline_* 命中 EARLY-EXIT →
+ * DSHA PTC 每次调用在 0ms 变成 TOOL_OUTCOME_UNKNOWN（真机日志证据）。
+ *
+ * 与下方 [2]/[3] 自检同一策略：access() 与裸 faccessat 任一条成功即视为可用。
+ * @param path 宿主绝对路径。
+ * @param mode R_OK / X_OK。
+ * @return 1 = 可用；0 = 不可用。
+ */
+static int px_host_access_ok(const char *path, int mode)
+{
+    if (path == NULL || path[0] == '\0')
+        return 0;
+    /*
+     * ★ fork child 里只能用裸 syscall（2026-10-29 真机 PTC 死锁）★
+     *
+     * 本函数被 px_tramp_cfg_cache() 调用，而后者在 px_trampoline_exec()
+     * 里执行 —— 那已经处在 fork 出来的子进程中。此时进程只剩一个线程，
+     * 却可能继承着父进程**其它线程**持有的 malloc / stdio / 环境锁。
+     *
+     * access() 是本库自己的钩子（preload.c:5355），要先做路径翻译，会
+     * 分配内存。在 fork child 里撞上那把消失线程的锁 → **永久死锁**。
+     *
+     * 真机表现：bxroot.50 时代配置为空，EARLY-EXIT 快速失败（0ms UNKNOWN）；
+     * 修好推导后反而变成「执行中… 永远不返回」——正是这条死锁。
+     *
+     * 所以 fork child 里跳过钩子，只走真裸 svc。
+     */
+    if (!g_after_fork_child && access(path, mode) == 0)
+        return 1;
+    return px_nraw(SYS_faccessat, AT_FDCWD, (long)(uintptr_t)path, mode, 0) == 0;
 }
 
 static int px_self_thread_count(void)
@@ -2660,6 +2715,15 @@ static void px_cfg_bool(int *dst, const char *v)
  *
  * dladdr 在某些静态/受限环境会失败，此时回落环境变量。
  */
+/* trampoline argv 缓冲上限；exec trampoline 用 alloca，不走 malloc/TLS。 */
+#define PX_TRAMP_ARGS_MAX 8192
+
+static int px_self_lib_path_fwd(char *dst, size_t cap);
+
+static char s_cfg_ulx[PX_PATH_MAX];
+static char s_cfg_ldso[PX_PATH_MAX];
+static void px_tramp_cfg_cache(void);
+
 static void px_detect_self_lib(char *dst, size_t cap)
 {
     Dl_info info;
@@ -2824,6 +2888,154 @@ static void px_cfg_merge_preload(void)
     }
 }
 
+/*
+ * ★ 无条件诊断输出到文件（2026-10-24，DSHA spawn EACCES 定位）★
+ *
+ * 为什么独立于 PX_LOG：PX_LOG 被 verbose 门控，发布版默认关闭。这条路径
+ * 的故障在用户侧只表现为一句 EACCES，没有任何上下文可查。写到固定文件
+ * 让设备能自己把证据带回来。
+ *
+ * 位置：$BXROOT_DIAG_FILE，未设置则 /tmp/bxroot-diag.log（guest 内可见）。
+ * 内容只含路径/布尔/errno，不含 token 或用户数据。
+ */
+/*
+ * stderr 静音开关：为 1 时 px_diag 只写文件、不写 fd 2。
+ * 用于 init 阶段的大量明细（selftest 逐项、路径回显），
+ * 避免污染 guest 里每条命令的 stderr。故障行在调用点显式解除。
+ */
+static int g_diag_quiet;
+/*
+ * diag 文件大小上限（字节）。超过就在下次写入前轮转成 "<path>.1"。
+ *
+ * ★ 为什么从 8 MiB 降到 2 MiB（2026-10-31 真机反馈）★
+ *
+ * 首版取 8 MiB，理由是"约覆盖 4000 条命令"。但真机上该设备磁盘
+ * 已用 95%（剩 25 GB），用户明确反馈 8 MiB 偏高；而且实测当前代次
+ * 只有 620 KB / 154 个 init 块，8 MiB 意味着要跑几万条命令才会轮转，
+ * 相当于"实际永不轮转"。
+ *
+ * 2 MiB 约覆盖 1000 条命令（按 2089 B/exec），对定位问题足够；
+ * 轮转后总量恒定 4 MiB，在吃紧的磁盘上也可接受。
+ */
+#define PX_DIAG_MAX_BYTES (2u * 1024u * 1024u)
+
+/* Set only in the post-fork child; avoid libc/stdio work before exec. */
+static volatile int g_after_fork_child;
+
+static void px_diag(const char *fmt, ...)
+{
+    if (g_after_fork_child)
+        return;
+    const char *path = getenv("BXROOT_DIAG_FILE");
+    FILE *f;
+    va_list ap;
+    /*
+     * ★ 必须保存并恢复 errno（2026-10-26 实测确认）★
+     *
+     * 本函数插在 exec/spawn 的关键路径中间（甚至有在实参里直接读 errno
+     * 的调用点），而 open/stat/strerror 都会改写它。实测：调用方
+     * errno=13(EACCES) → 调一次 px_diag → 读回 0(Success)。
+     * 这会把「上一句 syscall 失败的真实原因」抹掉，上层拿到假错误码，
+     * 排查时看到的 errno 与内核实际返回的对不上。
+     */
+    int saved_errno = errno;
+
+    if (path == NULL || path[0] == '\0')
+        path = "/tmp/bxroot-diag.log";
+    /*
+     * ★ 用裸 open/write 而不是 fopen（2026-10-24）★
+     *
+     * fopen 会走本进程装的 open 钩子 → 路径被翻译成 <rootfs>/tmp/...。
+     * 而 runtime 初始化阶段 rootfs 可能还没确定，翻译结果不可预测；
+     * 更糟的是翻译失败时 fopen 直接返回 NULL，日志静默丢失。
+     *
+     * 这里要的是「无论如何都能写下一行」，所以用 syscall 绕开所有钩子，
+     * 写宿主视角的原始路径。用户从 guest 里看是同一个 /tmp（bxroot
+     * 默认把宿主 /tmp 绑到 guest /tmp 的情形除外，那时两边都能看到）。
+     */
+    /*
+     * ★ 大小上限 + 单份轮转（2026-10-31 真机实测）★
+     *
+     * 原实现只 append，从不截断也不轮转。实测：每条命令平均增长 2089
+     * 字节，28 个 APK 代次累积到 8.4 MB / 84486 行，且没有任何上限。
+     * 在磁盘吃紧的设备上会持续吞空间。
+     *
+     * 策略：超过上限就把当前文件改名成 "<path>.1"（覆盖旧的那份），
+     * 再以 O_TRUNC 新建。只保留一份历史，总量恒定为 2×上限。
+     *
+     * 用裸 syscall 而非 rename()：本函数刻意绕开所有钩子（见上文），
+     * 走 libc 会再次进路径翻译。
+     *
+     * 失败一律静默忽略 —— 诊断设施本身不能成为新的故障源。
+     */
+    {
+        struct stat dst;
+        if (syscall(SYS_newfstatat, AT_FDCWD, path, &dst, 0) == 0 &&
+            dst.st_size > (off_t)PX_DIAG_MAX_BYTES) {
+            char rot[PX_PATH_MAX];
+            int rn = snprintf(rot, sizeof(rot), "%s.1", path);
+            if (rn > 0 && (size_t)rn < sizeof(rot)) {
+                (void)syscall(SYS_renameat, AT_FDCWD, path, AT_FDCWD, rot);
+            }
+        }
+    }
+    {
+        int fd = (int)syscall(SYS_openat, AT_FDCWD, path,
+                              O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        char buf[1024];
+        int n = -1;
+        int open_errno = (fd < 0) ? errno : 0;
+
+        va_start(ap, fmt);
+        n = vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        /* n >= 0：空格式串也必须输出空行，否则连下面的 OPEN FAILED 提示一起被吞 */
+        if (n >= 0) {
+            size_t len = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1;
+            /*
+             * ★ stderr 只在「值得打扰用户」时才写（2026-10-26）★
+             *
+             * 实测：一段 init 会往 fd 2 写 17 行，而 px_diag 是无条件调用的
+             * —— 未开 BXROOT_VERBOSE 也照写。后果：任何 `cmd 2>err`、
+             * 守护进程、CI 日志都会被容器噪声污染；guest 里每条命令的
+             * stderr 都混进一堆 [bxroot] 行。
+             *
+             * 现在分两级：
+             *   明细（selftest 各项、路径回显）→ 只进文件
+             *   故障（FAIL / OPEN FAILED）→ 文件 + stderr
+             * 判据用 g_diag_quiet：由 px_diag_set_quiet() 切换，
+             * init 进入时置 1、打完「selftest 结论」那行再置 0。
+             */
+            if (!g_diag_quiet) {
+                (void)!syscall(SYS_write, 2, "[bxroot] ", 9);
+                (void)!syscall(SYS_write, 2, buf, len);
+                (void)!syscall(SYS_write, 2, "\n", 1);
+            }
+            if (fd >= 0) {
+                (void)!syscall(SYS_write, fd, buf, len);
+                (void)!syscall(SYS_write, fd, "\n", 1);
+            } else {
+                /* 文件写不进时提示一次，附 errno —— 否则日志静默丢失无法察觉 */
+                static int warned;
+                if (!warned) {
+                    char eb[128];
+                    int en = snprintf(eb, sizeof(eb),
+                                      "[bxroot] diag file OPEN FAILED %s errno=%d(%s)\n",
+                                      path, open_errno, strerror(open_errno));
+                    warned = 1;
+                    if (en > 0)
+                        (void)!syscall(SYS_write, 2, eb,
+                                       (size_t)en < sizeof(eb) ? (size_t)en : sizeof(eb) - 1);
+                }
+            }
+        }
+        if (fd >= 0)
+            (void)syscall(SYS_close, fd);
+    }
+    (void)f;
+    errno = saved_errno;   /* 恢复调用方的 errno，见函数开头的说明 */
+}
+
 int px_runtime_init(void)
 {
     const char *v;
@@ -2833,6 +3045,304 @@ int px_runtime_init(void)
     }
     g_rt_ready = 1;
     memset(&g_rt_cfg, 0, sizeof(g_rt_cfg));
+
+    /* init 阶段全部明细只写文件，stderr 留给 selftest 结论与故障行 */
+    g_diag_quiet = 1;
+    px_diag("=== bxroot runtime init (pid=%ld) ===", (long)syscall(SYS_getpid));
+    px_diag("  LD_PRELOAD=%s", getenv("LD_PRELOAD") ? getenv("LD_PRELOAD") : "(unset)");
+    px_diag("  BXROOT_ULX_PATH=%s", getenv("BXROOT_ULX_PATH") ? getenv("BXROOT_ULX_PATH") : "(unset)");
+    px_diag("  BXROOT_ULX_LDSO=%s", getenv("BXROOT_ULX_LDSO") ? getenv("BXROOT_ULX_LDSO") : "(unset)");
+    px_diag("  PROROOT_TRAMPOLINE_PATH=%s", getenv("PROROOT_TRAMPOLINE_PATH") ? getenv("PROROOT_TRAMPOLINE_PATH") : "(unset)");
+    px_diag("  BXROOT_ROOTFS=%s", getenv("BXROOT_ROOTFS") ? getenv("BXROOT_ROOTFS") : "(unset)");
+
+    /*
+     * 立刻把 trampoline 配置抄进静态缓存 —— 此刻 environ 还是父进程给的，
+     * 值一定在。之后无论上层怎么清空环境，exec 钩子都能用。
+     */
+    px_tramp_cfg_cache();
+    px_diag("  [cached] ulx=%s ldso=%s",
+            s_cfg_ulx[0] ? s_cfg_ulx : "(empty)",
+            s_cfg_ldso[0] ? s_cfg_ldso : "(empty)");
+
+
+    /*
+     * ============================================================
+     * 启动自检（2026-10-26）
+     * ============================================================
+     *
+     * 【为什么要有自检】此前排障全靠人肉加诊断、重打包、等用户回传，
+     * 一轮 20 分钟以上，且经常因为缺一项信息而重来。这里在 init 时
+     * 一次性把所有**可静态判定**的前置条件都测一遍，把结果写进日志：
+     * 任何一项 FAIL 都能直接指出该修哪里，不用再猜。
+     *
+     * 只测事实，不做推测：每一项都是真实 stat/access/open 的返回值。
+     */
+    {
+        int nfail = 0;
+        char self[PX_PATH_MAX];
+        struct stat st;
+
+        /* 明细只进文件，不污染 stderr（结论那行再放出来） */
+        g_diag_quiet = 1;
+        long th;
+
+        px_diag("  --- selftest ---");
+
+        /* [1] 自身库路径：trampoline/preload 推导的基础 */
+        self[0] = '\0';
+        if (px_self_lib_path_fwd(self, sizeof(self)))
+            px_diag("    [1] self-lib      OK   %s", self);
+        else {
+            px_diag("    [1] self-lib      FAIL dladdr 拿不到自身绝对路径");
+            nfail++;
+        }
+
+        /* [2] ULX 文件存在性检查。s_cfg_ulx 可能是宿主 /data/app 路径；
+         * 经 LD_PRELOAD 的 stat() 会把它当 guest 路径再拼 rootfs，造成假 ENOENT。
+         * 用裸 newfstatat 检查实际文件，避免自检被路径翻译层污染。 */
+        long ulx_stat_rc = 0;
+        if (s_cfg_ulx[0] == '\0') {
+            px_diag("    [2] ulx           FAIL 未解析出路径");
+            nfail++;
+        } else if ((ulx_stat_rc = px_nraw(SYS_newfstatat, AT_FDCWD,
+                                          (long)(uintptr_t)s_cfg_ulx,
+                                          (long)(uintptr_t)&st, 0)) < 0) {
+            int e = (int)-ulx_stat_rc;
+            px_diag("    [2] ulx           FAIL raw stat(%s) errno=%d(%s)",
+                    s_cfg_ulx, e, strerror(e));
+            nfail++;
+        } else if (!S_ISREG(st.st_mode)) {
+            /* 原判据只看 S_IXUSR：目录/设备/FIFO 都能过（实测目录报 OK） */
+            px_diag("    [2] ulx           FAIL 不是普通文件 mode=%o %s",
+                    (unsigned)st.st_mode, s_cfg_ulx);
+            nfail++;
+        } else if (access(s_cfg_ulx, X_OK) != 0 &&
+                   px_nraw(SYS_faccessat, AT_FDCWD, (long)(uintptr_t)s_cfg_ulx,
+                           X_OK, 0) != 0) {
+            /*
+             * 用 access(X_OK) 而不是 (mode & S_IXUSR)：
+             * S_IXUSR 只测**属主**执行位，对「非属主但有组/其他执行位」
+             * 的文件会误报 FAIL；noexec 挂载点、SELinux 拒绝这类真实
+             * 故障又测不出来。
+             *
+             * ★ 为什么要试两条（2026-10-26）★
+             * 本库自己 hook 了 access（preload.c），对宿主路径会二次加
+             * rootfs 前缀 → 假 FAIL；而 px_nraw 的真裸 svc 在**嵌套**环境
+             * 下又看不到容器路径（实测 /tmp/ffmpeg 裸 svc 也 ENOENT）。
+             * 两者互补：任一条成功即认为可执行，都失败才判 FAIL。
+             */
+            px_diag("    [2] ulx           FAIL 不可执行 access=%d raw=%d %s",
+                    access(s_cfg_ulx, X_OK),
+                    (int)px_nraw(SYS_faccessat, AT_FDCWD,
+                                 (long)(uintptr_t)s_cfg_ulx, X_OK, 0),
+                    s_cfg_ulx);
+            nfail++;
+        } else {
+            px_diag("    [2] ulx           OK   %ld bytes mode=%o %s",
+                    (long)st.st_size, (unsigned)st.st_mode, s_cfg_ulx);
+        }
+
+        /* [3] LDSO：guest 的 PT_INTERP，必须存在且可读 */
+        if (s_cfg_ldso[0] == '\0') {
+            px_diag("    [3] ldso          FAIL 未解析出路径");
+            nfail++;
+        } else if (stat(s_cfg_ldso, &st) != 0) {
+            px_diag("    [3] ldso          FAIL stat(%s) errno=%d(%s)",
+                    s_cfg_ldso, errno, strerror(errno));
+            nfail++;
+        } else if (!S_ISREG(st.st_mode)) {
+            px_diag("    [3] ldso          FAIL 不是普通文件 mode=%o %s",
+                    (unsigned)st.st_mode, s_cfg_ldso);
+            nfail++;
+        } else if (access(s_cfg_ldso, R_OK) != 0 &&
+                   px_nraw(SYS_faccessat, AT_FDCWD, (long)(uintptr_t)s_cfg_ldso,
+                           R_OK, 0) != 0) {
+            /* ld.so 由内核 mmap 当解释器：需要 R_OK，**不需要** X_OK */
+            px_diag("    [3] ldso          FAIL 不可读 access=%d raw=%d %s",
+                    access(s_cfg_ldso, R_OK),
+                    (int)px_nraw(SYS_faccessat, AT_FDCWD,
+                                 (long)(uintptr_t)s_cfg_ldso, R_OK, 0),
+                    s_cfg_ldso);
+            nfail++;
+        } else {
+            px_diag("    [3] ldso          OK   %ld bytes %s",
+                    (long)st.st_size, s_cfg_ldso);
+        }
+
+        /*
+         * [9] ULX 是否在 apk_data_file 下（2026-10-26 新增）
+         *
+         * 这是 trampoline 能否工作的**决定性条件**：
+         *   /data/app/<pkg>/lib/arm64/  = apk_data_file
+         *       -> (allow appdomain apk_data_file (file (... execute
+         *          execute_no_trans)))  → appdomain 覆盖所有 app 域 → 可 execve
+         *   /data/data/<pkg>/...        = app_data_file
+         *       -> targetSdk>=29 的域没有 execute_no_trans → execve 恒 EACCES
+         *
+         * 所以 ULX 必须在 nativeLibraryDir 下。若这一项报 FAIL，
+         * 「trampoline 配置全对但仍然 EACCES」就得到解释了。
+         */
+        if (s_cfg_ulx[0] == '\0') {
+            px_diag("    [9] ulx-selinux   SKIP 未解析出 ulx 路径");
+        } else if (strstr(s_cfg_ulx, "/data/app/") != NULL) {
+            px_diag("    [9] ulx-selinux   OK   apk_data_file（可 execve）%s", s_cfg_ulx);
+        } else if (strstr(s_cfg_ulx, "/data/data/") != NULL ||
+                   strstr(s_cfg_ulx, "/data/user/") != NULL) {
+            px_diag("    [9] ulx-selinux   FAIL app_data_file（targetSdk>=29 无 execute_no_trans，execve 必 EACCES）%s",
+                    s_cfg_ulx);
+            nfail++;
+        } else {
+            px_diag("    [9] ulx-selinux   WARN 不在 /data/app 也不在 /data/data，需人工确认标签 %s",
+                    s_cfg_ulx);
+        }
+
+        /*
+         * [4] rootfs 目录
+         *
+         * ★ 2026-10-26 修复：原判据永远不成立 ★
+         *
+         * 原实现读 g_rt_cfg.have_rootfs，但该字段要到自检**之后**的
+         * 3133 行才赋值（g_rt_cfg 在 2938 被 memset 清零）→ 恒为 0
+         * → 恒走 WARN 分支，整个 FAIL 分支是死代码。
+         * 实测三种环境（未设 / 存在的路径 / 不存在的路径）输出完全一样，
+         * 也就是说「rootfs 写错」这个最常见的手工配置错误永远发现不了。
+         *
+         * 改为直接读环境变量（自检只依赖 getenv，无副作用，可安全提前）。
+         */
+        {
+            const char *rf = getenv("BXROOT_ROOTFS");
+            if (rf == NULL || rf[0] == '\0')
+                rf = getenv("PROROOT_ROOTFS");
+            if (rf == NULL || rf[0] == '\0') {
+                px_diag("    [4] rootfs        WARN 未设置（某些路径翻译会退化）");
+            } else if (stat(rf, &st) != 0) {
+                px_diag("    [4] rootfs        FAIL stat(%s) errno=%d(%s)",
+                        rf, errno, strerror(errno));
+                nfail++;
+            } else if (!S_ISDIR(st.st_mode)) {
+                px_diag("    [4] rootfs        FAIL 不是目录 mode=%o %s",
+                        (unsigned)st.st_mode, rf);
+                nfail++;
+            } else {
+                px_diag("    [4] rootfs        OK   %s", rf);
+            }
+        }
+
+        /* [5] 线程数：多线程 fork 后 malloc 可能死锁，必须知道 */
+        th = px_self_thread_count();
+        if (th == 1)
+            px_diag("    [5] threads       OK   1（fork 后 malloc 安全）");
+        else
+            px_diag("    [5] threads       WARN %ld（fork 后禁止 malloc）", th);
+
+        /* [6] /proc/self/exe：反推 rootfs 的最后手段 */
+        {
+            char exe[PX_PATH_MAX];
+            /*
+             * 必须用裸 syscall：本库 hook 了 readlink，走 libc 会拿到
+             * **guest 视角**的路径（/usr/local/bin/node），那是伪装值，
+             * 日志里看着正常但反推不出 rootfs —— 会误导排查。
+             */
+            ssize_t en = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                          "/proc/self/exe", exe,
+                                          sizeof(exe) - 1);
+            if (en > 0) {
+                exe[en] = '\0';
+                px_diag("    [6] self-exe      OK   %s (host view)", exe);
+            } else {
+                px_diag("    [6] self-exe      WARN readlink errno=%d(%s)",
+                        errno, strerror(errno));
+            }
+        }
+
+        /*
+         * [7] 诊断文件**真的**可写吗（2026-10-26 修正）
+         *
+         * 原实现只读环境变量就打印 OK —— 是假 OK。实测：proroot 嵌套下
+         * 裸 syscall 写任何容器路径都 ENOENT，但它照样报 OK，误导排查方向。
+         * 这里真的 openat 一次看结果。
+         */
+        {
+            const char *dp = getenv("BXROOT_DIAG_FILE");
+            int tfd;
+            if (dp == NULL || dp[0] == '\0') dp = "/tmp/bxroot-diag.log";
+            tfd = (int)syscall(SYS_openat, AT_FDCWD, dp,
+                               O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+            if (tfd >= 0) {
+                (void)syscall(SYS_close, tfd);
+                px_diag("    [7] diag-file     OK   %s", dp);
+            } else {
+                px_diag("    [7] diag-file     FAIL openat errno=%d(%s) %s",
+                        errno, strerror(errno), dp);
+                nfail++;
+            }
+        }
+
+        /*
+         * [8] 环境指纹（2026-10-26）
+         *
+         * 判据：用户态路径虚拟化存在时，裸 svc 与 libc 看到的是**不同**的根。
+         * 这一条让每份日志自带环境类型，以后不必再靠猜「当前是嵌套还是独立」。
+         *    kernel  = 虚拟化在内核里（chroot/mount ns）→ 裸 svc 正确
+         *    no-virt = 没有任何虚拟化 → 裸 svc 与 libc 等价
+         *    userspace = 有 LD_PRELOAD 式路径钩子 → 裸 svc 落到宿主命名空间
+         */
+        {
+            struct stat rs_raw, rs_libc;
+            int raw_ok, libc_ok, same;
+            /*
+             * ★ 必须用 px_nraw（真裸 svc），不能用 syscall() ★
+             *
+             * syscall() 在本项目里**本身就是钩子**（syscall_guard.c:1343
+             * 导出 T syscall，其路径表含 openat/newfstatat）。proc.c 与它
+             * 编在同一个 .so，PLT 解析会落到钩子上 —— 于是「裸」和 libc 的
+             * stat 走同一套翻译，dev/ino 恒相同，本项**恒判 none**。
+             *
+             * 实测：本容器真裸 svc stat("/") = dev 65037 ino 66，
+             * libc stat("/") = dev 65086 ino 7340711（不同）；而用 syscall()
+             * 的旧实现打印的却是 none。这一项想抓的正是这个差异。
+             */
+            raw_ok = (px_nraw(SYS_newfstatat, AT_FDCWD, (long)(uintptr_t)"/",
+                              (long)(uintptr_t)&rs_raw, 0) == 0);
+            libc_ok = (stat("/", &rs_libc) == 0);
+            same = (raw_ok && libc_ok && rs_raw.st_dev == rs_libc.st_dev &&
+                    rs_raw.st_ino == rs_libc.st_ino);
+            if (!raw_ok || !libc_ok)
+                px_diag("    [8] virt          unknown (stat 失败 raw=%d libc=%d)",
+                        raw_ok, libc_ok);
+            else if (same)
+                px_diag("    [8] virt          none (真裸 svc 与 libc 同根)");
+            else
+                px_diag("    [8] virt          userspace (真裸 svc 落在宿主: dev %lu vs %lu, ino %lu vs %lu)",
+                        (unsigned long)rs_raw.st_dev, (unsigned long)rs_libc.st_dev,
+                        (unsigned long)rs_raw.st_ino, (unsigned long)rs_libc.st_ino);
+        }
+
+        /*
+         * ★ 结论行默认也只进文件（2026-10-31 真机实测）★
+         *
+         * 原实现无条件 g_diag_quiet = 0 后再打结论行，导致**每个进程 exec
+         * 后都往子进程 fd 2 写一行** "[bxroot]   --- selftest PASS ---"。
+         * 后果：`cmd 2>&1 | jq`、`2>&1 | grep -c error`、把 stderr 当结构化
+         * 错误通道的脚本全部被打断；stdout 反而是干净的。
+         *
+         * 更要紧的是：这里复位成 0 之后**再也没复位回 1**，于是后续
+         * execve-ENTRY / ctl=… fd7=… 这类内部调试行也全部漏到 stderr。
+         *
+         * 现在分两级：
+         *   PASS      → 只进 diag 文件（正常路径不该有 stderr 输出）
+         *   HAS-FAILURE → 文件 + stderr（真故障必须让用户看见）
+         *
+         * 需要完整明细时用 BXROOT_VERBOSE=1。
+         */
+        if (nfail != 0) {
+            g_diag_quiet = 0;
+            px_diag("  --- selftest %s (fail=%d) ---", "HAS-FAILURE", nfail);
+        } else {
+            px_diag("  --- selftest PASS (fail=0) ---");
+        }
+        g_diag_quiet = 1;   /* 后续内部调试行一律只进文件 */
+    }
 
     px_cfg_bool(&g_rt_cfg.verbose, getenv("BXROOT_VERBOSE"));
     if (!g_rt_cfg.verbose) {
@@ -3055,6 +3565,33 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
         kv[n].mode = PX_ENV_SET;
         n++;
     }
+    /*
+     * ★ ULX trampoline 配置必须强制传给子进程（DSHA 真机 spawn EACCES）★
+     *
+     * 【缺陷（实测，bxroot 版 DSHA）】顶层 node 正常启动，但它 spawn
+     * 子进程时报 `spawn /usr/local/bin/node EACCES`。
+     *
+     * 【根因】launcher 在 try_exec_via_ulx() 里 setenv BXROOT_ULX_PATH /
+     * BXROOT_ULX_LDSO 后以 syscall(SYS_execve, ulx, nv, environ) 启动 ULX，
+     * 所以**顶层**进程的 environ 里这两个变量齐全。但 px_build_forced()
+     * 构造子进程 envp 的强制项里没有它们 —— 只有 LD_PRELOAD /
+     * PROROOT_ROOTFS / BXROOT_LD_PRELOAD / BXROOT_GUEST_EXE /
+     * BXROOT_ORIG_COMM。于是子进程 px_tramp_cfg() 读到 NULL →
+     * px_trampoline_spawn() 直接 return -1 → 回退 real_posix_spawn →
+     * 直接 exec 翻译后的 /data/data/<pkg>/files/... 路径。
+     * 而该目录 SELinux 标签是 app_data_file，**我们的 app 域没有
+     * app_data_file:file execute_no_trans 权限**（targetSdk>=29 所致）。
+     *
+     * 也就是说：顶层能用是因为 launcher 直接进 ULX（同进程 mmap 跳转，
+     * 不经内核 execve）；一旦子进程丢了 trampoline 配置，就必然落到
+     * 那条走不通的直 execve 路径。
+     *
+     * 【修法】把两个变量按「容器自身运行所需配置」强制注入子进程环境，
+     * 与 BXROOT_ROOTFS 同等级。只在变量已存在时注入（launcher 设过，
+     * 顶层必有），不凭空造值；不启用 BXROOT_AUTO_HOST，避免 PATH 改写等
+     * 副作用；proroot 场景走 PROROOT_TRAMPOLINE_PATH 分支，优先级更高，
+     * 不受影响。
+     */
 
     /*
      * ★ BXROOT_GUEST_EXE：**每次 exec 都更新**为当次的目标（上游语义）★
@@ -3133,6 +3670,87 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
         kv[n].mode = PX_ENV_SET;
         n++;
     }
+    /*
+     * ★ ULX trampoline 配置必须强制传给子进程（DSHA 真机 spawn EACCES）★
+     *
+     * 【缺陷（实测，bxroot 版 DSHA）】顶层 node 正常启动，但它 spawn
+     * 子进程时报 `spawn /usr/local/bin/node EACCES`。
+     *
+     * 【根因】launcher 在 try_exec_via_ulx() 里 setenv BXROOT_ULX_PATH /
+     * BXROOT_ULX_LDSO 后以 syscall(SYS_execve, ulx, nv, environ) 启动 ULX，
+     * 所以**顶层**进程的 environ 里这两个变量齐全。但 px_build_forced()
+     * 构造子进程 envp 的强制项里没有它们。于是子进程 px_tramp_cfg() 读到
+     * NULL → px_trampoline_spawn() 直接 return -1 → 回退 real_posix_spawn
+     * → 直接 exec 翻译后的 /data/data/<pkg>/files/... 路径。而该目录
+     * SELinux 标签是 app_data_file，**我们的 app 域没有 execute_no_trans
+     * 权限**（targetSdk>=29）。
+     *
+     * 顶层能用是因为 launcher 直接进 ULX（同进程 mmap 跳转，不经内核
+     * execve）；子进程一旦丢了 trampoline 配置，就必然落到走不通的直
+     * execve 路径。
+     *
+     * 【为什么放在**最后**】容量必须优先给身份/loader 等硬性条目；ULX
+     * 配置是"锦上添花"（缺了会退回直 execve），但它缺了就等于整条子
+     * 进程链断掉，所以**必须显式失败而不是静默丢弃** —— 这正是本缺陷
+     * 被掩盖两轮的原因（cap=7 恰好等于旧条目数，`n < cap` 恒假）。
+     *
+     * 【本次修法】
+     *   1. 调用点 cap 从硬编码 7 改为 PX_FORCED_MAX，留出余量；
+     *   2. 这里注入失败时返回 -1，让上层明确报错，而不是产出缺配置的
+     *      envp 让子进程静默崩在 EACCES 上；
+     *   3. 只在变量已存在时注入（launcher 设过，顶层必有），不凭空造值；
+     *      不启用 BXROOT_AUTO_HOST，避免 PATH 改写等副作用；proroot 走
+     *      PROROOT_TRAMPOLINE_PATH 分支，优先级更高，不受影响。
+     */
+    {
+        const char *const ulx_names[] = {"BXROOT_ULX_PATH", "BXROOT_ULX_LDSO"};
+        const char *const ulx_fallback[] = { s_cfg_ulx, s_cfg_ldso };
+        size_t i;
+        for (i = 0; i < sizeof(ulx_names) / sizeof(ulx_names[0]); i++) {
+            /*
+             * 取值顺序（2026-10-26）：
+             *   1) 当前 environ（顶层进程走这条）
+             *   2) init 期缓存 s_cfg_ulx / s_cfg_ldso
+             *
+             * 【为什么必须有第 2 条】真机实测：PTC worker 的 environ 里
+             * 这两个变量已被上层删除（PTC 把非启动变量全设 undefined），
+             * 于是原来只读 getenv 的写法直接 continue —— **一条都不注入**。
+             * 而本进程 init 时已经把值抄进了 static 缓存，那里有货。
+             *
+             * 注意 static 缓存跨 execve 不保留（新进程重新 init），
+             * 所以这条只在「同进程内 init 之后 exec」时救场；
+             * 跨 exec 的场景靠第 1 条（envp 继承）。
+             */
+            const char *value = getenv(ulx_names[i]);
+            if (value == NULL || value[0] == '\0')
+                value = ulx_fallback[i];
+            if (value == NULL || value[0] == '\0')
+                continue;               /* 两条来源都空：确实未启用 trampoline */
+            if (n >= cap)
+                return -1;              /* 容量不足必须可见，不得静默丢弃 */
+            /*
+             * ★ 值若只来自缓存，必须同时写回 environ（2026-10-26）★
+             *
+             * 【为什么】kv[] 只用于**本次** exec 的子进程 envp。
+             * 若本进程是刚 exec 出来的 worker（static 缓存空、environ 也空），
+             * 我们靠 dladdr 推导把缓存填上后，本次 exec 的子进程能拿到值；
+             * 但**孙进程**又是全新镜像，缓存从零重建 —— 若它那时推导不出来，
+             * 就彻底断了。写回 environ 让「本代已知」变成「可继续向下传播」，
+             * 这样即使推导链断一次，也还有 envp 继承兜着。
+             *
+             * 只在 getenv 为空时才 setenv：不改动调用方已有的值。
+             */
+            /* The forced entry reaches this exec; do not mutate environ in a
+             * fork child, where an inherited environment lock can deadlock. */
+            if (!g_after_fork_child && getenv(ulx_names[i]) == NULL &&
+                setenv(ulx_names[i], value, 1) != 0)
+                return -1;
+            kv[n].name = ulx_names[i];
+            kv[n].value = value;
+            kv[n].mode = PX_ENV_SET;
+            n++;
+        }
+    }
     return (int)n;
 }
 
@@ -3154,7 +3772,22 @@ static int px_build_forced(const px_rtconfig *cfg, px_env_kv *kv, size_t cap,
  * 返回 -1 让调用方失败，而不是静默丢条目 —— 丢 `PATH` 或
  * `PROROOT_TRAMPOLINE_PATH` 会让子进程起不来，且原因极难定位。
  */
+/*
+ * forced[] 容量。
+ *
+ * 各段上限（2026-10-26 复核）：
+ *   px_build_forced  最多 8 条（含 BXROOT_ULX_PATH / BXROOT_ULX_LDSO）
+ *   AUTO_HOST 分支   2 条（PATH + BXROOT_AUTO_HOST）+ 13 个透传名 = 15
+ *   native session   最多 4 条（BXROOT_SESSION_FD/ENTER/REENTRY/GUEST_PATH）
+ *   合计最坏 27 条
+ *
+ * 下面这条静态断言把「数一遍」变成「编译期保证」—— 以后谁往上面任何一段
+ * 加变量，超出 32 会直接编译失败，而不是运行时静默丢条目（那会表现为
+ * 「子进程莫名其妙缺一个环境变量」，极难定位）。
+ */
 #define PX_FORCED_MAX 32
+#define PX_FORCED_ITEMS_MAX 27
+typedef char px_forced_cap_check[(PX_FORCED_MAX >= PX_FORCED_ITEMS_MAX) ? 1 : -1];
 
 static int px_forced_push(px_env_kv *tab, int cap, int n, px_env_kv kv)
 {
@@ -3169,8 +3802,42 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
 {
     px_env_kv forced[PX_FORCED_MAX];  /* identity + native PATH/config + guest loader */
     char *native_path = NULL;
-    const char *const *src = envp != NULL ? (const char *const *)envp
-                                        : (const char *const *)environ;
+    /*
+     * ★★ src 必须在 px_build_forced() 之后才取值（崩溃修复，2026-10-26）★★
+     *
+     * 原实现在这里（函数入口）就把 src 定为 environ / 调用方 envp。
+     * 而 px_build_forced() 在当前 environ 里没有
+     * BXROOT_ULX_PATH / BXROOT_ULX_LDSO 时，会用 static 缓存回写
+     * setenv()；glibc 在 environ 数组**没有空位**时会 realloc
+     * 整个数组并 free 旧块。于是入口取到的 src 成为
+     * **悬垂指针**，px_env_build(src, ...) 遍历时 SIGSEGV（实测 pc
+     * 落在 px_env_build 的 ldrb w0,[x20]，fault 地址恰好等于
+     * environ 基址）。
+     *
+     * 为什么很难定位：realloc 只在"数组已满"时发生，而是否已满
+     * 取决于环境条目数与是否命中缓存回写分支，所以表现为
+     * "偶发"，且只在部分启动形态下复现。
+     *
+     * 修法：**只在 px_build_forced() 之后取值**。envp 指向调用方自己的
+     * 数组，不受 setenv 影响；environ 在那时已是稳定的最新数组。
+     *
+     * 回归：test/RUN_SYSTEM_ENV.sh（必须用默认启动形态 —— 用
+     * BXROOT_RUN_RUNTIME 指定宿主侧 runtime 时不复现，这正是它
+     * 长期未被发现的原因）。
+     */
+    const char *const *src;
+    /*
+     * ★ 入口就记下"envp 是不是 environ 本体"（崩溃修复，2026-10-26）★
+     *
+     * 调用方常写 execve(p, argv, environ)，于是 envp 就是 environ
+     * 数组本身。px_build_forced() 会 setenv()；glibc 在数组无空位时
+     * realloc 并 free 旧块 —— 那个指针就悬垂了。
+     *
+     * 必须在调 px_build_forced() **之前**做这个比较（那时 environ
+     * 还是原块），之后再用结果决定取哪个指针。
+     */
+    int envp_is_environ = (envp != NULL &&
+                           (const char *const *)envp == (const char *const *)environ);
     px_envpolicy pol;
     int nf;
 
@@ -3186,9 +3853,52 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
         return -1;
     }
 
-    nf = px_build_forced(&g_rt_cfg, forced, 7, g_exec_guest_exe, g_exec_orig_comm);
+    /* ★ cap 必须 ≥ px_build_forced 实际条目数（2026-10-24）★
+     *
+     * 原值 7 正好等于当时的条目数，于是任何新增强制项都会因为
+     * `n < cap` 恒假而**静默丢失** —— 这正是 spawn EACCES 修复被
+     * 吞掉的原因：注入的 BXROOT_ULX_PATH/BXROOT_ULX_LDSO 从未写入。
+     * 留出余量并保证后续新增项能进来。 */
+    nf = px_build_forced(&g_rt_cfg, forced, PX_FORCED_MAX, g_exec_guest_exe, g_exec_orig_comm);
     if (nf <= 0) {
         return -1;
+    }
+
+    /* ★ 现在才取 src：上一步可能 setenv → environ realloc（见函数头部）。
+     * envp 若当初就是 environ，必须重新取 environ（旧指针已失效）。 */
+    src = (envp != NULL && !envp_is_environ)
+              ? (const char *const *)envp
+              : (const char *const *)environ;
+
+    /*
+     * ★ 调用方显式给了另一个 BXROOT_ROOTFS：值会被下面的强制项覆盖（D3，2026-10-31）★
+     *
+     * 这是设计（见 px_build_forced 与 preload.c FR_CRITICAL_ENV：容器正确性
+     * 优先于调用方意愿），但此前**静默**——用户 export 另一个 rootfs、甚至
+     * 不存在的路径，子进程照旧看到原 rootfs，没有任何提示。切换 rootfs 的
+     * 正确做法是嵌套启动 launcher（libbxroot.so -r <rootfs> …）。
+     * 行为不变，只告警：每进程一次，裸 write(2)（可能处在 fork 子进程里，
+     * 不碰 stdio / malloc / 区域设置锁）。
+     */
+    if (g_rt_cfg.have_rootfs) {
+        static int s_rootfs_warned;
+        const char *want = px_env_lookup(src, "BXROOT_ROOTFS");
+
+        if (!s_rootfs_warned && want != NULL && want[0] != '\0' &&
+            strcmp(want, g_rt_cfg.rootfs) != 0) {
+            const char *const part[] = {
+                "[bxroot] warning: BXROOT_ROOTFS=", want,
+                " is ignored; this container's rootfs is ", g_rt_cfg.rootfs,
+                ". To use another rootfs, start a nested launcher: "
+                "libbxroot.so -r <rootfs> <cmd>\n"
+            };
+            size_t k;
+
+            s_rootfs_warned = 1;
+            for (k = 0; k < sizeof(part) / sizeof(part[0]); k++)
+                (void)px_nraw(SYS_write, 2, (long)(uintptr_t)part[k],
+                              (long)strlen(part[k]), 0);
+        }
     }
 
     if (px_auto_host()) {
@@ -3282,7 +3992,7 @@ int px_runtime_build_env(char *const envp[], px_envout *out)
          * （`px_trampoline_exec` / `px_trampoline_spawn`）正是靠这两个
          * 变量决定「要不要走 bridge」。变量为空 → 它们直接返回 -1
          * → 回退到「直接 execve 翻译后的宿主路径」→ 而 guest 可执行
-         * 文件位于 /data/data（SELinux `app_data_file`，内核禁止执行），
+         * 文件位于 /data/data（SELinux `app_data_file`，本 app 域无 execute_no_trans），
          * 必然失败。
          *
          * 也就是说：**子进程那一层 exec 失败，根因不在 trampoline
@@ -3444,14 +4154,19 @@ static void px_atfork_parent(void)
 
 static void px_atfork_child(void)
 {
+    g_after_fork_child = 1;
     /*
      * 顺序：放锁 → 失效 pid 缓存 → 重置账本。
      * 反过来（先查账本）会自锁，正是我们要修的那个死锁。
      */
     px_forkguard_child(&g_rt_guard, g_rt_ledger);
     g_cached_self_pid = 0;          /* 我的 pid 变了 */
-    /* 子进程把自己登记进账本（它继承了父进程的账本副本） */
-    (void)px_ledger_add(g_rt_ledger, px_self_pid(), 0, PX_TAG_SELF);
+    /*
+     * 不在 atfork child 中登记自身：px_ledger_add 可能触发 compact/grow
+     * 并调用 calloc/free；这条路径处于消失线程的 post-fork 状态，
+     * 任何 allocator 锁都可能让 execvp 永久等待。子进程随后会 exec，
+     * 父进程的 fork wrapper 已负责登记真实 child pid。
+     */
 }
 
 void px_runtime_register_self(void)
@@ -3621,15 +4336,34 @@ static void *px_dlsym(const char *name)
  * 【为什么必须这么做】
  *
  * 真实部署下 guest 可执行文件位于 `/data/data/<pkg>/files/...`，
- * 其 SELinux 标签为 `app_data_file`；**内核不允许执行该标签的文件**。
- * 实测（裸 syscall，绕开一切钩子）：
+ * 其 SELinux 标签为 `app_data_file`。**本 app 域没有该标签的
+ * file:execute_no_trans 权限**（2026-10-26 更正，详见下方）。
  *
- *     /data/data/.../ubuntu/bin/true   -> ❌ EACCES（即使 uid=0）
- *     /system/bin/sh                   -> ✅ 成功
- *     /data/app/.../lib/arm64/<任意>.so -> ✅ 成功
+ * ★ 准确机制（此前记录有误，已按真机实测更正）★
  *
- * 也就是说「翻译成宿主路径再 execve」这条路**不可能成功**，
- * 与权限、与加载器都无关。
+ * 过去这里写的是「内核禁止执行 app_data_file 标签」——**这是错的**：
+ * 内核根本不认识 app_data_file（AOSP hooks.c 里 grep 该名字 0 命中），
+ * 它是纯 SELinux 概念；而且本 app 的内核 uid 从来不是 0（fakeroot 只
+ * 伪造 getuid()，/proc/self/status 的 Uid 仍是 103xx）。
+ *
+ * 真实机制是三个**不同的权限位**：
+ *   file:execute           = mmap(PROT_EXEC) → dlopen 用，untrusted_app_all 全员都有
+ *   file:execute_no_trans  = execve() 且无域转换 → **只有** untrusted_app_25 /
+ *                            untrusted_app_27 / runas_app 有
+ *   file:execmod           = 可写映射可执行（text reloc），同上三个域
+ *
+ * 而授予哪个域由 **targetSdkVersion** 决定（AOSP seapp_contexts 的
+ * minTargetSdkVersion）：
+ *     targetSdk <= 28 → untrusted_app_27 → 有 execute_no_trans → 可 execve
+ *     targetSdk >= 29 → _29/_30/_32/untrusted_app → 无 → EACCES
+ * 这是 Android 10 (Q) 的 W^X 策略（b/112357170），至今保留 <=28 豁免。
+ *
+ * DSHA 的 targetSdk = 37，落在 untrusted_app 域 → **确实没有该权限**，
+ * 所以 trampoline 架构本身是必需的；但理由要写对，否则排查会被误导
+ * （曾据此误判为「内核级限制」，浪费了多轮排查）。
+ *
+ * 补充：与文件属主无关（SELinux 只看 subject label / object label / class）；
+ * 与内核 uid 无关。0644 的文件会因 DAC 而 EACCES，那是另一回事。
  *
  * 官方 runtime 因此改为 exec **它自己的 bridge**
  * （`PROROOT_TRAMPOLINE_PATH`，在 `/data/app/.../lib/arm64/` 下，可执行）：
@@ -3691,7 +4425,12 @@ static long px_raw_svc5(long nr, long a, long b, long c, long d, long e)
     register long x2 __asm__("x2") = c;
     register long x3 __asm__("x3") = d;
     register long x4 __asm__("x4") = e;
-    __asm__ __volatile__("svc #0"
+    __asm__ __volatile__(
+        "stp x1, x2, [sp, #-16]!\n\t"
+        "stp x3, x4, [sp, #-16]!\n\t"
+        "svc #0\n\t"
+        "ldp x3, x4, [sp], #16\n\t"
+        "ldp x1, x2, [sp], #16"
         : "+r"(x0)
         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
         : "memory", "cc");
@@ -3741,15 +4480,515 @@ static size_t px_argv_len(char *const argv[])
     return n;
 }
 
+/*
+ * ★ 从 dladdr 取本 runtime 的绝对路径（2026-10-24）★
+ *
+ * DSH 的工具执行跑在 PTC 运行时里，那里把**所有非启动变量设为 undefined**
+ * （dsh-ptc-runtime-node 的 STARTUP_ENVIRONMENT_NAMES 只有 PATH/PATHEXT/
+ * SYSTEMROOT/WINDIR/TEMP/TMP）。于是 BXROOT 与 PROROOT 前缀变量全部消失。
+ *
+ * 任何"从环境变量拿容器自身配置"的逻辑在这种环境下都拿不到值。
+ * dladdr 反查自身 .so 的绝对路径是唯一不依赖外部配置的来源。
+ *
+ * @returns 1 = 拿到绝对路径（写入 dst）；0 = 拿不到。
+ */
+static int px_self_lib_path(char *dst, size_t cap)
+{
+    Dl_info info;
+
+    if (cap == 0)
+        return 0;
+    dst[0] = '\0';
+    memset(&info, 0, sizeof(info));
+    if (dladdr((void *)(uintptr_t)&px_runtime_init, &info) == 0 ||
+        info.dli_fname == NULL || info.dli_fname[0] != '/')
+        return 0;
+    px_cfg_str(dst, cap, info.dli_fname);
+    return dst[0] == '/' ? 1 : 0;
+}
+
+/* 前向入口：让 px_tramp_cfg_cache（定义在前）能调用到本函数 */
+static int px_self_lib_path_fwd(char *dst, size_t cap)
+{
+    return px_self_lib_path(dst, cap);
+}
+
+/*
+ * init 期缓存的 trampoline 配置（2026-10-25）
+ *
+ * 【为什么必须缓存】真机日志实测（bxroot.18）：
+ *     execvp-HOOK file=/usr/local/bin/node pid=26960
+ *     trampoline: EARLY-EXIT no-config tramp=(null) linker=(null)
+ * 同一个进程的 init 块里 BXROOT_ULX_PATH / BXROOT_ULX_LDSO **都是有值的**，
+ * 但到 execvp 钩子里 getenv 却拿到 NULL。
+ *
+ * 原因是环境在"init 之后、exec 之前"被上层改写（PTC 运行时会把所有非启动
+ * 变量设成 undefined；DSH 的工具执行就跑在那个沙箱里）。于是：
+ *   - init 时能打印出值（那时 environ 还是父进程给的）
+ *   - exec 时 getenv 全空（environ 已被替换）
+ *
+ * dladdr 兜底在这条路径上也救不了：本库自己实现了 dladdr，而在没有
+ * ldso service 的早期阶段它会返回 0（见 preload.c 的自指防护）。
+ *
+ * 唯一可靠的做法：**init 时就把值抄进静态缓存**，之后无条件用缓存。
+ * 缓存的是宿主绝对路径，跨 exec 不需要重新解析。
+ */
+
+
+static void px_tramp_cfg_cache(void)
+{
+    const char *v;
+    char self[PX_PATH_MAX];
+
+    /*
+     * 第一来源：环境变量（顶层进程有值）。
+     */
+    if (s_cfg_ulx[0] == '\0') {
+        v = getenv("BXROOT_ULX_PATH");
+        if (v != NULL && v[0] != '\0')
+            px_cfg_str(s_cfg_ulx, sizeof(s_cfg_ulx), v);
+    }
+    if (s_cfg_ldso[0] == '\0') {
+        v = getenv("BXROOT_ULX_LDSO");
+        if (v != NULL && v[0] != '\0')
+            px_cfg_str(s_cfg_ldso, sizeof(s_cfg_ldso), v);
+    }
+
+    /*
+     * 第二来源：由自身库路径推导（PTC worker 唯一可靠来源）。
+     *
+     * PTC 派生 worker 时把 BXROOT_ULX_PATH / BXROOT_ULX_LDSO 从 envp 里删掉了
+     * （见 dsh-ptc-runtime-node 的 STARTUP_ENVIRONMENT_NAMES 白名单），
+     * 于是上面的 getenv 拿到 NULL。此时只能靠 dladdr 反查本库的绝对路径，
+     * 再推出同目录的 libbxroot-ulx.so。
+     */
+    /*
+     * ★ 优先用「当前真正在运行的 ULX」（2026-10-26）★
+     *
+     * 我们是被 ULX 启动的，/proc/self/exe 就是那个 ULX 的路径 —— 比
+     * 「runtime 同目录」更可靠：runtime 被单独拷到别处 preload 时，
+     * 同目录推导会给出**错误的**路径（实测：从 /tmp/libbxroot-ulx.so 启动、
+     * runtime 在 <rootfs>/tmp/rt8.so，同目录推导得到 <rootfs>/tmp/
+     * libbxroot-ulx.so —— 那个文件恰好存在，所以 access 校验也拦不住）。
+     *
+     * 必须用裸 syscall：本库 hook 了 readlink，走 libc 会拿到被伪装的
+     * guest 路径（/usr/local/bin/node）。
+     */
+    if (s_cfg_ulx[0] == '\0') {
+        char exe[PX_PATH_MAX];
+        ssize_t en = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                      "/proc/self/exe", exe, sizeof(exe) - 1);
+        if (en > 0 && (size_t)en < sizeof(exe)) {
+            const char *base;
+            exe[en] = '\0';
+            base = strrchr(exe, '/');
+            base = (base != NULL) ? base + 1 : exe;
+            if (strcmp(base, "libbxroot-ulx.so") == 0 && px_host_access_ok(exe, X_OK))
+                px_cfg_str(s_cfg_ulx, sizeof(s_cfg_ulx), exe);
+        }
+    }
+    if (s_cfg_ulx[0] == '\0' && px_self_lib_path_fwd(self, sizeof(self))) {
+        const char *slash = strrchr(self, '/');
+        if (slash != NULL) {
+            size_t dir = (size_t)(slash - self);
+            {
+                int __n = snprintf(s_cfg_ulx, sizeof(s_cfg_ulx), "%.*s/%s",
+                                   (int)dir, self, "libbxroot-ulx.so");
+                /*
+                 * 必须校验存在性（2026-10-26）：
+                 * 原来只要 snprintf 成功就采信 —— runtime 与 ulx 不同目录、
+                 * 或 runtime 是 dlopen 进来时，会往缓存里塞一个**不存在的路径**。
+                 * 假路径比空串更坏：trampoline 拿它去 exec 必然失败，
+                 * 而失败点离这里很远，极难定位。
+                 * 与下面 ldso 分支的 access() 校验保持一致：宁可空，不放假值。
+                 */
+                if (__n <= 0 || (size_t)__n >= sizeof(s_cfg_ulx) ||
+                    !px_host_access_ok(s_cfg_ulx, X_OK))
+                    s_cfg_ulx[0] = '\0';
+            }
+        }
+    }
+    if (s_cfg_ldso[0] == '\0') {
+        const char *rf = getenv("BXROOT_ROOTFS");
+        if (rf == NULL || rf[0] == '\0')
+            rf = getenv("PROROOT_ROOTFS");
+        if (rf != NULL && rf[0] != '\0') {
+            static const char *const cand[] = {
+                "/lib/ld-linux-aarch64.so.1",
+                "/usr/lib/ld-linux-aarch64.so.1",
+                "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+            };
+            size_t i;
+            /*
+             * 候选必须**真实可读**才算命中（2026-10-26）。
+             *
+             * 原实现只要 snprintf 成功就 break —— 于是候选②③永远走不到，
+             * 也不校验存在性。PTC worker 里 BXROOT_ROOTFS 被剥掉时，
+             * 缓存里会留下一个根本不存在的 ldso 路径，后续 trampoline
+             * 拿它去 exec 必然失败，且失败点离这里很远，极难定位。
+             */
+            s_cfg_ldso[0] = '\0';
+            for (i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+                char probe[PX_PATH_MAX];
+                int m = snprintf(probe, sizeof(probe), "%s%s", rf, cand[i]);
+                if (m <= 0 || (size_t)m >= sizeof(probe))
+                    continue;
+                if (!px_host_access_ok(probe, R_OK))
+                    continue;
+                px_cfg_str(s_cfg_ldso, sizeof(s_cfg_ldso), probe);
+                break;
+            }
+        }
+    }
+}
+
 static void px_tramp_cfg(const char **tramp, const char **linker)
 {
-    *tramp = getenv("PROROOT_TRAMPOLINE_PATH");
-    *linker = getenv("PROROOT_LINKER_PATH");
-    if (*tramp == NULL || (*tramp)[0] == '\0' || *linker == NULL ||
-        (*linker)[0] == '\0') {
-        *tramp = getenv("BXROOT_ULX_PATH");
-        *linker = getenv("BXROOT_ULX_LDSO");
+    int own_hint;
+    const char *own_env_tramp;
+    const char *own_env_linker;
+    static char s_ulx[PX_PATH_MAX];
+    static char s_ldso[PX_PATH_MAX];
+    static char s_rootfs[PX_PATH_MAX];
+
+    /* 缓存优先（init 期已抄好，跨 exec / 环境被清空都能用） */
+    px_tramp_cfg_cache();
+    /*
+     * 缓存优先，且**任一有值就用缓存**（2026-10-25）。
+     *
+     * 原实现要求两个都非空才用缓存，否则整段跳过、继续走 getenv。
+     * 真机上出现过 env 全空但 cache 有值的组合（fd 7 被占用那次），
+     * 结果 trampoline 拿到 NULL → EARLY-EXIT → 卡死。改成只要 ulx 有值
+     * 就用缓存里的对应项；ldso 缺失时下面还有 rootfs 拼接兜底。
+     */
+    /*
+     * ★ 取值顺序（2026-10-26 修复覆盖 bug）★
+     *
+     * 【原实现的缺陷】先把缓存值赋给 *tramp，但 ldso 为空时不 return，
+     * 紧接着 `*tramp = getenv(...)` 把缓存值**覆盖成 NULL**。
+     * 于是「缓存里明明有 ulx」却打印出 tramp=(null) —— 真机日志正是这个形状。
+     *
+     * 【正确做法】缓存值只在对应指针为空时填，绝不覆盖非空值。
+     * 两条来源分别独立回退：ulx 和 ldso 各走各的，不互相牵连。
+     */
+    *tramp = (s_cfg_ulx[0] != '\0') ? s_cfg_ulx : NULL;
+    *linker = (s_cfg_ldso[0] != '\0') ? s_cfg_ldso : NULL;
+    own_env_tramp = getenv("BXROOT_ULX_PATH");
+    own_env_linker = getenv("BXROOT_ULX_LDSO");
+    own_hint = (*tramp != NULL || *linker != NULL ||
+                (own_env_tramp != NULL && own_env_tramp[0] != '\0') ||
+                (own_env_linker != NULL && own_env_linker[0] != '\0'));
+    if (*tramp != NULL && *linker != NULL)
+        return;
+
+    /*
+     * ★ 环境来源的优先级：BXROOT_* 优先于 PROROOT_*（2026-10-26 修正）★
+     *
+     * 【原实现反了】先取 PROROOT_TRAMPOLINE_PATH，空了才取 BXROOT_ULX_PATH。
+     * 注释里的理由是「proroot 场景优先级更高」，那在**纯 proroot** 下成立。
+     *
+     * 但 bxroot 可能跑在 proroot **里面**（嵌套），此时 PROROOT_* 是**外层**
+     * 设的，指向外层的 libproroot-bridge.so —— 那个 bridge 不认识 bxroot 的
+     * rootfs，用它交接会**卡死**（无报错、不返回，正是用户报告的症状）。
+     *
+     * 真机日志形状：
+     *     PROROOT_TRAMPOLINE_PATH=/data/app/.../libproroot-bridge.so  ← 外层
+     *     [cached] ulx=/data/data/.../libbxroot-ulx.so                 ← 自己的
+     * 一旦缓存为空，就会误用外层的 bridge。
+     *
+     * 正确优先级：本容器自己的 BXROOT_ULX_* > 外层的 PROROOT_*。
+     * （缓存已经在最前面，这里只是补上环境变量这一层。）
+     */
+    {
+        const char *selected_tramp = NULL;
+        const char *selected_linker = NULL;
+        const char *outer_tramp = getenv("PROROOT_TRAMPOLINE_PATH");
+        const char *outer_linker = getenv("PROROOT_LINKER_PATH");
+        int kind = bxroot_tramp_pair_select(
+            s_cfg_ulx, s_cfg_ldso, own_hint,
+            own_env_tramp, own_env_linker,
+            NULL, NULL, outer_tramp, outer_linker,
+            &selected_tramp, &selected_linker);
+        *tramp = selected_tramp;
+        *linker = selected_linker;
+        if (kind == BXROOT_TRAMP_OWN || kind == BXROOT_TRAMP_OUTER)
+            return;
     }
+    /*
+     * ★ 环境里没有时的第三回落：从自身路径推导（2026-10-24）★
+     *
+     * 【缺陷（DSH 工具调用 spawn EACCES）】DSH 的工具执行跑在 PTC 运行时里，
+     * 那里会把**所有非启动变量设为 undefined**（见 dsh-ptc-runtime-node 的
+     * STARTUP_ENVIRONMENT_NAMES 只有 PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP）。
+     * 于是 BXROOT_ULX_PATH / BXROOT_ULX_LDSO 在子进程里**根本不存在**，
+     * 而 px_build_forced() 再怎么注入也只在"父进程有值"时才有东西可注入。
+     *
+     * 后果与丢 trampoline 配置完全一样：回退 real_posix_spawn → 直接 exec
+     * /data/data 下的 app_data_file → 内核 EACCES。
+     *
+     * 【为什么用 dladdr 而不是再加一层环境变量】
+     * 环境变量在这条链上已经不可靠（上层可以任意清空）。而 dladdr 反查
+     * 自身所在 .so 的绝对路径是**唯一不依赖外部配置**的来源 ——
+     * px_detect_self_lib() 早就为 preload 这么做了，这里同理：
+     *   ULX 与 runtime 同目录（都是 APK 的 nativeLibraryDir），
+     *   由 runtime 路径推出 ULX 路径；LDSO 则由 BXROOT_ROOTFS 拼出来。
+     *
+     * 【安全语义】只在环境两条来源都空时才启用；拿不到绝对路径就维持原状
+     * （继续返回空，调用方照旧回退），不会凭空造出错误路径。
+     */
+    {
+        Dl_info info;
+        const char *rf = getenv("BXROOT_ROOTFS");
+
+        memset(&info, 0, sizeof(info));
+        if (dladdr((void *)(uintptr_t)&px_runtime_init, &info) == 0 ||
+            info.dli_fname == NULL || info.dli_fname[0] != '/')
+            return;                      /* 拿不到自身绝对路径：保持原状 */
+
+        /*
+         * ★ 优先用「当前真正在运行的 ULX」路径（2026-10-26）★
+         *
+         * 我们是被 ULX 启动的，所以 /proc/self/exe 就是那个 ULX 的路径。
+         * 这比「runtime 同目录」更可靠 —— 二者不同目录时（例如 runtime
+         * 被单独拷到别处 preload），同目录推导会给出一个**错误的**路径。
+         *
+         * 必须用裸 syscall：本库 hook 了 readlink，走 libc 会拿到被伪装成
+         * guest 路径的值。
+         */
+        {
+            char exe[PX_PATH_MAX];
+            ssize_t en = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                          "/proc/self/exe", exe,
+                                          sizeof(exe) - 1);
+            if (en > 0 && (size_t)en < sizeof(exe)) {
+                exe[en] = '\0';
+                /* 只有当它是 libbxroot-ulx.so 才采信（本进程也可能是 launcher） */
+                {
+                    const char *base = strrchr(exe, '/');
+                    base = (base != NULL) ? base + 1 : exe;
+                    if (strcmp(base, "libbxroot-ulx.so") == 0 &&
+                        access(exe, X_OK) == 0) {
+                        px_cfg_str(s_ulx, sizeof(s_ulx), exe);
+                    }
+                }
+            }
+        }
+
+        /* ULX = runtime 同目录下的 libbxroot-ulx.so（上面没拿到时才走这条） */
+        {
+            const char *slash = strrchr(info.dli_fname, '/');
+            size_t dir = (slash != NULL) ? (size_t)(slash - info.dli_fname) : 0;
+            int n = snprintf(s_ulx, sizeof(s_ulx), "%.*s/%s",
+                             (int)dir, info.dli_fname, "libbxroot-ulx.so");
+            if (n <= 0 || (size_t)n >= sizeof(s_ulx))
+                return;
+            /*
+             * ★ 必须校验存在性（2026-10-26）★
+             *
+             * 原实现只要 snprintf 成功就采信 —— 于是 runtime 与 ULX 不同目录时
+             * 会往缓存里塞一个**不存在的路径**，后续 trampoline 拿它 execve
+             * 必然失败，而失败点离这里很远，极难定位。
+             *
+             * 实测：从 /tmp/ulx-test.so 启动、runtime 在 <rootfs>/tmp/rt7.so 时，
+             * 这里推导出 <rootfs>/tmp/libbxroot-ulx.so —— 那个文件恰好存在
+             * （旧调试遗留），所以即使加了 access 也会通过，但**路径是错的**。
+             * 因此还要与「当前实际运行的 ULX」比对：能从 /proc/self/exe
+             * 拿到真实路径时以它为准。
+             */
+            /* 上面 /proc/self/exe 已经采信过就不再覆盖 */
+            if (s_ulx[0] == '\0') {
+                if (!px_host_access_ok(s_ulx, X_OK)) {
+                    px_diag("tramp-cfg: dladdr 推出的 ulx 不可执行，丢弃");
+                    s_ulx[0] = '\0';
+                    return;
+                }
+            }
+        }
+        if (s_ulx[0] != '\0')
+            own_hint = 1;
+        /*
+         * ★ LDSO 必须与 guest ELF 的 PT_INTERP 一致（2026-10-24 实测）★
+         *
+         * rootfs 里 node 的 PT_INTERP 是 `/lib/ld-linux-aarch64.so.1`，
+         * 而 /lib 是 `-> usr/lib` 的软链、/usr/lib/ld-linux-aarch64.so.1
+         * 又 `-> aarch64-linux-gnu/ld-linux-aarch64.so.1`。三层之后才是
+         * 那个 203968 字节的实体文件。
+         *
+         * 之前硬编码成 `/usr/lib/aarch64-linux-gnu/...`（跳过前两层软链）。
+         * 虽然最终是同一文件，但 ulx 是按 argv[1] 直接 mmap 的 —— 走软链
+         * 与走实体在 guest 视角下不等价，且不同 rootfs 版本布局可能不同。
+         * 所以这里按 PT_INTERP 的真实形态探测，并对多种布局做兜底。
+         */
+        /*
+         * ★ rootfs 缺失时的兜底（2026-10-24）★
+         *
+         * PTC 会清空所有非启动环境变量，BXROOT_ROOTFS 也在其中。此前的
+         * 推导在这里直接 return，导致整个 dladdr 兜底形同虚设 —— 实测
+         * derived_without_rootfs=0。
+         *
+         * 兜底链：BXROOT_ROOTFS → PROROOT_ROOTFS → 由本进程 exe 反推。
+         * 最后一条的依据：bxroot 顶层进程的 exe 就在 <rootfs>/usr/local/bin/node，
+         * 去掉 /usr/local/bin/node 三段即得 rootfs。实测文件存在性校验后才采信。
+         */
+        if (rf == NULL || rf[0] != '/') {
+            const char *alt = own_hint ? NULL : getenv("PROROOT_ROOTFS");
+            if (alt != NULL && alt[0] == '/') {
+                px_cfg_str(s_rootfs, sizeof(s_rootfs), alt);
+                rf = s_rootfs;
+            } else {
+                /*
+                 * 从 /proc/self/exe 反推：<rootfs>/usr/local/bin/node
+                 *
+                 * ★ 必须用裸 syscall（2026-10-26 修复）★
+                 *
+                 * 本库自己 hook 了 readlink（preload.c:5547 readlink_fake_exe），
+                 * 命中 proc 下的 exe 链接时返回的是 guest 视角的 g_config.guest_exe
+                 * —— 也就是 /usr/local/bin/node。那不是宿主路径，反推不出 rootfs。
+                 *
+                 * 所以这里要内核给的原始宿主路径，绕开自己的钩子。
+                 * 同款先例见本文件下方「exec(/proc/self/exe)」处的注释。
+                 */
+                char exe[PX_PATH_MAX];
+                ssize_t en = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                              "/proc/self/exe", exe,
+                                              sizeof(exe) - 1);
+                if (en > 0) {
+                    const char *suffix = "/usr/local/bin/node";
+                    size_t sl = strlen(suffix);
+                    exe[en] = '\0';
+                    /*
+                     * 判据用 >= 而不是 >：
+                     * 原实现 `en > sl` 在「exe 恰好等于 suffix」时恒假，
+                     * 而 en == sl 恰恰是 rootfs == "/" 的合法情形。
+                     */
+                    if ((size_t)en >= sl && strcmp(exe + en - sl, suffix) == 0) {
+                        px_cfg_str(s_rootfs, sizeof(s_rootfs), exe);
+                        s_rootfs[en - sl] = '\0';
+                        /* en == sl 时上面会截成空串；空 rootfs 语义就是 "/" */
+                        if (s_rootfs[0] == '\0') {
+                            s_rootfs[0] = '/';
+                            s_rootfs[1] = '\0';
+                        }
+                        rf = s_rootfs;
+                    }
+                }
+            }
+        }
+        if (rf == NULL || rf[0] != '/') {
+            /* 静默返回是排查两度跑偏的直接原因：这里必须可见 */
+            px_diag("tramp-cfg: 回落3放弃 - 无 rootfs(BXROOT/PROROOT/exe反推 全失败)");
+            return;                      /* 仍无 rootfs：维持原回退行为 */
+        }
+        {
+            static const char *const cands[] = {
+                "/lib/ld-linux-aarch64.so.1",                          /* PT_INTERP 原型 */
+                "/usr/lib/ld-linux-aarch64.so.1",                      /* /lib -> usr/lib */
+                "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",    /* 实体 */
+            };
+            size_t ci;
+            int ok = 0;
+            for (ci = 0; ci < sizeof(cands) / sizeof(cands[0]); ci++) {
+                int n = snprintf(s_ldso, sizeof(s_ldso), "%s%s", rf, cands[ci]);
+                if (n <= 0 || (size_t)n >= sizeof(s_ldso))
+                    continue;
+                if (px_host_access_ok(s_ldso, R_OK)) {
+                    ok = 1;
+                    break;
+                }
+            }
+            if (!ok) {
+                px_diag("tramp-cfg: 回落3放弃 - ldso 候选一个都不可读 rf=%s",
+                        rf ? rf : "(null)");
+                return;                  /* 一个都不可读：维持原回退行为 */
+            }
+        }
+        /* 两者都必须真的可读/可执行，否则不采信，保持原回退行为 */
+        if (!px_host_access_ok(s_ulx, X_OK) || !px_host_access_ok(s_ldso, R_OK)) {
+            px_diag("tramp-cfg: 回落3放弃 - hook-access ulx=%d ldso=%d ulx=%s ldso=%s",
+                    access(s_ulx, X_OK), access(s_ldso, R_OK), s_ulx, s_ldso);
+            return;
+        }
+
+        /*
+         * 只在对应指针仍为空时填 —— 绝不覆盖已有值（2026-10-26）。
+         *
+         * 原实现无条件写回，连同 px_tramp_cfg 里的覆盖 bug，构成
+         * "缓存有值却报 NULL"的双重来源。
+         */
+        {
+            const char *selected_tramp = NULL;
+            const char *selected_linker = NULL;
+            const char *outer_tramp = getenv("PROROOT_TRAMPOLINE_PATH");
+            const char *outer_linker = getenv("PROROOT_LINKER_PATH");
+            int kind = bxroot_tramp_pair_select(
+                s_cfg_ulx, s_cfg_ldso, own_hint,
+                own_env_tramp, own_env_linker,
+                s_ulx, s_ldso, outer_tramp, outer_linker,
+                &selected_tramp, &selected_linker);
+            if (kind != BXROOT_TRAMP_NONE) {
+                *tramp = selected_tramp;
+                *linker = selected_linker;
+            }
+        }
+    }
+}
+
+/*
+ * ★ 构造 tramp_path：/proc/self/root 前缀必须**探测**，不能盲加 ★
+ *
+ * 历史理由：bridge/ulx 在 /data/app/... 或 <rootfs>/tmp/... 下，而本库的
+ * 路径翻译会把 /data/app 拼成 <rootfs>/data/app —— 那个路径不存在，execve
+ * 恒 ENOENT。加 /proc/self/root 前缀可绕开翻译（translate_path 对 /proc 透传）。
+ *
+ * 【嵌套环境下这个假设不成立】实测（容器内，proc.c 自检 [8] 报 userspace）：
+ *     ls <rootfs>/tmp/                   -> 3420 个文件（含 libbxroot-ulx.so）
+ *     ls /proc/self/root<rootfs>/tmp/     -> 只有 5 个文件
+ *     两者 stat 的 st_dev 不同（19 vs 65086）
+ * 即 /proc/self/root 指向的是**外层容器的根**，不是目标 rootfs。
+ * 盲加前缀会让 execve 拿到一个不存在的路径 → EACCES/ENOENT。
+ *
+ * 所以这里做一次探测：带前缀的路径 stat 成功才用，否则回落原路径。
+ * 探测用裸 syscall，避免被自己的翻译层二次干扰。
+ */
+static void px_build_tramp_path(char *out, size_t cap, const char *tramp)
+{
+    if (tramp == NULL || tramp[0] == '\0') {
+        if (cap > 0) out[0] = '\0';
+        return;
+    }
+    if (strncmp(tramp, "/proc/", 6) == 0) {
+        px_cfg_str(out, cap, tramp);
+        return;
+    }
+    /*
+     * ★ 默认**不加** /proc/self/root 前缀（2026-10-26 实测推翻旧结论）★
+     *
+     * 旧注释的理由：bridge/ulx 在 /data/app 或 <rootfs> 下，翻译层会把
+     * /data/app 拼成 <rootfs>/data/app 导致 ENOENT，加 /proc/self/root
+     * 可绕开翻译（translate_path 对 /proc 透传）。
+     *
+     * 【实测反证】最小复现（不经过任何钩子，直接 execve）：
+     *     execve("/proc/self/root<rootfs>/tmp/libbxroot-ulx.so") -> ENOENT
+     *     execve("<rootfs>/tmp/libbxroot-ulx.so")                -> 成功
+     * 而 stat 两种路径都成功 —— 说明 /proc/self/root 在**执行**阶段解析
+     * 到别处（st_dev 19 vs 65086；ls 只看到 5 个文件 vs 3420 个）。
+     * 探测（stat）看不出这个差异，所以「探测通过」不代表「执行通过」。
+     *
+     * 结论：默认用原路径；只有显式设置 BXROOT_TRAMP_PROCROOT=1 时才加前缀
+     * （给确实需要绕开翻译的旧部署留一个开关）。
+     */
+    {
+        const char *want = getenv("BXROOT_TRAMP_PROCROOT");
+        if (want != NULL && want[0] == '1') {
+            int n = snprintf(out, cap, "/proc/self/root%s", tramp);
+            if (n > 0 && (size_t)n < cap) {
+                struct stat st;
+                if (stat(out, &st) == 0)
+                    return;
+            }
+        }
+    }
+    px_cfg_str(out, cap, tramp);
 }
 
 static int px_trampoline_exec(const char *host, char *const argv[],
@@ -3778,10 +5017,19 @@ static int px_trampoline_exec(const char *host, char *const argv[],
     if (preload == NULL || preload[0] == '\0') {
         preload = getenv("PROROOT_LIB_PATH");
     }
+    if (preload == NULL || preload[0] == '\0') {
+        /* 环境里没有 → dladdr 反查自身（PTC 清空环境时唯一来源） */
+        static char s_self[PX_PATH_MAX];
+        if (px_self_lib_path(s_self, sizeof(s_self)))
+            preload = s_self;
+    }
 
     /* 未配置 trampoline → 交回调用方走原来的直接 execve */
     if (tramp == NULL || tramp[0] == '\0' || linker == NULL ||
         linker[0] == '\0') {
+        px_diag("trampoline: EARLY-EXIT no-config tramp=%s linker=%s",
+                (tramp && tramp[0]) ? tramp : "(null)",
+                (linker && linker[0]) ? linker : "(null)");
         return -1;
     }
 
@@ -3807,15 +5055,13 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * `/proc/self/root/proc/...` 这种畸形路径。
      */
     if (tramp[0] != '/') {
+        px_diag("trampoline: EARLY-EXIT tramp-not-absolute: %s", tramp);
         return -1;
     }
-    if (strncmp(tramp, "/proc/", 6) == 0) {
-        if (strlen(tramp) >= sizeof(tramp_path)) {
-            return -1;
-        }
-        memcpy(tramp_path, tramp, strlen(tramp) + 1);
-    } else if (snprintf(tramp_path, sizeof(tramp_path), "/proc/self/root%s",
-                        tramp) >= (int)sizeof(tramp_path)) {
+    /* 前缀是否可用由 px_build_tramp_path 探测决定（见其注释） */
+    px_build_tramp_path(tramp_path, sizeof(tramp_path), tramp);
+    if (tramp_path[0] == '\0') {
+        px_diag("trampoline: EARLY-EXIT tramp-path-empty tramp=%s", tramp);
         return -1;
     }
 
@@ -3825,9 +5071,18 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * `echo $(seq 1 5000)` 在 guest 里只输出 4095 个词，**静默截断**。
      * Linux 只限 ARG_MAX 字节，不限条数。
      */
-    nv = (char **)malloc((px_argv_len(argv) + 8u) * sizeof(char *));
-    if (nv == NULL) {
-        return -1;
+    /*
+     * fork 后禁止 malloc（2026-10-25，PTC 工具调用卡死）。libuv 可能在
+     * 多线程 Node 的 fork child 中进入 execvp；这里只用动态栈空间，
+     * 避免继承 allocator 锁，也避免给 dlopen 增加大块 static TLS。
+     */
+    {
+        size_t need = px_argv_len(argv) + 8u;
+        if (need > PX_TRAMP_ARGS_MAX) {
+            px_diag("trampoline: EARLY-EXIT argc-too-big need=%zu", need);
+            return -1;
+        }
+        nv = (char **)__builtin_alloca(need * sizeof(*nv));
     }
     nv[n++] = tramp_path;
     nv[n++] = (char *)(uintptr_t)linker;
@@ -3847,7 +5102,7 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * 装不上就没必要进 bridge。
      */
     if (preload == NULL || preload[0] == '\0') {
-        free(nv);
+        px_diag("trampoline: EARLY-EXIT no-preload");
         return -1;
     }
     if (argv0 != NULL && argv0[0] != '\0') {
@@ -3884,8 +5139,28 @@ static int px_trampoline_exec(const char *host, char *const argv[],
      * 而且裸 syscall 也顺带绕开了 syscall_guard 对 execve 的路径翻译
      * （bridge 在 /data/app 下，翻译后必然不存在）。
      */
-    (void)PX_RAW_EXECVE(tramp_path, nv, (char *const *)envp);
-    free(nv);
+    /*
+     * ★ 记录失败详情（2026-10-24，真机 EACCES 定位）★
+     *
+     * 此前这里只 (void) 掉返回值，调用方只打印一句笼统的
+     * "trampoline attempted (should not return)"。真机上 node（ET_EXEC
+     * 97.7MB）恒 EACCES 时完全看不出是哪一步、哪个 errno。
+     *
+     * 这里紧接 syscall 取 errno 再打印 —— 晚一步 errno 就可能被
+     * free() 之类覆盖。
+     */
+    {
+        long __rc = PX_RAW_EXECVE(tramp_path, nv, (char *const *)envp);
+        int __e = errno;
+        px_diag("trampoline: EXECVE FAILED rc=%ld errno=%d(%s)",
+                __rc, __e, strerror(__e));
+        px_diag("  tramp_path = %s", tramp_path);
+        px_diag("  linker     = %s", linker);
+        px_diag("  host       = %s", host ? host : "(null)");
+        px_diag("  preload    = %s", preload);
+        px_diag("  -> stat(tramp_path)=%d errno=%d(%s)",
+                access(tramp_path, X_OK), errno, strerror(errno));
+    }
     return 0;   /* 能返回就是失败了 */
 }
 
@@ -4028,9 +5303,11 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
         if (strlen(stub) >= sizeof(sp->path))
             return -1;
         memcpy(sp->path, stub, strlen(stub) + 1);
-    } else if (snprintf(sp->path, sizeof(sp->path), "/proc/self/root%s", stub)
-               >= (int)sizeof(sp->path)) {
-        return -1;
+    } else {
+        /* 前缀可用性由探测决定（嵌套环境下 /proc/self/root 不可用） */
+        px_build_tramp_path(sp->path, sizeof(sp->path), stub);
+        if (sp->path[0] == '\0')
+            return -1;
     }
 
     sp->nv = (char **)malloc((px_argv_len(argv) + 4u) * sizeof(char *));
@@ -4054,8 +5331,20 @@ static int px_stub_prepare(px_stub_plan *sp, const char *host,
         sp->renv[0] = '\0';
     }
 
-    if (envp != NULL)
-        while (envp[ec] != NULL)
+    /*
+     * ★ envp == NULL 必须换成 environ（2026-10-26，与 R4 同族）★
+     *
+     * execvp/execvpe 的语义是「继承当前环境」，内部以 envp==NULL 到这里。
+     * 原实现下 ec=0，sp->ne 只含 sp->genv（一条 PROROOT_STUB_GUEST_EXE=），
+     * 子进程的 PATH / LD_PRELOAD / BXROOT_* 全部丢失 ——
+     * 表现为钩子失效、库找不到、路径翻译停止。
+     *
+     * 实测依据（静态程序绕开钩子）：
+     *     execve(prog, argv, NULL) -> environ total=0（空环境，非继承）
+     */
+    if (envp == NULL)
+        envp = (char *const *)environ;
+    while (envp[ec] != NULL)
             ec++;
     for (i = 0; i < ec; i++)
         if (strncmp(envp[i], "LD_TRACE_LOADED_OBJECTS=", 24) == 0 && envp[i][24] != '\0')
@@ -4178,8 +5467,48 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
     if (pid == NULL || argv == NULL) {
         return -1;
     }
+    /*
+     * ★ envp == NULL 时用 environ（2026-10-26，与 execve/R4 同族）★
+     *
+     * 本函数会把 envp 原样交给 trampoline。若为 NULL，子进程拿到的是
+     * **空环境**而不是继承 —— PATH/LD_PRELOAD/BXROOT_* 全丢，表现为
+     * 钩子失效、库找不到、路径翻译停止（实测：静态程序 execve(...,NULL)
+     * 的 environ total=0）。
+     *
+     * 现有调用点都已自行兜底，这里再加一道，避免将来新增调用点踩坑。
+     */
+    if (envp == NULL)
+        envp = (char *const *)environ;
     if (tramp == NULL || tramp[0] == '\0' || linker == NULL ||
         linker[0] == '\0') {
+        /*
+         * ★ 回退不能静默（2026-10-24，DSHA spawn EACCES 排查）★
+         *
+         * 走到这里说明没有可用的 trampoline，调用方会回退 real_posix_spawn，
+         * 把翻译后的宿主路径交给内核。guest 可执行文件在 /data/data 下
+         * （SELinux app_data_file，本 app 域无 execute_no_trans），那条路径**必然失败**。
+         *
+         * 用户只看到一句 EACCES，看不出「其实是 trampoline 没配上」——
+         * 这个静默让本轮排查方向偏了两轮。所以：只在本进程确实带了 ULX 配置
+         * （说明部署方期望走 trampoline）却没生效时打印一次；普通 LD_PRELOAD
+         * 场景（两变量都没有）保持完全安静。
+         */
+        const char *want_ulx = getenv("BXROOT_ULX_PATH");
+        if (want_ulx != NULL && want_ulx[0] != '\0') {
+            static int warned;
+            if (!warned) {
+                const char *ldso = getenv("BXROOT_ULX_LDSO");
+                warned = 1;
+                fprintf(stderr,
+                        "[bxroot] proc: ULX 已配置但 trampoline 不可用"
+                        "（BXROOT_ULX_PATH=%s, BXROOT_ULX_LDSO=%s）。\n"
+                        "  本次 spawn 将回退到直接 execve；若 guest 位于 /data/data 下，"
+                        "内核会以 EACCES 拒绝。\n"
+                        "  检查 PROROOT_TRAMPOLINE_PATH 是否被外层容器占用，"
+                        "以及 BXROOT_ULX_LDSO 是否指向 rootfs 内可读的 ld.so。\n",
+                        want_ulx, ldso ? ldso : "(unset)");
+            }
+        }
         return -1;          /* 普通环境：走真实 posix_spawn，行为不变 */
     }
 
@@ -4241,6 +5570,12 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
         preload = getenv("PROROOT_LIB_PATH");
     }
     if (preload == NULL || preload[0] == '\0') {
+        /* 环境里没有 → dladdr 反查自身（PTC 清空环境时唯一来源） */
+        static char s_self[PX_PATH_MAX];
+        if (px_self_lib_path(s_self, sizeof(s_self)))
+            preload = s_self;
+    }
+    if (preload == NULL || preload[0] == '\0') {
         /*
          * 装不上钩子 → 进 bridge 没有意义。回退（普通环境里那条能用）。
          */
@@ -4256,17 +5591,24 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
             return -1;
         }
         memcpy(tramp_path, tramp, strlen(tramp) + 1);
-    } else if (snprintf(tramp_path, sizeof(tramp_path), "/proc/self/root%s",
-                        tramp) >= (int)sizeof(tramp_path)) {
-        return -1;
+    } else {
+        px_build_tramp_path(tramp_path, sizeof(tramp_path), tramp);
+        if (tramp_path[0] == '\0')
+            return -1;
     }
 
     /*
-     * argv 形态与 execve 路径**完全同构**：
-     *     [bridge, linker, --argv0 <name>, --preload <rt>, <host>, argv[1..]]
-     * 两条路径共用同一约定，避免"exec 能跑、spawn 不行"这类漂移。
+     * argv 形态与 execve 路径完全同构。使用动态栈空间，避免
+     * fork child 的 allocator 锁和 dlopen static TLS surplus 限制。
      */
-    nv = (char **)malloc((px_argv_len(argv) + 8u) * sizeof(char *));  /* BXR-ARG-1 */
+    {
+        size_t need2 = px_argv_len(argv) + 8u;
+        if (need2 > PX_TRAMP_ARGS_MAX) {
+            px_diag("trampoline_spawn: EARLY-EXIT argc-too-big need=%zu", need2);
+            return -1;
+        }
+        nv = (char **)__builtin_alloca(need2 * sizeof(*nv));
+    }
     if (nv == NULL) {
         return -1;
     }
@@ -4294,7 +5636,6 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
                                px_dlsym("posix_spawn");
     }
     if (real_posix_spawn == NULL) {
-        free(nv);
         return -1;
     }
 
@@ -4331,7 +5672,6 @@ static int px_trampoline_spawn(pid_t *pid, const char *host,
      * 作为"排查路径已收束"的路标，避免后来者重走。
      */
 rc = real_posix_spawn(pid, tramp_path, fa, attr, nv, (char *const *)envp);
-    free(nv);
     if (rc != 0) {
         /*
          * spawn 失败了 —— 回 -1 让调用方走原路径。
@@ -4916,6 +6256,23 @@ static int px_do_execve(const char *path, char *const argv[],
 {
     char host[PX_PATH_MAX];
     char guest[PX_PATH_MAX];
+
+    /*
+     * ★ 入口诊断（2026-10-25）：真机上 init 打印了但 execve 完全没有痕迹 ★
+     *
+     * 需要区分两种情形：
+     *   a) 钩子没被调用     → 这条不出现
+     *   b) 钩子调用了但早退 → 这条出现，后面没有后续诊断
+     */
+    px_diag("execve-ENTRY path=%s use_search=%d", path ? path : "(null)", use_search);
+    /* PTC 控制通道诊断（2026-10-25）：worker 需要 DSH_SUBPROCESS_CONTROL + FD7 socket */
+    {
+        const char *ctl = px_env_lookup((const char *const *)envp, "DSH_SUBPROCESS_CONTROL");
+        int fd7 = fcntl(7, F_GETFD);
+        px_diag("  ctl=%s fd7=%s",
+                (ctl != NULL && ctl[0] != 0) ? ctl : "(unset)",
+                (fd7 < 0) ? "MISSING" : ((fd7 & FD_CLOEXEC) ? "CLOEXEC" : "open"));
+    }
     px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     px_argv_plan plan;
     char **vec = NULL;      /* BXR-ARG-1：按实际 argc 堆分配（原栈上 PX_ARGV_MAX+1） */
@@ -5228,7 +6585,20 @@ static int px_do_execve(const char *path, char *const argv[],
         final_env_use = env.v[0];
         g_rt_stats.exec_env_injected++;
     } else {
-        final_env = envp;      /* 注入被禁用/失败 → 沿用调用方的 */
+        /*
+         * ★ envp 为 NULL 时必须换成 environ（2026-10-26 实测确认）★
+         *
+         * POSIX 里 execve 的 envp==NULL 交给内核就是**空环境**，不是「继承」。
+         * 实测（静态程序，绕开所有钩子）：
+         *     execve("/tmp/showenv", argv, NULL) -> environ total=0
+         *     execve("/tmp/showenv", argv, environ) -> 全部继承
+         *
+         * 而 execvp/execvpe 的语义是「继承当前环境」，它们内部会以
+         * envp==NULL 调用到这里。若不替换，trampoline 会用空环境启动
+         * 子进程 —— 子进程拿不到 PATH/LD_PRELOAD/BXROOT_*，行为完全错乱
+         * （典型表现：库找不到、钩子失效、路径翻译停止）。
+         */
+        final_env = (envp != NULL) ? envp : (char *const *)environ;
     }
     g_exec_guest_exe = NULL;
     g_exec_orig_comm = NULL;
@@ -5239,7 +6609,7 @@ static int px_do_execve(const char *path, char *const argv[],
      * ★★ 优先走 trampoline，而不是直接 execve ★★
      *
      * 真实部署环境里，guest 可执行文件位于 `/data/data/<pkg>/files/...`，
-     * 该目录的 SELinux 标签是 `app_data_file` —— **内核禁止执行它**
+     * 该目录的 SELinux 标签是 `app_data_file` —— **本 app 域无 execute_no_trans**
      * （实测：裸 `syscall(SYS_execve, <rootfs>/bin/true)` 恒返回
      *  EACCES，即使调用方 uid=0；同一二进制在 `/system` 下则可执行）。
      *
@@ -5360,16 +6730,32 @@ static int px_do_execve(const char *path, char *const argv[],
              * execve：它会给出与内核完全一致的权威 errno
              * （ENOENT / EACCES / ELOOP …），调用方拿到的语义不打折。
              */
+            px_diag("execve: SKIP trampoline (not executable) host=%s", host);
             PX_LOG("proc: 目标不是可执行文件(%s)，跳过 trampoline", host);
         } else if (px_elf_needs_stub(host) &&
                    px_stub_exec(host, final_argv, final_env, guest) == 0) {
+            px_diag("execve: stub-loader 失败 host=%s", host);
             PX_LOG("proc: stub-loader exec 失败，回退 %s", host);
         } else if (px_trampoline_exec(host, final_argv, final_env,
                                       raw_argv0[0] != '\0' ? raw_argv0 : guest,
                                       getenv("BXROOT_LD_PRELOAD")) == 0) {
             /* 走到这里说明 trampoline exec 失败（成功则永不返回），
              * 落到下面回退到直接 execve —— 保持普通环境的行为不变。 */
+            /* 返回 0 = 真的调用过 execve 但失败了（已打印详细原因） */
+            px_diag("execve: TRAMPOLINE-EXECVE-FAILED -> 回退直接 execve host=%s", host);
             PX_LOG("proc: trampoline exec 失败，回退直接 execve %s", host);
+        } else {
+            /*
+             * ★ 到达这里的语义：px_trampoline_exec 返回了**非 0**（实际是 -1）
+             *
+             * 即：在参数检查阶段就放弃了，**execve 根本没被调用**。
+             * 以前这里打印 "trampoline attempted (should not return)"，
+             * 把「提前放弃」写成了「已尝试执行」，两者是完全不同的故障：
+             *   -1 = 配置缺失/路径非法（查 px_tramp_cfg、ULX 路径）
+             *    0 = execve 真的失败（查 errno、SELinux、文件权限）
+             * 这个误导让排查数次跑偏，必须分开命名。
+             */
+            px_diag("execve: TRAMPOLINE-GAVE-UP(参数阶段,未调用execve) -> 回退直接 execve host=%s", host);
         }
     }
 
@@ -5417,6 +6803,8 @@ int execv(const char *path, char *const argv[])
 
 int execvp(const char *file, char *const argv[])
 {
+    /* 入口诊断：Node 的 uv_spawn 走 fork+execvp，这条是它的必经点 */
+    px_diag("execvp-HOOK file=%s pid=%ld", file ? file : "(null)", (long)syscall(SYS_getpid));
     return px_do_execve(file, argv, NULL, getenv("PATH"), 1);
 }
 
@@ -5581,7 +6969,7 @@ static int px_real_execveat(int dirfd, const char *path, char *const argv[],
                             char *const envp[], int flags)
 {
     px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
-    char *const *final_env = envp;
+    char *const *final_env = (envp != NULL) ? envp : (char *const *)environ;
     int rc;
 
     if (px_runtime_build_env(envp, &env) == 0) {
@@ -5768,6 +7156,9 @@ static int px_do_spawn(pid_t *pid, const char *path,
                        int use_search)
 {
     char host[PX_PATH_MAX];
+
+    /* 入口诊断（2026-10-25）：确认 spawn 钩子是否被调用 */
+    px_diag("spawn-ENTRY path=%s use_search=%d", path ? path : "(null)", use_search);
     /*
      * 调用方原始 argv[0]（argv 翻译前）—— trampoline --argv0 用，
      * 与 px_do_execve 的 raw_argv0 同语义（见那里注释）。
@@ -5780,7 +7171,7 @@ static int px_do_spawn(pid_t *pid, const char *path,
     px_envout env = {0};   /* ★ 必须零初始化：build_env 有失败路径不写 *out */
     px_argv_plan plan;
     char **vec = NULL;      /* BXR-ARG-1 */
-    char *const *final_env = envp;
+    char *const *final_env = (envp != NULL) ? envp : (char *const *)environ;
     char *const *final_argv = argv;
     size_t need = 0;
     const char *dl_name;
@@ -5980,7 +7371,7 @@ static int px_do_spawn(pid_t *pid, const char *path,
      * ★★ 优先走 trampoline ★★
      *
      * guest 可执行文件在 /data/data 下，SELinux 标签是 app_data_file，
-     * **内核禁止执行**（实测：即使 uid=0 也恒 EACCES）。所以真实
+     * **本 app 域无 execute_no_trans**（targetSdk>=29）。所以真实
      * posix_spawn 把翻译后的宿主路径交给内核必然失败。
      *
      * 官方 runtime 因此改为 exec 它自己的 bridge，由 bridge 完成
@@ -6014,15 +7405,19 @@ static int px_do_spawn(pid_t *pid, const char *path,
         goto out;
     }
 
+    px_diag("spawn: path=%s host=%s env_built=%d",
+            path ? path : "(null)", host[0] ? host : "(empty)", final_env != NULL);
     if (px_trampoline_spawn(pid, host, final_argv, final_env,
                             raw_argv0,
                             getenv("BXROOT_LD_PRELOAD"), fa, attr) == 0) {
+        px_diag("  => TRAMPOLINE ok pid=%ld", (pid && *pid > 0) ? (long)*pid : -1L);
         if (pid != NULL && *pid > 0) {
             (void)px_ledger_add(g_rt_ledger, *pid, px_self_pid(), PX_TAG_SPAWN);
         }
         rc = 0;
         goto out;
     }
+    px_diag("  => TRAMPOLINE UNAVAILABLE -> real_posix_spawn");
 
     if (real_posix_spawn == NULL) {
         real_posix_spawn = (int (*)(pid_t *, const char *,
@@ -6374,7 +7769,7 @@ pid_t vfork(void)
  *
  *   3. **走 trampoline 而不是直接 execve**（`px_system_via_guest` /
  *      `popen` 内部）：guest shell 位于 `/data/data`（SELinux
- *      `app_data_file`），内核禁止执行，直接 execve 恒 EACCES。
+ *      `app_data_file`），**本 app 域无 execute_no_trans**，直接 execve 恒 EACCES。
  *
  * 保留「直接转发」的回落分支，条件是：无 rootfs 配置（开发机 / 单测）、
  * 翻译器不可用、或 rootfs 内没有可用的 shell。真机上这些分支都不会命中。
@@ -6427,8 +7822,9 @@ static int px_guest_shell(char *out, size_t cap)
  * 最后一步 `posix_spawn(真 glibc, "<rootfs>/bin/sh", ...)`。
  *
  * 根因是 SELinux：guest 程序位于 `/data/data/<pkg>/files/...`，标签为
- * `app_data_file`，**内核禁止执行该标签的文件**（与 uid 无关，uid=0 也
- * 一样）。这一点 `px_do_execve` 的注释早已写明，它因此改走
+ * `app_data_file`，**本 app 域没有 file:execute_no_trans 权限**（因
+ * targetSdk>=29；准确机制见 px_trampoline_exec 上方注释）。这一点
+ * `px_do_execve` 的注释已写明，它因此改走
  * `px_trampoline_exec`（exec 官方 bridge，由 bridge 在特权上下文里
  * mmap+跳转）。但 `px_system_via_guest` 这一处**漏改了**，仍在用
  * 「直接 execve 翻译后的宿主路径」那条已证伪的路。
@@ -6995,6 +8391,33 @@ static int px_do_kill(pid_t pid, int sig, int (*real_fn)(pid_t, int))
     case PROC_KILL_DENY:
         g_rt_stats.kill_deny++;
         PX_LOG("proc: kill(%d, %d) 被拒绝（容器外进程）", (int)pid, sig);
+        /*
+         * sig == 0 必须返回 ESRCH，不能返回 EPERM（2026-10-30 真机 PTC 挂起）
+         *
+         * kill(pid, 0) 不是发信号，而是 POSIX 定义的存在性探测：
+         *   成功  -> 目标存在且有权限
+         *   EPERM -> 目标存在，但无权限发信号
+         *   ESRCH -> 目标不存在
+         *
+         * 本分支的语义是「该 PID 不在账本里」，对容器而言它不可见，
+         * 等价于不存在。返回 EPERM 等于告诉调用方「它还活着，只是你
+         * 管不了它」，与事实相反。
+         *
+         * 真实后果：DSH 的 dsh-subprocess-local 用
+         *     try { kill(-pid, 0); return true; }
+         *     catch (e) { if (e.code === "ESRCH") return false;
+         *                 if (e.code === "EPERM") return true; }
+         * 判断子进程存活，外层是 while (alive()) await sleepTick();
+         * bxroot 下子进程早已退出，这里却恒为 EPERM，alive() 恒真，
+         * 死循环导致 waitForExit() 永不返回，PTC run_code 永久挂起
+         * （worker 实际已算出结果并正常退出，SIGTERM 只是善后清理）。
+         *
+         * 这里仍然不发信号，安全性不变，只是把错误码改正。
+         */
+        if (sig == 0) {
+            errno = ESRCH;
+            return -1;
+        }
         errno = EPERM;
         return -1;
     case PROC_KILL_FAKE_OK:

@@ -53,9 +53,10 @@ static long bx_raw6(long nr, long a0, long a1, long a2,
     register long x4 __asm__("x4") = a4;
     register long x5 __asm__("x5") = a5;
 
+    /* 与 host-world.c 同一写法：x1..x5 读写声明，不在 asm 内移动 sp。 */
     __asm__ volatile("svc #0"
-        : "+r"(x0)
-        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+        : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5)
+        : "r"(x8)
         : "memory", "cc");
     return x0;
 }
@@ -71,9 +72,33 @@ static long bx_open(const char *path)
                    O_RDONLY | O_CLOEXEC, 0, 0, 0);
 }
 
+/*
+ * ★ execve 的系统调用号必须经寄存器间接写入 x8 ★
+ *
+ * bx-host 没有 PT_INTERP，在 guest 里由 runtime 的 static_exec 进程内装载；
+ * static_exec 会把 `mov x8,#221 … svc` 改写成跳板，送进 runtime 的 exec
+ * 钩子。那条钩子按 guest 程序处理目标，会向 bionic 程序注入 glibc 的
+ * LD_PRELOAD（实测：CANNOT LINK EXECUTABLE "getprop": library "libc.so.6"
+ * not found）。bx-host 的全部意义就是绕过钩子把宿主环境交给内核，所以这里
+ * 先把号放进 volatile 变量，再 `mov x8, xN`：扫描器只认 movz 立即数，寄存器
+ * 写 x8 视作屏障，不会改写本站点。其它系统调用（openat 等）仍可被翻译，
+ * 与 guest 的 bind 视图保持一致。
+ */
 static long bx_exec(const char *path, char *const argv[], char *const envp[])
 {
-    return bx_raw6(SYS_execve, (long)path, (long)argv, (long)envp, 0, 0, 0);
+    register long x0 __asm__("x0") = (long)path;
+    register long x1 __asm__("x1") = (long)argv;
+    register long x2 __asm__("x2") = (long)envp;
+    /*
+     * 号由 x16 经 `movz x16; mov x8, x16` 写入：不用可写全局（不新增 .data
+     * 段，保持单个 R E LOAD，static_exec 映射最简单），也不出现扫描器识别的
+     * `movz x8, #imm`。
+     */
+    __asm__ volatile("mov x16, %3\n\tmov x8, x16\n\tsvc #0"
+        : "+r"(x0), "+r"(x1), "+r"(x2)
+        : "i"(SYS_execve)
+        : "x8", "x16", "memory", "cc");
+    return x0;
 }
 
 static void bx_write_all(int fd, const char *s, size_t n)

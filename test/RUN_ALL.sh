@@ -77,9 +77,6 @@ RUNNER_TAIL=$(command -v tail) || exit 1
 RUNNER_CUT=$(command -v cut) || exit 1
 RUNNER_RM=$(command -v rm) || exit 1
 RUNNER_TIMEOUT=$(command -v timeout) || exit 1
-# Per-step scratch space: use /tmp when it is usable, otherwise fall back to a
-# directory under the ledger so the runner also works on hosts without /tmp.
-if [ -d /tmp ] && [ -w /tmp ]; then STEP_TMP_BASE=${TMPDIR:-/tmp}; else STEP_TMP_BASE=$RESULT_BASE; fi
 # Default the ledger to a per-user cache directory instead of a hard-coded
 # /root/work. A fixed absolute default made every CI runner (non-root, no
 # /root/work) exit 1 on the very first mkdir, before a single test had run.
@@ -97,6 +94,24 @@ case "$RESULT_BASE" in /*) ;; *) echo "ERROR: result base must be absolute"; exi
 # The ledger must survive a guest that wipes /tmp, so /tmp is still rejected.
 case "$RESULT_BASE" in /tmp|/tmp/*) echo "ERROR: result ledger must be outside /tmp"; exit 1 ;; esac
 mkdir -p "$RESULT_BASE" || exit 1
+#
+# Per-step scratch space, chosen AFTER RESULT_BASE exists.
+#
+# ★ Ordering bug fixed: this block used to sit above the RESULT_BASE
+# assignment and fall back to "$RESULT_BASE" when /tmp was unusable. Under
+# `set -u` (line 50) that is an unbound-variable error, so on hosts without a
+# writable /tmp -- notably Termux, where /tmp is drwxrwx--x shell -- the whole
+# regression runner aborted before running a single test with:
+#     test/RUN_ALL.sh: 82: RESULT_BASE: parameter not set
+# A host without /tmp is exactly the case this fallback exists for, so the
+# fallback has to be able to reference RESULT_BASE. Keep this block below the
+# ledger setup; ${RESULT_BASE:-} keeps it safe if that ever regresses.
+if [ -d /tmp ] && [ -w /tmp ]; then
+    STEP_TMP_BASE=${TMPDIR:-/tmp}
+else
+    STEP_TMP_BASE=${RESULT_BASE:?RESULT_BASE must be set before STEP_TMP_BASE}/step-tmp
+    mkdir -p "$STEP_TMP_BASE" || exit 1
+fi
 WORK_DIR=$(mktemp -d "$RESULT_BASE/quick-XXXXXX") || exit 1
 RESULT_FILE="$WORK_DIR/results.txt"
 : > "$RESULT_FILE" || exit 1
@@ -117,6 +132,8 @@ PASS=0
 FAIL=0
 SKIP=0
 KNOWN=0
+ENVFAIL=0
+TIMEOUTS=0
 
 # 已知缺陷登记表：这些项当前**预期失败**，失败记为 KNOWN 而不是 FAIL，
 # 免得整轮回归长期红着、把别的新问题掩盖掉。
@@ -216,6 +233,8 @@ runner_reviewed() {
     "copyout probe compile") return 0 ;;
     "native fork/wait compile") return 0 ;;
     "native fork/wait 自动插入") return 0 ;;
+    "PTC trampoline 配对") return 0 ;;
+    "PTC fork/exec 取消") return 0 ;;
     "copyout syscall capability") return 0 ;;
     "SHM runtime copyout") return 0 ;;
     "static SHM fd lifecycle") return 0 ;;
@@ -309,6 +328,12 @@ SUMMARY
     if [ "$rc" -eq 0 ]; then
         note PASS "$name" "rc=0 $summary log=$logf"
         PASS=$((PASS + 1)); echo "PASS $summary"
+    elif [ "$rc" -eq 124 ]; then
+        # timeout(1) was the one that gave up, not the code under test. Reporting
+        # this as a plain FAIL claims a correctness result we do not have: the
+        # step was still making progress when the budget ran out.
+        note TIMEOUT "$name" "rc=124 exceeded ${BXROOT_STEP_TIMEOUT:-180}s; last=$summary log=$logf"
+        TIMEOUTS=$((TIMEOUTS + 1)); echo "TIMEOUT $summary"
     elif [ "$rc" -eq 2 ] && "$RUNNER_PYTHON" - "$logf" <<'PREREQ'
 import re, sys
 s=open(sys.argv[1],errors='replace').read()
@@ -320,6 +345,35 @@ PREREQ
     then
         note SKIP "$name" "rc=2 explicit prerequisite $summary log=$logf"
         SKIP=$((SKIP + 1)); echo "SKIP $summary"
+    elif "$RUNNER_PYTHON" - "$logf" <<'INJECTOR'
+import re, sys
+s = open(sys.argv[1], errors='replace').read()
+# ---------------------------------------------------------------------
+# A failure that is purely about the *host* being unable to host the
+# test is not a bxroot defect. Mark it ENV instead of FAIL so it cannot
+# masquerade as a regression.
+#
+# Two markers, both emitted before any bxroot code runs:
+#   DSHA_PROROOT_PRELOAD_ENTRY_UNAVAILABLE
+#       the outer proroot could not vend its preload entry, so
+#       tools/bxroot-run cannot inject our runtime at all.
+#   bxroot-run: /bin/sh: No such file or directory
+#   bxroot-run: 找不到自检程序
+#       the injector's own self-check failed for the same reason.
+#
+# Observed impact in a plain Ubuntu container: 24 of 37 failures came from
+# this single cause. Without this classification they look like 24 separate
+# correctness bugs and bury the ones that matter.
+# ---------------------------------------------------------------------
+pat = re.compile(r'DSHA_PROROOT_PRELOAD_ENTRY_UNAVAILABLE'
+                 r'|bxroot-run: /bin/sh: No such file'
+                 r'|找不到自检程序')
+sys.exit(0 if pat.search(s) else 1)
+INJECTOR
+    then
+        note ENV "$name" "host injector unavailable (not a bxroot defect) log=$logf"
+        ENVFAIL=$((ENVFAIL + 1))
+        echo "ENV  $summary"
     else
         note FAIL "$name" "rc=$rc $summary log=$logf"
         FAIL=$((FAIL + 1)); echo "FAIL rc=$rc $summary"
@@ -1015,6 +1069,39 @@ else
     run_step "ulx 早期 SIGSYS"
 fi
 
+# l2s 计数锁 fork 安全（2026-10-26）
+if [ -f test/RUN_L2S_FORK.sh ]; then
+    run_step "l2s fork 安全" sh test/RUN_L2S_FORK.sh
+else
+    run_step "l2s fork 安全"
+fi
+
+# 小栈线程崩溃（resolver 单帧 64KB，2026-10-26）
+if [ -f test/RUN_STACK_DEPTH.sh ]; then
+    run_step "小栈线程崩溃" sh test/RUN_STACK_DEPTH.sh
+else
+    run_step "小栈线程崩溃"
+fi
+
+# environ / system() 崩溃（environ realloc 后悬垂指针，2026-10-26）
+if [ -f test/RUN_SYSTEM_ENV.sh ]; then
+    run_step "environ/system 崩溃" sh test/RUN_SYSTEM_ENV.sh
+else
+    run_step "environ/system 崩溃"
+fi
+
+# PTC/nested-container trampoline pair selection.
+if [ -f test/RUN_PTC_TRAMP_PAIR.sh ]; then
+    run_step "PTC trampoline 配对" sh test/RUN_PTC_TRAMP_PAIR.sh
+else
+    run_step "PTC trampoline 配对"
+fi
+if [ -f test/RUN_PTC_FORK_EXEC.sh ]; then
+    run_step "PTC fork/exec 取消" sh test/RUN_PTC_FORK_EXEC.sh
+else
+    run_step "PTC fork/exec 取消"
+fi
+
 # 沙箱逃逸（`..` 夹紧 / 宿主绝对链接 × 跟随型钩子，2026-09-27 真机爆破）
 if [ -f test/RUN_ESCAPE.sh ]; then
     run_step "沙箱逃逸" sh test/RUN_ESCAPE.sh
@@ -1171,14 +1258,27 @@ while IFS='|' read -r st nm sm; do
     BLOCKED) printf '  BLOCKED %-24s %s\n' "$nm" "$sm" ;;
     ERROR) printf '  ERROR %-24s %s\n' "$nm" "$sm" ;;
     KNOWN) printf '  ⚠️  %-24s %s\n' "$nm" "$sm" ;;
+    ENV) printf '  🌐 %-24s %s\n' "$nm" "$sm" ;;
+    TIMEOUT) printf '  ⏱️  %-24s %s\n' "$nm" "$sm" ;;
     esac
 done < "$RESULT_FILE"
 echo "------------------------------------------------------"
 echo "  通过 $PASS / 失败 $FAIL$([ "$KNOWN" -gt 0 ] && echo " / 已知缺陷 $KNOWN")"
 echo "  Evidence: $WORK_DIR (results and all logs retained)"
 
-echo "  跳过 $SKIP / 隔离阻止 $BLOCKED / 基础设施错误 $ERRORS"
-if [ "$FAIL" -gt 0 ] || [ "$BLOCKED" -gt 0 ]; then
+echo "  跳过 $SKIP / 隔离阻止 $BLOCKED / 基础设施错误 $ERRORS / 环境限制 $ENVFAIL / 超时 $TIMEOUTS"
+if [ "$TIMEOUTS" -gt 0 ]; then
+    echo "  ⚠️  其中 $TIMEOUTS 项是超时，不是失败：测试还在推进时预算用完，结果未知"
+fi
+# ENV is not a pass: say so explicitly so the green tail is never read as
+# "everything verified". These steps never reached bxroot code.
+if [ "$ENVFAIL" -gt 0 ]; then
+    echo "  ⚠️  其中 $ENVFAIL 项因宿主环境无法运行（未验证到 bxroot 代码，不等于通过）"
+fi
+# A timeout is an unknown result, not a pass. Letting exit be 0 here would
+# turn "we ran out of time" into a green tick -- exactly the failure mode the
+# ENV classification above exists to prevent.
+if [ "$FAIL" -gt 0 ] || [ "$BLOCKED" -gt 0 ] || [ "$TIMEOUTS" -gt 0 ]; then
     echo "  ❌ 回归未通过或未完整执行"
     exit 1
 fi

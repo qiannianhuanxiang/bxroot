@@ -14,7 +14,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BX="$ROOT/tools/bxroot-run"
 grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || { echo "⏭️  跳过：需要外层 proroot"; exit 2; }
 [ -f "$ROOT/build/libbxroot-runtime.so" ] || { echo "⏭️  跳过：无 runtime"; exit 2; }
-W=$(mktemp -d /tmp/bxroot-frchown-XXXXXX); trap 'rm -rf "$W"' EXIT
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-frchown-XXXXXX"); trap 'rm -rf "$W"' EXIT
 RF="$W/rf"; mkdir -p "$RF/etc" "$RF/tmp"
 ln -s ../../../usr "$RF/usr"; ln -s usr/bin "$RF/bin"; ln -s usr/lib "$RF/lib"
 cat > "$W/p.c" <<'C'

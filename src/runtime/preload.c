@@ -80,6 +80,7 @@ extern void bxroot_sysvshm_fork_child(void) __attribute__((weak));
  * 解析成 NULL，故必须判空）。
  */
 extern int  bxroot_fakeroot_atfork_child(void) __attribute__((weak));
+extern void bxroot_l2s_fork_child(void) __attribute__((weak));        /* 循环计数自旋锁复位 */
 
 static void bxroot_preload_fork_prepare(void)
 {
@@ -117,6 +118,17 @@ static void bxroot_preload_fork_child(void)
 
     if (bxroot_sysvshm_fork_child != NULL)
         bxroot_sysvshm_fork_child();
+
+    /*
+     * ★ l2s 的 cnt_lock 也必须在子进程里复位（2026-10-26）★
+     *
+     * g_cnt_lock 是进程内自旋锁，随 fork 被继承。父进程其它线程
+     * 正持锁做 link 计数时 fork，子进程会拿到一把**永远不会释放**
+     * 的锁：之后第一次走 read/write 回退分支就永久自旋。
+     * 与 fakeroot、sysvshm 同款：只在子进程回调里复位才安全。
+     */
+    if (bxroot_l2s_fork_child != NULL)
+        bxroot_l2s_fork_child();
 }
 
 static int bxroot_preload_register_fork_hooks(void)
@@ -217,6 +229,11 @@ int bxroot_l2s_lazy_enable(const char *host_path);
  *
  * 返回：>0 已改写（out 是绝对路径） / ==0 无需改写 / <0 失败。
  */
+/* Forward declaration: strip_rootfs_prefix_inplace() is used by
+ * bxroot_absolutize() below but defined much later. C99 forbids an
+ * implicit declaration of a static function, so declare it first. */
+static int strip_rootfs_prefix_inplace(char *buf);
+
 int bxroot_absolutize(const char *path, char *out, size_t outsz)
 {
     char cwd[MAX_PATH_LEN];
@@ -224,10 +241,45 @@ int bxroot_absolutize(const char *path, char *out, size_t outsz)
 
     if (path == NULL || out == NULL || outsz == 0)
         return -1;
+    /* Empty names are not cwd. Preserve them for the target syscall, including
+     * AT_EMPTY_PATH operations that intentionally address dirfd itself. */
+    if (path[0] == '\0')
+        return 0;
     if (path[0] == '/')
         return 0;                   /* 已经是绝对路径 */
     if (getcwd(cwd, sizeof(cwd)) == NULL)
         return -1;
+
+    /*
+     * getcwd() reports a HOST-view path, so translate it back to the guest
+     * view before joining the relative component.
+     *
+     * This was the root cause of `realpath .` (and every other relative-path
+     * absolutisation) leaking host paths when the rootfs is a SYMLINK:
+     * getcwd returns /home/u/dsharf/etc, joining '.' keeps it a host path,
+     * and the reverse-translation step only knows the literal
+     * g_config.rootfs prefix, so it never strips it.
+     *
+     * Measured on Termux with rootfs -> ~/dsharf:
+     *   -r <symlink>   realpath .  ->  /home/u/dsharf/etc   (leak)
+     *   -r <realpath>  realpath .  ->  /etc                 (correct)
+     *
+     * Falls back to the raw cwd when it genuinely sits outside the rootfs,
+     * which preserves the previous behaviour for that case.
+     */
+    {
+        char g[MAX_PATH_LEN];
+        size_t gl = strlen(cwd);
+
+        if (gl + 1 <= sizeof(g)) {
+            memcpy(g, cwd, gl + 1);
+            if (strip_rootfs_prefix_inplace(g) == 1) {
+                gl = strlen(g);
+                if (gl + 1 <= sizeof(cwd))
+                    memcpy(cwd, g, gl + 1);
+            }
+        }
+    }
 
     cl = strlen(cwd);
     pl = strlen(path);
@@ -260,6 +312,7 @@ int bxroot_absolutize(const char *path, char *out, size_t outsz)
  */
 static int resolve_dirfd_path(int dirfd, const char *path,
                               char *out, size_t outsz);
+static int dirfd_is_directory(int dirfd);
 static int realpath_fixup_inplace(char *buf, size_t cap);
 static ssize_t (*real_readlink)(const char *, char *, size_t);  /* 暂定定义，初始化见下文 */
 int bxroot_absolutize_at(int dirfd, const char *path, char *out, size_t outsz)
@@ -310,7 +363,12 @@ int bxroot_absolutize_at(int dirfd, const char *path, char *out, size_t outsz)
         return 0;
     }
     memcpy(dir, host, (size_t)n + 1);
-    /* 剥 rootfs 前缀 / 反 bind；都不命中说明 dirfd 不在客户视图内 */
+    /* 剥 rootfs 前缀 / 反 bind。都不命中说明 dirfd 指向 rootfs 之外的
+     * 宿主目录（/proc、/sys、/dev 之类的宿主视图，或用户配置的 bind 源）。
+     * 此时返回 0 = **保持 (dirfd, 相对名) 原样交给内核**，绝不改按 cwd
+     * 绝对化 —— 后者会把 "x" 解释成 cwd 下的同名文件，作用到错误对象。
+     * 这不是逃逸：客户拿到 rootfs 之外 fd 的唯一途径是本进程/父进程传下来
+     * 的 fd 或用户显式配置的 bind，dirfd 相对解析不会给出额外权限。 */
     if (realpath_fixup_inplace(dir, sizeof(dir)) == 0) {
         errno = saved;
         return 0;
@@ -404,6 +462,18 @@ static int g_fix_symlink_size = 0;
 /* 全局配置实例 */
 bxroot_config_t g_config = {0};
 
+/* Pick a tmp base that cannot recursively route back through /dev/shm. */
+static const char *bxroot_shm_tmp_base(void)
+{
+    static const char devshm[] = "/dev/shm";
+    const char *base = g_config.tmp_dir ? g_config.tmp_dir : "/tmp";
+    size_t n = sizeof(devshm) - 1;
+
+    if (strncmp(base, devshm, n) == 0 && (base[n] == '\0' || base[n] == '/'))
+        return "/tmp";
+    return base;
+}
+
 /* 缓存函数指针 */
 static int (*real_open)(const char *, int, ...) = NULL;
 static int (*real_openat)(int, const char *, int, ...) = NULL;
@@ -433,8 +503,19 @@ static DIR *(*real_opendir)(const char *) = NULL;
 static FILE *(*real_fopen)(const char *, const char *) = NULL;
 static FILE *(*real_fopen64)(const char *, const char *) = NULL;
 
-/* 最大 bind mount 数量 */
-#define MAX_BINDS 16
+/* config.h retains a legacy default; its struct has pointers, not arrays.
+ * Override locally, in sync with launcher.c, for the owning allocator/parser. */
+#undef MAX_BINDS
+#define MAX_BINDS 64
+/* Full BXROOT_BINDS=VALUE plus NUL; fits proc.c forced env entries. */
+#define MAX_BIND_ENV (16u * 1024u)
+
+static void bind_config_error(const char *reason) __attribute__((noreturn));
+static void bind_config_error(const char *reason) {
+    fprintf(stderr, "bxroot: invalid bind configuration: %s (max %d binds)\n",
+            reason, MAX_BINDS);
+    _exit(127);
+}
 
 /*
  * 去掉路径尾部的 '/'。
@@ -462,16 +543,20 @@ static void parse_binds(void) {
      *
      * 第三段是可选的**只读标志**：显式的 `:ro` 表示该 bind 挂载点在
      * guest 内只读（任何写意图返回 EROFS）。无第三段 = 可写（旧格式，
-     * 向后兼容）。只有字面量 "ro" 才置只读；其它第三段值一律忽略并
-     * 视为可写（宽松，避免因未来扩展而误锁）。
+     * 向后兼容）。第三段接受大小写不敏感的 ro/rw；无效配置显式失败。
      *
      * ★ 为什么只切前两个冒号 ★ source/target 里理论上不含冒号
      * （Unix 路径合法但极罕见），本项目历史格式也从未支持路径含冒号，
      * 所以按前两个冒号切分：第一个分 src|rest，在 rest 里再找一个冒号
      * 分 dst|flag。
      */
+    if (strnlen(env, MAX_BIND_ENV) >=
+        MAX_BIND_ENV - (sizeof("BXROOT_BINDS=") - 1))
+        bind_config_error("BXROOT_BINDS exceeds 16 KiB environment entry");
+    if (env[0] == ';' || env[strlen(env) - 1] == ';' || strstr(env, ";;"))
+        bind_config_error("empty BXROOT_BINDS entry");
     char *copy = strdup(env);
-    if (!copy) return;
+    if (!copy) bind_config_error("out of memory");
 
     g_config.bind_count = 0;
     g_config.bind_sources = calloc(MAX_BINDS, sizeof(char *));
@@ -480,12 +565,14 @@ static void parse_binds(void) {
     if (!g_config.bind_sources || !g_config.bind_targets ||
         !g_config.bind_readonly) {
         free(copy);
-        return;
+        bind_config_error("out of memory");
     }
 
     char *saveptr = NULL;
     char *entry = strtok_r(copy, ";", &saveptr);
-    while (entry && g_config.bind_count < MAX_BINDS) {
+    while (entry) {
+        if (g_config.bind_count >= MAX_BINDS)
+            bind_config_error("too many BXROOT_BINDS entries");
         char *colon = strchr(entry, ':');
         if (colon) {
             *colon = '\0';
@@ -508,24 +595,22 @@ static void parse_binds(void) {
                     if ((mod[0] == 'r' || mod[0] == 'R') &&
                         (mod[1] == 'o' || mod[1] == 'O') && mod[2] == '\0')
                         ro = 1;
-                    /* 其它第三段值（含空串、:rw）→ 忽略，按可写处理 */
+                    else if (strcasecmp(mod, "rw") != 0)
+                        bind_config_error("unsupported bind modifier");
                 }
             }
 
             /* 空 source 或空 target 是无效条目：留着会让匹配逻辑把
              * 空前缀当成"匹配一切"，把整棵树都翻译错。 */
             if (entry[0] == '\0' || rest[0] == '\0') {
-                LOG("bind: 跳过空条目");
-                entry = strtok_r(NULL, ";", &saveptr);
-                continue;
+                bind_config_error("empty bind source or target");
             }
 
             char *src = strdup(entry);
             char *tgt = strdup(rest);
             if (src == NULL || tgt == NULL) {
                 free(src); free(tgt);
-                entry = strtok_r(NULL, ";", &saveptr);
-                continue;
+                bind_config_error("out of memory");
             }
             strip_trailing_slash(src);
             strip_trailing_slash(tgt);
@@ -535,6 +620,8 @@ static void parse_binds(void) {
             g_config.bind_readonly[g_config.bind_count] = ro;
             g_config.bind_count++;
             LOG("bind: %s -> %s%s", src, tgt, ro ? " (ro)" : "");
+        } else {
+            bind_config_error("missing bind separator");
         }
         entry = strtok_r(NULL, ";", &saveptr);
     }
@@ -599,8 +686,15 @@ static long prcfg_sys(long nr, long a, long b, long c, long d)
     register long x1 __asm__("x1") = b;
     register long x2 __asm__("x2") = c;
     register long x3 __asm__("x3") = d;
-    __asm__ volatile("svc 0" : "+r"(x0)
-                     : "r"(x1), "r"(x2), "r"(x3), "r"(x8) : "memory", "cc");
+    __asm__ volatile(""
+        "stp x1, x2, [sp, #-16]!\n\t"
+        "str x3,     [sp, #-16]!\n\t"
+        "svc #0\n\t"
+        "ldr x3,     [sp], #16\n\t"
+        "ldp x1, x2, [sp], #16"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+        : "memory", "cc");
     return x0;
 #else
     long r = syscall(nr, a, b, c, d);
@@ -836,8 +930,8 @@ static void load_proroot_cfg(void)
     }
 
     nb = prcfg_u32(b, PRCFG_OFF_NBINDS);
-    if (nb > PRCFG_MAX_ENTRIES)
-        nb = PRCFG_MAX_ENTRIES;
+    if (nb > PRCFG_MAX_ENTRIES || nb > MAX_BINDS)
+        bind_config_error("PROROOT_CFG_FD exceeds 32-entry ABI capacity");
 
     if (nb > 0) {
         g_config.bind_sources = calloc(MAX_BINDS, sizeof(char *));
@@ -852,22 +946,22 @@ static void load_proroot_cfg(void)
             g_config.bind_targets = NULL;
             g_config.bind_readonly = NULL;
             free(b);
-            return;
+            bind_config_error("out of memory");
         }
     }
-    for (i = 0; i < nb && g_config.bind_count < MAX_BINDS; i++) {
+    for (i = 0; i < nb; i++) {
         size_t dl = prcfg_field(b, PRCFG_OFF_DST(i));
         size_t sl = prcfg_field(b, PRCFG_OFF_SRC(i));
         char *src, *dst;
 
         if (dl == 0 || sl == 0)
-            continue;
+            bind_config_error("empty PROROOT_CFG_FD bind field");
         src = strndup((const char *)b + PRCFG_OFF_SRC(i), sl);
         dst = strndup((const char *)b + PRCFG_OFF_DST(i), dl);
         if (src == NULL || dst == NULL) {
             free(src);
             free(dst);
-            continue;
+            bind_config_error("out of memory");
         }
         strip_trailing_slash(src);
         strip_trailing_slash(dst);
@@ -881,7 +975,10 @@ static void load_proroot_cfg(void)
     /*
      * rootfs。官方 launcher 不一定 setenv PROROOT_ROOTFS（见文件头）。
      * 来源按可靠程度：ESCAPE_FD 的内核路径 → blob +0x0000。
-     * 已经有 BXROOT_ROOTFS / PROROOT_ROOTFS 时不覆盖（用户/外层优先）。
+     * 已经有 BXROOT_ROOTFS / PROROOT_ROOTFS 时不覆盖（用户/外层优先）——
+     * **仅限本进程构造期**。之后每次 exec，proc.c 的 px_build_forced 会把
+     * 本进程的 rootfs 强制写进子进程 envp，覆盖调用方给的值（显式不同值时
+     * px_runtime_build_env 会告警一次）。换 rootfs 请嵌套启动 launcher。
      * 必须在 --link2symlink 段之前生效：那一段用 g_config.rootfs 拼 .l2s。
      */
     {
@@ -1451,7 +1548,7 @@ static int translate_path(const char *path, char *out, size_t out_size) {
             char redirect[MAX_PATH_LEN];
             int w = snprintf(redirect, sizeof(redirect),
                              "%s/.bxroot-shm%s",
-                             g_config.tmp_dir ? g_config.tmp_dir : "/tmp",
+                             bxroot_shm_tmp_base(),
                              path + sl);
             if (w < 0 || (size_t)w >= sizeof(redirect)) {
                 LOG("path too long (/dev/shm redirect): %s", path);
@@ -1841,9 +1938,20 @@ static int ro_guard_at(int dirfd, const char *path) {
     char joined[MAX_PATH_LEN];
     const char *g = path;
     if (path[0] != '/') {
-        if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1)
+        int rdp = resolve_dirfd_path(dirfd, path, joined, sizeof(joined));
+        if (rdp == 1) {
             g = joined;
-        /* 否则 g 仍是相对名，bind_is_readonly_target 会用 cwd 绝对化 */
+        } else if (dirfd != AT_FDCWD) {
+            /*
+             * dirfd 无法映射到 guest 视图（无效/非目录，或指向 rootfs 之外
+             * 的宿主目录）。**必须放弃判定**：若让 g 停在相对名，
+             * bind_is_readonly_target 会按**进程 cwd** 绝对化，把一条与只读
+             * bind 无关的调用误判成 EROFS（也可能反过来漏判）。
+             * 只读守卫是"宁可漏判也不误锁"的语义（见 ro_guard_fd）。
+             */
+            return 0;
+        }
+        /* dirfd == AT_FDCWD：相对名相对 cwd，bind 判定按 cwd 绝对化正确 */
     }
     return ro_guard_path(g);
 }
@@ -1921,6 +2029,12 @@ static int open_flags_write_intent(int flags) {
     return 0;
 }
 
+/* O_TMPFILE includes O_DIRECTORY in its value. A plain O_DIRECTORY must not
+ * trigger optional mode varargs or suppress symlink checks. */
+static int open_flags_has_tmpfile(int flags) {
+    return (flags & O_TMPFILE) == O_TMPFILE;
+}
+
 /* fopen/freopen 的 mode 串写意图判定：含 w/a/+ 即为写。 */
 static int fopen_mode_write_intent(const char *mode) {
     if (mode == NULL)
@@ -1940,6 +2054,22 @@ static int fopen_mode_write_intent(const char *mode) {
  * `BXROOT_VERBOSE` 决定要不要调我们。若这里再用编译期门控，就变成
  * 「编译期没开 → 运行期怎么设都看不到日志」，而现场排查时恰恰最需要它。
  */
+/*
+ * `format(printf, 1, 2)` is load-bearing, not decoration.
+ *
+ * Without it the compiler cannot know this is a printf-style forwarder,
+ * so `vfprintf(stderr, fmt, ap)` trips -Wformat-nonliteral:
+ *
+ *   src/runtime/preload.c:1948:22: warning: format string is not a
+ *   string literal [-Wformat-nonliteral]
+ *
+ * That is a false positive -- forwarding a va_list is the point of this
+ * function -- but suppressing the warning alone would be worse than
+ * useless. The attribute instead makes every CALL SITE checked, so a
+ * mismatched format argument becomes a compile error instead of silent
+ * runtime corruption.
+ */
+__attribute__((format(printf, 1, 2)))
 void bxroot_log(const char *fmt, ...) {
     va_list ap;
 
@@ -2648,7 +2778,9 @@ static int call_real_openat(int dirfd, const char *path, int flags, mode_t mode)
 static const char *l2s_open_path(const char *p, int flags,
                                 char *scratch, size_t scratchsz)
 {
-    if (p == NULL || (flags & O_NOFOLLOW) == 0)
+    /* l2s probes require an absolute host path; an unmapped dirfd pathname
+     * must be left for the kernel rather than reinterpreted against cwd. */
+    if (p == NULL || p[0] != '/' || (flags & O_NOFOLLOW) == 0)
         return p;
     /*
      * ★ probe 之前必须懒启用 ★
@@ -3352,15 +3484,21 @@ static int resolve_symlink_full(const char *translated,
                                 char *out, size_t out_size)
 {
     char cur[MAX_PATH_LEN];
-    char seen[16][MAX_PATH_LEN];   /* ★ 函数作用域：循环里每步都要比对 ★ */
+    char (*seen)[MAX_PATH_LEN] = NULL;   /* 堆上：栈溢出修复 2026-10-26 */
+    int  seen_cap = 16;
     int  nseen = 0;
     int depth;
 
     if (translated == NULL || out == NULL || out_size == 0)
-        return 0;
+        { free(seen); return 0; }
     if (strlen(translated) >= sizeof(cur))
-        return 0;
+        { free(seen); return 0; }
     memcpy(cur, translated, strlen(translated) + 1);
+
+    /* seen 放堆：原 16x8KB=128KB 在栈上，嵌套钩子 8 层就是 512KB，实测会 SIGSEGV。分配失败时退化为无循环检测。 */
+    seen = (char (*)[MAX_PATH_LEN])calloc((size_t)seen_cap, MAX_PATH_LEN);
+    if (seen == NULL)
+        seen_cap = 0;
 
     {
         /*
@@ -3380,7 +3518,7 @@ static int resolve_symlink_full(const char *translated,
          * -Wdangling-pointer 会抓，告警门禁零容忍。
          */
         size_t sl = strlen(translated);
-        if (sl < sizeof(seen[0]))
+        if (seen != NULL && sl < (size_t)MAX_PATH_LEN)
             memcpy(seen[nseen++], translated, sl + 1);
     }
 
@@ -3389,7 +3527,7 @@ static int resolve_symlink_full(const char *translated,
         ssize_t n;
 
         if (real_readlink == NULL)
-            return 0;
+            { free(seen); return 0; }
         if (proc_fd_magic_leaf(cur))
             break;
 
@@ -3419,9 +3557,9 @@ static int resolve_symlink_full(const char *translated,
              */
             char t2[MAX_PATH_LEN];
             if (translate_path(tgt, t2, sizeof(t2)) < 0)
-                return 0;
+                { free(seen); return 0; }
             if (strlen(t2) >= sizeof(cur))
-                return 0;
+                { free(seen); return 0; }
             memcpy(cur, t2, strlen(t2) + 1);
         } else {
             /* 相对目标：接在 cur 所在目录之后 */
@@ -3433,9 +3571,9 @@ static int resolve_symlink_full(const char *translated,
                      : snprintf(joined, sizeof(joined), "%.*s/%s",
                                 (int)dlen, cur, tgt);
             if (n2 < 0 || (size_t)n2 >= sizeof(joined))
-                return 0;
+                { free(seen); return 0; }
             if (strlen(joined) >= sizeof(cur))
-                return 0;
+                { free(seen); return 0; }
             memcpy(cur, joined, strlen(joined) + 1);
         }
 
@@ -3446,24 +3584,25 @@ static int resolve_symlink_full(const char *translated,
          */
         {
             int k;
-            for (k = 0; k < nseen; k++) {
+            for (k = 0; seen != NULL && k < nseen; k++) {
                 if (strcmp(seen[k], cur) == 0) {
                     resolve_loop_fill(translated, out, out_size);
                     errno = ELOOP;
-                    return -2;
+                    { free(seen); return -2; }
                 }
             }
-            if (nseen < 16)
-                memcpy(seen[nseen++], cur, strlen(cur) + 1);
+            if (seen != NULL && nseen < seen_cap &&
+                    strlen(cur) < (size_t)MAX_PATH_LEN)
+                    memcpy(seen[nseen++], cur, strlen(cur) + 1);
         }
     }
 
     if (strcmp(cur, translated) == 0)
-        return 0;                           /* 与最初入参相同 → 无需改写 */
+        { free(seen); return 0; }  /* 与最初入参相同 → 无需改写 */
     if (strlen(cur) >= out_size)
-        return 0;
+        { free(seen); return 0; }
     memcpy(out, cur, strlen(cur) + 1);
-    return 1;
+    { free(seen); return 1; }
 }
 
 /*
@@ -3502,7 +3641,8 @@ static int resolve_intermediate_symlinks(const char *translated,
      * 展开永不收敛；打破轮数上限后交回内核 open，内核视角下那条
      * 容器视角的绝对目标**不存在** → ENOENT 而非 ELOOP（宿主是 40）。
      */
-    char seen[16][MAX_PATH_LEN];
+    char (*seen)[MAX_PATH_LEN] = NULL;   /* 堆上：栈溢出修复 2026-10-26 */
+    int  seen_cap = 16;
     int  nseen = 0;
     /*
      * ★ 保存调用方的 errno，返回前恢复 ★
@@ -3523,14 +3663,20 @@ static int resolve_intermediate_symlinks(const char *translated,
 
     if (translated == NULL || out == NULL || out_size == 0) {
             errno = saved_errno;
-            return 0;
+            { free(seen); return 0; }
         }
     if (translated[0] != '/' || strlen(translated) >= sizeof(cur)) {
             errno = saved_errno;
-            return 0;
+            { free(seen); return 0; }
         }
     memcpy(cur, translated, strlen(translated) + 1);
-    memcpy(seen[nseen++], cur, strlen(cur) + 1);
+
+    /* seen 放堆：原 16x8KB=128KB 在栈上，嵌套钩子会 SIGSEGV。 */
+    seen = (char (*)[MAX_PATH_LEN])calloc((size_t)seen_cap, MAX_PATH_LEN);
+    if (seen == NULL)
+        seen_cap = 0;
+    if (seen != NULL && strlen(cur) < (size_t)MAX_PATH_LEN)
+        memcpy(seen[nseen++], cur, strlen(cur) + 1);
 
     /*
      * 单遍展开，最多 8 轮（拦链接环）。每轮从头扫一遍路径的每个前缀，
@@ -3564,15 +3710,16 @@ static int resolve_intermediate_symlinks(const char *translated,
             char pm[MAX_PATH_LEN];
             if (proc_magic_intermediate_resolve(cur, pm, sizeof(pm))) {
                 int k, dup = 0;
-                for (k = 0; k < nseen; k++)
+                for (k = 0; seen != NULL && k < nseen; k++)
                     if (strcmp(seen[k], pm) == 0) dup = 1;
                 if (dup) {
                     resolve_loop_fill(translated, out, out_size);
                     errno = ELOOP;
-                    return -2;
+                    { free(seen); return -2; }
                 }
                 memcpy(cur, pm, strlen(pm) + 1);
-                if (nseen < 16)
+                if (seen != NULL && nseen < seen_cap &&
+                    strlen(cur) < (size_t)MAX_PATH_LEN)
                     memcpy(seen[nseen++], cur, strlen(cur) + 1);
                 continue;                       /* 重头扫下一轮 */
             }
@@ -3592,7 +3739,7 @@ static int resolve_intermediate_symlinks(const char *translated,
 
             if (i >= sizeof(prefix)) {
                     errno = saved_errno;
-                    return 0;
+                    { free(seen); return 0; }
                 }
             memcpy(prefix, cur, i);
             prefix[i] = '\0';
@@ -3604,7 +3751,7 @@ static int resolve_intermediate_symlinks(const char *translated,
 
             if (strlen(cur + i) >= sizeof(rest)) {
                     errno = saved_errno;
-                    return 0;
+                    { free(seen); return 0; }
                 }
             memcpy(rest, cur + i, strlen(cur + i) + 1);
 
@@ -3621,14 +3768,14 @@ static int resolve_intermediate_symlinks(const char *translated,
              */
             if (rest[0] == '\0') {
                     errno = saved_errno;
-                    return 0;
+                    { free(seen); return 0; }
                 }
 
             if (tgt[0] == '/') {
                 /* 绝对目标：按 rootfs 翻译（translate_path 幂等） */
                 if (translate_path(tgt, joined, sizeof(joined)) < 0) {
                         errno = saved_errno;
-                        return 0;
+                        { free(seen); return 0; }
                     }
             } else {
                 /*
@@ -3663,7 +3810,7 @@ static int resolve_intermediate_symlinks(const char *translated,
                                   (int)dlen, prefix, tgt);
                 if (nj < 0 || (size_t)nj >= sizeof(joined)) {
                         errno = saved_errno;
-                        return 0;
+                        { free(seen); return 0; }
                     }
             }
 
@@ -3673,7 +3820,7 @@ static int resolve_intermediate_symlinks(const char *translated,
                 size_t rl2 = strlen(rest);
                 if (jl + rl2 + 1u > sizeof(work) || jl >= sizeof(joined)) {
                         errno = saved_errno;
-                        return 0;
+                        { free(seen); return 0; }
                     }
                 memcpy(work, joined, jl);
                 memcpy(work + jl, rest, rl2 + 1u);
@@ -3681,7 +3828,7 @@ static int resolve_intermediate_symlinks(const char *translated,
 
             if (strlen(work) >= sizeof(cur)) {
                     errno = saved_errno;
-                    return 0;
+                    { free(seen); return 0; }
                 }
             memcpy(cur, work, strlen(work) + 1);
             /*
@@ -3690,15 +3837,16 @@ static int resolve_intermediate_symlinks(const char *translated,
              */
             {
                 int k;
-                for (k = 0; k < nseen; k++) {
+                for (k = 0; seen != NULL && k < nseen; k++) {
                     if (strcmp(seen[k], cur) == 0) {
                         /* 原先这里先置 ELOOP 又被 saved_errno 覆盖（审计 A2-1） */
                         resolve_loop_fill(translated, out, out_size);
                         errno = ELOOP;
-                        return -2;
+                        { free(seen); return -2; }
                     }
                 }
-                if (nseen < 16)
+                if (seen != NULL && nseen < seen_cap &&
+                    strlen(cur) < (size_t)MAX_PATH_LEN)
                     memcpy(seen[nseen++], cur, strlen(cur) + 1);
             }
             changed_this_round = 1;
@@ -3711,15 +3859,15 @@ static int resolve_intermediate_symlinks(const char *translated,
 
     if (strcmp(cur, translated) == 0) {
             errno = saved_errno;
-            return 0;
+            { free(seen); return 0; }
         }                           /* 与**最初入参**比较 */
     if (strlen(cur) >= out_size) {
             errno = saved_errno;
-            return 0;
+            { free(seen); return 0; }
         }
     memcpy(out, cur, strlen(cur) + 1);
     errno = saved_errno;
-    return 1;
+    { free(seen); return 1; }
 }
 
 /*
@@ -4056,7 +4204,7 @@ int open(const char *path, int flags, ...) {
     ensure_real_functions();
 
     mode_t mode = 0666;
-    if (flags & (O_CREAT | O_TMPFILE)) {
+    if ((flags & O_CREAT) || open_flags_has_tmpfile(flags)) {
         va_list args;
         va_start(args, flags);
         mode = va_arg(args, mode_t);
@@ -4112,11 +4260,12 @@ int open(const char *path, int flags, ...) {
             }
         }
         if (!(flags & O_NOFOLLOW) && !(flags & O_CREAT) &&
-            !(flags & O_TMPFILE)) {
+            !open_flags_has_tmpfile(flags)) {
             int fd0 = call_real_open(q, flags | O_NOFOLLOW, mode);
             if (fd0 >= 0)
                 return fd0;             /* 不是符号链接：零额外开销 */
-            if (errno != ELOOP)
+            /* O_NOFOLLOW|O_DIRECTORY reports ENOTDIR for a symlink on some kernels. */
+            if (errno != ELOOP && !((flags & O_DIRECTORY) && errno == ENOTDIR))
                 return open_retry_abs_symlink(q, flags, mode);
 
             /*
@@ -4183,7 +4332,7 @@ int open64(const char *path, int flags, ...) {
     ensure_real_functions();
 
     mode_t mode = 0666;
-    if (flags & (O_CREAT | O_TMPFILE)) {
+    if ((flags & O_CREAT) || open_flags_has_tmpfile(flags)) {
         va_list args;
         va_start(args, flags);
         mode = va_arg(args, mode_t);
@@ -4249,11 +4398,12 @@ int open64(const char *path, int flags, ...) {
             }
         }
         if (!(flags & O_NOFOLLOW) && !(flags & O_CREAT) &&
-            !(flags & O_TMPFILE)) {
+            !open_flags_has_tmpfile(flags)) {
             int fd0 = real_open64(q, flags | O_NOFOLLOW, mode);
             if (fd0 >= 0)
                 return fd0;
-            if (errno == ELOOP) {
+            /* With O_DIRECTORY, O_NOFOLLOW may report ENOTDIR instead of ELOOP. */
+            if (errno == ELOOP || ((flags & O_DIRECTORY) && errno == ENOTDIR)) {
                 char full[MAX_PATH_LEN];
                 int rr;
                 rr = resolve_symlink_full(q, full, sizeof(full));
@@ -4314,6 +4464,59 @@ int open64(const char *path, int flags, ...) {
  *
  * 返回 1 = 已拼成绝对路径（out 有效）；0 = 调用方按原样处理。
  */
+/*
+ * host_path_is_passthrough —— "这条 (dirfd, path) 必须原样交给内核"。
+ *
+ * resolve_host_path() 无法给出绝对宿主路径时会**原样返回 path**（见那里的
+ * 三处 return path 分支：dirfd 无效/非目录、dirfd 指向 rootfs 之外的宿主
+ * 目录、AT_FDCWD）。调用方拿到同一指针即表示：
+ *
+ *   ① 不要做 l2s 判定 / 中间组件展开 / 绝对目标重试 —— 那些都要宿主绝对
+ *      路径，对相对名做只会按 **进程 cwd** 解析，作用到错误对象；
+ *   ② 直接用**原始 dirfd** 调真符号 —— 内核自己会给 EBADF / ENOTDIR，
+ *      且不会把 dirfd 相对解析错误地换成 cwd 相对解析。
+ *
+ * ★ 为什么必须逐调用点判，而不能让它"落到"后续逻辑 ★
+ * 后续逻辑（l2s probe、translate_path、resolve_abs_symlink 重试）全都
+ * 假设 p 是宿主绝对路径。相对名进去不会被拦，只会被按 cwd 解释 ——
+ * `fstatat(filefd, "../victim")` 本该 ENOTDIR，会变成 stat 到兄弟文件。
+ */
+static int host_path_is_passthrough(int dirfd, const char *path,
+                                   const char *resolved)
+{
+    if (dirfd == AT_FDCWD || path == NULL || path[0] == '\0' || path[0] == '/')
+        return 0;
+    return resolved == path;
+}
+
+static int dirfd_is_directory(int dirfd)
+{
+    struct stat st;
+    int saved_errno = errno;
+    int rc = (int)syscall(SYS_fstat, dirfd, &st);
+    int error = errno;
+    errno = saved_errno;
+    if (rc != 0)
+        return -(error != 0 ? error : EBADF);
+    return S_ISDIR(st.st_mode) ? 1 : 0;
+}
+
+/*
+ * resolve_dirfd_path 的返回值契约（调用方**必须**按此分支）:
+ *
+ *   1            = out 里是拼好的绝对路径；调用方可用它替原 path，
+ *                  并把 dirfd 换成 AT_FDCWD。
+ *   0            = 不适用（AT_FDCWD / 绝对路径 / 空路径）：原样传给内核。
+ *   RDP_PASSTHRU = dirfd 无效或不是目录。**原样**把 (dirfd, path) 交给
+ *                  内核 —— 内核给 EBADF/ENOTDIR，绝不可拼成任何可用路径。
+ *   <0           = -errno（readlink 失败 / 拼接截断），调用方必须以该错误
+ *                  失败或按各自既有约定关闭（fail closed）。
+ *
+ * 注意 RDP_PASSTHRU 刻意取 2 而不是 0：0 的语义是"按 AT_FDCWD 处理"，
+ * 而这里恰恰**不能**改成 cwd 相对 —— 必须保留原 dirfd。
+ */
+enum { RDP_PASSTHRU = 2 };
+
 static int resolve_dirfd_path(int dirfd, const char *path,
                               char *out, size_t outsz)
 {
@@ -4322,6 +4525,7 @@ static int resolve_dirfd_path(int dirfd, const char *path,
     ssize_t n;
     size_t dlen;
     int w;
+    int saved_errno = errno;
 
     if (dirfd == AT_FDCWD || path == NULL || path[0] == '\0')
         return 0;
@@ -4330,11 +4534,28 @@ static int resolve_dirfd_path(int dirfd, const char *path,
     if (path[0] == '/')
         return 0;
 
+    /*
+     * ★ fd 无效 / 不是目录 → 透传（RDP_PASSTHRU）★
+     *
+     * 让调用方**保留原始 dirfd 与原始 path** 直接调真符号：内核自己会
+     * 给出 EBADF / ENOTDIR，那正是本应发生的错误。绝不能被拼成任何
+     * 可用的绝对路径 —— 例如 `fstatat(filefd, "../victim")` 若在这里把
+     * 路径规范化成 "<dir>/victim"，内核本该拒绝的调用就变成对旁边文件的
+     * 一次**有效**操作（PR 审核 P1）。
+     */
+    if (dirfd_is_directory(dirfd) != 1) {
+        errno = saved_errno;
+        return RDP_PASSTHRU;
+    }
+
     snprintf(proc, sizeof(proc), "/proc/self/fd/%d", dirfd);
     n = real_readlink != NULL ? real_readlink(proc, dir, sizeof(dir) - 1)
                               : readlink(proc, dir, sizeof(dir) - 1);
-    if (n <= 0)
-        return 0;                   /* 拿不到目录就退回原行为，不乱猜 */
+    if (n <= 0) {
+        int e = errno != 0 ? errno : EXDEV;
+        errno = e;
+        return -e;
+    }
     dir[n] = '\0';
 
     /*
@@ -4369,7 +4590,16 @@ static int resolve_dirfd_path(int dirfd, const char *path,
  * translate_path 是幂等的（已带前缀时返回 0 并原样拷贝），所以两条分支
  * 都安全。
  *
- * 返回的指针可能是 out_host（拼好的宿主路径）或 path 本身。
+ * 【返回值有两种，调用方必须区分（见 host_path_is_passthrough）】
+ *   ① out_host / 绝对路径 —— 已翻译好的宿主绝对路径，可安全用于 l2s
+ *      probe、中间组件展开、绝对目标重试，并把 dirfd 换成 AT_FDCWD。
+ *   ② **与入参 path 同一个指针** —— 表示"这条调用必须原样透传"。三个
+ *      来源：dirfd 无效或不是目录（内核会给 EBADF/ENOTDIR）、dirfd 指向
+ *      rootfs 之外的宿主目录（/proc、/sys、/dev、用户 bind 源）、以及
+ *      AT_FDCWD 的相对路径但绝对化不可用。此时调用方必须保留**原始
+ *      dirfd 与原始 path** 直接调真符号。
+ * 另外 rr<0（拼接截断 / readlink 失败）会给一条 rootfs 内必不存在的
+ * 哨兵路径（内核回 ENOENT），这是"关闭"，不是"放行"。
  */
 static const char *resolve_host_path(int dirfd, const char *path,
                                      char *joined, size_t joinedsz,
@@ -4377,8 +4607,47 @@ static const char *resolve_host_path(int dirfd, const char *path,
 {
     const char *abs = path;
 
-    if (resolve_dirfd_path(dirfd, path, joined, joinedsz) == 1)
+    if (dirfd != AT_FDCWD && path != NULL && path[0] != '\0' &&
+        path[0] != '/') {
+        int rr = resolve_dirfd_path(dirfd, path, joined, joinedsz);
+        if (rr == 1) {
+            abs = joined;
+        } else {
+            /*
+             * ★ rr == 0 / RDP_PASSTHRU ⇒ 原样返回 path ★
+             *
+             * 两种情况都必须保留 (dirfd, 原 path)：
+             *   - rr == 0：dirfd 指向 rootfs 之外的宿主目录（/proc、/sys、
+             *     /dev 或用户配置的 bind 源）。按 cwd 改写会把 "x" 解释成
+             *     cwd 下的同名文件，作用到**错误对象**。
+             *   - RDP_PASSTHRU：dirfd 无效 / 不是目录。改成 cwd 相对会把
+             *     本该 EBADF/ENOTDIR 的调用变成一次有效操作。
+             *
+             * 返回同一指针即"C 契约上的 passthrough"，调用方用
+             * host_path_is_passthrough() 判出来后**直接调真符号**。
+             */
+            if (rr >= 0)
+                return path;
+            /*
+             * rr < 0：readlink(/proc/self/fd/N) 失败或拼接截断。此时绝
+             * 不能退回 path（相对名会按宿主 cwd 解析 → 逃逸），也绝不能
+             * 报错（本函数没有错误通道）。给一条 rootfs 内**必不存在**的
+             * 路径：内核回 ENOENT，是"关闭"而不是"放行"。
+             */
+            {
+                const char *rf = g_config.rootfs ? g_config.rootfs : "";
+                int n = snprintf(out_host, out_hostsz,
+                                 "%s/.bxroot-unresolvable-dirfd", rf);
+                if (n < 0 || (size_t)n >= out_hostsz) {
+                    errno = ENAMETOOLONG;
+                    return path;   /* 连哨兵都放不下：只能透传 */
+                }
+                return out_host;
+            }
+        }
+    } else if (resolve_dirfd_path(dirfd, path, joined, joinedsz) == 1) {
         abs = joined;
+    }
 
     /*
      * ★ 走到这里仍是相对路径 ⇒ 按 cwd 绝对化 ★
@@ -4457,7 +4726,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
     ensure_real_functions();
 
     mode_t mode = 0666;
-    if (flags & (O_CREAT | O_TMPFILE)) {
+    if ((flags & O_CREAT) || open_flags_has_tmpfile(flags)) {
         va_list args;
         va_start(args, flags);
         mode = va_arg(args, mode_t);
@@ -4483,6 +4752,8 @@ int openat(int dirfd, const char *path, int flags, ...) {
      */
     q = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
+    if (host_path_is_passthrough(dirfd, path, q))
+        return call_real_openat(dirfd, path, flags, mode);
     q = l2s_open_path(q, flags, resolved, sizeof(resolved));
 
     /*
@@ -4516,11 +4787,12 @@ int openat(int dirfd, const char *path, int flags, ...) {
         }
     }
 
-    if (!(flags & O_NOFOLLOW) && !(flags & O_CREAT) && !(flags & O_TMPFILE)) {
+    if (!(flags & O_NOFOLLOW) && !(flags & O_CREAT) && !open_flags_has_tmpfile(flags)) {
         int fd0 = call_real_openat(dirfd, q, flags | O_NOFOLLOW, mode);
         if (fd0 >= 0)
             return fd0;                 /* 不是符号链接：零额外开销 */
-        if (errno == ELOOP) {
+        /* O_NOFOLLOW|O_DIRECTORY may report ENOTDIR for a symlink. */
+        if (errno == ELOOP || ((flags & O_DIRECTORY) && errno == ENOTDIR)) {
             char full[MAX_PATH_LEN];
             int rr;
             rr = resolve_symlink_full(q, full, sizeof(full));
@@ -4546,7 +4818,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     ensure_real_functions();
 
     mode_t mode = 0666;
-    if (flags & (O_CREAT | O_TMPFILE)) {
+    if ((flags & O_CREAT) || open_flags_has_tmpfile(flags)) {
         va_list args;
         va_start(args, flags);
         mode = va_arg(args, mode_t);
@@ -4565,6 +4837,8 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     /* 与 openat 同理：先拼绝对路径，否则 O_NOFOLLOW 会撞上伪造链接 */
     q = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
+    if (host_path_is_passthrough(dirfd, path, q))
+        return real_openat64(dirfd, path, flags, mode);
     q = l2s_open_path(q, flags, resolved, sizeof(resolved));
 
     /* 与 openat 同款（理由见那里） */
@@ -4580,11 +4854,12 @@ int openat64(int dirfd, const char *path, int flags, ...) {
         }
     }
 
-    if (!(flags & O_NOFOLLOW) && !(flags & O_CREAT) && !(flags & O_TMPFILE)) {
+    if (!(flags & O_NOFOLLOW) && !(flags & O_CREAT) && !open_flags_has_tmpfile(flags)) {
         int fd0 = real_openat64(dirfd, q, flags | O_NOFOLLOW, mode);
         if (fd0 >= 0)
             return fd0;
-        if (errno == ELOOP) {
+        /* O_NOFOLLOW|O_DIRECTORY may report ENOTDIR for a symlink. */
+        if (errno == ELOOP || ((flags & O_DIRECTORY) && errno == ENOTDIR)) {
             char full[MAX_PATH_LEN];
             int rr = resolve_symlink_full(q, full, sizeof(full));
             if (rr == -2)
@@ -4795,12 +5070,16 @@ int newfstatat(int dirfd, const char *path, struct stat *buf, int flags) {
      */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
+    if (host_path_is_passthrough(dirfd, path, p))
+        return real_newfstatat(dirfd, path, buf, flags);
 
     /*
      * ★ 先探后改（理由见 stat_pre_resolve）★
      * AT_SYMLINK_NOFOLLOW 时该函数直接返回 0，语义不受影响。
+     * 空路径（AT_EMPTY_PATH：作用于 fd 自身）不做链接解析，否则会把
+     * 一条空串送进 resolve_intermediate_symlinks，errno 被污染。
      */
-    {
+    if (p != NULL && p[0] != '\0') {
         int rr = stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_));
         if (rr == -2)
             return -1;      /* 链接环：errno 已是 ELOOP（审计 A2-5） */
@@ -4814,10 +5093,17 @@ int newfstatat(int dirfd, const char *path, struct stat *buf, int flags) {
      * 带 NOFOLLOW 的调用方明确要求"看链接本身"，展开它正好违背语义
      * （tar/rsync 判断"这是不是链接"就靠它）。所以那种情形如实返回。
      */
-    if (rc != 0 && !(flags & AT_SYMLINK_NOFOLLOW)) {
+    if (rc != 0 && !(flags & AT_SYMLINK_NOFOLLOW) && errno != ELOOP) {
+        /*
+         * ★ ELOOP 时不重试 ★ 内核已经把"链接层数超限"算清楚了；再拿一条
+         * 部分解析过的路径重试，等于把内核的 40 层预算**重置**，本该 ELOOP
+         * 的链接环会被解析成功 —— 与内核语义相反，也让调用方看不到环。
+         * 空路径（AT_EMPTY_PATH）同样不重试：它作用于 fd 自身。
+         */
         int saved_ = errno;
         char rs2_[MAX_PATH_LEN];
-        if (resolve_abs_symlink(p, rs2_, sizeof(rs2_)) &&
+        if (p != NULL && p[0] != '\0' &&
+            resolve_abs_symlink(p, rs2_, sizeof(rs2_)) &&
             real_newfstatat(AT_FDCWD, rs2_, buf, flags) == 0)
             rc = 0;
         else
@@ -4844,6 +5130,9 @@ int newfstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
 
     char translated[MAX_PATH_LEN];
     char joined[MAX_PATH_LEN];
+    char mid_[MAX_PATH_LEN];
+    char rs_[MAX_PATH_LEN];
+    char rs2_[MAX_PATH_LEN];
     const char *p = path;
     int rc;
 
@@ -4860,8 +5149,37 @@ int newfstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
      */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
+    /* 无法映射的 dirfd：原样透传（内核给 EBADF/ENOTDIR），绝不按 cwd 改 */
+    if (host_path_is_passthrough(dirfd, path, p))
+        return real_newfstatat64(dirfd, path, buf, flags);
+
+    /* 空路径（AT_EMPTY_PATH：作用于 fd 自身）不做链接解析 */
+    if (p != NULL && p[0] != '\0') {
+        int rr = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+        if (rr == -2)
+            return -1;
+        if (rr > 0)
+            p = mid_;
+    }
+    if (p != NULL && p[0] != '\0' && !(flags & AT_SYMLINK_NOFOLLOW)) {
+        int rr = stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_));
+        if (rr == -2)
+            return -1;
+        if (rr > 0)
+            p = rs_;
+    }
 
     rc = real_newfstatat64(dirfd, p, buf, flags);
+    if (rc != 0 && !(flags & AT_SYMLINK_NOFOLLOW) && errno != ELOOP &&
+        p != NULL && p[0] != '\0') {
+        /* ELOOP 不重试：见 newfstatat（重启内核链接预算会掩盖链接环） */
+        int saved = errno;
+        if (resolve_abs_symlink(p, rs2_, sizeof(rs2_)) &&
+            real_newfstatat64(AT_FDCWD, rs2_, buf, flags) == 0)
+            rc = 0;
+        else
+            errno = saved;
+    }
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat64(buf, &g_fakeroot_state);
     if (rc == 0) {
@@ -5954,6 +6272,20 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
      * AT_SYMLINK_FOLLOW 等标志不影响路径归属。 */
     po = resolve_host_path(olddirfd, oldpath, jo, sizeof(jo), told, sizeof(told));
     pn = resolve_host_path(newdirfd, newpath, jn, sizeof(jn), tnew, sizeof(tnew));
+    /*
+     * ★ 任一端无法映射 ⇒ 整条调用原样透传 ★
+     * l2s 的 link 需要两端宿主绝对路径；拿相对名进去只会按**进程 cwd**
+     * 建出指向错误对象的链接（linkat(filefd,"../a",...) 本该 ENOTDIR）。
+     * 交给内核：它会给出 EBADF/ENOTDIR，或按 dirfd 正确解析。
+     */
+    if (host_path_is_passthrough(olddirfd, oldpath, po) ||
+        host_path_is_passthrough(newdirfd, newpath, pn)) {
+        if (fn == NULL)
+            fn = (int (*)(int, const char *, int, const char *, int))
+                 bxroot_next_symbol("linkat");
+        if (fn == NULL) { errno = ENOSYS; return -1; }
+        return fn(olddirfd, oldpath, newdirfd, newpath, flags);
+    }
     if (po != NULL && po[0] == '/') olddirfd = AT_FDCWD;
     if (pn != NULL && pn[0] == '/') newdirfd = AT_FDCWD;
 
@@ -6077,7 +6409,7 @@ static int fortify_open_common(int dirfd, int use64, int use_at,
 
     /* ② 失败后重试：只在 ENOENT（不改写其它 errno 语义） */
     if (!(flags & O_NOFOLLOW) && !(flags & O_CREAT) &&
-        !(flags & O_TMPFILE)) {
+        !open_flags_has_tmpfile(flags)) {
         r_ = resolve_symlink_full(p, full_, sizeof(full_));
         if (r_ == -2)
             return -1;                  /* 链接环 → errno 已是 ELOOP */
@@ -6191,6 +6523,8 @@ int __openat_2(int dirfd, const char *path, int flags) {
      * 伪造链接 → ELOOP（tar 的 "Cannot open"）。 */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
+    if (host_path_is_passthrough(dirfd, path, p))
+        return fn(dirfd, path, flags);
     p = l2s_open_path(p, flags, resolved, sizeof(resolved));
     return fortify_open_common(dirfd, 0, 1, p, flags, NULL, fn);
 }
@@ -6212,6 +6546,8 @@ int __openat64_2(int dirfd, const char *path, int flags) {
     /* 与 __openat_2 同理：dirfd 拼绝对路径 + l2s 解链 */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
+    if (host_path_is_passthrough(dirfd, path, p))
+        return fn(dirfd, path, flags);
     p = l2s_open_path(p, flags, resolved, sizeof(resolved));
     return fortify_open_common(dirfd, 1, 1, p, flags, NULL, fn);
 }
@@ -6322,11 +6658,36 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf, size_t len,
      * 相对名（tar 的 openat+readlinkat 组合）下 p 还是 "a"，
      * l2s 层拿它 probe 不到任何东西 —— 这正是此前漏改写的根因。
      * 拼成绝对后交给内核也是等价的（dirfd 对绝对路径被忽略）。
+     *
+     * ★ 拼不出来必须真透传 ★ 只判 == 1 会让其余分支把相对名交给
+     * translate_path / resolve_intermediate_symlinks —— 那些按进程 cwd
+     * 解释，readlinkat(filefd, "../victim") 会读到另一个对象。见
+     * readlinkat() 的同款注释。
      */
-    if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1)
-        p = joined;
-    if (translate_path(p, translated, sizeof(translated)) > 0)
-        p = translated;
+    {
+        int rdp = resolve_dirfd_path(dirfd, path, joined, sizeof(joined));
+        if (rdp == 1) {
+            p = joined;
+            if (translate_path(p, translated, sizeof(translated)) > 0)
+                p = translated;
+        } else if (rdp == 0) {
+            if (dirfd == AT_FDCWD &&
+                translate_path(p, translated, sizeof(translated)) > 0)
+                p = translated;
+            else if (dirfd != AT_FDCWD) {
+                char raw0[MAX_PATH_LEN];
+                ssize_t n0 = fn(dirfd, path, raw0, sizeof(raw0) - 1, sizeof(raw0));
+                return readlink_finish(path, raw0, n0, buf, len);
+            }
+        } else if (rdp == RDP_PASSTHRU) {
+            char raw1[MAX_PATH_LEN];
+            ssize_t n1 = fn(dirfd, path, raw1, sizeof(raw1) - 1, sizeof(raw1));
+            return readlink_finish(path, raw1, n1, buf, len);
+        } else {
+            errno = -rdp;
+            return -1;
+        }
+    }
 
     /* ★ 中间组件解析（叶子不动）——理由见 __readlink_chk */
     int rir_11 = 0;
@@ -6755,6 +7116,55 @@ static int strip_rootfs_prefix_inplace(char *buf)
         memmove(buf, rest, restlen + 1);
         return 1;
     }
+
+    /*
+     * rootfs may itself be a SYMLINK.
+     *
+     * The launcher deliberately does not realpath() the rootfs (its view is
+     * the container view, where realpath would resolve against the wrong
+     * base), so g_config.rootfs keeps the link path. The kernel, however,
+     * reports the RESOLVED path for getcwd() and readlink(/proc/self/fd/N),
+     * so the literal comparison above misses and reverse translation
+     * silently fails:
+     *
+     *   -r <symlink>   readlink /proc/self/fd/3  ->  /home/u/dsharf/etc/hostname
+     *   -r <realpath>  readlink /proc/self/fd/3  ->  /etc/hostname
+     *
+     * That is a host-path disclosure, not a cosmetic issue.
+     *
+     * Retry against realpath(rootfs). Only here: this is the one place the
+     * kernel hands us resolved paths, while translate_path goes the other
+     * direction and must keep using the link path.
+     */
+    {
+        static char cached_real[4096];
+        static int   cached_state;   /* 0 = not computed, 1 = usable, -1 = no */
+
+        if (cached_state == 0) {
+            if (real_realpath != NULL && real_realpath(rootfs, cached_real) != NULL)
+                cached_state = 1;
+            else
+                cached_state = -1;
+        }
+        if (cached_state == 1) {
+            size_t rrl = strlen(cached_real);
+
+            if (rrl > 0 && rrl != rl &&
+                strncmp(buf, cached_real, rrl) == 0 &&
+                (buf[rrl] == '\0' || buf[rrl] == '/')) {
+                const char *rest = buf + rrl;
+                size_t restlen = strlen(rest);
+
+                if (restlen == 0) {
+                    buf[0] = '/';
+                    buf[1] = '\0';
+                    return 1;
+                }
+                memmove(buf, rest, restlen + 1);
+                return 1;
+            }
+        }
+    }
     return 0;
 }
 
@@ -6883,40 +7293,24 @@ static int readlink_fixup(const char *raw, char *out, size_t outsz)
 
 static int getcwd_fixup(char *buf, size_t size)
 {
-    const char *rootfs;
-    size_t rl;
-
     if (buf == NULL)
         return 0;
 
     /*
-     * 反向翻译：剥掉 rootfs 前缀。
+     * Reverse translation: strip the rootfs prefix.
      *
-     * 只在**组件边界**上剥（前缀后面必须是 '\0' 或 '/'），
-     * 否则 `/foo/rootfsXYZ` 会被误当成 `/foo/rootfs` 下的路径。
-     * 剥完如果剩空串，说明正处于 rootfs 根 —— 返回 "/"。
+     * Delegates to strip_rootfs_prefix_inplace() instead of keeping a
+     * second copy of the rule here. The copy did not inherit the
+     * symlinked-rootfs fix, so getcwd() kept reporting host paths:
+     *
+     *   -r <symlink>   /usr/bin/realpath .  ->  /home/u/dsharf/etc
+     *   -r <realpath>  /usr/bin/realpath .  ->  /etc
+     *
+     * coreutils realpath does NOT call realpath(3) -- it has no such
+     * UND symbol; it walks getcwd + readlink itself. So fixing the
+     * realpath hook does nothing for it. The leak is here.
      */
-    rootfs = g_config.rootfs ? g_config.rootfs : "";
-    rl = strlen(rootfs);
-    if (rl == 0)
-        return 0;
-
-    if (strncmp(buf, rootfs, rl) == 0 &&
-        (buf[rl] == '\0' || buf[rl] == '/')) {
-        const char *rest = buf + rl;
-        size_t restlen = strlen(rest);
-
-        if (restlen == 0) {
-            /* 正好在 rootfs 根 */
-            if (size < 2)
-                return -ERANGE;
-            buf[0] = '/';
-            buf[1] = '\0';
-            return 0;
-        }
-        /* rest 以 '/' 开头，直接前移即可（含结尾 NUL） */
-        memmove(buf, rest, restlen + 1);
-    }
+    (void)strip_rootfs_prefix_inplace(buf);
 
     /*
      * 反向 bind 映射。
@@ -7108,13 +7502,31 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
      * 实现之一，某些程序直接调它。
      * ★ 缓冲必须在函数作用域（p 会指向它们）—— -Wdangling-pointer ★
      */
-    int rir_13 = 0;
-    rir_13 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
-    if (rir_13 == -2)
-        return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
-    if (rir_13 > 0)
-        p = mid_;
-    if (!(flags & AT_SYMLINK_NOFOLLOW)) {
+    /*
+     * 无法映射的 dirfd（无效/非目录，或指向 rootfs 之外的宿主目录）：
+     * **原样透传**。下面所有步骤都要求宿主绝对路径；对相对名做只会按
+     * **进程 cwd** 解释 —— fstatat(filefd, "../victim") 本该 ENOTDIR，
+     * 会变成 stat 到 cwd 旁的另一个文件。内核自己会给正确错误。
+     */
+    if (host_path_is_passthrough(dirfd, path, p)) {
+        if (fn != NULL)
+            return fn(dirfd, path, buf, flags);
+        if (fn_fx != NULL)
+            return fn_fx(0, dirfd, path, buf, flags);
+        errno = ENOSYS;
+        return -1;
+    }
+
+    /* 空路径（AT_EMPTY_PATH：作用于 fd 自身）不做链接解析 */
+    if (p != NULL && p[0] != '\0') {
+        int rir_13 = 0;
+        rir_13 = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+        if (rir_13 == -2)
+            return -1;   /* 链接环：errno=ELOOP，不得把未写入的缓冲当路径（审计 A2-1） */
+        if (rir_13 > 0)
+            p = mid_;
+    }
+    if (p != NULL && p[0] != '\0' && !(flags & AT_SYMLINK_NOFOLLOW)) {
         int rr = stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_));
         if (rr == -2)
             return -1;      /* 链接环：errno 已是 ELOOP，不得再重试 */
@@ -7183,6 +7595,9 @@ int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
     static int (*fn_fx)(int, int, const char *, struct stat64 *, int) = NULL;
     char translated[MAX_PATH_LEN];
     char joined[MAX_PATH_LEN];
+    char mid_[MAX_PATH_LEN];
+    char rs_[MAX_PATH_LEN];
+    char rs2_[MAX_PATH_LEN];
     const char *p = path;
     int rc;
 
@@ -7208,21 +7623,56 @@ int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
 
+    /* 无法映射的 dirfd：原样透传（见 fstatat 同款注释） */
+    if (host_path_is_passthrough(dirfd, path, p)) {
+        if (fn != NULL)
+            return fn(dirfd, path, buf, flags);
+        if (fn_fx != NULL)
+            return fn_fx(0, dirfd, path, buf, flags);
+        errno = ENOSYS;
+        return -1;
+    }
+
+    /* Match fstatat/newfstatat: resolve intermediate and final links in guest view. */
+    if (p != NULL && p[0] != '\0') {
+        int rr = resolve_intermediate_symlinks(p, mid_, sizeof(mid_));
+        if (rr == -2)
+            return -1;
+        if (rr > 0)
+            p = mid_;
+    }
+    if (p != NULL && p[0] != '\0' && !(flags & AT_SYMLINK_NOFOLLOW)) {
+        int rr = stat_pre_resolve(p, dirfd, flags, rs_, sizeof(rs_));
+        if (rr == -2)
+            return -1;
+        if (rr > 0)
+            p = rs_;
+    }
+
     if (fn != NULL) {
         rc = fn(dirfd, p, buf, flags);
     } else if (fn_fx != NULL) {
-        /*
-         * _STAT_VER：aarch64 上是 **0**，不是 1。
-         * 早前硬编码成 1（x86_64 的值）—— 只因这条兜底分支在
-         * glibc 2.33+ 上从不被走到（fstatat 符号本身存在）才没暴露。
-         * 一旦走到，glibc 会因版本不符回 EINVAL。
-         */
+        /* _STAT_VER is 0 on aarch64. */
         rc = fn_fx(0, dirfd, p, buf, flags);
     } else {
         errno = ENOSYS;
         return -1;
     }
 
+    if (rc != 0 && !(flags & AT_SYMLINK_NOFOLLOW) && errno != ELOOP &&
+        p != NULL && p[0] != '\0') {
+        /* ELOOP 不重试：见 newfstatat */
+        int saved = errno;
+        if (resolve_abs_symlink(p, rs2_, sizeof(rs2_))) {
+            int retry = (fn != NULL)
+                ? fn(AT_FDCWD, rs2_, buf, flags)
+                : fn_fx(0, AT_FDCWD, rs2_, buf, flags);
+            if (retry == 0)
+                rc = 0;
+            else
+                errno = saved;
+        }
+    }
     if (rc == 0 && g_fakeroot_on)
         fakeroot_patch_stat64(buf, &g_fakeroot_state);
     return rc;
@@ -7260,6 +7710,15 @@ int unlinkat(int dirfd, const char *path, int flags) {
     /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），理由见 faccessat */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
+    if (host_path_is_passthrough(dirfd, path, p)) {
+        /*
+         * dirfd 无效/非目录，或指向 rootfs 之外的宿主目录：**原样透传**。
+         * l2s 判定与 ".." 夹紧都要求宿主绝对路径；对相对名做只会按**进程
+         * cwd** 解释 —— unlinkat(filefd, "../victim") 本该 ENOTDIR，会变成
+         * 删掉 cwd 旁的另一个文件。内核自己会给 EBADF/ENOTDIR。
+         */
+        return fn(dirfd, path, flags);
+    }
     if (p != NULL && p[0] == '/')
         dirfd = AT_FDCWD;
 
@@ -7307,6 +7766,8 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
     /* ★ BXR-ESC-4：先按 dirfd 拼绝对再翻译（`..` 夹紧），理由见 faccessat */
     p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                           translated, sizeof(translated));
+    if (host_path_is_passthrough(dirfd, path, p))
+        return fn(dirfd, path, mode);
     if (p != NULL && p[0] == '/')
         dirfd = AT_FDCWD;
     return fn(dirfd, p, mode);
@@ -7370,6 +7831,8 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath) {
      * target 是链接内容，绝不翻译（客户 readlink 要看到 guest 视角）。 */
     pl = resolve_host_path(newdirfd, linkpath, joined, sizeof(joined),
                            tl, sizeof(tl));
+    if (host_path_is_passthrough(newdirfd, linkpath, pl))
+        return fn(target, newdirfd, linkpath);
     if (pl != NULL && pl[0] == '/')
         newdirfd = AT_FDCWD;
     return fn(target, newdirfd, pl);
@@ -7411,14 +7874,41 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath) {
  * （它们只操作 sem_t 内存，不碰文件名），无需在此重实现。
  */
 
-/* POSIX 名字 → guest 视角后备路径。name 形如 "/foo"（可无前导 /）。 */
-static void posix_shm_backing(char *out, size_t out_size,
-                              const char *name, const char *prefix)
+/* POSIX 名字 → guest 视角后备路径。只接受单一名字分量，拒绝路径穿越。 */
+static int posix_shm_backing(char *out, size_t out_size,
+                             const char *name, const char *prefix)
 {
-    const char *base = g_config.tmp_dir ? g_config.tmp_dir : "/tmp";
-    while (*name == '/')
-        name++;
-    snprintf(out, out_size, "%s/.bxroot-shm/%s%s", base, prefix, name);
+    const char *base = bxroot_shm_tmp_base();
+    const char *p;
+    size_t n, prefix_len;
+    int w;
+
+    if (out == NULL || out_size == 0 || name == NULL || prefix == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    p = name;
+    while (*p == '/')
+        p++;
+    /* POSIX shm/sem names are one component; '/' and dot components must not
+     * become guest_resolve_dotdot input. */
+    if (*p == '\0' || strcmp(p, ".") == 0 || strcmp(p, "..") == 0 ||
+        strchr(p, '/') != NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    n = strlen(p);
+    prefix_len = strlen(prefix);
+    if (prefix_len > NAME_MAX || n > NAME_MAX - prefix_len) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    w = snprintf(out, out_size, "%s/.bxroot-shm/%s%s", base, prefix, p);
+    if (w < 0 || (size_t)w >= out_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -7430,7 +7920,7 @@ static void posix_shm_backing(char *out, size_t out_size,
 static void posix_shm_ensure_dir(void)
 {
     char dir[MAX_PATH_LEN];
-    const char *base = g_config.tmp_dir ? g_config.tmp_dir : "/tmp";
+    const char *base = bxroot_shm_tmp_base();
     int saved = errno;              /* 别让 mkdir 的 EEXIST 污染调用方 errno */
     int w = snprintf(dir, sizeof(dir), "%s/.bxroot-shm", base);
     if (w < 0 || (size_t)w >= sizeof(dir)) {
@@ -7445,9 +7935,8 @@ static void posix_shm_ensure_dir(void)
 int shm_open(const char *name, int oflag, mode_t mode)
 {
     char guest[MAX_PATH_LEN];
-    if (name == NULL) { errno = EINVAL; return -1; }
+    if (posix_shm_backing(guest, sizeof(guest), name, "") != 0) return -1;
     posix_shm_ensure_dir();
-    posix_shm_backing(guest, sizeof(guest), name, "");
     /* 走本库导出的 open 钩子（O_CLOEXEC 与 glibc shm_open 语义一致） */
     return open(guest, oflag | O_CLOEXEC, mode);
 }
@@ -7456,7 +7945,7 @@ int shm_unlink(const char *name)
 {
     char guest[MAX_PATH_LEN];
     if (name == NULL) { errno = EINVAL; return -1; }
-    posix_shm_backing(guest, sizeof(guest), name, "");
+    if (posix_shm_backing(guest, sizeof(guest), name, "") != 0) return -1;
     return unlink(guest);
 }
 
@@ -7479,8 +7968,8 @@ sem_t *sem_open(const char *name, int oflag, ...)
         if (value > SEM_VALUE_MAX) { errno = EINVAL; return SEM_FAILED; }
     }
 
+    if (posix_shm_backing(guest, sizeof(guest), name, "sem.") != 0) return SEM_FAILED;
     posix_shm_ensure_dir();
-    posix_shm_backing(guest, sizeof(guest), name, "sem.");
 
     /* 先按调用方的 O_CREAT/O_EXCL 语义尝试创建
      *
@@ -7576,7 +8065,7 @@ int sem_unlink(const char *name)
 {
     char guest[MAX_PATH_LEN];
     if (name == NULL || name[0] == '\0') { errno = EINVAL; return -1; }
-    posix_shm_backing(guest, sizeof(guest), name, "sem.");
+    if (posix_shm_backing(guest, sizeof(guest), name, "sem.") != 0) return -1;
     return unlink(guest);
 }
 
@@ -7753,6 +8242,9 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
         char joined[MAX_PATH_LEN];
         p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                               translated, sizeof(translated));
+        /* 无法映射的 dirfd：原样透传（内核给 EBADF/ENOTDIR），绝不按 cwd 改 */
+        if (host_path_is_passthrough(dirfd, path, p))
+            return fn(dirfd, path, mode, flags);
         if (p != NULL && p[0] == '/')
             dirfd = AT_FDCWD;
     }
@@ -7795,6 +8287,9 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
         char joined[MAX_PATH_LEN];
         p = resolve_host_path(dirfd, path, joined, sizeof(joined),
                               translated, sizeof(translated));
+        /* 无法映射的 dirfd：原样透传（内核给 EBADF/ENOTDIR），绝不按 cwd 改 */
+        if (host_path_is_passthrough(dirfd, path, p))
+            return fn(dirfd, path, mode, flags);
         if (p != NULL && p[0] == '/')
             dirfd = AT_FDCWD;
     }
@@ -7870,11 +8365,42 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
      * l2s 层拿它 probe 不到任何东西 —— 这正是此前漏改写的根因。
      * 拼成绝对后交给内核等价（dirfd 对绝对路径被忽略），且
      * /proc/<who>/fd/N 这类 dirfd 形态的中间组件也能被展开。
+     *
+     * ★ 拼不出来时必须真透传 ★
+     *
+     * 此前只判 == 1，其余分支（dirfd 无效/非目录、dirfd 在 rootfs 之外）
+     * 都继续往下走，把**相对名**交给 translate_path 与
+     * resolve_intermediate_symlinks —— 那些按**进程 cwd** 解释相对名，
+     * 于是 readlinkat(filefd, "../victim") 会读到 cwd 旁的另一个链接。
+     * 现在按原始 dirfd 调真符号：内核给 EBADF/ENOTDIR，或按 dirfd 解析。
      */
-    if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1)
-        p = joined;
-    if (translate_path(p, translated, sizeof(translated)) > 0)
-        p = translated;
+    {
+        int rdp = resolve_dirfd_path(dirfd, path, joined, sizeof(joined));
+        if (rdp == 1) {
+            p = joined;
+            if (translate_path(p, translated, sizeof(translated)) > 0)
+                p = translated;
+        } else if (rdp == 0) {
+            /* AT_FDCWD 相对名（translate_path 内部按 cwd 绝对化）或
+             * dirfd 指向 rootfs 外的宿主目录（原样交内核）。 */
+            if (dirfd == AT_FDCWD &&
+                translate_path(p, translated, sizeof(translated)) > 0)
+                p = translated;
+            else if (dirfd != AT_FDCWD) {
+                char raw0[MAX_PATH_LEN];
+                ssize_t n0 = fn(dirfd, path, raw0, sizeof(raw0) - 1);
+                return readlink_finish(path, raw0, n0, buf, bufsiz);
+            }
+        } else if (rdp == RDP_PASSTHRU) {
+            /* fd 无效 / 非目录：内核应给 EBADF / ENOTDIR */
+            char raw1[MAX_PATH_LEN];
+            ssize_t n1 = fn(dirfd, path, raw1, sizeof(raw1) - 1);
+            return readlink_finish(path, raw1, n1, buf, bufsiz);
+        } else {
+            errno = -rdp;
+            return -1;
+        }
+    }
 
     /*
      * ★ 中间组件的符号链接必须解析（叶子不动）★
@@ -8052,13 +8578,29 @@ int utimensat(int dirfd, const char *path, const struct timespec times[2],
                     p = joined;
             }
             /* getcwd 失败 → 原样透传（保底） */
-        } else if (resolve_dirfd_path(dirfd, path, joined,
-                                      sizeof(joined)) == 1) {
-            /* 相对路径 + 非AT_FDCWD 的 dirfd → 拼成绝对路径后再翻译 */
-            if (translate_path(joined, translated, sizeof(translated)) > 0)
-                p = translated;
-            else
-                p = joined;   /* 翻译层不动它（如 /proc 透传），用拼好的 */
+        } else {
+            /*
+             * 相对路径 + 非 AT_FDCWD 的 dirfd。三种结果必须分开：
+             *   1  → 拼成绝对路径后翻译（正常路径）
+             *   0  → dirfd 指向 rootfs 之外的宿主目录：**原样透传**
+             *   2  → fd 无效 / 非目录：**原样透传**（内核给 EBADF/ENOTDIR）
+             *   <0 → 拼接截断 / readlink 失败：如实失败
+             *
+             * 此前只判 == 1，其余分支让 p 停在**相对名**上直接调内核 ——
+             * 内核按**进程 cwd** 解析，于是 utimensat(filefd, "../x") 改到
+             * 了 cwd 旁另一个文件的时间戳（本该 ENOTDIR）。
+             */
+            int rdp = resolve_dirfd_path(dirfd, path, joined, sizeof(joined));
+            if (rdp == 1) {
+                if (translate_path(joined, translated, sizeof(translated)) > 0)
+                    p = translated;
+                else
+                    p = joined;   /* 翻译层不动它（如 /proc 透传），用拼好的 */
+            } else if (rdp < 0) {
+                errno = -rdp;
+                return -1;
+            }
+            /* rdp == 0 / RDP_PASSTHRU：p 保持 path，dirfd 保持原值 */
         }
         /* path == NULL（对 dirfd 本身操作）不需要翻译 */
     }
@@ -8083,8 +8625,23 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
     if (path != NULL && path[0] != '\0') {
         char joined[MAX_PATH_LEN];
         const char *src = path;
-        if (resolve_dirfd_path(dirfd, path, joined, sizeof(joined)) == 1)
+        int rdp = resolve_dirfd_path(dirfd, path, joined, sizeof(joined));
+
+        if (rdp == 1) {
             src = joined;
+        } else if (rdp < 0) {
+            errno = -rdp;               /* 拼接截断 / readlink 失败：如实失败 */
+            return -1;
+        } else if (dirfd != AT_FDCWD && path[0] != '/') {
+            /*
+             * fd 无效/非目录（RDP_PASSTHRU）或 dirfd 指向 rootfs 外的宿主
+             * 目录（0）：**原样透传**。绝不能落到 translate_follow —— 它会
+             * 用 bxroot_absolutize 按**进程 cwd** 把相对名绝对化，于是
+             * fchownat(filefd, "../victim") 作用到 cwd 旁的另一个文件。
+             * 内核会自己给出 EBADF/ENOTDIR，或按 dirfd 正确解析。
+             */
+            return fn(dirfd, path, uid, gid, flags);
+        }
         if (translate_follow(src, translated, sizeof(translated),
                              (flags & AT_SYMLINK_NOFOLLOW) != 0) > 0) {
             p = translated;
@@ -8162,11 +8719,36 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
      * 产出 "cwd/" → 把对 fd 的 stat 误导到 CWD（实测缺陷）。空串既
      * 不需绝对化也不需翻译，直接让 fn(dirfd, "", …) 按 fd 语义走。
      */
-    if (path != NULL && path[0] != '\0' && path[0] != '/' &&
-        bxroot_absolutize(path, absbuf, sizeof(absbuf)) > 0)
-        p = absbuf;
-    else
+    if (path != NULL && path[0] != '\0' && path[0] != '/') {
+        /*
+         * ★ 相对名必须先分辨 dirfd 语义（审计）★
+         *
+         * 此前这里**无条件**按 cwd 绝对化 —— 包括 dirfd 不是 AT_FDCWD 的
+         * 情形。于是
+         *     statx(dirfd, "leaf", …)         // dirfd 指向别处
+         *     statx(filefd, "../victim", …)   // fd 根本不是目录
+         * 都被解释成 "cwd/leaf" / "cwd/../victim"：
+         *   - 结果来自**另一个文件**，dirfd 完全被忽略；
+         *   - 本该 EBADF/ENOTDIR 的调用变成一次成功 stat；
+         *   - 与 fstatat/stat 对同一 (dirfd, path) 给不同答案。
+         * 现在按 resolve_dirfd_path 的契约分支：拼得出来才翻译，
+         * 拼不出来就**原样**把 (dirfd, path) 交给内核。
+         */
+        int rdp = resolve_dirfd_path(dirfd, path, absbuf, sizeof(absbuf));
+        if (rdp == 1) {
+            p = absbuf;
+        } else if (rdp < 0) {
+            errno = -rdp;
+            return -1;
+        } else if (dirfd != AT_FDCWD) {
+            /* dirfd 无效/非目录，或指向 rootfs 外宿主目录：原样透传 */
+            return fn(dirfd, path, flags, mask, buf);
+        } else if (bxroot_absolutize(path, absbuf, sizeof(absbuf)) > 0) {
+            p = absbuf;
+        }
+    } else {
         p = path;
+    }
 
     if (p != NULL && p[0] != '\0' &&
         translate_path(p, translated, sizeof(translated)) > 0)
@@ -8588,11 +9170,16 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
         char mid[MAX_PATH_LEN], fin[MAX_PATH_LEN];
         const char *ao = resolve_host_path(olddirfd, oldpath, jo, sizeof(jo), ho, sizeof(ho));
         const char *an = resolve_host_path(newdirfd, newpath, jn, sizeof(jn), hn, sizeof(hn));
-        /* RENAME_EXCHANGE(2)/NOREPLACE(1)：不覆盖任何东西，不记账 */
-        int pre = (flags & 3u) ? 0
-                : l2s_rename_replace_pre(an, ao, an, mid, sizeof(mid),
-                                         fin, sizeof(fin));
+        int pre = 0;
         int rc;
+        /* 任一端无法映射 => 原样透传（理由见 renameat 同款注释） */
+        if (host_path_is_passthrough(olddirfd, oldpath, ao) ||
+            host_path_is_passthrough(newdirfd, newpath, an))
+            return fn(olddirfd, oldpath, newdirfd, newpath, flags);
+        /* RENAME_EXCHANGE(2)/NOREPLACE(1)：不覆盖任何东西，不记账 */
+        pre = (flags & 3u) ? 0
+            : l2s_rename_replace_pre(an, ao, an, mid, sizeof(mid),
+                                     fin, sizeof(fin));
         /* ★ BXR-ESC-4：用夹紧后的绝对宿主路径，理由见 renameat */
         if (ao != NULL && ao[0] == '/') { po = ao; olddirfd = AT_FDCWD; }
         if (an != NULL && an[0] == '/') { pn = an; newdirfd = AT_FDCWD; }
@@ -12103,6 +12690,9 @@ static int is_unix_path_sockaddr(const struct sockaddr *addr, socklen_t len,
     /* 至少要能装下 sun_family + 1 字节路径。这一步必须在读 sa_family 之前。 */
     if (len <= (socklen_t)offsetof(struct sockaddr_un, sun_path) + 1)
         return 0;
+    /* 长度超出 sockaddr_un 时不在用户态扫描；原样交给内核验证，避免 OOB。 */
+    if (len > (socklen_t)sizeof(struct sockaddr_un))
+        return 0;
 
     if (addr->sa_family != AF_UNIX)
         return 0;
@@ -12185,7 +12775,8 @@ static int translate_unix_sockaddr(const struct sockaddr *addr, socklen_t len,
  * len 为 NULL、地址非 AF_UNIX 路径、或前缀不匹配时不动。
  */
 static void untranslate_unix_sockaddr_inplace(struct sockaddr *addr,
-                                              socklen_t *len)
+                                              socklen_t *len,
+                                              socklen_t capacity)
 {
     struct sockaddr_un *un;
     size_t off = offsetof(struct sockaddr_un, sun_path);
@@ -12194,7 +12785,10 @@ static void untranslate_unix_sockaddr_inplace(struct sockaddr *addr,
 
     if (addr == NULL || len == NULL)
         return;
-    if (*len <= (socklen_t)off + 1 || *len > sizeof(struct sockaddr_un))
+    /* The kernel reports the full address length, which may exceed the caller's
+     * output buffer. Never inspect or rewrite bytes beyond that original capacity. */
+    if (*len <= (socklen_t)off + 1 || *len > capacity ||
+        *len > (socklen_t)sizeof(struct sockaddr_un))
         return;
     if (addr->sa_family != AF_UNIX)
         return;
@@ -12287,10 +12881,11 @@ ssize_t recvfrom(int sockfd, void *msgbuf, size_t len, int flags,
              bxroot_next_symbol("recvfrom");
     if (fn == NULL) { errno = ENOSYS; return -1; }
 
+    socklen_t addr_capacity = (addrlen != NULL) ? *addrlen : 0;
     r = fn(sockfd, msgbuf, len, flags, src_addr, addrlen);
     if (r >= 0 && src_addr != NULL && addrlen != NULL) {
         int saved = errno;
-        untranslate_unix_sockaddr_inplace(src_addr, addrlen);
+        untranslate_unix_sockaddr_inplace(src_addr, addrlen, addr_capacity);
         errno = saved;
     }
     return r;
@@ -12317,9 +12912,10 @@ int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
         fn = (int (*)(int, struct sockaddr *, socklen_t *))
              bxroot_next_symbol("getsockname");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+    socklen_t addr_capacity = (addrlen != NULL) ? *addrlen : 0;
     r = fn(sockfd, addr, addrlen);
     if (r == 0)
-        untranslate_unix_sockaddr_inplace(addr, addrlen);
+        untranslate_unix_sockaddr_inplace(addr, addrlen, addr_capacity);
     return r;
 }
 
@@ -12330,9 +12926,10 @@ int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
         fn = (int (*)(int, struct sockaddr *, socklen_t *))
              bxroot_next_symbol("getpeername");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+    socklen_t addr_capacity = (addrlen != NULL) ? *addrlen : 0;
     r = fn(sockfd, addr, addrlen);
     if (r == 0)
-        untranslate_unix_sockaddr_inplace(addr, addrlen);
+        untranslate_unix_sockaddr_inplace(addr, addrlen, addr_capacity);
     return r;
 }
 
@@ -12343,10 +12940,11 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
         fn = (int (*)(int, struct sockaddr *, socklen_t *, int))
              bxroot_next_symbol("accept4");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+    socklen_t addr_capacity = (addrlen != NULL) ? *addrlen : 0;
     r = fn(sockfd, addr, addrlen, flags);
     if (r >= 0 && addr != NULL && addrlen != NULL) {
         int saved = errno;
-        untranslate_unix_sockaddr_inplace(addr, addrlen);
+        untranslate_unix_sockaddr_inplace(addr, addrlen, addr_capacity);
         errno = saved;
     }
     return r;
@@ -12359,10 +12957,11 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
         fn = (int (*)(int, struct sockaddr *, socklen_t *))
              bxroot_next_symbol("accept");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+    socklen_t addr_capacity = (addrlen != NULL) ? *addrlen : 0;
     r = fn(sockfd, addr, addrlen);
     if (r >= 0 && addr != NULL && addrlen != NULL) {
         int saved = errno;
-        untranslate_unix_sockaddr_inplace(addr, addrlen);
+        untranslate_unix_sockaddr_inplace(addr, addrlen, addr_capacity);
         errno = saved;
     }
     return r;
@@ -12427,11 +13026,12 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
         fn = (ssize_t (*)(int, struct msghdr *, int))
              bxroot_next_symbol("recvmsg");
     if (fn == NULL) { errno = ENOSYS; return -1; }
+    socklen_t name_capacity = (msg != NULL) ? msg->msg_namelen : 0;
     r = fn(sockfd, msg, flags);
     if (r >= 0 && msg != NULL && msg->msg_name != NULL) {
         int saved = errno;
         untranslate_unix_sockaddr_inplace((struct sockaddr *)msg->msg_name,
-                                          &msg->msg_namelen);
+                                          &msg->msg_namelen, name_capacity);
         errno = saved;
     }
     return r;
@@ -14121,6 +14721,18 @@ static void constructor(void) {
     bxroot_livepatch_apply();
 
     /*
+     * 动态程序主映像 / 非 libc 共享库里的路径类内联 svc（D1，2026-10-31）。
+     * 与 livepatch 不同，它与 seccomp 无关：只要有 rootfs 就要翻译。
+     * 实现与边界见 static_exec.c 的 bxroot_inline_svc_scan。
+     */
+    {
+        extern int bxroot_inline_svc_scan(void) __attribute__((weak));
+        if (bxroot_inline_svc_scan != NULL && g_config.rootfs != NULL &&
+            g_config.rootfs[0] != '\0')
+            (void)bxroot_inline_svc_scan();
+    }
+
+    /*
      * 进程管理层初始化（P0-3 / D4）。
      *
      * 必须在 main 之前、且必须在**任何 exec/spawn/fork 之前**：
@@ -14240,8 +14852,42 @@ static void constructor(void) {
                 rl = strlen(g_config.rootfs);
                 /* rootfs 为 "/" 时任何绝对路径都在其内，跳过比较 */
                 if (rl > 1) {
-                    if (strncmp(cwdchk, g_config.rootfs, rl) != 0 ||
-                        (cwdchk[rl] != '/' && cwdchk[rl] != '\0'))
+                    int inside = (strncmp(cwdchk, g_config.rootfs, rl) == 0 &&
+                                  (cwdchk[rl] == '/' || cwdchk[rl] == '\0'));
+
+                    /*
+                     * getcwd reports the RESOLVED path, so with a symlinked
+                     * rootfs the literal prefix above never matches and a
+                     * SUCCESSFUL chdir is rejected here, forcing the
+                     * fallback to '/':
+                     *
+                     *   -r <symlink>   -w /etc  ->  pwd = '/'      (wrong)
+                     *   -r <realpath>  -w /etc  ->  pwd = '/etc'   (right)
+                     *
+                     * The guest would then start in the wrong directory, so
+                     * every relative path resolves somewhere else. Retry
+                     * against realpath(rootfs) before calling it outside.
+                     */
+                    if (!inside) {
+                        static char cr[4096];
+                        static int   cr_state;
+
+                        if (cr_state == 0) {
+                            if (real_realpath != NULL &&
+                                real_realpath(g_config.rootfs, cr) != NULL)
+                                cr_state = 1;
+                            else
+                                cr_state = -1;
+                        }
+                        if (cr_state == 1) {
+                            size_t crl = strlen(cr);
+                            if (crl > 1 &&
+                                strncmp(cwdchk, cr, crl) == 0 &&
+                                (cwdchk[crl] == '/' || cwdchk[crl] == '\0'))
+                                inside = 1;
+                        }
+                    }
+                    if (!inside)
                         outside = 1;
                 }
             }
@@ -14317,8 +14963,17 @@ static void constructor(void) {
     }
     {
         extern int bx_native_session_init(void) __attribute__((weak));
-        if (bx_native_session_init != NULL && bx_native_session_init() < 0)
-            fprintf(stderr, "bxroot: native session unavailable (%s)\n", strerror(errno));
+        if (bx_native_session_init != NULL && bx_native_session_init() < 0) {
+            /*
+             * 回入会话建不起来时只报一次：把 BXROOT_REENTRY 降为 0 写回本进程
+             * 环境，子进程（bash 在 main 之前就导入 environ）继承到 0 后不再
+             * 重试，也就不会每条命令都刷一遍同样的警告。guest→host 单向调用
+             * （bx-host / BXROOT_AUTO_HOST）不依赖会话，照常可用。
+             */
+            fprintf(stderr, "bxroot: native session unavailable (%s); "
+                    "host->guest re-entry disabled for this session\n", strerror(errno));
+            setenv("BXROOT_REENTRY", "0", 1);
+        }
     }
 }
 

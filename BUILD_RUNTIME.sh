@@ -115,7 +115,12 @@ DEFS="-DFAKEROOT_PURE_LOGIC -DPX_PURE_LOGIC=0"
 DEFS="$DEFS -DBXROOT_SHM_COPYOUT_VERIFIED=$COPYOUT_VERIFIED"
 DEFS="$DEFS -DBXROOT_SHM_CLAIM_VERIFIED=$CLAIM_VERIFIED"
 # ★ 16KB 页对齐（Android 15+ 16KB 内核设备硬要求；DSHA 集成调研 §六.2）
-LDFLAGS="-ldl -nostartfiles -Wl,-z,max-page-size=16384"
+# ★ 符号版本脚本（2026-10-26）★
+# node 的 PLT 引用带版本标签（execvp@GLIBC_2.17）。导出无版本符号会让 glibc
+# 版本化解析不匹配 → 钩子对 node 失效 → spawn 绕过路径翻译 → 直 exec
+# app_data_file → EACCES。必须带这个脚本链接。
+VERSCRIPT="-Wl,--version-script=$(dirname "$0")/src/proc/bxroot-hooks.ver"
+LDFLAGS="-ldl -nostartfiles -Wl,-z,max-page-size=16384 $VERSCRIPT"
 
 case "${1:-}" in
 clean)
@@ -249,7 +254,7 @@ for s in $D4; do D4_N=$((D4_N + 1)); done
 
 MISSING=""
 for s in $D4; do
-    if ! nm -D --defined-only "$OUT" 2>/dev/null | awk '{print $3}' | grep -qx "$s"; then
+    if ! nm -D --defined-only "$OUT" 2>/dev/null | awk '{print $3}' | grep -Eq "^${s}(@@.*)?$"; then
         MISSING="$MISSING $s"
     fi
 done

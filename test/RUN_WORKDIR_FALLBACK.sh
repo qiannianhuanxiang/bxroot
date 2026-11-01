@@ -36,7 +36,7 @@ grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || {
     echo "⏭️  跳过：没有 build/libbxroot-runtime.so"; exit 2; }
 [ -x /bin/dash ] && [ -x /bin/pwd ] || { echo "⏭️  跳过：缺 dash 或 /bin/pwd"; exit 2; }
 
-W=$(mktemp -d /tmp/bxroot-wd-XXXXXX)
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-wd-XXXXXX")
 trap 'rm -rf "$W"' EXIT
 MINI="$W/rootfs"
 

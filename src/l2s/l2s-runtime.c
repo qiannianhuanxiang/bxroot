@@ -238,6 +238,27 @@ static void cnt_unlock(void)
     __atomic_store_n(&g_cnt_lock, 0, __ATOMIC_RELEASE);
 }
 
+/*
+ * ★ fork 后复位 cnt_lock（fork 安全修复，2026-10-26）★
+ *
+ * g_cnt_lock 是**进程内**自旋锁（位于堆/数据段，随 fork 被子进程继承）。
+ * 若线程 A 持锁时线程 B 调 fork，子进程里只剩 B，而锁位仍为 1、
+ * 永远没人释放 —— B 之后第一次走到 read/write 回退分支就永久自旋。
+ *
+ * 与 fakeroot / sysvshm 同款处理：**只在子进程回调里复位**。
+ * prepare/parent 里清零都是错的：prepare 时父进程其它线程
+ * 照常运行，清零会让它们同时进临界区；parent 里清零等于
+ * 抢走 A 的锁。只有子进程里"父进程的持锁者已不存在"这个
+ * 前提才成立。
+ *
+ * 它由 preload.c 的 bxroot_preload_fork_child 以 weak 引用调用
+ * （与 bxroot_fakeroot_atfork_child / bxroot_sysvshm_fork_child 同一机制）。
+ */
+void bxroot_l2s_fork_child(void)
+{
+    __atomic_store_n(&g_cnt_lock, 0, __ATOMIC_RELEASE);
+}
+
 static int read_nlink(const char *final_path, unsigned int *out)
 {
     char cnt[L2S_PATH_MAX];
