@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include "../src/runtime/static_exec.c"
 #include <sys/wait.h>
+#include <time.h>
 
 static int fails;
 #define CHECK(cond, ...)                                  \
@@ -79,6 +80,22 @@ int main(int argc, char **argv)
     CHECK(viaTramp == (long)getpid(), "C 经跳板 getpid=%ld（真实 %d）", viaTramp, (int)getpid());
     long bad = f(0, 0, 9999);
     CHECK(bad == -ENOSYS, "C2 无效号经跳板返回 -ENOSYS（%ld）", bad);
+
+    {   /* G：开销。直接 syscall vs 经真实跳板（保存 x1..x18 + q0..q31 + NZCV） */
+        enum { N = 200000 };
+        struct timespec t0, t1;
+        double direct, tramp;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < N; i++) syscall(172);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        direct = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / N;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < N; i++) f(0, 0, 172);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        tramp = ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / N;
+        printf("  bench: 直接 getpid %.0f ns, 经跳板 getpid %.0f ns, 额外 %.0f ns\n",
+               direct, tramp, tramp - direct);
+    }
 
     /* D：clone(SIGCHLD) 等价 fork，子进程从桩返回 0 */
     long pid = f(17 /* SIGCHLD */, 0, 220);
