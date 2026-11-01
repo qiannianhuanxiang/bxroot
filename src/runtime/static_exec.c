@@ -618,6 +618,53 @@ __asm__(
 );
 #endif
 
+/*
+ * ★ 「野」svc 站点的前置桩（BXROOT_SVC_ALL=1，2026-11-02 实验）★
+ *
+ * 站点的调用号不是 `movz x8,#imm`（Go 的 syscall.Syscall6、号经寄存器传入等），
+ * 扫描期认不出号，原先整点放过 → 路径以 guest 视角直达内核。
+ * 现在这类点也改成 `b veneer`；号在运行时读 x8，px_static_dispatch 对不关心的
+ * 号原样转发（mask==0 → sx_sc6），所以语义不变，只多一次跳板往返。
+ *
+ * 但有几个号**不能**进跳板（跳板要建 688 字节栈帧并从原栈返回）：
+ *   clone(220)/clone3(435)  子线程/子进程在新栈上返回，原栈帧不存在
+ *   rt_sigreturn(139)       不返回，由内核恢复整套上下文
+ *   exit(93)/exit_group(94) 不返回
+ * 这五个在建帧之前直接发真 svc，再 `br x16` 回站点下一条。
+ * 判断用 sub+cbz，不碰 NZCV（内核跨 svc 保留 NZCV，不能被我们改掉）。
+ * 入口约定同 veneer：x16 = 返回地址，x17 = 可随意使用。
+ */
+#if defined(__aarch64__)
+__asm__(
+    ".text\n"
+    ".macro PX_WILD_PRE name, tramp\n"
+    ".globl \\name\n"
+    ".hidden \\name\n"
+    ".type  \\name,%function\n"
+    "\\name:\n"
+    "    bti  c\n"
+    "    sub  x17, x8, #220\n"
+    "    cbz  x17, 1f\n"
+    "    sub  x17, x8, #435\n"
+    "    cbz  x17, 1f\n"
+    "    sub  x17, x8, #139\n"
+    "    cbz  x17, 1f\n"
+    "    sub  x17, x8, #93\n"
+    "    cbz  x17, 1f\n"
+    "    sub  x17, x8, #94\n"
+    "    cbz  x17, 1f\n"
+    "    b    \\tramp\n"
+    "1:  svc  #0\n"
+    "    br   x16\n"
+    ".size \\name, .-\\name\n"
+    ".endm\n"
+    "PX_WILD_PRE px_wild_pre_static, px_static_tramp\n"
+    "PX_WILD_PRE px_wild_pre_inline, px_inline_tramp\n"
+);
+extern void px_wild_pre_static(void);
+extern void px_wild_pre_inline(void);
+#endif
+
 /* ------------------------------------------------------------------ */
 /* ELF 装载                                                            */
 /* ------------------------------------------------------------------ */
@@ -878,6 +925,18 @@ static long sx_movz_x8(uint32_t ins)
 static void (*sx_scan_tramp)(void) = px_static_tramp;
 #endif
 
+/* BXROOT_SVC_ALL=1：连号不明的 svc 站点也改写（实验，默认关）。 */
+static int sx_svc_all(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("BXROOT_SVC_ALL");
+        cached = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
 static size_t sx_scan(uint32_t *code, size_t n, uint32_t *pool, size_t pool_cap_bytes)
 {
     long nr = -1;
@@ -889,7 +948,9 @@ static size_t sx_scan(uint32_t *code, size_t n, uint32_t *pool, size_t pool_cap_
         long m;
 
         if (ins == SX_SVC_INSN) {
-            if (nr >= 0 && sx_wants_site(nr)) {
+            /* 号已知且不关心（read/write/mmap…）→ 放过；号未知 + 野站点模式 → 也改 */
+            if ((nr >= 0 && sx_wants_site(nr)) || (nr < 0 && sx_svc_all())) {
+                int wild = nr < 0;
                 if (pool != NULL) {
                     uint32_t *v = pool + total * (SX_VENEER_SIZE / 4);
                     long off;
@@ -907,7 +968,11 @@ static size_t sx_scan(uint32_t *code, size_t n, uint32_t *pool, size_t pool_cap_
                     v[3] = 0xd503201fu;         /* nop */
                     *(uint64_t *)(void *)&v[4] = (uint64_t)(uintptr_t)&code[j + 1];
 #if defined(__aarch64__)
-                    *(uint64_t *)(void *)&v[6] = (uint64_t)(uintptr_t)sx_scan_tramp;
+                    *(uint64_t *)(void *)&v[6] = wild
+                        ? (sx_scan_tramp == px_inline_tramp
+                               ? (uint64_t)(uintptr_t)px_wild_pre_inline
+                               : (uint64_t)(uintptr_t)px_wild_pre_static)
+                        : (uint64_t)(uintptr_t)sx_scan_tramp;
 #else
                     /* px_static_tramp is AArch64-only (see its #if). */
                     (void)v;
