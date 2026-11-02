@@ -1202,6 +1202,12 @@ struct sx_ksigaction {
     unsigned long mask;
 };
 
+/* seccomp 兜底层（默认关；BXROOT_SECCOMP_FALLBACK=1）。见该文件头。 */
+#include "seccomp_fallback.c"
+
+/* 本次 exec 是否启用兜底层：按**目标** envp 判定（跳转前设置） */
+static int sx_sfb_want;
+
 /* 线程数：读 /proc/self/status 的 Threads: 行。读不到按「多线程」处理。 */
 static int sx_thread_count(void)
 {
@@ -1242,10 +1248,17 @@ static void sx_reset_process_state(void)
             SC(SYS_rt_sigaction, sig, &sa, 0, 8);
         }
     }
-    memset(&sa, 0, sizeof sa);
-    sa.handler = (unsigned long)(void *)&sx_early_sigsys;
-    sa.flags = 4 /* SA_SIGINFO */;
-    SC(SYS_rt_sigaction, 31, &sa, 0, 8);
+#if defined(__aarch64__)
+    if (sx_sfb_want && sfb_install_handler() == 0) {
+        /* 常驻处理器已装（兼含 sx_early_sigsys 的语义） */
+    } else
+#endif
+    {
+        memset(&sa, 0, sizeof sa);
+        sa.handler = (unsigned long)(void *)&sx_early_sigsys;
+        sa.flags = 4 /* SA_SIGINFO */;
+        SC(SYS_rt_sigaction, 31, &sa, 0, 8);
+    }
     /*
      * ★ 整体清空信号掩码（缺陷修复，2026-10-18 第五轮）★
      *
@@ -1721,6 +1734,14 @@ static int px_static_exec_inner(const char *host, const char *argv0, char *const
     }
 
     sx_record_self_lib(envp, nenv);
+    {
+        size_t k3;
+
+        sx_sfb_want = 0;
+        for (k3 = 0; k3 < nenv; k3++)
+            if (strcmp(envp[k3], "BXROOT_SECCOMP_FALLBACK=1") == 0)
+                sx_sfb_want = 1;
+    }
     sx_reset_process_state();
 
 #if defined(__aarch64__)
@@ -1735,6 +1756,20 @@ static int px_static_exec_inner(const char *host, const char *argv0, char *const
     px_static_dyn_tls = tls;
     sx_cur_base = img->rsv_base;
     sx_cur_len = img->rsv_len;
+#if defined(__aarch64__)
+    /*
+     * 兜底过滤器最后装：此后本进程（含 runtime）发出的上述调用只要 IP 在
+     * [lo, hi) 就进陷阱，所以之前的准备工作（读 /proc、关 fd）不能晚于这里。
+     * 装不上不致命：退化为只有改写路径，并如实记日志。
+     */
+    if (sx_sfb_want) {
+        int fr = sfb_install_filter(img->lo, img->hi);
+
+        if (bxroot_log != NULL && (verbose || fr != 0))
+            bxroot_log("static_exec: seccomp 兜底层 %s [%lx,%lx) rc=%d",
+                       fr == 0 ? "已启用" : "未启用", img->lo, img->hi, fr);
+    }
+#endif
 
     if (verbose && bxroot_log != NULL)
         bxroot_log("static_exec: 即将跳转 entry=%lx sp=%lx tls=%lx", img->entry,
