@@ -1374,6 +1374,10 @@ static int guest_resolve_dotdot(const char *in, char *out, size_t outsz)
 }
 
 /* 翻译路径：绝对路径加上 rootfs 前缀，处理 bind mount */
+#include "termux_compat.h"
+/* Termux 路径兼容开关：-1 未判定（首次翻译时按 rootfs / 环境判定一次），见 translate_path。 */
+static int g_termux_compat = -1;
+
 static int translate_path(const char *path, char *out, size_t out_size) {
     if (!path || !out || out_size == 0) {
         return -1;
@@ -1556,6 +1560,25 @@ static int translate_path(const char *path, char *out, size_t out_size) {
             }
             LOG("translate (/dev/shm redirect): %s -> %s", path, redirect);
             return translate_path(redirect, out, out_size);
+        }
+    }
+
+    /*
+     * ★ Termux 路径兼容（专为 Termux 写的脚本 / 配置）★ 见 termux_compat.h。
+     * 映射成 guest 路径后**再走一遍**常规翻译（与 /dev/shm 重定向同一写法），
+     * bind、rootfs 前缀、`..` 夹紧照旧。超长时不改写、继续常规翻译（绝不返回 -1：
+     * 调用方会把 guest 原串漏给内核）。真 Termux 宿主或 BXROOT_NO_TERMUX_COMPAT=1 时关闭。
+     */
+    {
+        if (g_termux_compat < 0)
+            g_termux_compat = bx_termux_compat_enabled(
+                rootfs, getenv("BXROOT_NO_TERMUX_COMPAT"));
+        if (g_termux_compat) {
+            char redirect[MAX_PATH_LEN];
+            if (bx_termux_compat_map(path, redirect, sizeof(redirect)) > 0) {
+                LOG("translate (termux compat): %s -> %s", path, redirect);
+                return translate_path(redirect, out, out_size);
+            }
         }
     }
 
