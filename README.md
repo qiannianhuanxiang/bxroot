@@ -2,7 +2,7 @@
 
 用 `LD_PRELOAD` 在用户态做路径翻译的开源容器运行时。主战场是 **Android arm64**：不依赖 root、`chroot`、`mount` 或 `ptrace`，在应用私有目录里跑完整的 Ubuntu 用户态（apt / dpkg / node / pnpm / git）。
 
-当前版本 **v0.2.4**，MIT 许可。[更新日志](CHANGELOG.md) · [发行说明](docs/RELEASE-v0.2.4.md) · [架构](docs/ARCHITECTURE.md)
+当前版本 **v0.2.5**，MIT 许可。[更新日志](CHANGELOG.md) · [发行说明](docs/RELEASE-v0.2.5.md) · [架构](docs/ARCHITECTURE.md)
 
 > **先读这条：bxroot 是兼容性运行时，不是安全沙箱，也不是 Android root。**
 > fakeroot 只改变 guest 看到的 uid/gid；静态 ELF、裸 syscall 和未覆盖的内核接口可能绕过部分视图；bind 的源路径由启动参数决定。不要把不可信代码或敏感宿主目录交给 bxroot。详见 [安全边界](#安全边界)。
@@ -120,7 +120,7 @@ fd/dirfd 形态的 exec 用它。所以最低门槛由 `statx` 决定 = **4.11**
 
 ## 当前状态
 
-**v0.2.4 可用**（Android arm64；native session v3 + SHM 硬化 + 静态 ELF 进程内执行）。
+**v0.2.5 可用**（Android arm64；native session v3 + SHM 硬化 + 静态 ELF 进程内执行 + Termux 路径兼容）。
 
 > 相对 v0.1.x：**guest → host → guest 回入口**、官方启动器 `PROROOT_CFG_FD`、进程内执行无 `PT_INTERP` 的静态 ELF、SIGSYS 影子槽、livepatch 扫 libc 全部 r-x 段、SysV SHM 生命周期硬化。详细条目见 [`CHANGELOG.md`](CHANGELOG.md) 与 [`docs/RELEASE-v0.2.3.md`](docs/RELEASE-v0.2.3.md)。
 >
@@ -130,9 +130,9 @@ fd/dirfd 形态的 exec 用它。所以最低门槛由 `statx` 决定 = **4.11**
 >
 > 更早的 v0.1.3 沙箱打通 / DNS path-relay / fakeroot 收敛见 CHANGELOG。竞品对标见 [`docs/竞品对标分析.md`](docs/竞品对标分析.md)。
 
-### 未发布（`bxroot.9-native-calls` 分支）
+### v0.2.5 新增
 
-v0.2.4 之后新增，还没打 tag：
+相对 v0.2.4：
 
 - **Termux 路径兼容（默认开）**：写死 Termux 前缀的脚本可以直接跑。shebang `#!/data/data/com.termux/files/usr/bin/bash`、`$PREFIX/etc/...`、Termux home 在 `translate_path` 里先改写成 Ubuntu 布局（`$PREFIX` → `/usr`，`$PREFIX/{etc,var,tmp}` → `/{etc,var,tmp}`，home → `/root`），再走常规翻译。只管路径，不提供 `pkg`，也不跑 Termux 的 bionic 二进制。真机（DSHA build214，vivo / Android 16）实测：Termux shebang 脚本输出 `ok`，`cd` 到 Termux home 后 `pwd -P` 为 `/root`。详见 [§2.18](docs/已知限制与架构能力边界.md#218-termux-路径兼容默认开启)。
 - **静态映像 seccomp 兜底层（默认关）**：`BXROOT_SECCOMP_FALLBACK=1` 时，给进程内执行的静态 ELF 叠一层只盯映像地址范围的 seccomp 过滤器，改写漏掉的路径类 `svc`（号来自寄存器、运行期生成代码）会被陷阱接住再翻译。只在容器里验证过，真机上的原生子进程和 Go 二进制还没测，见 [§2.17](docs/已知限制与架构能力边界.md#217-seccomp-兜底层静态映像默认关闭)。
@@ -149,8 +149,8 @@ v0.2.4 之后新增，还没打 tag：
 | `system()`/`popen()`（子进程带钩子 + 路径翻译） | ✅ |
 | seccomp 中和（Android 沙箱禁止的系统调用 + livepatch；站点表按 glibc 版本登记，不匹配时回退到运行期指令扫描） | ✅ |
 | shebang 脚本直接 exec | ✅ |
-| Termux 路径兼容（Termux 前缀 shebang、`$PREFIX/...`、Termux home → Ubuntu 布局） | ✅ 未发布分支；真机 DSHA build214 实测。`BXROOT_NO_TERMUX_COMPAT=1` 关闭 |
-| 静态映像 seccomp 兜底层（接住改写漏掉的路径类 `svc`） | ⚠️ 未发布分支，默认关（`BXROOT_SECCOMP_FALLBACK=1`）；仅容器验证 |
+| Termux 路径兼容（Termux 前缀 shebang、`$PREFIX/...`、Termux home → Ubuntu 布局） | ✅ v0.2.5；真机 DSHA build214 实测。`BXROOT_NO_TERMUX_COMPAT=1` 关闭 |
+| 静态映像 seccomp 兜底层（接住改写漏掉的路径类 `svc`） | ⚠️ v0.2.5，默认关（`BXROOT_SECCOMP_FALLBACK=1`）；仅容器验证 |
 | NSS 用户/组查询（by-name 与 by-id 全套直解回退 + fakeroot 合成） | ✅ |
 | libaudit 符号（passwd/login/chage 等 20 个程序依赖） | ✅ |
 | `dpkg -l` / `dpkg -S` / `dpkg-deb --build` / `dpkg -i`（unpack+configure） | ✅ |
@@ -478,7 +478,7 @@ bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 | 想了解 | 看这里 |
 |---|---|
 | 整体设计 | [ARCHITECTURE](docs/ARCHITECTURE.md) · [已知限制与架构能力边界](docs/已知限制与架构能力边界.md) |
-| 本版本发行与变更 | [CHANGELOG](CHANGELOG.md) · [RELEASE-v0.2.4](docs/RELEASE-v0.2.4.md) · [RELEASE-runtime-gates](docs/RELEASE-runtime-gates.md) · [当前收口状态](docs/CLOSEOUT-current.md) |
+| 本版本发行与变更 | [CHANGELOG](CHANGELOG.md) · [RELEASE-v0.2.5](docs/RELEASE-v0.2.5.md) · [RELEASE-v0.2.4](docs/RELEASE-v0.2.4.md) · [RELEASE-runtime-gates](docs/RELEASE-runtime-gates.md) · [当前收口状态](docs/CLOSEOUT-current.md) |
 | Android 集成 | [ANDROID-INTEGRATION](docs/ANDROID-INTEGRATION.md) · [DSHA 适配说明](docs/DSHA-适配说明.md) · [真机验证清单](docs/真机验证清单.md) |
 | native v3 / bx-host | [第一版](docs/bx-host-第一版.md) · [第二版](docs/bx-host-第二版.md) · [第三版](docs/bx-host-第三版.md) · [ANDROID-NATIVE-V3-RELEASE](docs/ANDROID-NATIVE-V3-RELEASE.md) |
 | SysV SHM | [TEST-shm-final-closure](docs/TEST-shm-final-closure.md) · [TEST-shm-closeout](docs/TEST-shm-closeout.md) · [BUILD-runtime-capability-matrix](docs/BUILD-runtime-capability-matrix.md) |

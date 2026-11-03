@@ -56,7 +56,7 @@
  * 既有设计，兼容层必须照做，不能"统一"成同一个小写选项。
  */
 #ifndef BXROOT_VERSION
-#define BXROOT_VERSION "0.2.4"
+#define BXROOT_VERSION "0.2.5"
 #endif
 
 /* DSHA stable layout needs 31-32 binds before trial overrides. Keep both

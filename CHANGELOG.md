@@ -2,8 +2,11 @@
 
 本项目遵循语义化版本。日期为 UTC。
 
-## 未发布
+## v0.2.5 — 2026-11-03
 
+**主题：Termux 路径兼容 + 静态映像兜底（两项默认关）+ 原生调用集成。** 发行说明见 [`docs/RELEASE-v0.2.5.md`](docs/RELEASE-v0.2.5.md)。
+
+- launcher `-V` 为 `0.2.5`。
 - **Termux 路径兼容（默认开）**：`translate_path` 先把 Termux 前缀（`/data/data/com.termux/files/usr`、`/data/user/0/...` 及 home）改写成 Ubuntu 布局。rootfs 在 `com.termux` 下时自动关闭，`BXROOT_NO_TERMUX_COMPAT=1` 显式关闭。真机 DSHA build214 实测 shebang 与 `pwd -P`。
 - **静态映像 seccomp 兜底层（默认关）**：`BXROOT_SECCOMP_FALLBACK=1`，只陷阱映像地址范围内的路径类调用。附 `test/bench_seccomp_fallback.c`。
 - **`BXROOT_SVC_ALL=1`（默认关）**：改写号来自寄存器的 `svc` 站点。
