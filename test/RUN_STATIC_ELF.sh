@@ -29,7 +29,7 @@ grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || {
 [ -f "$ROOT/build/libbxroot-runtime.so" ] || { echo "⏭️  跳过：没有 runtime"; exit 2; }
 [ -n "${PROROOT_STUB_LOADER:-}" ] || { echo "⏭️  跳过：环境无 PROROOT_STUB_LOADER"; exit 2; }
 
-W=$(mktemp -d /tmp/bxroot-static-XXXXXX)
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-static-XXXXXX")
 trap 'rm -rf "$W"' EXIT
 FAIL=0
 bad()  { FAIL=$((FAIL + 1)); echo "  ❌ $*"; }

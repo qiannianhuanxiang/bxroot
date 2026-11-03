@@ -59,31 +59,12 @@
 #define BXROOT_VERSION "0.2.4"
 #endif
 
-/*
- * 最大 bind mount 数量。
- *
- * 从 16 提到 48：参考实现的 `-R` 别名一次会加 **18 条** bind（见
- * PROOT_RECOMMENDED_BINDS），若上限仍是 16，`-R` 必然在中途失败。
- * 这是"兼容性不能只加选项名、还要够容量"的一个实例 ——
- * 只把 `-R` 认下来却让它因容量不足而半途报错，比不支持更糟。
- */
-/*
- * ★ 必须与 runtime 的 MAX_BINDS 一致（缺陷修复，2026-10-18）★
- *
- * 原值是 48，而 runtime（src/runtime/preload.c:434）是 16，且它的
- * binds 数组按该常量静态分配。于是 `-b` 累计到 17..48 条时：
- *   · launcher **全盘接受**（报错文案还写着"上限 48"）；
- *   · runtime 解析到第 16 条就停，**剩余条目静默丢弃**；
- *   · 缺的往往正是 `-R` 清单末尾的 `$HOME` / `*path*`；
- *   · 任何 verbose 级别都没有提示。
- *
- * 改成 16 之后，超限会在 **launcher 就明确报错**，而不是让用户以为
- * 挂载生效了。
- *
- * 注意：这个数字是两侧的硬约束。若将来要放宽，必须同时改
- * runtime 的数组分配方式（它是静态 calloc(MAX_BINDS)）。
- */
-#define MAX_BINDS 16
+/* DSHA stable layout needs 31-32 binds before trial overrides. Keep both
+ * launcher and runtime at 64; overflow must fail, never drop a mapping. */
+#define MAX_BINDS 64
+/* Full NAME=VALUE plus NUL: fits proc.c forced-entry budget (16416 bytes),
+ * passthrough budget (128 KiB), and Linux per-string exec limit. */
+#define MAX_BIND_ENV (16u * 1024u)
 
 /* 默认 rootfs */
 #ifndef BXROOT_DEFAULT_ROOTFS
@@ -1276,16 +1257,8 @@ static int expand_bind_list(launcher_config_t *cfg,
                 skipped++;
                 continue;
             }
-            if (add_bind(cfg, rootfs, rootfs) != 0) {
-                /*
-                 * `*path*` is the last entry of PROOT_RECOMMENDED_BINDS, so
-                 * when the 16-slot budget is already used up this is where
-                 * the overflow lands. Same best-effort rule as the loop
-                 * body below: report it as skipped, do not abort.
-                 */
-                skipped++;
-                continue;
-            }
+            if (add_bind(cfg, rootfs, rootfs) != 0)
+                return -1;
             continue;
         }
 
@@ -1323,25 +1296,8 @@ static int expand_bind_list(launcher_config_t *cfg,
             continue;
         }
 
-        if (add_bind(cfg, item, item) != 0) {
-            /*
-             * ★ 容量不足必须降级，不能整条命令失败（缺陷修复，2026-10-19）★
-             *
-             * PROOT_RECOMMENDED_BINDS 有 19 条，而 MAX_BINDS 是 16。
-             * 原先这里 return -1 → 调用方报 "错误: -R 的推荐 bind 超出上限"
-             * 并退出，于是 `-R` 在**推荐项恰好都存在**的宿主机上必然不可用；
-             * 在推荐项缺几条的机器上又恰好能跑。同一份代码随宿主环境时好时坏，
-             * 而 -R 是 proot 最常用的入口（`proot -R rootfs cmd`）。
-             *
-             * 实测：GitHub Actions ubuntu-24.04-arm 上 `-R /tmp /bin/true` 因此
-             * 被判为"未实现"（RUN_CLI_COMPAT 的 F 段失败）。
-             *
-             * proot 自身对推荐 bind 是尽力而为语义：装不上就跳过，不阻断启动。
-             * 这里对齐该语义 —— 记进 skipped 并在下面统一提示，命令照常执行。
-             */
-            skipped++;
-            continue;
-        }
+        if (add_bind(cfg, item, item) != 0)
+            return -1;
     }
     return skipped;
 }
@@ -1706,7 +1662,7 @@ static int read_elf_interp(const char *path, char *out, size_t outsz)
  *
  * 成功不返回；返回即表示不适用或失败（调用方继续走原来的 execve）。
  */
-static void try_exec_via_ulx(const launcher_config_t *cfg, const char *lib_dir,
+static int try_exec_via_ulx(const launcher_config_t *cfg, const char *lib_dir,
                              const char *caller_guest_path)
 {
     char ulx[PATH_MAX], interp[PATH_MAX], ldso[PATH_MAX * 2];
@@ -1718,13 +1674,13 @@ static void try_exec_via_ulx(const launcher_config_t *cfg, const char *lib_dir,
     int n = 0, i;
 
     if (v != NULL && v[0] != '\0' && v[0] != '0')
-        return;
+        return 0;
     v = getenv("PROROOT_TRAMPOLINE_PATH");
     if (v != NULL && v[0] != '\0')
-        return;
+        return 0;
     if (join_dir_name(ulx, sizeof(ulx), lib_dir, LIBBXROOT_ULX) != 0 ||
         access(ulx, X_OK) != 0)
-        return;
+        return 0;
     /*
      * shebang 脚本：内核语义是 exec 解释器、argv = [interp, (arg), 脚本, ...]。
      * 不在这里处理的话会落到直接 execve —— 内核按宿主视角解析 `#!/bin/sh`，
@@ -1737,7 +1693,7 @@ static void try_exec_via_ulx(const launcher_config_t *cfg, const char *lib_dir,
         ssize_t m;
         int fd = open(cfg->guest_exe, O_RDONLY | O_CLOEXEC);
         if (fd < 0)
-            return;
+            return 0;
         m = read(fd, line, sizeof(line) - 1);
         close(fd);
         if (m >= 2 && line[0] == '#' && line[1] == '!') {
@@ -1745,10 +1701,10 @@ static void try_exec_via_ulx(const launcher_config_t *cfg, const char *lib_dir,
             line[m] = '\0';
             e = strchr(s, '\n');
             if (e == NULL)
-                return;                  /* 行过长：交内核处理 */
+                return 0;                  /* 行过长：交内核处理 */
             *e = '\0';
             if (e > s && e[-1] == '\r')
-                return;                  /* CRLF：交原路径，explain_exec_failure 会解释 */
+                return 0;                  /* CRLF：交原路径，explain_exec_failure 会解释 */
             while (*s == ' ' || *s == '\t')
                 s++;
             a = s;
@@ -1768,27 +1724,49 @@ static void try_exec_via_ulx(const launcher_config_t *cfg, const char *lib_dir,
                 }
             }
             if (s[0] != '/')
-                return;
+                return 0;
             snprintf(sb_interp, sizeof(sb_interp), "%s", s);
             guest_to_host(sb_host, sizeof(sb_host), cfg->rootfs, sb_interp);
             if (resolve_guest_symlinks(sb_host, cfg->rootfs) != 0)
-                return;
+                return 0;
             exe_host = sb_host;
             is_script = 1;
         }
     }
-    if (read_elf_interp(exe_host, interp, sizeof(interp)) != 1)
-        return;
+    {
+        int ri = read_elf_interp(exe_host, interp, sizeof(interp));
+        if (ri == 0) {
+            /* A well-formed ELF with no PT_INTERP is statically linked.
+             *
+             * ulx cannot help: it maps an image and enters it, and patches no
+             * syscall sites. Running the guest directly leaves its own svc
+             * instructions hitting seccomp with no SIGSYS handler installed, and
+             * the kernel kills it -- measured rc=159 with 18 bytes of
+             * "Unknown signal 31", which no user can act on.
+             *
+             * Running static images needs the svc-site patching that
+             * static_exec.c performs in-process. Until that is wired up here,
+             * fail loudly instead of crashing. */
+            fprintf(stderr,
+                    "错误: %s 是静态链接的可执行文件（没有 PT_INTERP）\n"
+                    "      bxroot 需要改写静态 ELF 里的 svc 站点才能在 guest 内运行它，\n"
+                    "      本构建没有这个能力。请改用动态链接的版本，或改用 proot。\n",
+                    cfg->guest_exe);
+            return 2;   /* caller must not execve */
+        }
+        if (ri != 1)
+            return 0;
+    }
     guest_to_host(ldso, sizeof(ldso), cfg->rootfs, interp);
     if (access(ldso, R_OK) != 0)
-        return;
+        return 0;
 
     setenv("BXROOT_ULX_PATH", ulx, 1);
     setenv("BXROOT_ULX_LDSO", ldso, 1);
 
     nv = calloc((size_t)cfg->guest_argc + 10, sizeof(char *));
     if (nv == NULL)
-        return;
+        return 0;
     nv[n++] = ulx;
     nv[n++] = ldso;
     nv[n++] = (char *)"--argv0";
@@ -1820,6 +1798,7 @@ static void try_exec_via_ulx(const launcher_config_t *cfg, const char *lib_dir,
     unsetenv("BXROOT_ULX_PATH");
     unsetenv("BXROOT_ULX_LDSO");
     free(nv);
+    return 0;   /* ulx exec failed; the caller falls back to a direct execve */
 }
 
 static void explain_exec_failure(const char *exe, const char *rootfs, int err)
@@ -2005,7 +1984,15 @@ int main(int argc, char **argv) {
         free(path);
     }
 
-    /* 获取本程序所在目录（用于查找 runtime .so） */
+    /*
+     * 获取本程序所在目录（用于查找 runtime .so）
+     *
+     * 【为什么这里用普通 readlink 是安全的】
+     * launcher 是**静态链接**的（Makefile: LAUNCH_LDFLAGS = -static），
+     * 不经动态符号解析，LD_PRELOAD 的 readlink 钩子对它无效 ——
+     * 所以拿到的就是内核给的真实宿主路径，不会被伪装成 guest 路径。
+     * （2026-10-26 复核：曾怀疑此处被钩子干扰，实测静态链接排除。）
+     */
     char exe_path[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (n <= 0) {
@@ -2293,7 +2280,7 @@ int main(int argc, char **argv) {
                 need += 3;                        /* ":ro" */
             if (i > 0)
                 need += 1;                        /* 分隔符 ';' */
-            if (need > (size_t)1 << 20) {         /* 1 MiB 上限，防御性 */
+            if (need > MAX_BIND_ENV - (sizeof("BXROOT_BINDS=") - 1)) {
                 fprintf(stderr, "错误: bind 列表过长（%zu 字节）\n", need);
                 free_config(&cfg);
                 return 1;
@@ -2325,7 +2312,12 @@ int main(int argc, char **argv) {
             *w = '\0';
         }
 
-        setenv("BXROOT_BINDS", bind_env, 1);
+        if (setenv("BXROOT_BINDS", bind_env, 1) != 0) {
+            perror("错误: setenv BXROOT_BINDS");
+            free(bind_env);
+            free_config(&cfg);
+            return 1;
+        }
         free(bind_env);
     } else {
         /*
@@ -2663,7 +2655,14 @@ int main(int argc, char **argv) {
      * execve 被改写，syscall(SYS_execve) 不被改写）。失败时回退到 libc
      * execve，保持原来的行为与错误信息。
      */
-    try_exec_via_ulx(&cfg, lib_dir, caller_guest_path);   /* 成功不返回 */
+    if (try_exec_via_ulx(&cfg, lib_dir, caller_guest_path) == 2) {
+        /* The guest is static and this build cannot run it. Executing it anyway
+         * produces rc=159 and 18 bytes of "Unknown signal 31"; a clear failure
+         * is more useful than a crash nobody can diagnose. 126 = found but not
+         * executable, which is exactly what this is. */
+        free_config(&cfg);
+        return 126;
+    }
     syscall(SYS_execve, cfg.guest_exe, cfg.guest_argv, environ);
     execve(cfg.guest_exe, cfg.guest_argv, environ);
 

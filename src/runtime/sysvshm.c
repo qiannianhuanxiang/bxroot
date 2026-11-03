@@ -39,8 +39,31 @@
  *
  * 默认构建 `BXROOT_SHM_CLAIM_VERIFIED=0`，于是：
  *   · `shmget(IPC_PRIVATE)` 与 `shmget(key, ...)` 一律返回 **ENOSYS(38)**；
- *   · `shmat` / `shmdt` / `shmctl` **仍然可用** —— 只要 backing 目录里
- *     本来就有 `seg-<id>`。
+ *   · `shmat` / `shmdt` **仍然可用** —— 只要 backing 目录里本来就有 `seg-<id>`；
+ *   · **`shmctl(IPC_RMID)` 返回 ENOSYS(38)** —— 删除也要先拿 claim 锁
+ *     （见 shm_do_ctl 的 K_IPC_RMID 分支），与"新建"同属被保守关掉的那一半。
+ *   · **`shmctl(IPC_STAT)` 也返回 ENOSYS(38)** —— 但**不是**因为 claim 锁，
+ *     而是**第二个独立 gate** `BXROOT_SHM_COPYOUT_VERIFIED=0`（见
+ *     shm-copyout.h）。两个 gate 互相独立，只读本文件头的人很容易把
+ *     IPC_STAT 的 ENOSYS 误记到 claim 头上。
+ *
+ * 一句话记法：**默认构建只保留"读已有的段"这一条路**；凡是需要写 backing
+ * 目录（新建/删除）或需要 copy-out 到 guest 地址空间（IPC_STAT）的，一律
+ * 显式 ENOSYS。
+ *
+ * ★ 2026-10-20 更正 ★ 上一版这里写的是「shmat / shmdt / shmctl 仍然可用」，
+ * 把 `shmctl` 整个算进"可用"，**与实际不符**：IPC_RMID 走 claim 锁，默认
+ * profile 下必返回 ENOSYS。真机实测（Termux / Android 16）：
+ *
+ *   A shmget(IPC_PRIVATE)   = -1 errno=38   符合
+ *   B shmget(key=0x1234)    = -1 errno=38   符合
+ *   C 手工建 seg-1001 后：
+ *   D shmat(1001)           = 0x...  写入可读回   可用
+ *   E shmctl(1001,IPC_RMID) = -1 errno=38   ← 与旧注释矛盾
+ *
+ * 之所以要改准：这条含糊的措辞让排查者（包括本注释的修正者）把"默认关闭"
+ * 误判成"功能坏了"，为此多花了两轮去追一个并不存在的缺陷。契约写不准
+ * 的代价就是反复误诊。
  *
  * 为什么这样切分（而不是把四个调用全关掉）：
  *   · 目录里出现 `seg-<id>` 只有两种来源：官方 proroot 建的（共用目录
@@ -177,7 +200,14 @@ static long shm_svc6(long nr, long a, long b, long c, long d, long e, long f)
     register long x3 __asm__("x3") = d;
     register long x4 __asm__("x4") = e;
     register long x5 __asm__("x5") = f;
-    __asm__ __volatile__("svc #0"
+    __asm__ volatile(""
+        "stp x1, x2, [sp, #-16]!\n\t"
+        "stp x3, x4, [sp, #-16]!\n\t"
+        "str x5,     [sp, #-16]!\n\t"
+        "svc #0\n\t"
+        "ldr x5,     [sp], #16\n\t"
+        "ldp x3, x4, [sp], #16\n\t"
+        "ldp x1, x2, [sp], #16\n"
         : "+r"(x0)
         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
         : "memory", "cc");

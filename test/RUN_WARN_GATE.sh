@@ -279,17 +279,26 @@ for f in $UNITS; do
     rc=1
     i=1
     ICE=0
+    # Scratch file for this compile.
+    #
+    # Honours TMPDIR and falls back to a cache dir, because /tmp is not
+    # writable on every supported host (Termux: drwxrwx--x shell). With a
+    # hard-coded /tmp the redirect failed, the log stayed empty, and the
+    # gate then reported "not a warning, a real error" -- misdiagnosing a
+    # missing scratch file as a compile failure.
+    WARN_LOG="${TMPDIR:-${XDG_CACHE_HOME:-$HOME/.cache}}/bxroot-warn-$$.txt"
+    mkdir -p "$(dirname "$WARN_LOG")" 2>/dev/null || true
     while [ "$i" -le 10 ]; do
         # shellcheck disable=SC2086
         "$CC" $BASE $EXTRA -O1 -I"${PROC_DIR:-.}" $DEFS -c -o /dev/null "$f" \
-            >/dev/null 2>"/tmp/bxroot-warn-$$.txt"
+            >/dev/null 2>"$WARN_LOG"
         rc=$?
-        grep -q 'internal compiler error' "/tmp/bxroot-warn-$$.txt" || break
+        grep -q 'internal compiler error' "$WARN_LOG" || break
         ICE=1
         i=$((i + 1))
     done
 
-    if [ "$rc" -ne 0 ] && ! grep -q 'warning:' "/tmp/bxroot-warn-$$.txt" 2>/dev/null; then
+    if [ "$rc" -ne 0 ] && ! grep -q 'warning:' "$WARN_LOG" 2>/dev/null; then
         # ★ 区分"ICE 耗尽"与"真错误" ★
         #
         # 两者的处置完全不同：真错误要改代码，ICE 耗尽只说明这次运气差
@@ -305,7 +314,7 @@ for f in $UNITS; do
         fi
         CHECKED=$((CHECKED + 1))
         echo "❌ $f —— 编译失败（非告警，是真错误）"
-        head -20 "/tmp/bxroot-warn-$$.txt" | sed 's/^/     /'
+        head -20 "$WARN_LOG" | sed 's/^/     /'
         FAILED="$FAILED $f"
         TOTAL=$((TOTAL + 1))
         continue
@@ -314,24 +323,51 @@ for f in $UNITS; do
     # 走到这里 = 本轮真的编译过了（可能 0 条告警），才计入"已检查"
     CHECKED=$((CHECKED + 1))
 
-    n=$(grep -c 'warning:' "/tmp/bxroot-warn-$$.txt" 2>/dev/null)
+    #
+    # ★ 只统计**代码**告警，不统计工具链/命令行告警 ★
+    #
+    # 原先用 `grep -c 'warning:'`，把这几类也算了进去：
+    #   gcc: warning: argument unused during compilation: '-shared' ...
+    #   warning: unknown warning option '-Wno-nonnull-compare' ...
+    # 它们来自**编译器自身的命令行处理**（clang 不认某个 -Wno- 开关时
+    # 必然报一条），与源码质量无关。实测 Termux（clang 21）上每个编译单元
+    # 都稳定产生 2 条，22 个单元 ⇒ 45 条"告警"，但源码里一条都没有。
+    #
+    # 后果不是"多报几条"那么轻：一个必然为真的误报把整块门禁淹了，
+    # 真正的告警混在里面看不出来 —— 门禁失去意义。
+    #
+    # 过滤规则：匹配 `file:line:col: warning:` 形式（代码位置前缀）。
+    # 这样 `gcc: warning:` / `clang: warning:` 没有行号列号，自然被排除。
+    CODE_WARN_RE='^[A-Za-z0-9_./-]+:[0-9]+:[0-9]+: warning:'
+    n=$(grep -cE "$CODE_WARN_RE" "$WARN_LOG" 2>/dev/null)
     n=${n:-0}
     # grep -c 在无匹配时输出 "0" 但退出码非零，用 printf 归一化
     n=$(printf '%s' "$n" | head -1)
+
+    # 工具链告警单独计数，报告但不判失败：它是环境属性，不是代码缺陷。
+    tool_n=$(grep 'warning:' "$WARN_LOG" 2>/dev/null | grep -vcE "$CODE_WARN_RE")
+    tool_n=${tool_n:-0}
+    [ -n "$tool_n" ] || tool_n=0
 
     if [ "$n" -gt 0 ]; then
         printf '⚠️  %-34s %s 条告警\n' "$f" "$n"
         TOTAL=$((TOTAL + n))
         FAILED="$FAILED $f"
         if [ "$VERBOSE" = 1 ]; then
-            grep -A2 'warning:' "/tmp/bxroot-warn-$$.txt" | sed 's/^/     /'
+            grep -E "$CODE_WARN_RE" "$WARN_LOG" | sed 's/^/     /'
+        fi
+    elif [ "$tool_n" -gt 0 ]; then
+        # Compiled clean; the only warnings were about the compiler invocation.
+        printf '✅ %-34s 0 条（另有 %s 条工具链告警，不计）\n' "$f" "$tool_n"
+        if [ "$VERBOSE" = 1 ]; then
+            grep 'warning:' "$WARN_LOG" | grep -vE "$CODE_WARN_RE" | sed 's/^/     /'
         fi
     else
         printf '✅ %-34s 0 条\n' "$f"
     fi
 done
 
-rm -f "/tmp/bxroot-warn-$$.txt"
+rm -f "$WARN_LOG"
 
 echo "---------------------------------------------------------------------"
 if [ "$CHECKED" -eq 0 ]; then

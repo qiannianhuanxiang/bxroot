@@ -33,6 +33,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +45,7 @@
 #include <unistd.h>
 
 #include "early_sigsys.h"
+#include "ulx-libpath.h"
 
 #define ULX_MAX_PHDR   64
 #define ULX_STACK_SIZE (8UL << 20)
@@ -247,9 +249,51 @@ int main(int argc, char **argv, char **envp)
     static const char *const libdirs[] = {
         "/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu",
         "/usr/local/lib/aarch64-linux-gnu", "/lib", "/usr/lib", "/usr/local/lib",
+        /* Ubuntu keeps systemd's private shared object beside its helpers. */
+        "/usr/lib/aarch64-linux-gnu/systemd",
     };
-    char libpath[8192];
+    char libpath[BXROOT_ULX_LIBPATH_SIZE];
     const char *rf = getenv("BXROOT_ROOTFS");
+    /*
+     * ★ rootfs 兜底（2026-10-26，真机 ulx 失败根因）★
+     *
+     * 下面的 --library-path 是 ld.so 找到 guest libc 的唯一来源：
+     *     add_lp = (rf != NULL && rf[0] == '/' && !has_opt(...))
+     * 若 rf 为空则 add_lp=0，ld.so 直接报
+     *     "libc.so.6: cannot open shared object file"
+     * （实测：不设 BXROOT_ROOTFS → 失败；设了 → 成功；手动加
+     *  --library-path → 也成功。三者一一对应。）
+     *
+     * 而 PTC 会把所有非启动环境变量设成 undefined，BXROOT_ROOTFS
+     * 也在其中 —— 于是 worker 里 rf 恒为 NULL，ULX 必然失败。
+     * 这正是「trampoline 配置明明对、却仍然跑不起来」的原因。
+     *
+     * 兜底：从 argv[1]（ld.so 的宿主绝对路径）反推 rootfs。
+     * ld.so 一定在 <rootfs>/lib/ 或 <rootfs>/usr/lib/ 下，
+     * 找到这两个片段就截断。argv[1] 是调度方给的绝对路径，
+     * 不受环境变量影响。
+     */
+    if (rf == NULL || rf[0] != '/') {
+        static char s_rf[4096];
+        const char *p;
+        if (argc >= 2 && argv[1] != NULL && argv[1][0] == '/') {
+            p = strstr(argv[1], "/usr/lib/");
+            if (p == NULL)
+                p = strstr(argv[1], "/lib/");
+            if (p != NULL && (size_t)(p - argv[1]) < sizeof(s_rf)) {
+                memcpy(s_rf, argv[1], (size_t)(p - argv[1]));
+                s_rf[p - argv[1]] = '\0';
+                if (s_rf[0] == '/')
+                    rf = s_rf;
+            }
+        }
+    }
+    if (rf == NULL || rf[0] != '/') {
+        /* 最后兜底：PROROOT_ROOTFS（嵌套场景里外层可能设过） */
+        const char *alt = getenv("PROROOT_ROOTFS");
+        if (alt != NULL && alt[0] == '/')
+            rf = alt;
+    }
     char **nargv, **p;
     int nargc = 0, nenv = 0, i, add_lp;
     ulx_image img;
@@ -267,17 +311,20 @@ int main(int argc, char **argv, char **envp)
         _exit(e == ENOENT ? 127 : 126);
     }
 
-    /* --library-path：调用方没给就按 rootfs 补 */
+    /* ULX's explicit --library-path overrides LD_LIBRARY_PATH in glibc.
+     * Build one translated guest path so package-private directories and a
+     * caller-provided path both remain visible to the guest loader. */
     add_lp = (rf != NULL && rf[0] == '/' && !has_opt(argv, 2, "--library-path"));
     if (add_lp) {
         size_t n = 0;
+        const char *env_lp = bxroot_ulx_env_value(envp, "LD_LIBRARY_PATH");
+
         for (i = 0; i < (int)(sizeof libdirs / sizeof libdirs[0]); i++) {
-            int k = snprintf(libpath + n, sizeof libpath - n, "%s%s%s",
-                             n ? ":" : "", rf, libdirs[i]);
-            if (k < 0 || (size_t)k >= sizeof libpath - n)
-                break;
-            n += (size_t)k;
+            if (bxroot_ulx_append_libdir(libpath, sizeof libpath, &n, rf, libdirs[i]) != 0)
+                die(126, "库搜索路径过长", NULL);
         }
+        if (bxroot_ulx_append_env_libpath(libpath, sizeof libpath, &n, rf, env_lp) != 0)
+            die(126, "LD_LIBRARY_PATH 过长", NULL);
     }
 
     nargv = calloc((size_t)argc + 4, sizeof(char *));

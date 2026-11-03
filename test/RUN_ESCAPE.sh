@@ -25,7 +25,7 @@ grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || {
     echo "⏭️  跳过：需要外层 proroot 注入链路"; exit 2; }
 [ -f "$ROOT/build/libbxroot-runtime.so" ] || { echo "⏭️  跳过：没有 build/libbxroot-runtime.so"; exit 2; }
 
-W=$(mktemp -d /tmp/bxroot-escape-XXXXXX)
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-escape-XXXXXX")
 trap 'rm -rf "$W"' EXIT
 F=0
 bad()  { F=$((F + 1)); echo "  ❌ $*"; }
@@ -39,6 +39,7 @@ ln -s usr/bin "$RF/bin"; ln -s usr/lib "$RF/lib"
 echo "ESC-GUEST" > "$RF/etc/hostname"
 echo CANARY > "$W/canary"
 echo CANARY > "$W/hd/canary"
+ln -s /etc "$RF/tmp/lnk"
 
 bld() {
     i=1
@@ -51,6 +52,10 @@ bld() {
 }
 bld -O1 -w -o "$RF/tmp/pe1" "$ROOT/test/probe_escape_dotdot.c" || exit 1
 bld -O1 -w -o "$RF/tmp/pe2" "$ROOT/test/probe_escape_symlink.c" || exit 1
+bld -O1 -w -o "$RF/tmp/odir" "$ROOT/test/probe_o_directory.c" || exit 1
+bld -O1 -w -o "$RF/tmp/empty_path" "$ROOT/test/probe_empty_path.c" || exit 1
+bld -O1 -w -o "$RF/tmp/fstatat64_link" "$ROOT/test/probe_fstatat64_link.c" || exit 1
+bld -O1 -w -o "$RF/tmp/nondirfd" "$ROOT/test/probe_nondir_dirfd.c" || exit 1
 
 run() { (cd / && timeout 60 "$BX" --rootfs "$RF" -- "$@") 2>&1; }
 
@@ -65,7 +70,38 @@ n=$(ls "$W/hd" | wc -l)
 [ "$n" -eq 1 ] && good "canary 目录未被写入" || bad "canary 目录多出文件: $(ls "$W/hd" | tr '\n' ' ')"
 grep -q '^CANARY$' "$W/hd/canary" && good "canary 内容未被改动" || bad "canary 被改动"
 
+echo "== O_DIRECTORY 不应跳过绝对链接隔离 =="
+o=$(run /tmp/odir)
+printf '%s\n' "$o" | grep -q '^O_DIRECTORY_SYMLINK_GUEST_OK$' && good "O_DIRECTORY 仍解析绝对符号链接到 guest /etc" || bad "O_DIRECTORY 链接路径 → [$o]"
+
+echo "== fstatat64 guest 符号链接视角 =="
+o=$(run /tmp/fstatat64_link 2>&1)
+printf '%s\n' "$o" | grep -q '^FSTATAT64_GUEST_LINK_OK$' && good "fstatat64 返回 guest 链接目标元数据" || bad "fstatat64 链接 → [$o]"
+
+echo "== 空路径 / AT_EMPTY_PATH 语义 =="
+o=$(run /tmp/empty_path 2>&1)
+printf '%s\n' "$o" | grep -q '^EMPTY_PATH_SEMANTICS_OK$' && good "AT_EMPTY_PATH 对应 dirfd；普通空路径返回 ENOENT" || bad "空路径语义 → [$o]"
+
+echo "== 非目录 / 无效 dirfd 语义（PR #1 P1）=="
+o=$(run /tmp/nondirfd 2>&1)
+printf '%s
+' "$o" | grep -q '^NONDIRFD_SEMANTICS_OK$' && good "filefd/badfd + 相对名全部按内核语义失败，未回退 cwd" || bad "非目录 dirfd → [$(printf '%s' "$o" | tail -6 | tr '
+' ' ')]"
+
 echo "== 语义不倒退 =="
+# 本节用 /bin/sh -c 驱动，而子进程 exec 在**嵌套容器**下会丢失外层加载器的路径翻译，
+# 于是 ld.so 找不到 libc.so.6（实测同样失败于不带任何修改的基线）。那种环境下本节无法判定，
+# 应明确跳过而不是报假红。
+# 判据不能用退出码：sh 本身能起来，失败发生在**它去 exec 子命令**时。
+# 所以直接看 stderr 里有没有动态链接器报找不到库。
+_shout=$(run /bin/sh -c 'cat /etc/hostname' 2>&1)
+case "$_shout" in
+    *"error while loading shared libraries"*) _sh_ok=0 ;;
+    *) _sh_ok=1 ;;
+esac
+if [ "$_sh_ok" = 0 ]; then
+    echo "  ⏭️ 跳过：子进程 exec 不可用（嵌套容器环境限制，非运行时回归）"
+else
 o=$(run /bin/sh -c 'cat /etc/../etc/hostname')
 [ "$o" = "ESC-GUEST" ] && good "/etc/../etc/hostname" || bad "/etc/../etc/hostname → [$o]"
 o=$(run /bin/sh -c 'cat /../../etc/hostname')
@@ -85,6 +121,7 @@ o=$(run /bin/sh -c 'ln -s /etc /tmp/le && cat /tmp/le/../etc/hostname')
 [ "$o" = "ESC-GUEST" ] && good "绝对链接中间组件 + .." || bad "/tmp/le/../etc/hostname → [$o]"
 o=$(run /bin/sh -c 'cat /proc/self/root/../etc/hostname')
 [ "$o" = "ESC-GUEST" ] && good "/proc/self/root/.. 夹紧" || bad "/proc/self/root/../etc/hostname → [$o]"
+fi
 
 echo "------------------------------------------------------"
 [ $F -eq 0 ] && { echo "RESULT: PASS"; exit 0; }

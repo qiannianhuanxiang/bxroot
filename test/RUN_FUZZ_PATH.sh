@@ -44,7 +44,7 @@ grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || {
 [ -f "$ROOT/build/libbxroot-runtime.so" ] || {
     echo "⏭️  跳过：没有 build/libbxroot-runtime.so"; exit 2; }
 
-W=$(mktemp -d /tmp/bxroot-fuzzpath-XXXXXX)
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-fuzzpath-XXXXXX")
 trap 'rm -rf "$W"' EXIT
 F=0
 bad()  { F=$((F + 1)); echo "  ❌ $*"; }

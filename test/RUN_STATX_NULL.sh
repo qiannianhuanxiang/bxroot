@@ -19,7 +19,7 @@ grep -q 'libproroot' /proc/self/maps 2>/dev/null || {
     echo "⏭️  跳过：没有 build/libbxroot-runtime.so"; exit 2; }
 command -v gcc >/dev/null 2>&1 || { echo "⏭️  跳过：无 gcc"; exit 2; }
 
-W=$(mktemp -d /tmp/bxroot-statxnull-XXXXXX)
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-statxnull-XXXXXX")
 trap 'rm -rf "$W"' EXIT
 
 bld() {

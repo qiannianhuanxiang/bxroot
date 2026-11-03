@@ -4,6 +4,10 @@
 
 ## 未发布
 
+- **Termux 路径兼容（默认开）**：`translate_path` 先把 Termux 前缀（`/data/data/com.termux/files/usr`、`/data/user/0/...` 及 home）改写成 Ubuntu 布局。rootfs 在 `com.termux` 下时自动关闭，`BXROOT_NO_TERMUX_COMPAT=1` 显式关闭。真机 DSHA build214 实测 shebang 与 `pwd -P`。
+- **静态映像 seccomp 兜底层（默认关）**：`BXROOT_SECCOMP_FALLBACK=1`，只陷阱映像地址范围内的路径类调用。附 `test/bench_seccomp_fallback.c`。
+- **`BXROOT_SVC_ALL=1`（默认关）**：改写号来自寄存器的 `svc` 站点。
+- 原生调用集成：`bx-host` 间接 `execve`、跳板保存 x18、session 初始化失败告警并关闭回入口。
 - 新增 [`docs/BENCH-2026-10-13.md`](docs/BENCH-2026-10-13.md) 与 README「性能」一节：proot 对 bxroot 的两方实测（官方后端被自检剔除）。README 同时去掉"ptrace 每个调用都停两次"的绝对说法。
 
 ## v0.2.4 — 2026-10-13

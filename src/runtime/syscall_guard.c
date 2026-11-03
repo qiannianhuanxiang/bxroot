@@ -381,7 +381,14 @@ static long raw_syscall6(long nr, long a0, long a1, long a2,
     register long x4 __asm__("x4") = a4;
     register long x5 __asm__("x5") = a5;
 
-    __asm__ __volatile__("svc #0"
+    __asm__ volatile(""
+        "stp x1, x2, [sp, #-16]!\n\t"
+        "stp x3, x4, [sp, #-16]!\n\t"
+        "str x5,     [sp, #-16]!\n\t"
+        "svc #0\n\t"
+        "ldr x5,     [sp], #16\n\t"
+        "ldp x3, x4, [sp], #16\n\t"
+        "ldp x1, x2, [sp], #16\n"
         : "+r"(x0)
         : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
         : "memory", "cc");

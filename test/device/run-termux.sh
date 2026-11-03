@@ -22,7 +22,21 @@ unset LD_PRELOAD
 # guest 继承宿主 PATH（与 proot 同语义）；Termux 的 PATH 在 rootfs 里不存在
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # 宿主 cwd 不在 rootfs 内 → launcher 会按上游语义警告并回退 /；脚本显式 -w /
-bxw() { "$BX" -w / "$@"; }
+#
+# Separate stdout from stderr for every bxroot invocation.
+#
+# The tests below capture command output with `out=$(... 2>&1)` and compare it
+# VERBATIM against an expected string. Merging the streams makes that
+# comparison wrong: the launcher legitimately writes diagnostics to stderr
+# (e.g. "bxroot warning: cannot chdir to ..., falling back to /"), and a
+# single such line turned all 26 path-translation cases into false FAILs on
+# the first Termux run -- none of them real.
+#
+# Rather than edit all 34 capture sites, route stderr from `bxw` into a file.
+# `2>&1` in the caller then only ever sees stdout, while the diagnostics stay
+# available for debugging at BXTM_STDERR.
+BXTM_STDERR="${TMPDIR:-$HOME/tmp}/bxtm-stderr.$$"
+bxw() { "$BX" -w / "$@" 2>>"$BXTM_STDERR"; }
 P=0; F=0
 pass() { P=$((P+1)); echo "PASS $*"; }
 fail() { F=$((F+1)); echo "FAIL $*"; }
@@ -38,7 +52,7 @@ info env "termux prefix: $PREFIX"
 [ -f "$BXROOT_LIB_PATH" ] || { fail A0 "runtime 缺失"; exit 1; }
 
 echo; echo "=== E0 launcher 本身能否运行 ==="
-out=$("$BX" -V 2>&1); rc=$?
+out=$("$BX" -V 2>>"$BXTM_STDERR"); rc=$?
 [ $rc -eq 0 ] && pass E0 "launcher -V: $out" || { fail E0 "launcher -V rc=$rc: $out"; }
 
 echo; echo "=== E1 LD_PRELOAD 注入是否真的生效（最关键）==="
@@ -101,8 +115,15 @@ out=$(bxw -r "$RF" /usr/bin/realpath /etc/hostname 2>&1)
 [ "$out" = "/etc/hostname" ] && pass B4 "$out" || fail B4 "[$out]"
 out=$(bxw -r "$RF" -w /tmp /bin/sh -c 'test "$(pwd -P)" = "$(realpath .)" && echo SAME' 2>&1)
 [ "$out" = "SAME" ] && pass B7 "pwd -P == realpath ." || fail B7 "[$out]"
-out=$("$BX" -r "$RF" -w /nonexistent /bin/sh -c 'pwd; echo PWD=$PWD' 2>&1)
-echo "$out" | grep -q "falling back" && echo "$out" | grep -q "PWD=/" && pass B6 "workdir 回退（$(echo "$out" | head -1)）" || fail B6 "[$out]"
+out=$("$BX" -r "$RF" -w /nonexistent /bin/sh -c 'pwd; echo PWD=$PWD' 2>>"$BXTM_STDERR")
+out=$(bxw -r "$RF" -w /nonexistent /bin/sh -c 'pwd; echo PWD=$PWD')
+#
+# This case asserts the fallback WARNING, which lives on stderr. bxw sends# stderr to $BXTM_STDERR (see its definition), so grep that file rather# than $out -- otherwise the assertion can never pass.
+if grep -q "falling back" "$BXTM_STDERR" 2>/dev/null && echo "$out" | grep -q "PWD=/" ; then
+    pass B6 "workdir 回退"
+else
+    fail B6 "[$out]"
+fi
 
 echo; echo "=== C1/C2 -v 静默 / C4 SIGPIPE ==="
 out=$(bxw -v -1 -r "$RF" /bin/true 2>&1); rc=$?

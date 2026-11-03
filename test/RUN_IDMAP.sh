@@ -55,7 +55,7 @@ grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || {
 }
 
 if [ "$RUNTIME_OK" = 1 ]; then
-    W=$(mktemp -d /tmp/bxroot-idmap-XXXXXX) || W="$ROOT/.tmp-idmap"
+    W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-idmap-XXXXXX") || W="$ROOT/.tmp-idmap"
     mkdir -p "$W"
 
     # 身份探针：直接读回 getresuid/getresgid、裸 syscall 174-177、getgroups。
@@ -146,7 +146,7 @@ CC="${CC:-gcc}"
 if ! command -v "$CC" >/dev/null 2>&1; then
     echo "  ⏭️  跳过 launcher 部分：找不到编译器 $CC"
 else
-    LW=$(mktemp -d /tmp/bxroot-idmap-cli-XXXXXX) || LW="$ROOT/.tmp-idmap-cli"
+    LW=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-idmap-cli-XXXXXX") || LW="$ROOT/.tmp-idmap-cli"
     mkdir -p "$LW"
     LCH="$LW/launcher"
     i=1

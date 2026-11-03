@@ -14,11 +14,27 @@ SO_CFLAGS = -shared -fPIC $(COMMON_CFLAGS)
 # ★ 16KB 页对齐（Android 15+ 16KB 内核设备硬要求；DSHA 集成的
 #   调研报告 §六.2 点名缺失）。对静态 launcher 同样需要——
 #   可执行文件的加载段对齐由链接器按 max-page-size 决定。
-SO_LDFLAGS = -ldl -nostartfiles -Wl,-z,max-page-size=16384
+SO_LDFLAGS = -ldl -nostartfiles -Wl,-z,max-page-size=16384 -Wl,--version-script=src/proc/bxroot-hooks.ver
 LAUNCH_LDFLAGS = -static -Wl,-z,max-page-size=16384 -Wl,-e,bx_early_start
+# ★ ulx 必须编成 static-PIE（ET_DYN），不能与 guest 抢 0x400000 ★
+#
+# 实测（Termux 真机，Android 16）：ulx 若按 -static 编成 ET_EXEC，它的
+# LOAD 段就落在 0x400000；而 load_elf() 给 ET_EXEC 形态的 guest 做
+# MAP_FIXED_NOREPLACE 预留的地址也正是 guest 自己的 p_vaddr(通常 0x400000)。
+# 两者冲突 → 预留失败 → load_elf 返回失败 → 对外表现为无声 SIGILL(132)。
+#
+#   ET_DYN guest          → 正常
+#   ET_EXEC @0x400000     → SIGILL 132   ← node 就是这种
+#   ET_EXEC @0x10000000   → 正常（换基址即可，证实是地址冲突）
+#
+# static-PIE 保持"静态、无 PT_INTERP、可独立 exec"的全部性质，只是加载
+# 基址由内核选到高地址，把 0x400000 空出来给 guest。
+ULX_LDFLAGS = -static-pie -fPIE -Wl,-z,max-page-size=16384 -Wl,-e,bx_early_start
 # bx-host 不依赖 libc：它要在 guest 的 static-exec 路径中自举，且所有
 # 检查/exec 都发 raw svc，避免再次进入 bxroot 的 exec hook。
-HOST_CFLAGS = -O2 -Wall -Wextra -D_GNU_SOURCE -ffreestanding -fno-stack-protector -fno-pie
+# -ffixed-x18：x18 在 Android 上是平台保留寄存器（shadow call stack），bx-host
+# 不得把活值放在里面跨 svc；runtime 跳板也会保存它，两侧各自守住。
+HOST_CFLAGS = -O2 -Wall -Wextra -D_GNU_SOURCE -ffreestanding -fno-stack-protector -fno-pie -ffixed-x18
 HOST_LDFLAGS = -static -nostdlib -Wl,-z,max-page-size=16384 -Wl,-e,_start
 
 ENTER_CFLAGS = -O2 -Wall -Wextra -D_GNU_SOURCE -DBX_ENTER_NATIVE -ffreestanding -fno-builtin -fno-stack-protector -fPIE -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
@@ -60,9 +76,9 @@ $(BUILD_DIR)/libbxroot.so: src/launcher/launcher.c src/host/host-world.c src/hos
 	$(CC) $(COMMON_CFLAGS) $(LAUNCH_LDFLAGS) -o $@ src/launcher/launcher.c src/host/host-world.c
 
 # === 用户态 exec 加载器（静态可执行，伪装为 .so；见 src/ldr/ulx.c） ===
-$(BUILD_DIR)/libbxroot-ulx.so: src/ldr/ulx.c src/ldr/early_sigsys.h
+$(BUILD_DIR)/libbxroot-ulx.so: src/ldr/ulx.c src/ldr/early_sigsys.h src/ldr/ulx-libpath.h
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(COMMON_CFLAGS) $(LAUNCH_LDFLAGS) -o $@ src/ldr/ulx.c
+	$(CC) $(COMMON_CFLAGS) $(ULX_LDFLAGS) -o $@ src/ldr/ulx.c
 
 # === Explicit host-world entry (Android bionic) ===
 $(BUILD_DIR)/bx-host: src/host/bx-host.c src/host/host-common.h

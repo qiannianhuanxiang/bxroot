@@ -149,7 +149,7 @@ fi
 # 旧判据"关掉必须 rc!=0"因此误报。真正被 path-relay 决定的是"resolver
 # 有没有读到 resolv.conf"：开 → ns0 = resolv.conf 里的地址；关 → 127.0.0.1。
 echo "--- F) 判别力：BXROOT_NO_PATHRELAY=1 时 res_init 读不到 resolv.conf ---"
-FW=$(mktemp -d /tmp/bxroot-dns-f-XXXXXX)
+FW=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-dns-f-XXXXXX")
 f_ok=0
 i=1
 while [ $i -le 10 ]; do
@@ -189,7 +189,7 @@ rm -rf "$FW"
 echo "--- G) 绝对符号链接 resolv.conf（systemd 布局，res_init 判据）---"
 # 用 res_init 探针（走 resolver 的库内内联 svc openat，正是 BUG-D1 命中的
 # 那条路；cat/open 走 exported 钩子有重试腿，测不出来）。探针需 -lresolv。
-GW=$(mktemp -d /tmp/bxroot-dns-abssym-XXXXXX)
+GW=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-dns-abssym-XXXXXX")
 RESPROBE="$GW/resinit"
 gcc_ok=0
 i=1

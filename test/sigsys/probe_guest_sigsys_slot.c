@@ -21,6 +21,7 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <signal.h>
+#include <dlfcn.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -84,6 +85,31 @@ int main(void)
         } else puts("OK 内核处理器仍是 runtime 的，没被 guest 顶掉");
     }
 
+    /*
+     * 判据 3 只有在 sigaction() 确实落到 bxroot 的钩子上时才有意义。
+     * 宿主上若有别的 preload（proroot 之类）抢先提供 sigaction，影子槽
+     * 根本不会被调用，回读自然是「别人」的处理器 —— 那是环境，不是缺陷。
+     *
+     * 判断来源只能靠 dladdr：runtime 由绝对路径 LD_PRELOAD 加载，而且
+     * 链接时没有写 SONAME，所以 dlopen("libbxroot-runtime.so", RTLD_NOLOAD)
+     * 永远返回 NULL —— 实测 nil，而同一时刻 dladdr(sigaction) 给出
+     * ".../libbxroot-runtime.so"。用 dlopen 判断会把这条判据永久跳过，
+     * 看起来「通过」而实际上一次也没检查过。
+     */
+    {
+        void *sym = dlsym(RTLD_DEFAULT, "sigaction");
+        Dl_info who;
+        int ours = 0;
+        const char *from = "unknown";
+        if (sym != NULL && dladdr(sym, &who) && who.dli_fname != NULL) {
+            from = who.dli_fname;
+            ours = strstr(from, "libbxroot-runtime.so") != NULL;
+        }
+        if (!ours) {
+            printf("SKIP 判据3：sigaction 不来自 libbxroot-runtime.so（%s）\n", from);
+            goto judge12;
+        }
+    }
     memset(&old, 0, sizeof old);
     sigaction(SIGSYS, NULL, &old);
     if (old.sa_handler != guest_handler) {
@@ -91,6 +117,7 @@ int main(void)
         fail = 1;
     } else puts("OK 回读到 guest 自己设置的处理器");
 
+judge12:
     errno = 0;
     r = syscall(SYS_faccessat2, AT_FDCWD, "/", F_OK, 0);
     printf("faccessat2 -> %ld errno=%d  guest_called=%d\n", r, errno, guest_called);

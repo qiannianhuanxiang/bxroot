@@ -170,7 +170,12 @@ static long raw4(long nr, long a, long b, long c, long d)
     register long x1 __asm__("x1") = b;
     register long x2 __asm__("x2") = c;
     register long x3 __asm__("x3") = d;
-    __asm__ __volatile__("svc #0"
+    __asm__ volatile(""
+        "stp x1, x2, [sp, #-16]!\n\t"
+        "str x3,     [sp, #-16]!\n\t"
+        "svc #0\n\t"
+        "ldr x3,     [sp], #16\n\t"
+        "ldp x1, x2, [sp], #16\n"
         : "+r"(x0)
         : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
         : "memory", "cc");

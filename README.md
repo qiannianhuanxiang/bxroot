@@ -130,6 +130,15 @@ fd/dirfd 形态的 exec 用它。所以最低门槛由 `statx` 决定 = **4.11**
 >
 > 更早的 v0.1.3 沙箱打通 / DNS path-relay / fakeroot 收敛见 CHANGELOG。竞品对标见 [`docs/竞品对标分析.md`](docs/竞品对标分析.md)。
 
+### 未发布（`bxroot.9-native-calls` 分支）
+
+v0.2.4 之后新增，还没打 tag：
+
+- **Termux 路径兼容（默认开）**：写死 Termux 前缀的脚本可以直接跑。shebang `#!/data/data/com.termux/files/usr/bin/bash`、`$PREFIX/etc/...`、Termux home 在 `translate_path` 里先改写成 Ubuntu 布局（`$PREFIX` → `/usr`，`$PREFIX/{etc,var,tmp}` → `/{etc,var,tmp}`，home → `/root`），再走常规翻译。只管路径，不提供 `pkg`，也不跑 Termux 的 bionic 二进制。真机（DSHA build214，vivo / Android 16）实测：Termux shebang 脚本输出 `ok`，`cd` 到 Termux home 后 `pwd -P` 为 `/root`。详见 [§2.18](docs/已知限制与架构能力边界.md#218-termux-路径兼容默认开启)。
+- **静态映像 seccomp 兜底层（默认关）**：`BXROOT_SECCOMP_FALLBACK=1` 时，给进程内执行的静态 ELF 叠一层只盯映像地址范围的 seccomp 过滤器，改写漏掉的路径类 `svc`（号来自寄存器、运行期生成代码）会被陷阱接住再翻译。只在容器里验证过，真机上的原生子进程和 Go 二进制还没测，见 [§2.17](docs/已知限制与架构能力边界.md#217-seccomp-兜底层静态映像默认关闭)。
+- **寄存器取号 svc 改写（默认关）**：`BXROOT_SVC_ALL=1` 时，静态映像里号来自寄存器的 `svc` 站点（如 Go `syscall.Syscall6`）也会改写进跳板；`clone`/`clone3`/`rt_sigreturn`/`exit` 族在建帧前直接放行给内核。
+- **原生调用集成**：`bx-host` 改用间接 `execve`，避免被 `static_exec` 改写；两个静态执行跳板都保存/恢复 x18（bionic 的影子调用栈寄存器）；native session 初始化失败时告警一次并关闭回入口。
+
 | 能力 | 状态 |
 |---|---|
 | 路径翻译（含 bind mount、特殊路径透传；**含裸 syscall 与相对路径形态**） | ✅ |
@@ -140,6 +149,8 @@ fd/dirfd 形态的 exec 用它。所以最低门槛由 `statx` 决定 = **4.11**
 | `system()`/`popen()`（子进程带钩子 + 路径翻译） | ✅ |
 | seccomp 中和（Android 沙箱禁止的系统调用 + livepatch；站点表按 glibc 版本登记，不匹配时回退到运行期指令扫描） | ✅ |
 | shebang 脚本直接 exec | ✅ |
+| Termux 路径兼容（Termux 前缀 shebang、`$PREFIX/...`、Termux home → Ubuntu 布局） | ✅ 未发布分支；真机 DSHA build214 实测。`BXROOT_NO_TERMUX_COMPAT=1` 关闭 |
+| 静态映像 seccomp 兜底层（接住改写漏掉的路径类 `svc`） | ⚠️ 未发布分支，默认关（`BXROOT_SECCOMP_FALLBACK=1`）；仅容器验证 |
 | NSS 用户/组查询（by-name 与 by-id 全套直解回退 + fakeroot 合成） | ✅ |
 | libaudit 符号（passwd/login/chage 等 20 个程序依赖） | ✅ |
 | `dpkg -l` / `dpkg -S` / `dpkg-deb --build` / `dpkg -i`（unpack+configure） | ✅ |
@@ -344,12 +355,16 @@ Node 全部 `ENOENT`。
 | `BXROOT_VERBOSE` | 排障日志（**部分日志为 debug 构建编译期开关**：release 包中仅 proc 等运行期日志生效，`preload.c` 的 LOG 需 `make debug`/`-DBXROOT_VERBOSE=1` 重编才完整） |
 | `BXROOT_SCG` | `syscall` 层追踪 |
 | `BXROOT_RAW_SYSCALL` | 置 1 时对「因 Android 策略而中和」的调用（io_uring 家族 425/426/427）**真透传**，不再恒定回 `ENOSYS`，由真实内核/宿主 seccomp 给出答案 —— 适用于非 Android 环境（如通用 seccomp profile 的普通容器）。身份/降权伪装与路径翻译不受影响；`0` 或未设时行为不变 |
-| `BXROOT_NO_AUTORUN` | 置 1 跳过 runtime 构造链（源码级单元测试专用，正常使用勿设） |
+| `BXROOT_NO_AUTORUN` | 置 1 跳过 runtime 构造链（源码级单元测试专用，正常使用勿设）。**不是隔离开关**：`LD_PRELOAD` 仍在、库仍被加载、导出符号的钩子仍生效，只是不做初始化 —— 进程处在半初始化状态，测出的数字不能当"无 bxroot"基线。见 [已知限制 §2.13](docs/已知限制与架构能力边界.md) |
+| `LD_PRELOAD` / `BXROOT_ROOTFS`（容器内） | **每次 exec 都被强制写回**子进程（`env -u`、`env -i`、置空均无效）。这是设计：子进程不带 runtime 就会直接 exec app 私有目录里的文件（Android 拒绝，EACCES），或跑到宿主 `/system/bin` 上。容器内显式改 `BXROOT_ROOTFS` 会打印一行告警；要用别的 rootfs 请嵌套启动 `libbxroot.so -r <rootfs> <cmd>` |
 | `BXROOT_REENTRY` / `BXROOT_ENTER` / `BXROOT_SESSION_FD` | native session v3：guest 回宿主入口与封印 session fd |
 | `PROROOT_CFG_FD` | 官方启动器配置块路径；有此文件时不注入 `STUB_ROOTFS`。显式 `BXROOT_ROOTFS` / `BXROOT_BINDS` 仍优先 |
 | `BXROOT_NO_CRASH` | 置 1 不安装崩溃处理器，由客户程序自管 SIGSEGV/SIGBUS |
 | `BXROOT_CRASH_CHAIN` | 置 1 打印现场后链式调用更早注册的 handler（默认关，开启会有双方各一段输出） |
 | `BXROOT_NO_LIVEPATCH` | 置 1 跳过 libc 站点活体补丁（非 Android 环境兜底；正常有 `PR_GET_SECCOMP` 自动门控） |
+| `BXROOT_NO_TERMUX_COMPAT` | 置 1 关闭 Termux 路径兼容（默认开；rootfs 本身在 `com.termux` 下时自动关闭）。见 [§2.18](docs/已知限制与架构能力边界.md#218-termux-路径兼容默认开启) |
+| `BXROOT_SECCOMP_FALLBACK` | 置 1 为进程内执行的静态映像叠加 seccomp 兜底过滤器（默认关，按目标 envp 判定）。见 [§2.17](docs/已知限制与架构能力边界.md#217-seccomp-兜底层静态映像默认关闭) |
+| `BXROOT_SVC_ALL` | 置 1 时静态映像里号来自寄存器的 `svc` 站点也改写进跳板（默认关） |
 | `BXROOT_FORCE_NO_LDSO_SERVICE` | 置 1 强制走"无 ldso 服务"降级分支（**测试专用**：让该分支可在开发环境真实执行） |
 
 > 提示：检测到 `PROROOT_*`（旧名/官方名）环境变量但未设对应 `BXROOT_*` 时，启动会向 stderr 打一行拼写/迁移防呆警告（每进程最多一次）。
@@ -407,6 +422,9 @@ sh test/RUN_KILL_ON_EXIT.sh     # --kill-on-exit 监督进程（6 种退出方�
 sh test/RUN_EXEC_DIAG.sh        # execveat/fexecve + exec 失败诊断 + 127/126
 sh test/RUN_STATIC_ELF.sh       # 静态/static-PIE/ld.so/ldd 经 stub-loader（带官方对照）
 sh test/RUN_STUB_PATCH.sh       # stub-loader PT_INTERP 补丁：临时目录 + 产物结构
+sh test/RUN_TERMUX_COMPAT.sh    # Termux 路径兼容，真实 runtime 8 项（BXROOT_RUN_RUNTIME=<so> 指定被测库）
+gcc -O1 -I src/runtime -o /tmp/ptc test/probe_termux_compat.c && /tmp/ptc   # 映射纯函数 37 项
+(cd test && gcc -std=gnu11 -O1 -ffixed-x18 -o /tmp/tsfb test_seccomp_fallback.c -ldl && /tmp/tsfb)  # seccomp 兜底 A–I
 bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 ```
 
@@ -449,6 +467,8 @@ bash issue-regression-test.sh   # 上游 24 issue 的 25 用例回归
 | livepatch 站点表版本绑定 | 换 glibc 时 | 站点偏移针对特定 glibc 版本；已加运行期版本断言，不匹配时**打印告警并跳过**（原先会静默失效） |
 | `-H`/`-p`/`-q` 等 CLI 选项 | 少数用户 | 官方 proroot 同样未实现；bxroot **明确报错**而非静默忽略 |
 | 架构死绑 aarch64 | 其他架构 | syscall 编号表与寄存器上下文 arm64 硬编码（O_NOFOLLOW 等常量也按本机实测）；armv7/x86_64 需要独立工作 |
+| Termux 兼容只到路径 | Termux 专用项目 | `pkg`、Termux 的 bionic 二进制、Termux:X11/Boot/Widget 不支持；不设 `PREFIX`/`TERMUX_VERSION`（§2.18） |
+| seccomp 兜底层未经真机验证 | 静态 Go 等程序 | 继承过滤器的原生子进程、Go 信号栈交互未测，所以默认关（§2.17） |
 
 
 ## 文档索引

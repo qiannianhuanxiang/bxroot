@@ -168,8 +168,17 @@ int bx_native_session_init(void)
         goto publish;
     }
 create_fresh:
-    runtime = native_env("PROROOT_LIB_PATH"); if (!runtime || !*runtime) runtime = native_env("BXROOT_LIB_PATH");
-    if (!runtime && dladdr((void *)bx_native_session_init, &info) && info.dli_fname) runtime = info.dli_fname;
+    /*
+     * 会话里记的 runtime 必须是**当前正在跑的这一份**：回入口按它装载 guest。
+     * 先用 dladdr 取本库实际映射的路径；只有拿不到绝对路径时才回落环境变量。
+     * 旧顺序先信 PROROOT_LIB_PATH，外层若是官方 proroot 容器，该变量指向
+     * libproroot-runtime.so，回入的 guest 就跑在别的 runtime 下（实测：
+     * 回入后自动分流失效，getprop 找不到）。
+     */
+    runtime = NULL;
+    if (dladdr((void *)bx_native_session_init, &info) && info.dli_fname && info.dli_fname[0] == '/')
+        runtime = info.dli_fname;
+    if (!runtime) { runtime = native_env("BXROOT_LIB_PATH"); if (!runtime || !*runtime) runtime = native_env("PROROOT_LIB_PATH"); }
     if (!entry || !*entry) {
         if (runtime_path(buf, sizeof(buf), runtime)) goto fail;
         char *slash = strrchr(buf, '/');
@@ -183,8 +192,14 @@ create_fresh:
     }
     if (bx_session_raw(SYS_faccessat, AT_FDCWD, (long)entry, X_OK, 0, 0, 0) < 0 ||
         bx_session_set(&s, "BXROOT_ENTER", entry)) goto fail;
-    tramp = native_env("PROROOT_TRAMPOLINE_PATH"); linker = native_env("PROROOT_LINKER_PATH");
-    if (!tramp || !*tramp || !linker || !*linker) { tramp = native_env("BXROOT_ULX_PATH"); linker = native_env("BXROOT_ULX_LDSO"); }
+    /*
+     * 装载链：bxroot launcher 设了 ULX 就用 ULX（本会话自己的链）；只有没有 ULX
+     * 时才退回 proroot 的 bridge/linker。旧顺序先信 PROROOT_*，当外层恰好是
+     * proroot 容器时会回落到对方的 vendor linker，而它只接受自家 runtime：
+     *     DSHA_PROROOT_PRELOAD_ENTRY_UNAVAILABLE stage=ARGV_PRELOAD_VENDOR
+     */
+    tramp = native_env("BXROOT_ULX_PATH"); linker = native_env("BXROOT_ULX_LDSO");
+    if (!tramp || !*tramp || !linker || !*linker) { tramp = native_env("PROROOT_TRAMPOLINE_PATH"); linker = native_env("PROROOT_LINKER_PATH"); }
     if (!tramp || !linker) { errno = ENOTSUP; goto fail; }
     if (runtime_path(buf, sizeof(buf), tramp) || bx_session_set(&s, "_TRAMP", buf) ||
         runtime_path(buf, sizeof(buf), linker) || bx_session_set(&s, "_LINKER", buf) ||

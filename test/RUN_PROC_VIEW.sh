@@ -31,7 +31,7 @@ grep -q 'libproroot-runtime\.so' /proc/self/maps 2>/dev/null || {
     echo "⏭️  跳过：需要外层 proroot 注入链路"; exit 2; }
 [ -f "$ROOT/build/libbxroot-runtime.so" ] || { echo "⏭️  跳过：没有 build/libbxroot-runtime.so"; exit 2; }
 
-W=$(mktemp -d /tmp/bxroot-procview-XXXXXX)
+W=$(mktemp -d "${TMPDIR:-/tmp}/bxroot-procview-XXXXXX")
 trap 'rm -rf "$W"' EXIT
 FAIL=0
 # 失败明细另存一份（RUN_ALL 只保留摘要行，偶发红时需要现场）

@@ -1,0 +1,22 @@
+/* 版本脚本（2026-10-25）
+ *
+ * 只给进程创建/exec 系列打 GLIBC_2.17 标签：
+ *   node 的 PLT 引用是 execvp@GLIBC_2.17，无版本导出匹配不上 → 钩子失效 →
+ *   spawn 绕过路径翻译 → 直 exec app_data_file → EACCES。
+ *
+ * 其余符号（fcntl/dup2/socket/waitpid/sigaction/open/stat/...）保持**无版本导出**：
+ * 它们此前对 node 就是不生效的，node 一直用 libc 原版。给它们加标签会让这些
+ * 钩子对 node 一并生效，其中任何一个有缺陷都会导致工具调用卡死（无响应）。
+ * 所以只在版本节点里列 exec 系列，其余不放进去 = 保持无版本。
+ */
+GLIBC_2.17 {
+    global:
+        execl;
+        execle;
+        execlp;
+        execv;
+        execve;
+        execveat;
+        execvp;
+        execvpe;
+};
